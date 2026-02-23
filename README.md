@@ -4,6 +4,8 @@ A lightweight, pull-based orchestrator for services running in [Firecracker](htt
 
 ## Related Repositories
 
+You can use them to have everything working end-to-end:
+
 - [firework-deployment-example](https://github.com/artemnikitin/firework-deployment-example) - Terraform + Packer deployment on AWS
 - [firework-gitops-example](https://github.com/artemnikitin/firework-gitops-example) - example GitOps input repo and rootfs image build pipeline
 
@@ -38,7 +40,8 @@ flowchart TD
 
 ## Documentation
 
-- Architecture: [`docs/architecture/README.md`](docs/architecture/README.md)
+- Architecture overview: [`docs/architecture/README.md`](docs/architecture/README.md)
+- Design decisions and rationale: [`docs/architecture/DESIGN.md`](docs/architecture/DESIGN.md)
 - Configuration reference: [`docs/configs/README.md`](docs/configs/README.md)
 - Example agent configs: [`examples/`](examples/)
 
@@ -61,11 +64,6 @@ Run agent with an example config:
 ```bash
 sudo ./bin/firework-agent --config examples/agent-s3.yaml
 ```
-
-## Deployment Modes
-
-- **Recommended:** GitOps input -> enricher -> S3 `nodes/*.yaml` -> agent polls S3.
-- **Simple mode:** agent pulls fully resolved `nodes/*.yaml` directly from Git (no enricher/scheduler).
 
 ## License
 
