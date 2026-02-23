@@ -1,0 +1,15 @@
+# Service definition for the background worker.
+# Uses a different node_type so it ends up on compute-optimized nodes.
+name: "worker"
+source_image: "python:3.12-slim"
+image: "/var/lib/images/worker-rootfs.ext4"
+node_type: "compute"
+vcpus: 4
+memory_mb: 1024
+network: true
+health_check:
+  type: "tcp"
+  port: 9090
+metadata:
+  environment: "production"
+  version: "2.0.0"

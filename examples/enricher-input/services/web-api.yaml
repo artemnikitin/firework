@@ -1,0 +1,20 @@
+# Service definition for the web API.
+# The enricher fills in missing fields from defaults.yaml.
+# All services with the same node_type are grouped into one node config.
+name: "web-api"
+source_image: "nginx:alpine"
+image: "/var/lib/images/web-api-rootfs.ext4"
+node_type: "general-purpose"
+vcpus: 2
+memory_mb: 512
+network: true
+port_forwards:
+  - host_port: 80
+    vm_port: 8080
+health_check:
+  type: "http"
+  port: 8080
+  path: "/health"
+metadata:
+  environment: "production"
+  version: "1.2.3"

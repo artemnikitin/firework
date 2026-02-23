@@ -1,0 +1,127 @@
+version: 2
+
+project_name: firework
+
+builds:
+  - id: firework-agent
+    main: ./cmd/agent
+    binary: firework-agent
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - linux
+      - darwin
+    goarch:
+      - amd64
+      - arm64
+    ignore:
+      - goos: darwin
+        goarch: amd64
+    ldflags:
+      - -s -w -X github.com/artemnikitin/firework/internal/version.Version={{.Version}} -X github.com/artemnikitin/firework/internal/version.Commit={{.ShortCommit}} -X github.com/artemnikitin/firework/internal/version.BuildTime={{.Date}}
+
+  - id: enricher-bootstrap
+    main: ./cmd/enricher
+    binary: bootstrap
+    tags:
+      - lambda.norpc
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - linux
+    goarch:
+      - arm64
+    ldflags:
+      - -s -w -X github.com/artemnikitin/firework/internal/version.Version={{.Version}} -X github.com/artemnikitin/firework/internal/version.Commit={{.ShortCommit}} -X github.com/artemnikitin/firework/internal/version.BuildTime={{.Date}}
+
+  - id: scheduler-bootstrap
+    main: ./cmd/scheduler
+    binary: bootstrap
+    tags:
+      - lambda.norpc
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - linux
+    goarch:
+      - arm64
+    ldflags:
+      - -s -w -X github.com/artemnikitin/firework/internal/version.Version={{.Version}} -X github.com/artemnikitin/firework/internal/version.Commit={{.ShortCommit}} -X github.com/artemnikitin/firework/internal/version.BuildTime={{.Date}}
+
+  - id: fc-init
+    main: ./cmd/fc-init
+    binary: fc-init
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - linux
+    goarch:
+      - arm64
+
+archives:
+  - id: firework-agent-binaries
+    ids:
+      - firework-agent
+    name_template: "firework-agent-{{ .Os }}-{{ .Arch }}"
+    formats:
+      - binary
+    files: []
+
+  - id: firework-enricher-bootstrap-binary
+    ids:
+      - enricher-bootstrap
+    name_template: "firework-enricher-bootstrap-{{ .Os }}-{{ .Arch }}"
+    formats:
+      - binary
+    files: []
+
+  - id: firework-enricher-lambda-zip
+    ids:
+      - enricher-bootstrap
+    # Named "enricher" (not "firework-enricher-lambda-linux-arm64") so the
+    # published asset is enricher.zip — exactly what terraform/control-plane
+    # download_enricher provisioner looks for.
+    name_template: "enricher"
+    formats:
+      - zip
+    wrap_in_directory: false
+    files: []
+
+  - id: firework-scheduler-bootstrap-binary
+    ids:
+      - scheduler-bootstrap
+    name_template: "firework-scheduler-bootstrap-{{ .Os }}-{{ .Arch }}"
+    formats:
+      - binary
+    files: []
+
+  - id: firework-scheduler-lambda-zip
+    ids:
+      - scheduler-bootstrap
+    # Named "scheduler" so the published asset is scheduler.zip — exactly what
+    # terraform/control-plane download_scheduler provisioner looks for.
+    name_template: "scheduler"
+    formats:
+      - zip
+    wrap_in_directory: false
+    files: []
+
+  - id: firework-fc-init-binary
+    ids:
+      - fc-init
+    name_template: "fc-init-{{ .Os }}-{{ .Arch }}"
+    formats:
+      - binary
+    files: []
+
+checksum:
+  name_template: SHA256SUMS
+
+source:
+  enabled: false
+
+release:
+  # GitHub immutable releases reject asset uploads to already-published
+  # releases. Create as draft first, upload assets, then publish in workflow.
+  draft: true
+  replace_existing_draft: true

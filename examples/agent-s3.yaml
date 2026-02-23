@@ -1,0 +1,57 @@
+# Agent configuration (S3 store mode).
+# Place on each node at /etc/firework/agent.yaml.
+#
+# In this mode the enricher Lambda writes enriched configs to S3 and
+# the agent polls the bucket for changes. The agent's node_name must
+# match a node_type used in the enricher input service specs.
+#
+# AWS credentials are resolved from the standard chain:
+#   1. Environment variables (AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY)
+#   2. EC2 instance profile / IAM role (recommended for production)
+#   3. Shared credentials file (~/.aws/credentials)
+node_name: "general-purpose"
+
+# Multi-label support: a single node can pull configs for multiple node types.
+# The agent fetches and merges services from all listed labels.
+# Overrides node_name when set.
+# node_names:
+#   - "web"
+#   - "backend"
+
+# Config store settings
+store_type: "s3"
+s3_bucket: "my-firework-configs"
+s3_prefix: ""              # optional, e.g. "prod/" to namespace configs
+s3_region: "us-east-1"     # optional, resolved from env/instance metadata if empty
+# s3_endpoint_url: "http://localhost:4566"  # uncomment for LocalStack testing
+
+# Image sync: if set, the agent downloads VM images from this S3 bucket
+# before starting VMs. Uses ETag-based caching to skip unchanged files.
+# s3_images_bucket: "my-firework-images"
+
+# Local directory where VM images are stored
+images_dir: "/var/lib/images"
+
+# How often the agent polls S3 for config changes
+poll_interval: "30s"
+
+# Path to the Firecracker binary
+firecracker_bin: "/usr/bin/firecracker"
+
+# Where the agent stores runtime state (VM sockets, logs, etc.)
+state_dir: "/var/lib/firework"
+
+# Log level: debug, info, warn, error
+log_level: "info"
+
+# Status/health HTTP API
+api_listen_addr: ":8080"
+
+enable_health_checks: true
+enable_network_setup: true
+
+# Shared bridge networking: VMs share a bridge for inter-VM communication.
+vm_subnet: "172.16.0.0/24"
+vm_gateway: "172.16.0.1"
+vm_bridge: "br-firework"
+# out_interface: "eth0"  # host NIC for masquerade (internet access for VMs)

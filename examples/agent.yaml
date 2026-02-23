@@ -1,0 +1,33 @@
+# Agent configuration (Git store mode).
+# Place on each node at /etc/firework/agent.yaml.
+#
+# In this mode the agent pulls fully resolved node configs directly from
+# the Git repo. No enricher Lambda is needed — you write the node configs
+# by hand (see examples/nodes/node-1.yaml).
+node_name: "node-1"
+
+# Config store settings
+store_type: "git"
+store_url: "https://github.com/artemnikitin/firework-gitops-example.git"
+store_branch: "main"
+
+# How often the agent pulls from the config store
+poll_interval: "30s"
+
+# Path to the Firecracker binary
+firecracker_bin: "/usr/bin/firecracker"
+
+# Where the agent stores runtime state (VM sockets, logs, etc.)
+state_dir: "/var/lib/firework"
+
+# Log level: debug, info, warn, error
+log_level: "info"
+
+# Status/health HTTP API (leave empty to disable)
+api_listen_addr: ":8080"
+
+# Enable health checks for services that define them (default: true)
+enable_health_checks: true
+
+# Enable automatic TAP/bridge network setup (default: true)
+enable_network_setup: true

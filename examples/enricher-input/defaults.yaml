@@ -1,0 +1,13 @@
+# Global defaults applied to every service unless overridden.
+# All fields are optional — hardcoded fallbacks apply if not set here.
+kernel: "/var/lib/images/vmlinux-5.10"
+vcpus: 1
+memory_mb: 256
+kernel_args: "console=ttyS0 reboot=k panic=1 pci=off init=/sbin/fc-init"
+health_check:
+  type: "http"
+  port: 8080
+  path: "/health"
+  interval: "10s"
+  timeout: "5s"
+  retries: 3

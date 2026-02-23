@@ -1,0 +1,46 @@
+# Demo agent config — single machine running all 6 VMs (2 tenants × kibana + elasticsearch).
+# Place on the demo node at /etc/firework/agent.yaml.
+#
+# This node pulls both "web" (kibana) and "backend" (elasticsearch) configs
+# from S3 so that all tenant services run on a single host.
+
+# Pull configs for both node types so all 6 VMs run on this machine:
+#   web:     kibana, tenant-1-kibana, tenant-2-kibana
+#   backend: elasticsearch, tenant-1-elasticsearch, tenant-2-elasticsearch
+node_names:
+  - "web"
+  - "backend"
+
+# Config store: S3 bucket where the enricher Lambda writes nodes/*.yaml
+store_type: "s3"
+s3_bucket: "firework-demo-configs-20260218164843682300000002"
+s3_region: "us-east-1"
+
+# Image sync: download VM rootfs images from S3 before starting VMs
+s3_images_bucket: "artemnikitin-firework-images"
+images_dir: "/var/lib/images"
+
+# How often to poll S3 for config changes
+poll_interval: "30s"
+
+# Path to the Firecracker binary
+firecracker_bin: "/usr/bin/firecracker"
+
+# Runtime state directory
+state_dir: "/var/lib/firework"
+
+log_level: "info"
+api_listen_addr: ":8080"
+enable_health_checks: true
+enable_network_setup: true
+
+# Shared bridge: all 6 VMs share this subnet for inter-VM communication.
+# tenant-N-kibana resolves tenant-N-elasticsearch via the bridge IP.
+vm_subnet: "172.16.0.0/24"
+vm_gateway: "172.16.0.1"
+vm_bridge: "br-firework"
+
+# Host NIC for internet access inside VMs (masquerade/NAT).
+# Run `ip route | awk '/^default/{print $5; exit}'` on the demo machine to find it.
+# Typically eth0 or ens5 on EC2.
+out_interface: "eth0"

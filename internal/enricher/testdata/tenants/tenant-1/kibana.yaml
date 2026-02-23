@@ -1,0 +1,26 @@
+source_image: "docker.elastic.co/kibana/kibana:8.17.4"
+node_type: "web"
+vcpus: 2
+memory_mb: 2048
+kernel_args: "console=ttyS0 reboot=k panic=1 pci=off init=/sbin/fc-init /bin/tini -- /usr/local/bin/kibana-docker"
+network: true
+links:
+  - service: "elasticsearch"
+    env: "ELASTICSEARCH_HOSTS"
+    port: 9200
+port_forwards:
+  - host_port: 5611
+    vm_port: 5601
+health_check:
+  type: "http"
+  port: 5601
+  path: "/api/status"
+  interval: "15s"
+  timeout: "5s"
+  retries: 5
+env:
+  TENANT_ID: "tenant-1"
+metadata:
+  tenant: "tenant-1"
+  tier: "standard"
+  version: "8.17.4"

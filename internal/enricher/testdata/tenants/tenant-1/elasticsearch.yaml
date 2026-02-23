@@ -1,0 +1,19 @@
+source_image: "docker.elastic.co/elasticsearch/elasticsearch:8.17.4"
+node_type: "backend"
+vcpus: 2
+memory_mb: 2048
+kernel_args: "console=ttyS0 reboot=k panic=1 pci=off init=/sbin/fc-init /bin/tini -- /usr/local/bin/docker-entrypoint.sh eswrapper"
+network: true
+health_check:
+  type: "http"
+  port: 9200
+  path: "/_cluster/health"
+  interval: "15s"
+  timeout: "10s"
+  retries: 5
+env:
+  TENANT_ID: "tenant-1"
+metadata:
+  tenant: "tenant-1"
+  tier: "standard"
+  version: "8.17.4"
