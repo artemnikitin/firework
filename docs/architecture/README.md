@@ -80,7 +80,7 @@ If the enricher can resolve EC2 private IPs for scheduled nodes:
 - Guest IPs are assigned deterministically from `vm_subnet`.
 - Host-to-guest exposure uses DNAT rules from `port_forwards`.
 - Same-node service discovery uses runtime-resolved guest IPs (links).
-- For cross-node proxying, Traefik sync can include peer-node services when the store supports listing all node configs (S3 store does).
+- For cross-node proxying, Traefik sync can include peer-node services when the store supports listing all node configs.
 
 ## Alternative Flow: Direct Git Mode
 
@@ -94,5 +94,6 @@ This is simpler operationally, but you manage full per-node configs yourself.
 
 ## See Also
 
+- Design decisions and rationale: [`DESIGN.md`](DESIGN.md)
 - Main overview: [`../../README.md`](../../README.md)
 - Config reference: [`../configs/README.md`](../configs/README.md)
