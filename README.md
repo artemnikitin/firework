@@ -26,21 +26,19 @@ flowchart TB
         EB["EventBridge"]
         ENRICHER["Enricher Lambda"]
         SCHED["Scheduler Lambda"]
-        S3CFG["S3 Config Bucket"]
         CW["CloudWatch"]
     end
 
-    S3IMG["S3 Images Bucket"]
+    subgraph storage["AWS – Storage"]
+        S3CFG["S3 Config Bucket"]
+        S3IMG["S3 Images Bucket"]
+    end
 
     subgraph vpc["AWS VPC – Data Plane"]
         ALB["Application Load Balancer\n(public, multi-AZ)"]
-
-        subgraph node1["EC2 Node 1  (c6g.metal, private subnet)"]
-            N1["firework-agent\nFirecracker VMs"]
-        end
-
-        subgraph node2["EC2 Node 2  (c6g.metal, private subnet)"]
-            N2["firework-agent\nFirecracker VMs"]
+        subgraph nodes["EC2 Nodes  (c6g.metal, private subnets)"]
+            N1["Node 1\nfirework-agent · Firecracker VMs"]
+            N2["Node 2\nfirework-agent · Firecracker VMs"]
         end
     end
 
@@ -49,15 +47,14 @@ flowchart TB
 
     GITHUB -->|push webhook| APIGW
     APIGW --> ENRICHER
-    EB -->|periodic trigger| ENRICHER
+    EB -->|periodic| ENRICHER
     ENRICHER -->|invoke| SCHED
     CW -->|capacity metrics| SCHED
-    SCHED -->|node assignments| ENRICHER
-    ENRICHER -->|write node configs| S3CFG
+    SCHED -->|assignments| ENRICHER
+    ENRICHER -->|write configs| S3CFG
+    CI -->|upload| S3IMG
 
-    CI -->|upload images| S3IMG
-
-    N1 & N2 -->|poll configs| S3CFG
+    N1 & N2 -->|poll & sync| S3CFG
     N1 & N2 -->|pull images| S3IMG
     N1 & N2 -->|publish metrics| CW
 ```
