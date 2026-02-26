@@ -52,7 +52,7 @@ dependencies, and different failure modes. Splitting them means the enricher can
 the scheduler (for single-node setups), the scheduler can be invoked independently for
 debugging, and each can be tested separately.
 
-## Node Discovery via CloudWatch, Not a Static Inventory
+## Node Discovery via CloudWatch
 
 The scheduler needs to know which nodes exist and what capacity they have. The options are:
 
@@ -91,7 +91,7 @@ assignments for other services. It would be a problem for very dynamic workloads
 
 ## Static Service Linking
 
-Services that depend on each other (e.g. Kibana → Elasticsearch) are linked at config
+Services that depend on each other (e.g. UI → backend) are linked at config
 resolution time, not at runtime. The enricher resolves the guest IP of the target service
 and injects it as an environment variable into the dependent service's kernel args.
 
@@ -141,7 +141,7 @@ This makes agent updates non-disruptive to running workloads.
 
 ## What Was Left Out
 
-Several things were considered and deliberately not built:
+Several things were considered and deliberately not implemented in the initial version:
 
 **Rolling updates / canary deployments**: Firework applies all changes in a single
 reconciliation pass. There is no built-in mechanism for staged rollouts. 

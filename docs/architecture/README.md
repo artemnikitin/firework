@@ -24,6 +24,29 @@ This document explains how Firework components work together at runtime.
 - Applies best-fit scheduling with anti-affinity support for remaining services.
 - Returns per-node assignments to the enricher.
 
+## Agent Internals
+
+```mermaid
+flowchart TD
+  CFG[(Config store<br/>S3 or Git)] -->|poll| AGENT[firework-agent]
+  IMG[(S3 images bucket)] -->|optional image sync| SYNC[Image syncer]
+  AGENT --> SYNC
+  AGENT --> REC[Reconcile loop]
+  SYNC --> REC
+
+  REC --> NET[Network manager<br/>bridge / TAP / iptables]
+  REC --> VM[VM manager]
+  VM --> FC[Firecracker microVMs]
+
+  REC --> HC[Health monitor]
+  HC -->|restart on repeated failures| VM
+
+  REC --> TR[Traefik config manager]
+  TR --> DYN[/Traefik dynamic config files/]
+
+  AGENT --> API[Local API<br/>/healthz /health /status /metrics]
+```
+
 ## Recommended Production Flow (S3 Mode)
 
 ```mermaid
