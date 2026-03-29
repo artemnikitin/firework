@@ -1,0 +1,37 @@
+# Firework control-plane configuration.
+# Roles: registry | events | controller | all
+role: "all"
+
+registry_listen_addr: ":9443"
+events_listen_addr: ":9444"
+
+state:
+  backend: "s3"
+  prefix: "cp/v1"
+  s3:
+    bucket: "my-firework-controlplane"
+    region: "us-east-1"
+    # endpoint_url: "http://localhost:4566"
+    force_path_style: false
+
+leader_lease_ttl: "30s"
+leader_renew_interval: "10s"
+node_stale_ttl: "45s"
+controller_tick: "10s"
+
+target_branch: "main"
+# config_dir: "firework"
+github_webhook_secret: "replace-me"
+
+tls:
+  cert_file: "/etc/firework/tls/controlplane.crt"
+  key_file: "/etc/firework/tls/controlplane.key"
+  client_ca_file: "/etc/firework/pki/node-ca.crt"
+
+enrollment:
+  ca_file: "/etc/firework/pki/node-ca.crt"
+  ca_key_file: "/etc/firework/pki/node-ca.key"
+  node_cert_ttl: "24h"
+  bootstrap_tokens:
+    - token: "replace-me-bootstrap-token"
+      node_id: "node-1"

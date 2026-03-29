@@ -128,6 +128,9 @@ type HealthCheckConfig struct {
 
 // AgentConfig holds the agent's own operational configuration.
 type AgentConfig struct {
+	// NodeID is the stable identity used for control-plane registry and mTLS
+	// certificate subject matching. Defaults to NodeName when empty.
+	NodeID string `yaml:"node_id,omitempty"`
 	// NodeName is this node's unique identifier.
 	NodeName string `yaml:"node_name"`
 	// StoreType is the config store backend: "git" or "s3".
@@ -193,4 +196,26 @@ type AgentConfig struct {
 	// directory and picks up changes without a reload.
 	// If empty, Traefik config management is disabled.
 	TraefikConfigDir string `yaml:"traefik_config_dir,omitempty"`
+
+	// RegistryURL enables control-plane registry integration when set.
+	// The agent will enroll/renew mTLS certificates and send register/heartbeat
+	// updates to this endpoint.
+	RegistryURL string `yaml:"registry_url,omitempty"`
+	// RegistryServerName overrides TLS server name for the registry endpoint.
+	RegistryServerName string `yaml:"registry_server_name,omitempty"`
+	// RegistryCertFile is the local path to the node mTLS client certificate.
+	RegistryCertFile string `yaml:"registry_cert_file,omitempty"`
+	// RegistryKeyFile is the local path to the node mTLS private key.
+	RegistryKeyFile string `yaml:"registry_key_file,omitempty"`
+	// RegistryCAFile is the CA bundle used to verify the registry TLS cert.
+	RegistryCAFile string `yaml:"registry_ca_file,omitempty"`
+	// RegistryBootstrapToken is used once to enroll a node certificate.
+	// Supports env placeholders (for example ${REGISTRY_BOOTSTRAP_TOKEN}).
+	RegistryBootstrapToken string `yaml:"registry_bootstrap_token,omitempty"`
+	// RegistryBootstrapTokenFile points to a file containing the bootstrap
+	// token. Useful for secret mounts; file contents are trimmed.
+	RegistryBootstrapTokenFile string `yaml:"registry_bootstrap_token_file,omitempty"`
+	// RegistryCertRenewBefore triggers proactive certificate renewal when the
+	// current certificate expires within this window.
+	RegistryCertRenewBefore time.Duration `yaml:"registry_cert_renew_before,omitempty"`
 }

@@ -61,10 +61,32 @@ func testAgentConfig(t *testing.T) config.AgentConfig {
 type fakeCapacityReader struct {
 	cap capacity.NodeCapacity
 	err error
+	// reads tracks how many times Read() was called.
+	reads int
 }
 
 func (f *fakeCapacityReader) Read() (capacity.NodeCapacity, error) {
+	f.reads++
 	return f.cap, f.err
+}
+
+type scriptedCapacityRead struct {
+	cap capacity.NodeCapacity
+	err error
+}
+
+type scriptedCapacityReader struct {
+	steps []scriptedCapacityRead
+	idx   int
+}
+
+func (s *scriptedCapacityReader) Read() (capacity.NodeCapacity, error) {
+	if s.idx >= len(s.steps) {
+		return capacity.NodeCapacity{}, fmt.Errorf("no scripted read at index %d", s.idx)
+	}
+	step := s.steps[s.idx]
+	s.idx++
+	return step.cap, step.err
 }
 
 func testLogger() *slog.Logger {
@@ -262,5 +284,50 @@ func TestTick_CapacityCheck_ProceedsWhenSufficient(t *testing.T) {
 	// Capacity gauges should be set.
 	if !strings.Contains(out, "firework_node_capacity_vcpus") {
 		t.Error("expected capacity vcpus gauge in metrics output")
+	}
+}
+
+func TestTick_CapacityReaderReadOncePerTick(t *testing.T) {
+	nodeYAML := []byte("node: web\nservices:\n- name: light\n  image: /img/light\n  kernel: /kern\n  vcpus: 1\n  memory_mb: 256\n")
+	s := &fakeStore{
+		data:     map[string][]byte{"web": nodeYAML},
+		revision: "rev-1",
+	}
+
+	a := New(testAgentConfig(t), s, testLogger())
+	reader := &fakeCapacityReader{
+		cap: capacity.NodeCapacity{VCPUs: 64, MemoryMB: 131072},
+	}
+	a.capacityReader = reader
+
+	a.tick(context.Background())
+
+	if reader.reads != 1 {
+		t.Fatalf("expected one capacity read per tick, got %d", reader.reads)
+	}
+}
+
+func TestReadNodeCapacity_UsesLastKnownOnError(t *testing.T) {
+	reader := &scriptedCapacityReader{
+		steps: []scriptedCapacityRead{
+			{cap: capacity.NodeCapacity{VCPUs: 8, MemoryMB: 16384}},
+			{err: fmt.Errorf("transient read error")},
+		},
+	}
+	a := &Agent{
+		capacityReader: reader,
+		logger:         testLogger(),
+	}
+
+	first, ok := a.readNodeCapacity()
+	if !ok {
+		t.Fatal("expected first capacity read to succeed")
+	}
+	second, ok := a.readNodeCapacity()
+	if !ok {
+		t.Fatal("expected fallback to last-known capacity")
+	}
+	if second != first {
+		t.Fatalf("expected last-known capacity %+v, got %+v", first, second)
 	}
 }

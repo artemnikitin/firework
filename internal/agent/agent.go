@@ -37,8 +37,11 @@ type Agent struct {
 	metrics        *runtimeMetrics
 	capacityReader capacity.Reader
 	traefikMgr     *traefik.Manager
+	registryClient *registryClient
 
-	lastRevision string
+	lastRevision         string
+	lastKnownCapacity    capacity.NodeCapacity
+	hasLastKnownCapacity bool
 }
 
 // New creates a new Agent with all its dependencies.
@@ -125,6 +128,9 @@ func New(cfg config.AgentConfig, s store.Store, logger *slog.Logger) *Agent {
 		capacityReader: capReader,
 		traefikMgr:     traefikMgr,
 	}
+	if cfg.RegistryURL != "" {
+		a.registryClient = newRegistryClient(cfg, logger, time.Now().UTC().UnixNano())
+	}
 
 	// Set up optional API server.
 	if cfg.APIListenAddr != "" {
@@ -175,6 +181,11 @@ func (a *Agent) Run(ctx context.Context) error {
 
 // shutdown cleans up all resources.
 func (a *Agent) shutdown() {
+	if a.registryClient != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		a.registryClient.markDown(ctx, a.cfg.NodeID)
+		cancel()
+	}
 	if a.healthMon != nil {
 		a.healthMon.Stop()
 	}
@@ -189,12 +200,16 @@ func (a *Agent) shutdown() {
 func (a *Agent) tick(ctx context.Context) {
 	a.logger.Debug("reconciliation tick starting")
 
-	// Always publish node capacity so the scheduler can discover this node
-	// in CloudWatch even before a config has been assigned. When services are
-	// loaded below, checkCapacity will overwrite the used values with actuals.
+	var (
+		nodeCap capacity.NodeCapacity
+		hasCap  bool
+	)
+	// Capture node capacity early so registry heartbeats include capacity even
+	// when no desired services are assigned yet.
 	if a.capacityReader != nil {
-		if cap, err := a.capacityReader.Read(); err == nil {
-			a.metrics.setCapacity(cap, capacity.NodeCapacity{})
+		nodeCap, hasCap = a.readNodeCapacity()
+		if hasCap {
+			a.metrics.setCapacity(nodeCap, capacity.NodeCapacity{})
 		}
 	}
 
@@ -204,6 +219,7 @@ func (a *Agent) tick(ctx context.Context) {
 		// No local config, but still sync Traefik with remote nodes so that
 		// this node can proxy requests for services placed on peer nodes.
 		a.syncTraefikConfigs(ctx, nil)
+		a.syncRegistry(ctx, nodeCap, capacity.NodeCapacity{})
 		return
 	}
 
@@ -236,7 +252,9 @@ func (a *Agent) tick(ctx context.Context) {
 	a.injectEnvVars(merged.Services)
 
 	// Check node capacity before reconciling; skip if resources are exceeded.
-	if !a.checkCapacity(merged.Services) {
+	used := sumResources(merged.Services)
+	if !a.checkCapacity(nodeCap, used, hasCap) {
+		a.syncRegistry(ctx, nodeCap, used)
 		return
 	}
 
@@ -247,6 +265,7 @@ func (a *Agent) tick(ctx context.Context) {
 		a.metrics.observeImageSync(time.Since(syncStart), err != nil)
 		if err != nil {
 			a.logger.Error("image sync failed", "error", err)
+			a.syncRegistry(ctx, nodeCap, used)
 			return
 		}
 	}
@@ -257,6 +276,7 @@ func (a *Agent) tick(ctx context.Context) {
 	a.metrics.observeReconcile(time.Since(reconcileStart), err != nil)
 	if err != nil {
 		a.logger.Error("reconciliation failed", "error", err)
+		a.syncRegistry(ctx, nodeCap, used)
 		return
 	}
 
@@ -273,6 +293,7 @@ func (a *Agent) tick(ctx context.Context) {
 	}
 	a.metrics.recordConfigApply(appliedRevision, time.Now())
 	a.refreshRuntimeMetrics()
+	a.syncRegistry(ctx, nodeCap, used)
 
 	a.logger.Debug("reconciliation tick completed", "revision", rev)
 }
@@ -492,20 +513,12 @@ func (a *Agent) syncTraefikConfigs(ctx context.Context, services []config.Servic
 	}
 }
 
-// checkCapacity reads node capacity and compares it against the desired
-// services. Returns false (skip reconcile) if resources would be exceeded.
-func (a *Agent) checkCapacity(services []config.ServiceConfig) bool {
-	if a.capacityReader == nil {
+// checkCapacity compares desired usage against host capacity. Returns false
+// (skip reconcile) if resources would be exceeded.
+func (a *Agent) checkCapacity(cap, used capacity.NodeCapacity, hasCap bool) bool {
+	if !hasCap {
 		return true
 	}
-
-	cap, err := a.capacityReader.Read()
-	if err != nil {
-		a.logger.Debug("capacity check skipped", "error", err)
-		return true
-	}
-
-	used := sumResources(services)
 	a.metrics.setCapacity(cap, used)
 
 	if used.VCPUs > cap.VCPUs || used.MemoryMB > cap.MemoryMB {
@@ -517,6 +530,21 @@ func (a *Agent) checkCapacity(services []config.ServiceConfig) bool {
 	}
 
 	return true
+}
+
+func (a *Agent) readNodeCapacity() (capacity.NodeCapacity, bool) {
+	cap, err := a.capacityReader.Read()
+	if err == nil {
+		a.lastKnownCapacity = cap
+		a.hasLastKnownCapacity = true
+		return cap, true
+	}
+	if a.hasLastKnownCapacity {
+		a.logger.Debug("capacity read failed, using last-known-good value", "error", err)
+		return a.lastKnownCapacity, true
+	}
+	a.logger.Debug("capacity check skipped", "error", err)
+	return capacity.NodeCapacity{}, false
 }
 
 // sumResources returns the total vCPUs and memory requested by all services.
@@ -620,6 +648,13 @@ func (a *Agent) refreshRuntimeMetrics() {
 		results = a.healthMon.Results()
 	}
 	a.metrics.setServiceSnapshot(a.vmManager.List(), results)
+}
+
+func (a *Agent) syncRegistry(ctx context.Context, cap, used capacity.NodeCapacity) {
+	if a.registryClient == nil {
+		return
+	}
+	a.registryClient.sync(ctx, a.cfg.NodeID, a.cfg.NodeNames, cap, used)
 }
 
 // healthAdapter wraps healthcheck.Monitor to satisfy api.HealthResultsProvider.

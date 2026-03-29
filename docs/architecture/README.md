@@ -6,66 +6,46 @@ This document explains how Firework components work together at runtime.
 
 ### `firework-agent` (runs on each node)
 
-- Polls a config store (`git` or `s3`) for desired state.
-- Reconciles local Firecracker microVMs to match that state.
-- Additionally, manages networking, health checks, image sync, and Traefik dynamic routes.
+- Polls S3 (or Git in direct mode) for desired `nodes/<node>.yaml`.
+- Reconciles local Firecracker microVMs to match desired state.
+- Manages networking, health checks, image sync, and Traefik dynamic routes.
+- Registers with control plane and sends periodic heartbeat over mTLS.
 - Exposes local HTTP endpoints (`/healthz`, `/health`, `/status`, `/metrics`).
 
-### `enricher` Lambda
+### `firework-controlplane` (single binary, role-based runtime)
 
-- Receives GitHub push webhooks (or scheduled EventBridge invocations).
-- Clones the config repo, loads user-facing specs, applies defaults, validates, and writes `nodes/*.yaml` to S3.
-- Optionally calls scheduler Lambda for multi-node placement.
+Roles:
 
-### `scheduler` Lambda
+- `registry`: node enrollment (bootstrap token + CSR), register, heartbeat, node-state APIs.
+- `events`: GitHub webhook ingestion, repo clone, enrichment, desired revision publishing.
+- `controller`: leader-elected scheduler/publisher loop.
+- `all`: runs all roles in one process.
 
-- Discovers active nodes from CloudWatch capacity metrics.
-- Preserves stable placement from existing S3 node configs when possible.
-- Applies best-fit scheduling with anti-affinity support for remaining services.
-- Returns per-node assignments to the enricher.
+All roles use the same S3-backed state layout under `cp/v1/`.
 
-## Agent Internals
+## Control-Plane State Model (S3)
 
-```mermaid
-flowchart TD
-  CFG[(Config store<br/>S3 or Git)] -->|poll| AGENT[firework-agent]
-  IMG[(S3 images bucket)] -->|optional image sync| SYNC[Image syncer]
-  AGENT --> SYNC
-  AGENT --> REC[Reconcile loop]
-  SYNC --> REC
+- `cp/v1/registry/nodes/<node>.json` — node records (state, generation, capacity, last seen).
+- `cp/v1/desired/revisions/<rev>.json` + `cp/v1/desired/current.json`.
+- `cp/v1/placements/revisions/<rev>.json` + `cp/v1/placements/current.json`.
+- `cp/v1/rendered/revisions/<rev>/nodes/<node>.yaml` + `cp/v1/rendered/current.json`.
+- `cp/v1/locks/controller.json` — controller leader lease.
 
-  REC --> NET[Network manager<br/>bridge / TAP / iptables]
-  REC --> VM[VM manager]
-  VM --> FC[Firecracker microVMs]
-
-  REC --> HC[Health monitor]
-  HC -->|restart on repeated failures| VM
-
-  REC --> TR[Traefik config manager]
-  TR --> DYN[/Traefik dynamic config files/]
-
-  AGENT --> API[Local API<br/>/healthz /health /status /metrics]
-```
+The controller writes immutable revisions and flips pointer files atomically.
 
 ## Recommended Production Flow (S3 Mode)
 
 ```mermaid
 flowchart LR
-  GH[GitHub config repo] -->|push webhook| APIGW[API Gateway]
-  APIGW --> ENRICHER[enricher Lambda]
-  ENRICHER -->|optional invoke| SCHED[scheduler Lambda]
-  SCHED -->|node configs| ENRICHER
-  ENRICHER -->|write nodes/*.yaml| S3CFG[S3 config bucket]
-  CW[CloudWatch capacity metrics] --> SCHED
-  S3CFG -->|poll| AGENT[firework-agent]
-  AGENT --> FC[Firecracker microVMs]
+  GH[GitHub config repo] -->|push webhook| EV[events role]
+  EV -->|desired revision| S3[(S3 state)]
+  AGENTS[firework agents] -->|mTLS register/heartbeat| REG[registry role]
+  REG --> S3
+  CTRL[controller role] -->|leader lease + schedule| S3
+  CTRL -->|render nodes/*.yaml| CFG[(S3 config objects)]
+  CFG -->|poll| AGENTS
+  AGENTS --> FC[Firecracker microVMs]
 ```
-
-### Write semantics
-
-- Enricher output is stored as `nodes/<node>.yaml`.
-- Stale `nodes/*.yaml` files are deleted when no longer part of desired output.
-- Empty scheduler output does not trigger destructive cleanup (guarded no-op write path).
 
 ## Agent Reconciliation Pipeline
 
@@ -81,39 +61,23 @@ Per poll interval, the agent executes roughly this sequence:
 8. Optionally sync images from S3.
 9. Plan/apply VM changes (create/update/delete).
 10. Sync Traefik dynamic files.
+11. Send registry heartbeat (capacity + used resources).
 
 ## Scheduling and Multi-Node Behavior
 
-When scheduler integration is enabled:
-
-- Enricher sends enriched services to scheduler.
-- Scheduler reads node capacity metrics and current placement.
-- Existing healthy placements are kept where possible.
+- Controller discovers active nodes from registry records (`state=ready`, fresh lease).
+- Existing healthy placements are preserved where possible.
 - Unplaced services are bin-packed to nodes with available capacity.
-- `anti_affinity_group` is respected as a preference constraint.
-
-If the enricher can resolve EC2 private IPs for scheduled nodes:
-
-- `cross_node_links` are expanded to env vars like `<host_ip>:<host_port>`.
-- `node_host_ip_env` is injected with the service's host node IP.
-
-## Networking and Traffic Model
-
-- Firework can create a shared bridge and TAP interfaces for VM networking.
-- Guest IPs are assigned deterministically from `vm_subnet`.
-- Host-to-guest exposure uses DNAT rules from `port_forwards`.
-- Same-node service discovery uses runtime-resolved guest IPs (links).
-- For cross-node proxying, Traefik sync can include peer-node services when the store supports listing all node configs.
+- `anti_affinity_group` is treated as a preference.
+- `cross_node_links` and `node_host_ip_env` are resolved from registry host IPs.
 
 ## Alternative Flow: Direct Git Mode
 
-You can run without enricher/scheduler:
+You can still run without control plane:
 
 - Store fully resolved `nodes/*.yaml` directly in Git.
 - Configure agent with `store_type: git`.
 - Agent pulls and reconciles directly from that repo.
-
-This is simpler operationally, but you manage full per-node configs yourself.
 
 ## See Also
 

@@ -67,10 +67,8 @@ jobs:
         include:
           - binary: agent
             path: ./cmd/agent/
-          - binary: enricher
-            path: ./cmd/enricher/
-          - binary: scheduler
-            path: ./cmd/scheduler/
+          - binary: controlplane
+            path: ./cmd/controlplane/
           - binary: fc-init
             path: ./cmd/fc-init/
             env: GOOS=linux GOARCH=arm64
@@ -83,3 +81,25 @@ jobs:
 
       - name: Build ${{ matrix.binary }}
         run: ${{ matrix.env }} go build -o /dev/null ${{ matrix.path }}
+
+  docker:
+    name: Docker Build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build control-plane image (linux/amd64)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile.controlplane
+          platforms: linux/amd64
+          push: false
+          load: false
+          build-args: |
+            VERSION=ci
+            COMMIT=${{ github.sha }}
+            BUILD_TIME=ci

@@ -2,9 +2,10 @@
 # Place on each node at /etc/firework/agent.yaml.
 #
 # In this mode the agent pulls fully resolved node configs directly from
-# the Git repo. No enricher Lambda is needed — you write the node configs
+# the Git repo. No control-plane roles are required — you write the node configs
 # by hand (see examples/nodes/node-1.yaml).
 node_name: "node-1"
+node_id: "node-1"
 
 # Config store settings
 store_type: "git"
@@ -25,6 +26,15 @@ log_level: "info"
 
 # Status/health HTTP API (leave empty to disable)
 api_listen_addr: ":8080"
+
+# Optional control-plane registry integration (mTLS).
+# registry_url: "https://controlplane.internal:9443"
+# registry_server_name: "controlplane.internal"
+# registry_cert_file: "/etc/firework/pki/node.crt"
+# registry_key_file: "/etc/firework/pki/node.key"
+# registry_ca_file: "/etc/firework/pki/node-ca.crt"  # must be pre-provisioned
+# registry_bootstrap_token: "${REGISTRY_BOOTSTRAP_TOKEN}"
+# registry_bootstrap_token_file: "/run/secrets/firework/registry_bootstrap_token"
 
 # Enable health checks for services that define them (default: true)
 enable_health_checks: true

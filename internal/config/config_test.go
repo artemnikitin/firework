@@ -294,3 +294,147 @@ func TestLoadAgentConfig_FileNotFound(t *testing.T) {
 		t.Error("expected error for missing file")
 	}
 }
+
+func TestLoadAgentConfig_NodeIDDefaultsToNodeName(t *testing.T) {
+	yaml := `
+node_name: "node-a"
+store_type: "s3"
+s3_bucket: "bucket-a"
+`
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, "agent.yaml")
+	if err := os.WriteFile(cfgPath, []byte(yaml), 0o644); err != nil {
+		t.Fatalf("writing test config: %v", err)
+	}
+
+	cfg, err := LoadAgentConfig(cfgPath)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if cfg.NodeID != "node-a" {
+		t.Fatalf("expected node_id default to node_name, got %q", cfg.NodeID)
+	}
+}
+
+func TestLoadAgentConfig_RegistryRequiresCertPaths(t *testing.T) {
+	yaml := `
+node_name: "node-a"
+store_type: "s3"
+s3_bucket: "bucket-a"
+registry_url: "https://registry.internal:9443"
+`
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, "agent.yaml")
+	if err := os.WriteFile(cfgPath, []byte(yaml), 0o644); err != nil {
+		t.Fatalf("writing test config: %v", err)
+	}
+
+	_, err := LoadAgentConfig(cfgPath)
+	if err == nil {
+		t.Fatal("expected validation error for missing registry cert paths")
+	}
+}
+
+func TestLoadAgentConfig_RegistryRejectsBlankNodeID(t *testing.T) {
+	yaml := `
+node_id: "   "
+node_name: "node-a"
+store_type: "s3"
+s3_bucket: "bucket-a"
+registry_url: "https://registry.internal:9443"
+registry_cert_file: "/tmp/node.crt"
+registry_key_file: "/tmp/node.key"
+registry_ca_file: "/tmp/ca.crt"
+`
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, "agent.yaml")
+	if err := os.WriteFile(cfgPath, []byte(yaml), 0o644); err != nil {
+		t.Fatalf("writing test config: %v", err)
+	}
+
+	_, err := LoadAgentConfig(cfgPath)
+	if err == nil {
+		t.Fatal("expected validation error for blank node_id")
+	}
+}
+
+func TestLoadAgentConfig_RegistryBootstrapTokenFromEnv(t *testing.T) {
+	t.Setenv("FW_BOOTSTRAP_TOKEN", "env-token-123")
+	yaml := `
+node_name: "node-a"
+store_type: "s3"
+s3_bucket: "bucket-a"
+registry_url: "https://registry.internal:9443"
+registry_cert_file: "/tmp/node.crt"
+registry_key_file: "/tmp/node.key"
+registry_ca_file: "/tmp/ca.crt"
+registry_bootstrap_token: "${FW_BOOTSTRAP_TOKEN}"
+`
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, "agent.yaml")
+	if err := os.WriteFile(cfgPath, []byte(yaml), 0o644); err != nil {
+		t.Fatalf("writing test config: %v", err)
+	}
+
+	cfg, err := LoadAgentConfig(cfgPath)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if cfg.RegistryBootstrapToken != "env-token-123" {
+		t.Fatalf("expected expanded bootstrap token, got %q", cfg.RegistryBootstrapToken)
+	}
+}
+
+func TestLoadAgentConfig_RegistryBootstrapTokenFromFile(t *testing.T) {
+	tokenFile := filepath.Join(t.TempDir(), "bootstrap-token")
+	if err := os.WriteFile(tokenFile, []byte("file-token-456\n"), 0o600); err != nil {
+		t.Fatalf("writing token file: %v", err)
+	}
+	yaml := `
+node_name: "node-a"
+store_type: "s3"
+s3_bucket: "bucket-a"
+registry_url: "https://registry.internal:9443"
+registry_cert_file: "/tmp/node.crt"
+registry_key_file: "/tmp/node.key"
+registry_ca_file: "/tmp/ca.crt"
+registry_bootstrap_token_file: "` + tokenFile + `"
+`
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, "agent.yaml")
+	if err := os.WriteFile(cfgPath, []byte(yaml), 0o644); err != nil {
+		t.Fatalf("writing test config: %v", err)
+	}
+
+	cfg, err := LoadAgentConfig(cfgPath)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if cfg.RegistryBootstrapToken != "file-token-456" {
+		t.Fatalf("expected token loaded from file, got %q", cfg.RegistryBootstrapToken)
+	}
+}
+
+func TestLoadAgentConfig_RegistryBootstrapTokenAndFileMutuallyExclusive(t *testing.T) {
+	yaml := `
+node_name: "node-a"
+store_type: "s3"
+s3_bucket: "bucket-a"
+registry_url: "https://registry.internal:9443"
+registry_cert_file: "/tmp/node.crt"
+registry_key_file: "/tmp/node.key"
+registry_ca_file: "/tmp/ca.crt"
+registry_bootstrap_token: "inline-token"
+registry_bootstrap_token_file: "/tmp/bootstrap-token"
+`
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, "agent.yaml")
+	if err := os.WriteFile(cfgPath, []byte(yaml), 0o644); err != nil {
+		t.Fatalf("writing test config: %v", err)
+	}
+
+	_, err := LoadAgentConfig(cfgPath)
+	if err == nil {
+		t.Fatal("expected validation error when both bootstrap token fields are set")
+	}
+}
