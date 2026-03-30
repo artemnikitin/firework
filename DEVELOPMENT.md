@@ -35,7 +35,7 @@ internal/
   imagesync/   S3 image sync
   capacity/    node vCPU/memory discovery
   api/         HTTP status/health/metrics server
-examples/      example agent configs and enricher inputs
+examples/      example agent and control-plane configs
 scripts/       smoke-local.sh
 docs/          architecture and config reference
 ```
@@ -48,7 +48,7 @@ make help          # show all targets with descriptions
 
 | Target | Output | When to use |
 |--------|--------|-------------|
-| `make build` | `bin/firework-agent` (native OS) | local testing, smoke test |
+| `make build-agent` | `bin/firework-agent` (native OS) | local testing, smoke test |
 | `make build-controlplane` | `bin/firework-controlplane` (native OS) | local control-plane testing |
 | `make build-linux-amd64` | `bin/firework-agent-linux-amd64` + `bin/firework-controlplane-linux-amd64` + `bin/fc-init-linux-amd64` | producing Linux x86_64 artifacts |
 | `make build-linux-arm64` | `bin/firework-agent-linux-arm64` + `bin/firework-controlplane-linux-arm64` + `bin/fc-init-linux-arm64` (+ `bin/fc-init` alias) | updating ARM64 nodes or Packer AMI builds |
@@ -173,7 +173,7 @@ See [firework-deployment-example](https://github.com/artemnikitin/firework-deplo
 1. **Build AMI** — run Packer with the agent and Traefik binaries baked in.
 2. **Deploy control plane** — Terraform creates control-plane instances and S3 state bucket.
 3. **Deploy data plane** — Terraform creates the VPC, ALB, and Auto Scaling Group using the AMI from step 1.
-4. **Configure GitHub webhook** — point the config repo's webhook at the API Gateway URL with the shared secret.
+4. **Configure GitHub webhook** — point the config repo's webhook at the control-plane `events` role endpoint with the shared secret.
 5. **Push a config** — GitHub webhook triggers the `events` role, controller schedules and publishes rendered `nodes/*.yaml` to S3. Agents pick it up on their next poll.
 
 For IAM setup, refer to `iam-policies/` in the deployment repo. The policy for the deployment user has a ~6 KB size limit, so check coverage before adding new AWS resources to Terraform.

@@ -20,7 +20,7 @@ LDFLAGS   := -s -w \
 	-X '$(MODULE)/internal/version.Commit=$(COMMIT)' \
 	-X '$(MODULE)/internal/version.BuildTime=$(BUILD_TIME)'
 
-.PHONY: all build-all build build-controlplane build-fc-init build-linux-amd64 build-linux-arm64 clean test test-verbose test-race lint vet fmt tidy run smoke-local docker-build-controlplane-image docker-push-controlplane-image push-controlplane-image help
+.PHONY: all build-all build-agent build-controlplane build-fc-init build-linux-amd64 build-linux-arm64 clean test test-verbose test-race lint vet fmt tidy run smoke-local docker-build-controlplane-image docker-push-controlplane-image push-controlplane-image install help
 
 all: build-all ## Alias for build-all
 
@@ -86,7 +86,7 @@ tidy: ## Tidy and verify module dependencies
 	go mod tidy
 	go mod verify
 
-run: build ## Build and run with example config
+run: build-agent ## Build and run with example config
 	$(BUILD_DIR)/$(AGENT_BINARY) --config examples/agent.yaml
 
 smoke-local: ## Run local smoke test with fake firecracker
@@ -110,7 +110,7 @@ docker-push-controlplane-image: ## Build and push multi-arch control-plane image
 push-controlplane-image: ## Push image via helper script (requires image tag vars)
 	./scripts/push-controlplane-image.sh "$(CONTROLPLANE_IMAGE):$(IMAGE_TAG)"
 
-install: build ## Install the binary to $GOPATH/bin
+install: build-agent ## Install the binary to $GOPATH/bin
 	cp $(BUILD_DIR)/$(AGENT_BINARY) $(shell go env GOPATH)/bin/$(AGENT_BINARY)
 	@echo "Installed to $(shell go env GOPATH)/bin/$(AGENT_BINARY)"
 
