@@ -19,9 +19,9 @@ RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} \
       -ldflags "-s -w -X github.com/artemnikitin/firework/internal/version.Version=${VERSION} -X github.com/artemnikitin/firework/internal/version.Commit=${COMMIT} -X github.com/artemnikitin/firework/internal/version.BuildTime=${BUILD_TIME}" \
       -o /out/firework-controlplane ./cmd/controlplane
 
-FROM gcr.io/distroless/static-debian12:nonroot
+FROM alpine:3.21
 
 COPY --from=build /out/firework-controlplane /usr/local/bin/firework-controlplane
 
-USER nonroot:nonroot
+USER nobody:nobody
 ENTRYPOINT ["/usr/local/bin/firework-controlplane"]
