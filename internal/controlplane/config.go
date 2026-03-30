@@ -31,7 +31,9 @@ type Config struct {
 
 	TargetBranch string `yaml:"target_branch"`
 	ConfigDir    string `yaml:"config_dir"`
+	GitRepoURL   string `yaml:"git_repo_url"`
 
+	ReconcileOnStart    bool   `yaml:"reconcile_on_start"`
 	GitHubWebhookSecret string `yaml:"github_webhook_secret"`
 
 	TLS        TLSConfig        `yaml:"tls"`
@@ -168,6 +170,9 @@ func (c Config) Validate() error {
 	needsEvents := c.Role == RoleAll || c.Role == RoleEvents
 	if needsEvents && c.GitHubWebhookSecret == "" {
 		return fmt.Errorf("github_webhook_secret is required for role %q", c.Role)
+	}
+	if c.ReconcileOnStart && c.GitRepoURL == "" {
+		return fmt.Errorf("git_repo_url is required when reconcile_on_start is enabled")
 	}
 
 	return nil

@@ -34,6 +34,11 @@ func Run(ctx context.Context, cfg Config, logger *slog.Logger) error {
 
 	if roleEnabled(cfg.Role, RoleEvents) {
 		ev := NewEventsServer(cfg, store, logger)
+		if cfg.ReconcileOnStart {
+			if err := ev.ReconcileOnStart(ctx); err != nil {
+				return err
+			}
+		}
 		srv, err := ev.HTTPServer()
 		if err != nil {
 			return err

@@ -142,6 +142,21 @@ func (s *EventsServer) handleGitHubEvent(w http.ResponseWriter, r *http.Request)
 	})
 }
 
+// ReconcileOnStart builds and publishes a desired revision from the configured
+// git repo URL immediately at startup, without waiting for a webhook event.
+func (s *EventsServer) ReconcileOnStart(ctx context.Context) error {
+	s.logger.Info("reconciling gitops repo on start", "url", s.cfg.GitRepoURL, "branch", s.cfg.TargetBranch)
+	desiredRev, err := s.buildDesiredRevision(ctx, s.cfg.GitRepoURL, s.cfg.TargetBranch, "startup")
+	if err != nil {
+		return fmt.Errorf("building desired revision on start: %w", err)
+	}
+	if err := s.publishDesiredRevision(ctx, desiredRev); err != nil {
+		return fmt.Errorf("publishing desired revision on start: %w", err)
+	}
+	s.logger.Info("startup reconciliation complete", "revision", desiredRev.Revision, "services", len(desiredRev.Services))
+	return nil
+}
+
 func (s *EventsServer) releaseEventClaim(ctx context.Context, deliveryID string) {
 	if deliveryID == "" {
 		return
