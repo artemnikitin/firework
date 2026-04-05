@@ -218,4 +218,9 @@ type AgentConfig struct {
 	// RegistryCertRenewBefore triggers proactive certificate renewal when the
 	// current certificate expires within this window.
 	RegistryCertRenewBefore time.Duration `yaml:"registry_cert_renew_before,omitempty"`
+	// RegistryHeartbeatInterval is how often the agent sends heartbeats to the
+	// registry on its own goroutine, independent of the reconciliation loop.
+	// Must be shorter than the server-side node_stale_ttl (default 45s).
+	// Default: 15s.
+	RegistryHeartbeatInterval time.Duration `yaml:"registry_heartbeat_interval,omitempty"`
 }

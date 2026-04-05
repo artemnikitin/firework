@@ -22,7 +22,8 @@ func DefaultAgentConfig() AgentConfig {
 		VMSubnet:                "172.16.0.0/24",
 		VMGateway:               "172.16.0.1",
 		VMBridge:                "br-firework",
-		RegistryCertRenewBefore: 6 * time.Hour,
+		RegistryCertRenewBefore:   6 * time.Hour,
+		RegistryHeartbeatInterval: 15 * time.Second,
 	}
 }
 

@@ -7,6 +7,7 @@ import (
 	"net"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/artemnikitin/firework/internal/api"
@@ -42,6 +43,13 @@ type Agent struct {
 	lastRevision         string
 	lastKnownCapacity    capacity.NodeCapacity
 	hasLastKnownCapacity bool
+
+	// heartbeatMu guards the resource snapshot read by the independent
+	// heartbeat goroutine. Updated by the reconcile loop; read by runHeartbeat.
+	heartbeatMu    sync.RWMutex
+	heartbeatCap   capacity.NodeCapacity
+	heartbeatUsed  capacity.NodeCapacity
+	heartbeatReady bool // true once capacity has been read at least once
 }
 
 // New creates a new Agent with all its dependencies.
@@ -164,6 +172,10 @@ func (a *Agent) Run(ctx context.Context) error {
 	// Run an initial reconciliation immediately.
 	a.tick(ctx)
 
+	// Start the independent heartbeat goroutine after the first tick so that
+	// the registry client is already enrolled and capacity is known.
+	go a.runHeartbeat(ctx)
+
 	ticker := time.NewTicker(a.cfg.PollInterval)
 	defer ticker.Stop()
 
@@ -177,6 +189,48 @@ func (a *Agent) Run(ctx context.Context) error {
 			a.tick(ctx)
 		}
 	}
+}
+
+// runHeartbeat sends registry heartbeats on a fixed interval that is
+// independent of the reconciliation loop. This prevents long-running
+// operations (image downloads, reconciliation) from blocking heartbeats
+// and causing the controller to mark the node as stale.
+func (a *Agent) runHeartbeat(ctx context.Context) {
+	if a.registryClient == nil {
+		return
+	}
+	interval := a.cfg.RegistryHeartbeatInterval
+	if interval <= 0 {
+		interval = 15 * time.Second
+	}
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			cap, used, ready := a.getHeartbeatResources()
+			if !ready {
+				continue
+			}
+			a.syncRegistry(ctx, cap, used)
+		}
+	}
+}
+
+func (a *Agent) setHeartbeatResources(cap, used capacity.NodeCapacity) {
+	a.heartbeatMu.Lock()
+	defer a.heartbeatMu.Unlock()
+	a.heartbeatCap = cap
+	a.heartbeatUsed = used
+	a.heartbeatReady = true
+}
+
+func (a *Agent) getHeartbeatResources() (cap capacity.NodeCapacity, used capacity.NodeCapacity, ready bool) {
+	a.heartbeatMu.RLock()
+	defer a.heartbeatMu.RUnlock()
+	return a.heartbeatCap, a.heartbeatUsed, a.heartbeatReady
 }
 
 // shutdown cleans up all resources.
@@ -210,6 +264,9 @@ func (a *Agent) tick(ctx context.Context) {
 		nodeCap, hasCap = a.readNodeCapacity()
 		if hasCap {
 			a.metrics.setCapacity(nodeCap, capacity.NodeCapacity{})
+			// Publish capacity to the heartbeat goroutine immediately so it can
+			// keep the node active in the registry even while images are downloading.
+			a.setHeartbeatResources(nodeCap, capacity.NodeCapacity{})
 		}
 	}
 
@@ -253,6 +310,12 @@ func (a *Agent) tick(ctx context.Context) {
 
 	// Check node capacity before reconciling; skip if resources are exceeded.
 	used := sumResources(merged.Services)
+	// Update the heartbeat goroutine with the latest used resources now, before
+	// the potentially long-running image sync, so heartbeats reflect current
+	// scheduling intent while downloads are in progress.
+	if hasCap {
+		a.setHeartbeatResources(nodeCap, used)
+	}
 	if !a.checkCapacity(nodeCap, used, hasCap) {
 		a.syncRegistry(ctx, nodeCap, used)
 		return
