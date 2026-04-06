@@ -10,8 +10,9 @@
 node_names:
   - "web"
   - "backend"
+node_id: "demo-node-1"
 
-# Config store: S3 bucket where the enricher Lambda writes nodes/*.yaml
+# Config store: S3 bucket where control-plane controller writes nodes/*.yaml
 store_type: "s3"
 s3_bucket: "firework-demo-configs-20260218164843682300000002"
 s3_region: "us-east-1"

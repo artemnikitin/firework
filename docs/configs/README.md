@@ -29,6 +29,7 @@ Examples:
 
 | Field | Required | Default | Notes |
 |---|---|---|---|
+| `node_id` | no | derived from `node_name` | Stable registry identity for mTLS control-plane integration |
 | `node_name` | no | host name | Display/identity name for this node |
 | `node_names` | no | derived from `node_name` | Labels to fetch and merge (`nodes/<label>.yaml`) |
 | `store_type` | no | `git` | `git` or `s3` |
@@ -55,6 +56,19 @@ Examples:
 | `update_strategy` | no | `all-at-once` | `all-at-once` or `rolling` |
 | `update_delay` | no | `0s` | Delay between updates in rolling mode |
 | `traefik_config_dir` | no | empty | Enables Traefik dynamic config management |
+| `registry_url` | no | empty | Enables node register/heartbeat to control-plane registry |
+| `registry_server_name` | no | empty | Optional TLS server name override for registry endpoint |
+| `registry_cert_file` | when `registry_url` set | - | Node mTLS cert path |
+| `registry_key_file` | when `registry_url` set | - | Node mTLS key path |
+| `registry_ca_file` | when `registry_url` set | - | CA bundle for registry TLS validation (pre-provisioned trust anchor) |
+| `registry_bootstrap_token` | no | empty | Bootstrap token used for automated cert enrollment (supports `${ENV_VAR}` expansion) |
+| `registry_bootstrap_token_file` | no | empty | File path containing bootstrap token (trimmed; mutually exclusive with `registry_bootstrap_token`) |
+| `registry_cert_renew_before` | no | `6h` | Proactive cert renewal window |
+
+Notes for cert lifecycle:
+
+- The bootstrap token is optional for steady-state renewals.
+- If mTLS renew is rejected and no bootstrap token is configured, automatic recovery is not possible; rotate/provision node certs manually.
 
 ## 2) Enricher Input Repository
 
@@ -135,37 +149,38 @@ Standalone mode defaults `image` to:
 
 Tenant expansions rewrite links to tenant-prefixed service names automatically.
 
-## 3) Enricher Runtime Environment (Lambda)
+## 3) Control Plane Config (`controlplane.yaml`)
 
-`cmd/enricher` supports these env vars:
+`cmd/controlplane` uses a YAML config file with these important fields:
 
-| Variable | Required | Description |
+| Field | Required | Description |
 |---|---|---|
-| `S3_BUCKET` | yes | Destination bucket for `nodes/*.yaml` |
-| `S3_PREFIX` | no | Prefix before `nodes/` |
-| `S3_REGION` | no | Region for S3 client |
-| `S3_ENDPOINT_URL` | no | Custom S3 endpoint |
-| `TARGET_BRANCH` | no | Branch filter for webhook events (default `main`) |
-| `CONFIG_DIR` | no | Subdirectory in cloned repo containing config files |
-| `GITHUB_WEBHOOK_SECRET` | no | Validate `X-Hub-Signature-256` |
-| `GITHUB_TOKEN` | no | Clone private GitHub repos |
-| `CONFIG_REPO_URL` | scheduled mode only | Repo URL for EventBridge-triggered runs |
-| `SCHEDULER_LAMBDA_ARN` | no | Enables scheduler invocation |
-| `SCHEDULER_REGION` | no | Scheduler invoke region (defaults to `S3_REGION`) |
-| `EC2_REGION` | no | Region for resolving node private IPs |
+| `role` | yes | `registry`, `events`, `controller`, or `all` |
+| `registry_listen_addr` | registry/all | HTTPS bind address for registry APIs |
+| `events_listen_addr` | events/all | HTTPS bind address for GitHub webhook API |
+| `state.backend` | yes | Currently `s3` |
+| `state.prefix` | yes | Prefix for control-plane state objects (for example `cp/v1`) |
+| `state.s3.bucket` | yes | Bucket for control-plane state and rendered configs |
+| `state.s3.region` | no | S3 region |
+| `state.s3.endpoint_url` | no | Custom S3 endpoint (MinIO/LocalStack) |
+| `leader_lease_ttl` | controller/all | Controller leadership lease TTL |
+| `leader_renew_interval` | controller/all | Leadership renewal interval |
+| `node_stale_ttl` | controller/all | Freshness threshold for schedulable nodes |
+| `controller_tick` | controller/all | Scheduling/publish loop tick |
+| `target_branch` | events/all | Git branch filter (default `main`) |
+| `config_dir` | no | Optional subdirectory in cloned repo for enrichment input |
+| `github_webhook_secret` | events/all | Validates `X-Hub-Signature-256` |
+| `tls.cert_file` | role with HTTPS | Server TLS cert |
+| `tls.key_file` | role with HTTPS | Server TLS key |
+| `tls.client_ca_file` | registry/all | Client cert CA for node mTLS validation |
+| `enrollment.ca_file` | registry/all | Node client-cert signing CA cert |
+| `enrollment.ca_key_file` | registry/all | Node client-cert signing CA key |
+| `enrollment.node_cert_ttl` | no | Issued node cert lifetime |
+| `enrollment.bootstrap_tokens` | registry/all | Token list for automated node enrollment |
 
-## 4) Scheduler Runtime Environment (Lambda)
+See [`examples/controlplane.yaml`](../../examples/controlplane.yaml).
 
-`cmd/scheduler` supports:
-
-| Variable | Required | Description |
-|---|---|---|
-| `CW_NAMESPACE` | yes | Namespace containing `firework_node_*` metrics |
-| `S3_BUCKET` | no | Reads existing placement from this bucket |
-| `S3_PREFIX` | no | Prefix before `nodes/` |
-| `S3_REGION` | no | Region for CloudWatch + S3 clients |
-
-## 5) Resolved Node Configs (`nodes/<node>.yaml`)
+## 4) Resolved Node Configs (`nodes/<node>.yaml`)
 
 Agents consume this schema:
 
@@ -185,7 +200,7 @@ Notes:
 - `host_ip` is optional and usually added in scheduled multi-node flows.
 - `health_check.target` can be set directly, but enriched configs usually use `port`/`path` and let the agent compose the target from guest IP.
 
-## 6) CI-Only Fields (Not Used By Firework Runtime)
+## 5) CI-Only Fields (Not Used By Firework Runtime)
 
 Some repositories (for example `firework-gitops-example`) include extra fields for image-build pipelines, such as:
 

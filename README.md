@@ -11,7 +11,8 @@ You can use them to have everything working end-to-end:
 
 ## How It Works
 
-The diagram below shows an example deployment: two EC2 bare-metal nodes running inside a private VPC, fronted by an ALB, with a GitOps-driven control plane built from two Lambdas, an S3 config bucket, and CloudWatch for observability.
+The control plane runs as a single binary (`firework-controlplane`) with role-based
+runtime modes: `registry`, `events`, `controller`, or `all`.
 
 ```mermaid
 flowchart TB
@@ -21,42 +22,33 @@ flowchart TB
         CI["CI / CD"]
     end
 
-    subgraph control_plane["AWS – Control Plane"]
-        APIGW["API Gateway"]
-        EB["EventBridge"]
-        ENRICHER["Enricher Lambda"]
-        SCHED["Scheduler Lambda"]
-        CW["CloudWatch"]
+    subgraph control_plane["Firework Control Plane"]
+        REG["registry role\n(enroll/register/heartbeat)"]
+        EV["events role\n(GitHub webhook)"]
+        CTRL["controller role\n(schedule + publish)"]
     end
 
-    subgraph storage["AWS – Storage"]
-        S3CFG["S3 Config Bucket"]
-        S3IMG["S3 Images Bucket"]
+    subgraph storage["S3"]
+        S3STATE["cp/v1 state"]
+        S3CFG["nodes/*.yaml"]
+        S3IMG["images bucket"]
     end
 
-    subgraph vpc["AWS VPC – Data Plane"]
-        ALB["Application Load Balancer\n(public, multi-AZ)"]
-        subgraph nodes["EC2 Nodes  (c6g.metal, private subnets)"]
-            N1["Node 1\nfirework-agent · Firecracker VMs"]
-            N2["Node 2\nfirework-agent · Firecracker VMs"]
-        end
+    subgraph data_plane["Firework Nodes"]
+        N1["Node 1\nfirework-agent · Firecracker VMs"]
+        N2["Node 2\nfirework-agent · Firecracker VMs"]
     end
 
-    USER -->|HTTPS| ALB
-    ALB --> N1 & N2
-
-    GITHUB -->|push webhook| APIGW
-    APIGW --> ENRICHER
-    EB -->|periodic| ENRICHER
-    ENRICHER -->|invoke| SCHED
-    CW -->|capacity metrics| SCHED
-    SCHED -->|assignments| ENRICHER
-    ENRICHER -->|write configs| S3CFG
+    USER -->|HTTPS| N1 & N2
+    GITHUB -->|push webhook| EV
+    EV --> S3STATE
+    REG --> S3STATE
+    CTRL --> S3STATE
+    CTRL -->|rendered configs| S3CFG
     CI -->|upload| S3IMG
-
-    N1 & N2 -->|poll & sync| S3CFG
+    N1 & N2 -->|mTLS register + heartbeat| REG
+    N1 & N2 -->|poll configs| S3CFG
     N1 & N2 -->|pull images| S3IMG
-    N1 & N2 -->|publish metrics| CW
 ```
 
 ## Documentation
@@ -66,6 +58,14 @@ flowchart TB
 - Configuration reference: [`docs/configs/README.md`](docs/configs/README.md)
 - Example agent configs: [`examples/`](examples/)
 - Development guide: [`DEVELOPMENT.md`](DEVELOPMENT.md)
+
+## Container Image
+
+Official control-plane container images are published to GitHub Container Registry:
+
+- `ghcr.io/artemnikitin/firework-controlplane:<tag>`
+
+For production deployments, prefer immutable digests (`@sha256:...`).
 
 ## License
 

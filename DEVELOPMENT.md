@@ -18,11 +18,11 @@ Most development (coding, unit tests, smoke test) works on macOS or Linux withou
 ```
 cmd/
   agent/       firework-agent entry point
-  enricher/    enricher Lambda entry point
-  scheduler/   scheduler Lambda entry point
+  controlplane/ firework-controlplane entry point (roles: registry/events/controller/all)
   fc-init/     guest init process (runs as PID 1 inside each VM)
 internal/
   agent/       reconciliation loop, metrics publishing
+  controlplane/ control-plane state, APIs, leader election, scheduling runtime
   config/      config types and YAML loader
   enricher/    enrichment pipeline (spec → node config)
   scheduler/   bin-packing placement algorithm
@@ -35,7 +35,7 @@ internal/
   imagesync/   S3 image sync
   capacity/    node vCPU/memory discovery
   api/         HTTP status/health/metrics server
-examples/      example agent configs and enricher inputs
+examples/      example agent and control-plane configs
 scripts/       smoke-local.sh
 docs/          architecture and config reference
 ```
@@ -48,15 +48,17 @@ make help          # show all targets with descriptions
 
 | Target | Output | When to use |
 |--------|--------|-------------|
-| `make build` | `bin/firework-agent` (native OS) | local testing, smoke test |
-| `make build-linux-arm64` | `bin/firework-agent-linux-arm64` + `bin/fc-init` | updating a running node or Packer AMI build |
-| `make build-fc-init` | `bin/fc-init` (Linux ARM64, static) | updating the guest init binary in a rootfs image |
-| `make package-enricher` | `bin/enricher.zip` | deploying the enricher Lambda |
-| `make package-scheduler` | `bin/scheduler.zip` | deploying the scheduler Lambda |
-| `make build-all` | everything above | full release build |
+| `make build-agent` | `bin/firework-agent` (native OS) | local testing, smoke test |
+| `make build-controlplane` | `bin/firework-controlplane` (native OS) | local control-plane testing |
+| `make build-linux-amd64` | `bin/firework-agent-linux-amd64` + `bin/firework-controlplane-linux-amd64` + `bin/fc-init-linux-amd64` | producing Linux x86_64 artifacts |
+| `make build-linux-arm64` | `bin/firework-agent-linux-arm64` + `bin/firework-controlplane-linux-arm64` + `bin/fc-init-linux-arm64` (+ `bin/fc-init` alias) | updating ARM64 nodes or Packer AMI builds |
+| `make build-fc-init` | `bin/fc-init-linux-arm64` + `bin/fc-init` alias (Linux ARM64, static) | updating the guest init binary in a rootfs image |
+| `make build-all` | native binaries + Linux amd64/arm64 variants for all binaries | full release build |
 | `make clean` | removes `bin/` and test cache | — |
 
-`fc-init` is always built as a static Linux/ARM64 binary (`CGO_ENABLED=0`) because it runs inside the VM rootfs as PID 1. Lambda binaries are built with `-tags lambda.norpc` and packaged as `bootstrap` inside a ZIP.
+`fc-init` cross-compiled artifacts are static (`CGO_ENABLED=0`). The compatibility
+alias `bin/fc-init` points to the Linux/ARM64 build because the guest runtime
+still uses ARM64 by default.
 
 Version, commit, and build time are injected at link time via `ldflags` and reported by `firework-agent --version`.
 
@@ -99,40 +101,80 @@ make fmt           # gofmt -s in place
 make tidy          # go mod tidy + verify
 ```
 
-## Iterating on Lambda Code
+## Running the Control Plane
 
-You do not need to rebuild the Packer AMI to update Lambda code. After changing enricher or scheduler code:
-
-```bash
-make package-enricher
-aws lambda update-function-code \
-  --function-name <enricher-function-name> \
-  --zip-file fileb://bin/enricher.zip
-
-make package-scheduler
-aws lambda update-function-code \
-  --function-name <scheduler-function-name> \
-  --zip-file fileb://bin/scheduler.zip
-```
-
-Trigger the enricher manually (skipping the GitHub webhook) with an EventBridge test event or:
+Build and run the new control-plane binary:
 
 ```bash
-aws lambda invoke \
-  --function-name <enricher-function-name> \
-  --payload '{}' \
-  /tmp/enricher-out.json && cat /tmp/enricher-out.json
+make build-controlplane
+bin/firework-controlplane --config examples/controlplane.yaml
 ```
+
+Role modes:
+
+- `registry`: node enrollment/register/heartbeat APIs
+- `events`: GitHub webhook ingestion
+- `controller`: leader-elected scheduler/publisher loop
+- `all`: all roles in one process
+
+## Control-Plane Container (GHCR)
+
+Release tags publish a multi-arch image to:
+
+- `ghcr.io/artemnikitin/firework-controlplane:<tag>`
+
+### Local push for pre-merge deployment testing
+
+Useful when testing changes with `firework-deployment-example` before merge.
+
+1. Log in to GHCR:
+
+```bash
+echo "$GHCR_TOKEN" | docker login ghcr.io -u "$GHCR_USER" --password-stdin
+```
+
+`GHCR_TOKEN` should have `write:packages` (and usually `read:packages`).
+
+2. Build and push a test tag:
+
+```bash
+scripts/push-controlplane-image.sh ghcr.io/<owner>/firework-controlplane:<test-tag>
+```
+
+The helper auto-creates a `docker-container` buildx builder for multi-platform
+pushes when the current driver does not support it.
+
+If you only need a single-arch image, override platforms:
+
+```bash
+PLATFORMS=linux/amd64 scripts/push-controlplane-image.sh ghcr.io/<owner>/firework-controlplane:<test-tag>
+```
+
+Example:
+
+```bash
+scripts/push-controlplane-image.sh ghcr.io/artemnikitin/firework-controlplane:dev-$(date +%Y%m%d%H%M)
+```
+
+Alternative via Makefile:
+
+```bash
+make docker-push-controlplane-image \
+  CONTROLPLANE_IMAGE=ghcr.io/<owner>/firework-controlplane \
+  IMAGE_TAG=<test-tag>
+```
+
+The deployment repo can then reference that tag (or digest) directly.
 
 ## End-to-End Deployment Flow
 
 See [firework-deployment-example](https://github.com/artemnikitin/firework-deployment-example) for Terraform and Packer sources. The high-level order:
 
 1. **Build AMI** — run Packer with the agent and Traefik binaries baked in.
-2. **Deploy control plane** — Terraform creates the enricher/scheduler Lambdas, S3 config bucket, API Gateway, and EventBridge rule.
+2. **Deploy control plane** — Terraform creates control-plane instances and S3 state bucket.
 3. **Deploy data plane** — Terraform creates the VPC, ALB, and Auto Scaling Group using the AMI from step 1.
-4. **Configure GitHub webhook** — point the config repo's webhook at the API Gateway URL with the shared secret.
-5. **Push a config** — a push to the config repo (or waiting up to 1 min for EventBridge) triggers the enricher, which writes `nodes/*.yaml` to S3. Agents pick it up on their next poll.
+4. **Configure GitHub webhook** — point the config repo's webhook at the control-plane `events` role endpoint with the shared secret.
+5. **Push a config** — GitHub webhook triggers the `events` role, controller schedules and publishes rendered `nodes/*.yaml` to S3. Agents pick it up on their next poll.
 
 For IAM setup, refer to `iam-policies/` in the deployment repo. The policy for the deployment user has a ~6 KB size limit, so check coverage before adding new AWS resources to Terraform.
 

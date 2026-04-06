@@ -42,5 +42,4 @@ vendor/
 **/*.DS_Store
 
 /agent
-/enricher
 /fc-init

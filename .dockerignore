@@ -1,0 +1,9 @@
+.git
+.github
+.idea
+agent-transcripts
+bin
+dist
+coverage.out
+*.log
+**/.DS_Store

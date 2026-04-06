@@ -36,44 +36,37 @@ Pull-based design means:
 
 The cost is eventual consistency and a polling delay (30s by default). This is an acceptable tradeoff.
 
-## Enricher / Scheduler Split
+## Role-Based Control Plane
 
-The enrichment and scheduling problems are meaningfully different:
+The enrichment and scheduling problems are meaningfully different, but we still ship
+them as a single control-plane binary. The runtime is split by role:
 
-**Enricher** is a pure transformation: take human-friendly service specs, apply defaults, validate, write resolved per-node configs. It's deterministic given the
+**Events** is a pure transformation trigger: take GitHub push input, clone config,
+apply defaults/validation, publish desired revision. It's deterministic given the
 same input. 
 
-**Scheduler** is an optimization problem: given a set of services and a set of nodes with
-known capacity, find a placement that respects constraints. It needs
-to read live node state (capacity metrics) and ideally preserve existing placements.
+**Controller** is an optimization loop: given a desired revision and live nodes,
+find placement that respects constraints and publish rendered node configs.
 
-Combining them into a single Lambda would mix two concerns with different inputs, different
-dependencies, and different failure modes. Splitting them means the enricher can run without
-the scheduler (for single-node setups), the scheduler can be invoked independently for
-debugging, and each can be tested separately.
+**Registry** is the node-lifecycle API: enrollment, register, heartbeat, state transitions.
 
-## Node Discovery via CloudWatch
+This gives operational flexibility (you can run roles separately) without forcing a
+multi-service deployment model.
 
-The scheduler needs to know which nodes exist and what capacity they have. The options are:
+## Node Discovery via Registry Leases
 
-1. **Static inventory file** — manually maintained, error-prone, doesn't reflect live state
-2. **Some registry/database** — another piece of infrastructure to manage
-3. **CloudWatch metrics** — nodes publish capacity metrics; scheduler queries CloudWatch to discover active nodes
+The controller needs to know which nodes exist and what capacity they have.
+Node discovery is based on explicit registry records with lease freshness:
 
-CloudWatch is already in the stack for observability. Agents publish `firework_node_vcpus_available`
-and `firework_node_memory_available_mb` metrics on each reconciliation cycle. The scheduler
-queries CloudWatch `ListMetrics` to discover all nodes that have published recently, and
-reads their current capacity.
+1. Nodes enroll with mTLS certs and register identity/capacity.
+2. Nodes send periodic heartbeats with current capacity/usage.
+3. Controller schedules only nodes with `state=ready` and non-expired lease.
 
-This avoids a separate node registry entirely. Nodes self-register by publishing metrics,
-and they disappear from the scheduler's view when they stop publishing. The tradeoff is up to 15 minutes 
-delay before new nodes become visible (CloudWatch metric propagation latency),
-which is acceptable given that metal instances take 15-20 minutes to launch anyway.
+Registry state is persisted in S3 objects under `cp/v1/registry/nodes/*.json`.
+This keeps discovery semantics cloud-agnostic and independent from telemetry pipelines.
 
-At larger scale, a dedicated registry would be a cleaner separation of concerns — node
-discovery and observability serving different purposes with different consistency
-requirements. For the current scale, reusing CloudWatch avoids building and operating
-additional infrastructure.
+Observability metrics remain useful, but they are no longer the source of truth
+for control-plane membership decisions.
 
 ## Deterministic Network Assignment
 

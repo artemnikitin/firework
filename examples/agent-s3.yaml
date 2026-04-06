@@ -1,7 +1,7 @@
 # Agent configuration (S3 store mode).
 # Place on each node at /etc/firework/agent.yaml.
 #
-# In this mode the enricher Lambda writes enriched configs to S3 and
+# In this mode the control-plane controller writes enriched configs to S3 and
 # the agent polls the bucket for changes. The agent's node_name must
 # match a node_type used in the enricher input service specs.
 #
@@ -10,6 +10,7 @@
 #   2. EC2 instance profile / IAM role (recommended for production)
 #   3. Shared credentials file (~/.aws/credentials)
 node_name: "general-purpose"
+node_id: "node-1"
 
 # Multi-label support: a single node can pull configs for multiple node types.
 # The agent fetches and merges services from all listed labels.
@@ -46,6 +47,18 @@ log_level: "info"
 
 # Status/health HTTP API
 api_listen_addr: ":8080"
+
+# Optional control-plane registry integration (mTLS).
+# When configured, the agent enrolls/renews client certs and sends
+# register/heartbeat updates for scheduling discovery.
+# registry_url: "https://controlplane.internal:9443"
+# registry_server_name: "controlplane.internal"
+# registry_cert_file: "/etc/firework/pki/node.crt"
+# registry_key_file: "/etc/firework/pki/node.key"
+# registry_ca_file: "/etc/firework/pki/node-ca.crt"  # must be pre-provisioned
+# registry_bootstrap_token: "${REGISTRY_BOOTSTRAP_TOKEN}"
+# registry_bootstrap_token_file: "/run/secrets/firework/registry_bootstrap_token"
+# registry_cert_renew_before: "6h"
 
 enable_health_checks: true
 enable_network_setup: true
