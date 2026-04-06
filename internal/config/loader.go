@@ -12,16 +12,16 @@ import (
 // DefaultAgentConfig returns sensible defaults for the agent configuration.
 func DefaultAgentConfig() AgentConfig {
 	return AgentConfig{
-		StoreType:               "git",
-		StoreBranch:             "main",
-		PollInterval:            30 * time.Second,
-		FirecrackerBin:          "/usr/bin/firecracker",
-		StateDir:                "/var/lib/firework",
-		LogLevel:                "info",
-		ImagesDir:               "/var/lib/images",
-		VMSubnet:                "172.16.0.0/24",
-		VMGateway:               "172.16.0.1",
-		VMBridge:                "br-firework",
+		StoreType:                 "git",
+		StoreBranch:               "main",
+		PollInterval:              30 * time.Second,
+		FirecrackerBin:            "/usr/bin/firecracker",
+		StateDir:                  "/var/lib/firework",
+		LogLevel:                  "info",
+		ImagesDir:                 "/var/lib/images",
+		VMSubnet:                  "172.16.0.0/24",
+		VMGateway:                 "172.16.0.1",
+		VMBridge:                  "br-firework",
 		RegistryCertRenewBefore:   6 * time.Hour,
 		RegistryHeartbeatInterval: 15 * time.Second,
 	}
