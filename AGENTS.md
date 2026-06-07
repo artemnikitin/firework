@@ -6,28 +6,21 @@ Firework is a lightweight pull-based orchestrator for Firecracker microVMs writt
 
 ## Layout
 
-- `cmd/`: contains binary entrypoints.
-- `internal/`: contains all the logic, it's a mix of a pure agent logic and control plane logic.
-- `docs/`: contains documentation.
+- `cmd/agent`: `firework-agent` entry point.
+- `cmd/controlplane`: control-plane entry point.
+- `cmd/fc-init`: guest init process used inside microVM rootfs images.
+- `internal/config`: YAML config types and loading.
+- `internal/enricher`: GitOps input expansion and defaults.
+- `internal/scheduler`: placement and bin-packing logic.
+- `internal/reconciler`: desired-vs-running VM plan/apply logic.
+- `internal/agent`: node runtime.
+- `internal/vm`: VM lifecycle.
+- `internal/network`: host networking.
+- `internal/controlplane`: registry/events/controller runtime.
+- `internal/store`: Git and S3 config backends.
+- `docs/configs/`: source of truth for config formats.
+- `docs/architecture/`: contains the main design/architecture details on the project.
 - `examples/`: sample agent, control-plane, and node configs.
-
-  ## Layout
-
-    - `cmd/agent`: `firework-agent` entry point.
-    - `cmd/controlplane`: control-plane entry point.
-    - `cmd/fc-init`: guest init process used inside microVM rootfs images.
-    - `internal/config`: YAML config types and loading.
-    - `internal/enricher`: GitOps input expansion and defaults.
-    - `internal/scheduler`: placement and bin-packing logic.
-    - `internal/reconciler`: desired-vs-running VM plan/apply logic.
-    - `internal/agent`: node runtime.
-    - `internal/vm`: VM lifecycle.
-    - `internal/network`: host networking.
-    - `internal/controlplane`: registry/events/controller runtime.
-    - `internal/store`: Git and S3 config backends.
-    - `docs/configs/`: source of truth for config formats.
-    - `docs/architecture/`: contains the main design/architecture details on the project.
-    - `examples/`: sample agent, control-plane, and node configs.
 
 ## Conventions
 
@@ -57,5 +50,4 @@ Use the narrowest check that matches the change:
 - Dependency or module changes: run `make tidy` and verify go.mod/go.sum diffs are intentional.
 - End-to-end reconcile behavior changes: run `make smoke-local`.
 
-For CI-equivalent local validation, run:
-The logic/steps can be found in `.github/workflows/ci.yaml`. 
+For CI-equivalent local validation run the logic/steps from `.github/workflows/ci.yaml`. 
