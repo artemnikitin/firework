@@ -96,10 +96,11 @@ Static linking is simpler and eliminates the runtime dependency entirely. The co
 is that service addresses are fixed at enrichment time — suitable for stable, long-running
 services, but the wrong fit for workloads where service addresses change frequently.
 
-Environment injection uses kernel args (`firework.env.KEY=VALUE`), which the guest init
-process (`fc-init`) reads from `/proc/cmdline` and exports to the environment before
-exec-ing the application. This means no sidecar, no agent inside the VM, and no
-dependency on the guest OS beyond a standard init binary.
+Environment injection uses kernel args (`firework.env.KEY=VALUE`, or
+`firework.env64.KEY=VALUE` for values that need whitespace encoding), which the guest
+init process (`fc-init`) reads from `/proc/cmdline` and exports to the environment
+before exec-ing the application. This means no sidecar, no agent inside the VM, and
+no dependency on the guest OS beyond a standard init binary.
 
 ## Traefik with File Provider for Dynamic Routing
 

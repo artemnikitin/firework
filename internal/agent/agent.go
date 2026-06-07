@@ -2,6 +2,7 @@ package agent
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/binary"
 	"fmt"
 	"log/slog"
@@ -550,9 +551,10 @@ func (a *Agent) resolveLinks(services []config.ServiceConfig) {
 	}
 }
 
-// injectEnvVars appends environment variables to each service's KernelArgs
-// as firework.env.KEY=VALUE entries. The guest's /sbin/fc-init parses
-// /proc/cmdline for these entries and exports them before launching the app.
+// injectEnvVars appends environment variables to each service's KernelArgs.
+// Values with whitespace are encoded as firework.env64.KEY=VALUE so they
+// remain a single kernel-argument token; fc-init also supports legacy raw
+// firework.env.KEY=VALUE entries for values that need no encoding.
 func (a *Agent) injectEnvVars(services []config.ServiceConfig) {
 	for i := range services {
 		svc := &services[i]
@@ -569,13 +571,21 @@ func (a *Agent) injectEnvVars(services []config.ServiceConfig) {
 
 		for _, k := range keys {
 			v := svc.Env[k]
-			arg := fmt.Sprintf("firework.env.%s=%s", k, v)
+			arg := envKernelArg(k, v)
 			svc.KernelArgs = insertKernelArg(svc.KernelArgs, arg)
 		}
 
 		a.logger.Debug("injected env vars into kernel args",
 			"service", svc.Name, "env_count", len(svc.Env))
 	}
+}
+
+func envKernelArg(key, value string) string {
+	if strings.ContainsAny(value, " \t\n\r\v\f") {
+		encoded := base64.RawURLEncoding.EncodeToString([]byte(value))
+		return fmt.Sprintf("firework.env64.%s=%s", key, encoded)
+	}
+	return fmt.Sprintf("firework.env.%s=%s", key, value)
 }
 
 // syncTraefikConfigs writes or removes Traefik dynamic config files to match

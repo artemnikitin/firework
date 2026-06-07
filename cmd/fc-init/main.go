@@ -4,8 +4,8 @@
 //
 // It runs as PID 1 (init=/sbin/fc-init) inside the guest and:
 //  1. Mounts /proc, /sys, /dev/pts
-//  2. Reads /proc/cmdline and exports any firework.env.KEY=VALUE pairs
-//     as environment variables for the child process.
+//  2. Reads /proc/cmdline and exports firework.env.KEY=VALUE and encoded
+//     firework.env64.KEY=VALUE pairs as environment variables for the child process.
 //  3. Execs the remainder of argv (os.Args[1:]), or falls back to
 //     /sbin/init if no arguments are given.
 //
@@ -17,6 +17,7 @@
 package main
 
 import (
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io/fs"
@@ -30,6 +31,11 @@ import (
 )
 
 const runtimeMetadataPath = "/etc/firework/runtime.json"
+
+const (
+	fireworkEnvPrefix   = "firework.env."
+	fireworkEnv64Prefix = "firework.env64."
+)
 
 type runtimeMetadata struct {
 	User          string            `json:"user,omitempty"`
@@ -139,8 +145,8 @@ func applyImageEnv(env map[string]string) {
 	}
 }
 
-// exportFireworkEnv reads /proc/cmdline and exports any
-// firework.env.KEY=VALUE entries into the process environment.
+// exportFireworkEnv reads /proc/cmdline and exports any firework.env.KEY=VALUE
+// or encoded firework.env64.KEY=VALUE entries into the process environment.
 func exportFireworkEnv() {
 	data, err := os.ReadFile("/proc/cmdline")
 	if err != nil {
@@ -148,18 +154,42 @@ func exportFireworkEnv() {
 		return
 	}
 	for _, arg := range strings.Fields(string(data)) {
-		rest, ok := strings.CutPrefix(arg, "firework.env.")
-		if !ok {
+		key, val, ok, err := parseFireworkEnvArg(arg)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "fc-init: parse env arg: %v\n", err)
 			continue
 		}
-		key, val, found := strings.Cut(rest, "=")
-		if !found {
+		if !ok {
 			continue
 		}
 		if err := os.Setenv(key, val); err != nil {
 			fmt.Fprintf(os.Stderr, "fc-init: setenv %s: %v\n", key, err)
 		}
 	}
+}
+
+func parseFireworkEnvArg(arg string) (key, val string, ok bool, err error) {
+	if rest, found := strings.CutPrefix(arg, fireworkEnv64Prefix); found {
+		key, encoded, hasValue := strings.Cut(rest, "=")
+		if !hasValue {
+			return "", "", false, nil
+		}
+		decoded, err := base64.RawURLEncoding.DecodeString(encoded)
+		if err != nil {
+			return "", "", true, fmt.Errorf("decode %s: %w", key, err)
+		}
+		return key, string(decoded), true, nil
+	}
+
+	rest, found := strings.CutPrefix(arg, fireworkEnvPrefix)
+	if !found {
+		return "", "", false, nil
+	}
+	key, val, hasValue := strings.Cut(rest, "=")
+	if !hasValue {
+		return "", "", false, nil
+	}
+	return key, val, true, nil
 }
 
 // execService execs argv[1:] if provided, otherwise /sbin/init.
