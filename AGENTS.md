@@ -20,6 +20,8 @@ Firework is a lightweight pull-based orchestrator for Firecracker microVMs writt
 
 ## Validation
 
+Be mindful about validating changes. For example, if changes only touching some text files, then there is no need to run full validation on it. At the same time, if unsure, then prefer to run full validation to be on the safe side.
+
 ### Unit tests and linters
 
 Use the narrowest useful check first:
