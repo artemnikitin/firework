@@ -117,7 +117,7 @@ func (r *Reconciler) Apply(ctx context.Context, actions []Action) error {
 	return r.applyAllAtOnce(ctx, actions)
 }
 
-// applyAllAtOnce applies all actions concurrently (default behaviour).
+// applyAllAtOnce applies all actions without rolling-update delays.
 func (r *Reconciler) applyAllAtOnce(ctx context.Context, actions []Action) error {
 	var errs []error
 
