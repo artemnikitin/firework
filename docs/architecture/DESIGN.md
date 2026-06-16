@@ -106,15 +106,16 @@ dependency on the guest OS beyond a standard init binary.
 Each node runs Traefik as a reverse proxy. Firework writes Traefik dynamic config files
 (one per service) that Traefik watches and reloads automatically.
 
-The alternative — managing ALB listener rules programmatically — would require the enricher
-to call ALB APIs on each config change, handle rule limits, and manage ordering. Traefik
-with file provider is simpler: the agent writes a file, Traefik picks it up, no API calls
-needed.
+The alternative — managing ALB listener rules programmatically — would require the control
+plane to call ALB APIs after scheduling changes, handle rule limits, and manage ordering.
+Traefik with file provider is simpler: the agent writes a file, Traefik picks it up, no API
+calls needed.
 
 For multi-node routing, agents read S3 configs for all peer nodes and write `remote-{svc}.yaml`
-files that proxy to the peer node's host IP. This means every node can route to every
-service in the cluster, which avoids the problem of ALB round-robining requests to a node
-that doesn't have the target service scheduled.
+files for peer services that have `metadata.host` and a `port_forwards` entry. Those files
+proxy to the peer node's `host_ip` and forwarded host port. This means every node can route
+to every routed service in the cluster, which avoids the problem of ALB round-robining
+requests to a node that doesn't have the target service scheduled.
 
 Traefik was chosen primarily for integration simplicity — since the agent already manages
 files on disk, a proxy that watches config files required no additional API surface compared

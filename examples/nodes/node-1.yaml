@@ -29,6 +29,7 @@ services:
       timeout: "5s"
       retries: 3
     metadata:
+      host: "web-api.example.com"
       environment: "production"
       version: "1.2.3"
 

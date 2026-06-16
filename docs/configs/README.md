@@ -55,7 +55,7 @@ Examples:
 | `enable_capacity_check` | no | `true` | Skip reconcile when desired > node capacity |
 | `update_strategy` | no | `all-at-once` | `all-at-once` or `rolling` |
 | `update_delay` | no | `0s` | Delay between updates in rolling mode |
-| `traefik_config_dir` | no | empty | Enables Traefik dynamic config management |
+| `traefik_config_dir` | no | empty | Enables Traefik dynamic config management for local and remote service routes |
 | `registry_url` | no | empty | Enables node register/heartbeat to control-plane registry |
 | `registry_server_name` | no | empty | Optional TLS server name override for registry endpoint |
 | `registry_cert_file` | when `registry_url` set | - | Node mTLS cert path |
@@ -127,11 +127,11 @@ Supported fields:
 | `memory_mb` | no | Memory in MiB |
 | `kernel_args` | no | Kernel boot args |
 | `network` | no | When true, networking is configured |
-| `port_forwards` | no | Host-to-guest DNAT mappings |
+| `port_forwards` | no | Host-to-guest DNAT mappings; required for remote Traefik routing |
 | `health_check` | no | `type` supports `http` or `tcp` |
 | `env` | no | Env vars injected via kernel args |
 | `links` | no | Same-node service links (`env` gets resolved URL) |
-| `metadata` | no | Arbitrary key/value tags |
+| `metadata` | no | Arbitrary key/value tags; `host` enables Traefik host routing |
 | `anti_affinity_group` | no | Scheduler anti-affinity preference |
 | `cross_node_links` | no | Cross-node env injection (`host_ip:host_port`) |
 | `node_host_ip_env` | no | Env var name to inject current node host IP |
@@ -186,7 +186,7 @@ Agents consume this schema:
 
 ```yaml
 node: "node-or-instance-id"
-host_ip: "10.0.1.42"   # optional, used for cross-node links
+host_ip: "10.0.1.42"   # optional, used for cross-node links and remote Traefik routing
 services:
   - name: "svc-a"
     image: "/var/lib/images/svc-a-rootfs.ext4"
@@ -197,7 +197,13 @@ services:
 
 Notes:
 
-- `host_ip` is optional and usually added in scheduled multi-node flows.
+- `host_ip` is optional and usually added in scheduled multi-node flows. It is used for
+  cross-node links and for remote Traefik routes to services on peer nodes.
+- Traefik route generation requires `traefik_config_dir` on the agent and `metadata.host`
+  on the service. Local routes proxy to the VM guest IP; remote routes proxy to the peer
+  node's `host_ip` and the first `port_forwards[].host_port`.
+- Remote Traefik routing is available when the config store can list peer node configs,
+  such as the S3-backed control-plane flow.
 - `health_check.target` can be set directly, but enriched configs usually use `port`/`path` and let the agent compose the target from guest IP.
 
 ## 5) CI-Only Fields (Not Used By Firework Runtime)
