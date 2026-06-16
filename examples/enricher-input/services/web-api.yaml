@@ -16,5 +16,6 @@ health_check:
   port: 8080
   path: "/health"
 metadata:
+  host: "web-api.example.com"
   environment: "production"
   version: "1.2.3"
