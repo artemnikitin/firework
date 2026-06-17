@@ -172,6 +172,65 @@ func TestAssignNetworking_InsertsIPBeforeAppSeparator(t *testing.T) {
 	}
 }
 
+func TestAssignNetworking_AllocatesMACPastLastOctet(t *testing.T) {
+	cfg := testAgentConfig(t)
+	cfg.VMSubnet = "172.16.0.0/16"
+	cfg.VMGateway = "172.16.0.1"
+
+	a := &Agent{
+		cfg:    cfg,
+		logger: testLogger(),
+	}
+
+	services := make([]config.ServiceConfig, 256)
+	for i := range services {
+		services[i] = config.ServiceConfig{
+			Name:    fmt.Sprintf("svc-%03d", i),
+			Network: &config.NetworkConfig{Interface: fmt.Sprintf("tap-%03d", i)},
+		}
+	}
+
+	a.assignNetworking(services)
+
+	if got := services[254].Network.GuestMAC; got != "AA:FC:00:00:00:FF" {
+		t.Fatalf("expected 255th MAC to be AA:FC:00:00:00:FF, got %s", got)
+	}
+	if got := services[255].Network.GuestMAC; got != "AA:FC:00:00:01:00" {
+		t.Fatalf("expected 256th MAC to be AA:FC:00:00:01:00, got %s", got)
+	}
+}
+
+func TestAssignNetworking_StopsWhenSubnetExhausted(t *testing.T) {
+	cfg := testAgentConfig(t)
+	cfg.VMSubnet = "172.16.0.0/30"
+	cfg.VMGateway = "172.16.0.1"
+
+	a := &Agent{
+		cfg:    cfg,
+		logger: testLogger(),
+	}
+
+	services := []config.ServiceConfig{
+		{Name: "first", Network: &config.NetworkConfig{Interface: "tap-first"}},
+		{Name: "second", Network: &config.NetworkConfig{Interface: "tap-second"}},
+	}
+
+	a.assignNetworking(services)
+
+	if got := services[0].Network.GuestIP; got != "172.16.0.2" {
+		t.Fatalf("expected first guest IP 172.16.0.2, got %s", got)
+	}
+	if got := services[0].Network.GuestMAC; got != "AA:FC:00:00:00:01" {
+		t.Fatalf("expected first guest MAC AA:FC:00:00:00:01, got %s", got)
+	}
+	if got := services[1].Network.GuestIP; got != "" {
+		t.Fatalf("expected second guest IP to remain unset, got %s", got)
+	}
+	if got := services[1].Network.GuestMAC; got != "" {
+		t.Fatalf("expected second guest MAC to remain unset, got %s", got)
+	}
+}
+
 func TestInjectEnvVars_InsertsBeforeAppSeparatorAndSortsKeys(t *testing.T) {
 	a := &Agent{logger: testLogger()}
 

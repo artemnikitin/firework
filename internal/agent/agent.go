@@ -2,6 +2,7 @@ package agent
 
 import (
 	"context"
+	"encoding/binary"
 	"fmt"
 	"log/slog"
 	"net"
@@ -427,8 +428,8 @@ func (a *Agent) assignNetworking(services []config.ServiceConfig) {
 	gateway := stripCIDR(a.cfg.VMGateway)
 	netmask := network.SubnetMaskBits(a.cfg.VMSubnet)
 
-	// Parse subnet to compute sequential IPs starting at .2.
-	ip, _, err := net.ParseCIDR(a.cfg.VMSubnet)
+	// Parse subnet to compute sequential IPs starting at network + 2.
+	ip, ipNet, err := net.ParseCIDR(a.cfg.VMSubnet)
 	if err != nil {
 		a.logger.Error("invalid vm_subnet", "subnet", a.cfg.VMSubnet, "error", err)
 		return
@@ -438,11 +439,7 @@ func (a *Agent) assignNetworking(services []config.ServiceConfig) {
 		a.logger.Error("vm_subnet is not IPv4", "subnet", a.cfg.VMSubnet)
 		return
 	}
-
-	// Start at .2 (gateway is .1).
-	nextIP := make(net.IP, 4)
-	copy(nextIP, ip)
-	nextIP[3] = 2
+	ipNet.IP = ip
 
 	idx := 0
 	for i := range services {
@@ -451,8 +448,13 @@ func (a *Agent) assignNetworking(services []config.ServiceConfig) {
 			continue
 		}
 
-		guestIP := nextIP.String()
-		mac := fmt.Sprintf("AA:FC:00:00:00:%02X", idx+1)
+		guestIP, ok := guestIPv4ForIndex(ipNet, idx)
+		if !ok {
+			a.logger.Error("vm_subnet has no available guest IPs",
+				"subnet", a.cfg.VMSubnet, "assigned_services", idx)
+			return
+		}
+		mac := guestMACForIndex(idx)
 
 		svc.Network.GuestIP = guestIP
 		svc.Network.GuestMAC = mac
@@ -465,8 +467,40 @@ func (a *Agent) assignNetworking(services []config.ServiceConfig) {
 		}
 
 		idx++
-		nextIP[3]++
 	}
+}
+
+func guestIPv4ForIndex(ipNet *net.IPNet, idx int) (string, bool) {
+	if idx < 0 || ipNet == nil {
+		return "", false
+	}
+	base := ipNet.IP.To4()
+	if base == nil {
+		return "", false
+	}
+	ones, bits := ipNet.Mask.Size()
+	if bits != 32 || ones > 30 {
+		return "", false
+	}
+
+	hostCount := uint64(1) << uint(32-ones)
+	offset := uint64(idx) + 2 // reserve network + .1 gateway
+	if offset >= hostCount-1 {
+		return "", false
+	}
+
+	candidate := make(net.IP, net.IPv4len)
+	binary.BigEndian.PutUint32(candidate, binary.BigEndian.Uint32(base)+uint32(offset))
+	if !ipNet.Contains(candidate) {
+		return "", false
+	}
+	return candidate.String(), true
+}
+
+func guestMACForIndex(idx int) string {
+	n := uint32(idx + 1)
+	return fmt.Sprintf("AA:FC:%02X:%02X:%02X:%02X",
+		byte(n>>24), byte(n>>16), byte(n>>8), byte(n))
 }
 
 // resolveLinks iterates over each service's declared links and resolves them
