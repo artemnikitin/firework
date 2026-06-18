@@ -129,7 +129,7 @@ Supported fields:
 | `network` | no | When true, networking is configured |
 | `port_forwards` | no | Host-to-guest DNAT mappings; required for remote Traefik routing |
 | `health_check` | no | `type` supports `http` or `tcp` |
-| `env` | no | Env vars injected via kernel args |
+| `env` | no | Env vars injected via kernel args; values with whitespace are encoded |
 | `links` | no | Same-node service links (`env` gets resolved URL) |
 | `metadata` | no | Arbitrary key/value tags; `host` enables Traefik host routing |
 | `anti_affinity_group` | no | Scheduler anti-affinity preference |

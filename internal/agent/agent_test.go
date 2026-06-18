@@ -265,6 +265,40 @@ func TestInjectEnvVars_InsertsBeforeAppSeparatorAndSortsKeys(t *testing.T) {
 	}
 }
 
+func TestInjectEnvVars_EncodesValuesWithWhitespace(t *testing.T) {
+	a := &Agent{logger: testLogger()}
+
+	services := []config.ServiceConfig{
+		{
+			Name:       "worker",
+			KernelArgs: "console=ttyS0 init=/sbin/fc-init -- /app",
+			Env: map[string]string{
+				"MESSAGE": "hello world",
+			},
+		},
+	}
+
+	a.injectEnvVars(services)
+
+	got := strings.Fields(services[0].KernelArgs)
+	arg := "firework.env64.MESSAGE=aGVsbG8gd29ybGQ"
+
+	argIdx := tokenIndex(got, arg)
+	sepIdx := tokenIndex(got, "--")
+	if argIdx == -1 {
+		t.Fatalf("expected encoded env arg in kernel args, got %q", services[0].KernelArgs)
+	}
+	if sepIdx == -1 {
+		t.Fatalf("expected app separator \"--\" in kernel args, got %q", services[0].KernelArgs)
+	}
+	if argIdx > sepIdx {
+		t.Fatalf("expected %q before \"--\", got %q", arg, services[0].KernelArgs)
+	}
+	if strings.Contains(services[0].KernelArgs, "firework.env.MESSAGE=hello world") {
+		t.Fatalf("expected whitespace value to be encoded, got %q", services[0].KernelArgs)
+	}
+}
+
 func tokenIndex(tokens []string, want string) int {
 	for i, tok := range tokens {
 		if tok == want {

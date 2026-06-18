@@ -50,3 +50,39 @@ func TestNormalizeWritablePaths(t *testing.T) {
 		t.Fatalf("expected %v, got %v", want, got)
 	}
 }
+
+func TestParseFireworkEnvArg_LegacyRaw(t *testing.T) {
+	key, val, ok, err := parseFireworkEnvArg("firework.env.DATABASE_URL=postgres://user:pass@host/db")
+	if err != nil {
+		t.Fatalf("parseFireworkEnvArg returned error: %v", err)
+	}
+	if !ok {
+		t.Fatal("expected env arg to be parsed")
+	}
+	if key != "DATABASE_URL" || val != "postgres://user:pass@host/db" {
+		t.Fatalf("expected DATABASE_URL raw value, got %s=%s", key, val)
+	}
+}
+
+func TestParseFireworkEnvArg_Base64WhitespaceValue(t *testing.T) {
+	key, val, ok, err := parseFireworkEnvArg("firework.env64.MESSAGE=aGVsbG8gd29ybGQ")
+	if err != nil {
+		t.Fatalf("parseFireworkEnvArg returned error: %v", err)
+	}
+	if !ok {
+		t.Fatal("expected encoded env arg to be parsed")
+	}
+	if key != "MESSAGE" || val != "hello world" {
+		t.Fatalf("expected MESSAGE=hello world, got %s=%s", key, val)
+	}
+}
+
+func TestParseFireworkEnvArg_IgnoresNonEnvArg(t *testing.T) {
+	_, _, ok, err := parseFireworkEnvArg("console=ttyS0")
+	if err != nil {
+		t.Fatalf("parseFireworkEnvArg returned error: %v", err)
+	}
+	if ok {
+		t.Fatal("expected non-env arg to be ignored")
+	}
+}

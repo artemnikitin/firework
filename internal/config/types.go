@@ -35,7 +35,9 @@ type ServiceConfig struct {
 	PortForwards []PortForward `yaml:"port_forwards,omitempty"`
 	// Env holds environment variables injected into the guest via kernel
 	// boot arguments. The agent appends firework.env.KEY=VALUE entries
-	// to KernelArgs and the guest's fc-init parses them from /proc/cmdline.
+	// to KernelArgs, using encoded firework.env64.KEY=VALUE entries when
+	// values contain whitespace. The guest's fc-init parses both formats
+	// from /proc/cmdline.
 	Env map[string]string `yaml:"env,omitempty"`
 	// Links declares dependencies on other services. The agent resolves each
 	// link to the target service's guest IP and injects the composed URL into
