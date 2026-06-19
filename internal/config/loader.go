@@ -70,8 +70,12 @@ func LoadAgentConfig(path string) (AgentConfig, error) {
 		if cfg.S3Bucket == "" {
 			return cfg, fmt.Errorf("s3_bucket is required for s3 store")
 		}
+	case "gcs":
+		if cfg.GCSBucket == "" {
+			return cfg, fmt.Errorf("gcs_bucket is required for gcs store")
+		}
 	default:
-		return cfg, fmt.Errorf("unsupported store_type: %q (expected \"git\" or \"s3\")", cfg.StoreType)
+		return cfg, fmt.Errorf("unsupported store_type: %q (expected \"git\", \"s3\", or \"gcs\")", cfg.StoreType)
 	}
 
 	if cfg.RegistryURL != "" {

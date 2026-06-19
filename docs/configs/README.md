@@ -16,12 +16,14 @@ Examples:
 
 - [`examples/agent.yaml`](../../examples/agent.yaml) (Git mode)
 - [`examples/agent-s3.yaml`](../../examples/agent-s3.yaml) (S3 mode)
+- [`examples/agent-gcs.yaml`](../../examples/agent-gcs.yaml) (GCS mode)
 - [`examples/agent-demo.yaml`](../../examples/agent-demo.yaml) (multi-label demo)
 
 ### Required rules
 
 - `store_type: "git"` requires `store_url`.
 - `store_type: "s3"` requires `s3_bucket`.
+- `store_type: "gcs"` requires `gcs_bucket`.
 - If `node_name` is empty and `node_names` is empty, hostname is used.
 - If `node_names` is empty but `node_name` is set, `node_names` becomes `[node_name]`.
 
@@ -32,18 +34,23 @@ Examples:
 | `node_id` | no | derived from `node_name` | Stable registry identity for mTLS control-plane integration |
 | `node_name` | no | host name | Display/identity name for this node |
 | `node_names` | no | derived from `node_name` | Labels to fetch and merge (`nodes/<label>.yaml`) |
-| `store_type` | no | `git` | `git` or `s3` |
+| `store_type` | no | `git` | `git`, `s3`, or `gcs` |
 | `store_url` | git mode | - | Git repository URL |
 | `store_branch` | no | `main` | Git branch |
 | `s3_bucket` | s3 mode | - | S3 config bucket |
 | `s3_prefix` | no | empty | Prefix before `nodes/` |
 | `s3_region` | no | AWS default chain | Region for config bucket |
 | `s3_endpoint_url` | no | empty | Custom S3 endpoint (LocalStack/MinIO) |
+| `gcs_bucket` | gcs mode | - | GCS config bucket |
+| `gcs_prefix` | no | empty | Prefix before `nodes/` |
+| `gcs_project` | no | ADC project | GCP project containing the bucket |
+| `gcs_credentials_file` | no | ADC | Service-account credentials file; omit on GCE |
 | `poll_interval` | no | `30s` | Poll cadence |
 | `firecracker_bin` | no | `/usr/bin/firecracker` | Firecracker binary path |
 | `state_dir` | no | `/var/lib/firework` | Runtime state (VM sockets/logs) |
 | `images_dir` | no | `/var/lib/images` | Local image cache directory |
 | `s3_images_bucket` | no | empty | Enables image sync from S3 |
+| `gcs_images_bucket` | no | empty | Enables native image sync from GCS |
 | `log_level` | no | `info` | `debug`, `info`, `warn`, `error` |
 | `api_listen_addr` | no | empty | Enables local API server when set |
 | `enable_health_checks` | no | `true` | Health monitor toggle |

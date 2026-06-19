@@ -135,7 +135,7 @@ type AgentConfig struct {
 	NodeID string `yaml:"node_id,omitempty"`
 	// NodeName is this node's unique identifier.
 	NodeName string `yaml:"node_name"`
-	// StoreType is the config store backend: "git" or "s3".
+	// StoreType is the config store backend: "git", "s3", or "gcs".
 	StoreType string `yaml:"store_type"`
 	// StoreURL is the URL/path to the config store.
 	// For git: the repo URL. For S3: not used (use S3Bucket instead).
@@ -152,6 +152,14 @@ type AgentConfig struct {
 	S3Region string `yaml:"s3_region,omitempty"`
 	// S3EndpointURL overrides the S3 endpoint (useful for LocalStack/MinIO).
 	S3EndpointURL string `yaml:"s3_endpoint_url,omitempty"`
+	// GCSBucket is the GCS bucket name (for gcs store).
+	GCSBucket string `yaml:"gcs_bucket,omitempty"`
+	// GCSPrefix is an optional key prefix. Include a trailing slash.
+	GCSPrefix string `yaml:"gcs_prefix,omitempty"`
+	// GCSCredentialsFile overrides Application Default Credentials when set.
+	GCSCredentialsFile string `yaml:"gcs_credentials_file,omitempty"`
+	// GCSProject is the GCP project containing the bucket.
+	GCSProject string `yaml:"gcs_project,omitempty"`
 	// PollInterval is how often the agent polls the config store.
 	PollInterval time.Duration `yaml:"poll_interval"`
 	// FirecrackerBin is the path to the firecracker binary.
@@ -173,6 +181,8 @@ type AgentConfig struct {
 	// S3ImagesBucket is the S3 bucket containing VM images (rootfs, kernels).
 	// If empty, image sync is disabled (images must be pre-placed on disk).
 	S3ImagesBucket string `yaml:"s3_images_bucket,omitempty"`
+	// GCSImagesBucket is the GCS bucket containing VM images.
+	GCSImagesBucket string `yaml:"gcs_images_bucket,omitempty"`
 	// ImagesDir is the local directory where VM images are stored.
 	ImagesDir string `yaml:"images_dir"`
 	// VMSubnet is the CIDR subnet for VM guest IPs.

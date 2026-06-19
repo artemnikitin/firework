@@ -23,7 +23,7 @@ func branchFromRef(ref string) string {
 	return ref
 }
 
-func upsertPointer(ctx context.Context, store *S3StateStore, key, rev string) error {
+func upsertPointer(ctx context.Context, store StateStore, key, rev string) error {
 	ptr := RevisionPointer{
 		Revision:  rev,
 		UpdatedAt: time.Now().UTC(),
@@ -31,7 +31,7 @@ func upsertPointer(ctx context.Context, store *S3StateStore, key, rev string) er
 
 	for i := 0; i < 6; i++ {
 		var current RevisionPointer
-		etag, exists, err := store.GetJSON(ctx, key, &current)
+		token, exists, err := store.GetJSON(ctx, key, &current)
 		if err != nil {
 			return err
 		}
@@ -46,7 +46,7 @@ func upsertPointer(ctx context.Context, store *S3StateStore, key, rev string) er
 			continue
 		}
 
-		ok, _, err := store.PutJSONIfMatch(ctx, key, etag, ptr)
+		ok, _, err := store.PutJSONIfMatch(ctx, key, token, ptr)
 		if err != nil {
 			return err
 		}

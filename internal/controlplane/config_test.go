@@ -22,8 +22,19 @@ func TestConfigValidate_BackendAndRole(t *testing.T) {
 	}
 
 	cfg.State.Backend = "gcs"
+	cfg.State.GCS.Bucket = "test-gcs-bucket"
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("expected valid GCS config, got error: %v", err)
+	}
+
+	cfg.State.GCS.Bucket = ""
 	if err := cfg.Validate(); err == nil {
-		t.Fatalf("expected backend validation error")
+		t.Fatalf("expected missing GCS bucket validation error")
+	}
+
+	cfg.State.Backend = "azure"
+	if err := cfg.Validate(); err == nil {
+		t.Fatalf("expected unsupported backend validation error")
 	}
 
 	cfg = validConfigForRole("bad-role")

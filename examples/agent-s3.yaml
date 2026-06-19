@@ -27,7 +27,7 @@ s3_region: "us-east-1"     # optional, resolved from env/instance metadata if em
 # s3_endpoint_url: "http://localhost:4566"  # uncomment for LocalStack testing
 
 # Image sync: if set, the agent downloads VM images from this S3 bucket
-# before starting VMs. Uses ETag-based caching to skip unchanged files.
+# before starting VMs. Uses opaque object tokens to skip unchanged files.
 # s3_images_bucket: "my-firework-images"
 
 # Local directory where VM images are stored

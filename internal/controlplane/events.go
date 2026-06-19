@@ -22,12 +22,12 @@ import (
 // EventsServer serves GitHub event ingestion endpoints.
 type EventsServer struct {
 	cfg    Config
-	store  *S3StateStore
+	store  StateStore
 	logger *slog.Logger
 }
 
 // NewEventsServer creates a new events server.
-func NewEventsServer(cfg Config, store *S3StateStore, logger *slog.Logger) *EventsServer {
+func NewEventsServer(cfg Config, store StateStore, logger *slog.Logger) *EventsServer {
 	return &EventsServer{
 		cfg:    cfg,
 		store:  store,

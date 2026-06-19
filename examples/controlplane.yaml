@@ -13,6 +13,12 @@ state:
     region: "us-east-1"
     # endpoint_url: "http://localhost:4566"
     force_path_style: false
+  # For GCS, set backend: "gcs" and use this block instead. Empty
+  # credentials_file uses Application Default Credentials.
+  # gcs:
+  #   bucket: "my-firework-controlplane"
+  #   project: "my-gcp-project"
+  #   credentials_file: ""
 
 leader_lease_ttl: "30s"
 leader_renew_interval: "10s"

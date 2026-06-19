@@ -98,18 +98,24 @@ func New(cfg config.AgentConfig, s store.Store, logger *slog.Logger) *Agent {
 
 	// Set up optional image syncer.
 	var imgSyncer *imagesync.Syncer
-	if cfg.S3ImagesBucket != "" {
+	switch {
+	case cfg.S3ImagesBucket != "":
 		var err error
-		imgSyncer, err = imagesync.NewSyncer(
-			context.Background(),
-			cfg.S3ImagesBucket,
-			cfg.ImagesDir,
-			cfg.S3Region,
-			cfg.S3EndpointURL,
-			logger,
-		)
+		imgSyncer, err = imagesync.NewS3Syncer(context.Background(), imagesync.S3Config{
+			Bucket: cfg.S3ImagesBucket, Region: cfg.S3Region,
+			EndpointURL: cfg.S3EndpointURL, ForcePathStyle: cfg.S3EndpointURL != "",
+		}, cfg.ImagesDir, logger)
 		if err != nil {
-			logger.Error("failed to create image syncer", "error", err)
+			logger.Error("failed to create S3 image syncer", "error", err)
+		}
+	case cfg.GCSImagesBucket != "":
+		var err error
+		imgSyncer, err = imagesync.NewGCSSyncer(context.Background(), imagesync.GCSConfig{
+			Bucket: cfg.GCSImagesBucket, Project: cfg.GCSProject,
+			CredentialsFile: cfg.GCSCredentialsFile,
+		}, cfg.ImagesDir, logger)
+		if err != nil {
+			logger.Error("failed to create GCS image syncer", "error", err)
 		}
 	}
 
@@ -237,6 +243,9 @@ func (a *Agent) getHeartbeatResources() (cap capacity.NodeCapacity, used capacit
 
 // shutdown cleans up all resources.
 func (a *Agent) shutdown() {
+	if a.imageSyncer != nil {
+		_ = a.imageSyncer.Close()
+	}
 	if a.registryClient != nil {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		a.registryClient.markDown(ctx, a.cfg.NodeID)
@@ -283,7 +292,7 @@ func (a *Agent) tick(ctx context.Context) {
 	}
 
 	// Check revision only after fetch, so stores that update revision state
-	// during Fetch (Git pull, S3 ETag) are evaluated against fresh data.
+	// during Fetch (Git pull, object write token) are evaluated against fresh data.
 	// For multi-label nodes we skip this optimization because revision is
 	// store-scoped, not label-scoped.
 	var rev string

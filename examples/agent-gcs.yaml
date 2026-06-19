@@ -1,0 +1,16 @@
+# Firework agent configuration using native Google Cloud Storage.
+node_names:
+  - "firework-node-abc123"
+
+store_type: "gcs"
+gcs_bucket: "my-firework-configs"
+gcs_prefix: "cp/v1/"
+gcs_project: "my-gcp-project"
+# gcs_credentials_file: "/etc/firework/gcp-service-account.json"
+
+gcs_images_bucket: "my-firework-images-amd64"
+images_dir: "/var/lib/images"
+poll_interval: "30s"
+firecracker_bin: "/usr/bin/firecracker"
+state_dir: "/var/lib/firework"
+log_level: "info"

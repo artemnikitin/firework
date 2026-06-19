@@ -42,10 +42,18 @@ type Config struct {
 
 // StateConfig configures durable control-plane state storage.
 type StateConfig struct {
-	Backend string `yaml:"backend"` // currently: s3
+	Backend string `yaml:"backend"` // s3 or gcs
 	Prefix  string `yaml:"prefix"`
 
-	S3 S3StateConfig `yaml:"s3"`
+	S3  S3StateConfig  `yaml:"s3"`
+	GCS GCSStateConfig `yaml:"gcs"`
+}
+
+// GCSStateConfig configures native GCS state storage.
+type GCSStateConfig struct {
+	Bucket          string `yaml:"bucket"`
+	Project         string `yaml:"project"`
+	CredentialsFile string `yaml:"credentials_file"`
 }
 
 // S3StateConfig configures S3 state storage.
@@ -123,11 +131,17 @@ func (c Config) Validate() error {
 		return fmt.Errorf("unsupported role %q", c.Role)
 	}
 
-	if c.State.Backend != "s3" {
-		return fmt.Errorf("unsupported state backend %q (only s3 is supported)", c.State.Backend)
-	}
-	if c.State.S3.Bucket == "" {
-		return fmt.Errorf("state.s3.bucket is required")
+	switch c.State.Backend {
+	case "s3":
+		if c.State.S3.Bucket == "" {
+			return fmt.Errorf("state.s3.bucket is required")
+		}
+	case "gcs":
+		if c.State.GCS.Bucket == "" {
+			return fmt.Errorf("state.gcs.bucket is required")
+		}
+	default:
+		return fmt.Errorf("unsupported state backend %q (expected s3 or gcs)", c.State.Backend)
 	}
 	if c.State.Prefix == "" {
 		return fmt.Errorf("state.prefix is required")

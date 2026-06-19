@@ -270,6 +270,42 @@ store_type: "s3"
 	}
 }
 
+func TestLoadAgentConfig_GCSStore(t *testing.T) {
+	yaml := `
+node_name: "gcp-node"
+store_type: "gcs"
+gcs_bucket: "firework-configs"
+gcs_prefix: "cp/v1/"
+gcs_project: "test-project"
+gcs_credentials_file: "/tmp/gcp.json"
+gcs_images_bucket: "firework-images-amd64"
+`
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, "agent.yaml")
+	if err := os.WriteFile(cfgPath, []byte(yaml), 0o644); err != nil {
+		t.Fatalf("writing test config: %v", err)
+	}
+	cfg, err := LoadAgentConfig(cfgPath)
+	if err != nil {
+		t.Fatalf("LoadAgentConfig: %v", err)
+	}
+	if cfg.GCSBucket != "firework-configs" || cfg.GCSPrefix != "cp/v1/" || cfg.GCSProject != "test-project" || cfg.GCSCredentialsFile != "/tmp/gcp.json" || cfg.GCSImagesBucket != "firework-images-amd64" {
+		t.Fatalf("unexpected GCS config: %#v", cfg)
+	}
+}
+
+func TestLoadAgentConfig_GCSMissingBucket(t *testing.T) {
+	yaml := "node_name: gcp-node\nstore_type: gcs\n"
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, "agent.yaml")
+	if err := os.WriteFile(cfgPath, []byte(yaml), 0o644); err != nil {
+		t.Fatalf("writing test config: %v", err)
+	}
+	if _, err := LoadAgentConfig(cfgPath); err == nil {
+		t.Fatal("expected error for missing gcs_bucket")
+	}
+}
+
 func TestLoadAgentConfig_UnsupportedStoreType(t *testing.T) {
 	yaml := `
 node_name: "my-node"
