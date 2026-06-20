@@ -112,11 +112,21 @@ plane to call ALB APIs after scheduling changes, handle rule limits, and manage 
 Traefik with file provider is simpler: the agent writes a file, Traefik picks it up, no API
 calls needed.
 
+A service requests a public route via its metadata: `metadata.subdomain` (a single DNS
+label, resolved to `<subdomain>.<ingress_domain>` using the agent's deployment-owned
+`ingress_domain`) or `metadata.host` (an exact hostname used verbatim, retained for
+backward compatibility and custom hosts). A single shared resolver turns metadata into the
+final hostname, so local and remote routes for the same service are identical regardless of
+scheduling. The route set is fully resolved and validated in memory — rejecting invalid
+metadata and duplicate hostnames — before any file is written; files are staged and renamed
+into place so Traefik never observes a partial document.
+
 For multi-node routing, agents read S3 configs for all peer nodes and write `remote-{svc}.yaml`
-files for peer services that have `metadata.host` and a `port_forwards` entry. Those files
-proxy to the peer node's `host_ip` and forwarded host port. This means every node can route
-to every routed service in the cluster, which avoids the problem of ALB round-robining
-requests to a node that doesn't have the target service scheduled.
+files for peer services that have a routing key (`metadata.subdomain` or `metadata.host`) and
+a `port_forwards` entry. Those files proxy to the peer node's `host_ip` and forwarded host
+port. This means every node can route to every routed service in the cluster, which avoids
+the problem of ALB round-robining requests to a node that doesn't have the target service
+scheduled.
 
 Traefik was chosen primarily for integration simplicity — since the agent already manages
 files on disk, a proxy that watches config files required no additional API surface compared

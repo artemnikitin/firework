@@ -63,6 +63,14 @@ api_listen_addr: ":8080"
 enable_health_checks: true
 enable_network_setup: true
 
+# Public ingress routing (optional). When traefik_config_dir is set, the agent
+# writes per-service Traefik dynamic config for services that request a route.
+# traefik_config_dir: "/etc/traefik/dynamic"
+# ingress_domain is the deployment-owned DNS suffix used to form the public
+# hostname for a service that sets metadata.subdomain: <subdomain>.<ingress_domain>.
+# On GCP this is typically the data-plane base_domain (e.g. gcp.example.com).
+# ingress_domain: "gcp.example.com"
+
 # Shared bridge networking: VMs share a bridge for inter-VM communication.
 vm_subnet: "172.16.0.0/24"
 vm_gateway: "172.16.0.1"

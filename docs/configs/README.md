@@ -63,6 +63,7 @@ Examples:
 | `update_strategy` | no | `all-at-once` | `all-at-once` or `rolling` |
 | `update_delay` | no | `0s` | Delay between updates in rolling mode |
 | `traefik_config_dir` | no | empty | Enables Traefik dynamic config management for local and remote service routes |
+| `ingress_domain` | no | empty | Deployment-owned DNS suffix for `metadata.subdomain`. Final hostname is `<subdomain>.<ingress_domain>`. A bare domain only — no `*.`, scheme, port, or path. Validated/normalized at load (a trailing root dot is stripped) |
 | `registry_url` | no | empty | Enables node register/heartbeat to control-plane registry |
 | `registry_server_name` | no | empty | Optional TLS server name override for registry endpoint |
 | `registry_cert_file` | when `registry_url` set | - | Node mTLS cert path |
@@ -138,7 +139,7 @@ Supported fields:
 | `health_check` | no | `type` supports `http` or `tcp` |
 | `env` | no | Env vars injected via kernel args; values with whitespace are encoded |
 | `links` | no | Same-node service links (`env` gets resolved URL) |
-| `metadata` | no | Arbitrary key/value tags; `host` enables Traefik host routing |
+| `metadata` | no | Arbitrary key/value tags. Public routing: set **either** `subdomain` (one DNS label; final host is `<subdomain>.<ingress_domain>`) **or** `host` (exact hostname, used verbatim). Setting both is an error |
 | `anti_affinity_group` | no | Scheduler anti-affinity preference |
 | `cross_node_links` | no | Cross-node env injection (`host_ip:host_port`) |
 | `node_host_ip_env` | no | Env var name to inject current node host IP |
@@ -206,9 +207,25 @@ Notes:
 
 - `host_ip` is optional and usually added in scheduled multi-node flows. It is used for
   cross-node links and for remote Traefik routes to services on peer nodes.
-- Traefik route generation requires `traefik_config_dir` on the agent and `metadata.host`
-  on the service. Local routes proxy to the VM guest IP; remote routes proxy to the peer
-  node's `host_ip` and the first `port_forwards[].host_port`.
+- Traefik route generation requires `traefik_config_dir` on the agent and a routing key on
+  the service — either `metadata.subdomain` or `metadata.host`. Local routes proxy to the
+  VM guest IP; remote routes proxy to the peer node's `host_ip` and the first
+  `port_forwards[].host_port`.
+- `metadata.subdomain` is the portable, deployment-neutral form: it is exactly one DNS
+  label and the agent forms the final hostname as `<subdomain>.<ingress_domain>`. It
+  requires the agent's `ingress_domain` to be set and `traefik_config_dir` to be enabled;
+  otherwise the revision fails rather than silently producing no route. Because deployments
+  provision a single-label wildcard certificate (`*.<ingress_domain>`), only one label is
+  allowed — `myservice.mysub` is rejected.
+- `metadata.host` is an exact hostname used verbatim, retained for backward compatibility
+  and custom/internal-host routing. Exact custom hosts require separately compatible DNS and
+  TLS configuration that the deployment does not manage. On an installation that leaves
+  Traefik management disabled, a legacy `metadata.host` generates no route (historical
+  no-op); `metadata.subdomain` is rejected in that mode.
+- The same resolver is used for local and remote routes, so a given service resolves to an
+  identical `Host(...)` rule regardless of where it is scheduled. Two services that resolve
+  to the same hostname fail the sync rather than create nondeterministic equal-priority
+  routers.
 - Remote Traefik routing is available when the config store can list peer node configs,
   such as the S3-backed control-plane flow.
 - `health_check.target` can be set directly, but enriched configs usually use `port`/`path` and let the agent compose the target from guest IP.

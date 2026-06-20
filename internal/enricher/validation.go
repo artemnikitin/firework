@@ -5,6 +5,7 @@ import (
 	"strings"
 
 	"github.com/artemnikitin/firework/internal/config"
+	"github.com/artemnikitin/firework/internal/ingress"
 )
 
 // ValidationError holds multiple validation issues.
@@ -29,8 +30,22 @@ func (e *ValidationError) hasErrors() bool {
 	return len(e.Errors) > 0
 }
 
+// Warning codes are stable identifiers so callers can act on a specific
+// warning class without matching free-text messages.
+const (
+	// WarnHealthCheckWithoutNetwork: a service defines a health check but has
+	// networking disabled.
+	WarnHealthCheckWithoutNetwork = "health_check_without_network"
+	// WarnRemoteRoutingNoHostPort: a routed service has no usable first
+	// port_forwards host port, so it cannot participate in remote multi-node
+	// routing (remote nodes proxy through the host port).
+	WarnRemoteRoutingNoHostPort = "remote_routing_no_host_port"
+)
+
 // Warn represents a non-fatal issue found during validation.
 type Warn struct {
+	// Code is a stable identifier for the warning class.
+	Code    string
 	Message string
 }
 
@@ -39,6 +54,8 @@ func ValidateInput(input *InputConfig) error {
 	ve := &ValidationError{}
 
 	svcNames := make(map[string]bool)
+	subSeen := make(map[string]string)  // subdomain -> first service using it
+	hostSeen := make(map[string]string) // normalized host -> first service using it
 	for _, s := range input.Services {
 		if s.Name == "" {
 			ve.add("service with empty name")
@@ -62,12 +79,69 @@ func ValidateInput(input *InputConfig) error {
 				ve.addf("service %s: invalid health check type %q (must be http or tcp)", s.Name, s.HealthCheck.Type)
 			}
 		}
+
+		validateRouting(ve, s, input.Defaults, subSeen, hostSeen)
 	}
 
 	if ve.hasErrors() {
 		return ve
 	}
 	return nil
+}
+
+// validateRouting checks a service's public-routing metadata: at most one of
+// metadata.subdomain / metadata.host, a valid value for whichever is set, no
+// duplicate subdomains or exact hosts across services, and a usable network and
+// backend port for any routed service.
+func validateRouting(ve *ValidationError, s ServiceSpec, defs Defaults, subSeen, hostSeen map[string]string) {
+	host, hasHost := s.Metadata[ingress.MetadataHost]
+	sub, hasSub := s.Metadata[ingress.MetadataSubdomain]
+
+	if hasHost && hasSub {
+		ve.addf("service %s: cannot set both metadata.%s and metadata.%s", s.Name, ingress.MetadataHost, ingress.MetadataSubdomain)
+	}
+
+	switch {
+	case hasSub:
+		if err := ingress.ValidateSubdomain(sub); err != nil {
+			ve.addf("service %s: %v", s.Name, err)
+		} else if other, ok := subSeen[sub]; ok {
+			ve.addf("services %s and %s: duplicate metadata.subdomain %q", other, s.Name, sub)
+		} else {
+			subSeen[sub] = s.Name
+		}
+	case hasHost:
+		if h, err := ingress.ValidateHost(host); err != nil {
+			ve.addf("service %s: %v", s.Name, err)
+		} else if other, ok := hostSeen[h]; ok {
+			ve.addf("services %s and %s: duplicate metadata.host %q", other, s.Name, h)
+		} else {
+			hostSeen[h] = s.Name
+		}
+	}
+
+	if hasHost || hasSub {
+		if !s.Network {
+			ve.addf("service %s: public routing requires network: true", s.Name)
+		}
+		if effectiveBackendPort(s, defs) == 0 {
+			ve.addf("service %s: public routing requires a port_forwards entry or a health_check port", s.Name)
+		}
+	}
+}
+
+// effectiveBackendPort mirrors traefik.backendPort: the agent proxies to the
+// first port forward's VM port, falling back to the (merged) health-check port.
+// Keep these two implementations in agreement so a config that passes enricher
+// validation also renders a route at the agent.
+func effectiveBackendPort(spec ServiceSpec, defs Defaults) int {
+	if len(spec.PortForwards) > 0 {
+		return spec.PortForwards[0].VMPort
+	}
+	if hc := mergeHealthCheck(spec.HealthCheck, defs.HealthCheck); hc != nil && hc.Port > 0 {
+		return hc.Port
+	}
+	return 0
 }
 
 // ValidateOutput checks a fully enriched NodeConfig for correctness.
@@ -116,8 +190,20 @@ func CheckWarnings(input *InputConfig) []Warn {
 	for _, svc := range input.Services {
 		if svc.HealthCheck != nil && !svc.Network {
 			warns = append(warns, Warn{
+				Code:    WarnHealthCheckWithoutNetwork,
 				Message: fmt.Sprintf("service %s has health check but network is disabled", svc.Name),
 			})
+		}
+
+		_, hasHost := svc.Metadata[ingress.MetadataHost]
+		_, hasSub := svc.Metadata[ingress.MetadataSubdomain]
+		if hasHost || hasSub {
+			if len(svc.PortForwards) == 0 || svc.PortForwards[0].HostPort == 0 {
+				warns = append(warns, Warn{
+					Code:    WarnRemoteRoutingNoHostPort,
+					Message: fmt.Sprintf("service %s requests routing but has no first port_forwards host port; it cannot participate in remote multi-node routing", svc.Name),
+				})
+			}
 		}
 	}
 

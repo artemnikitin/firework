@@ -214,6 +214,59 @@ store_type: "git"
 	}
 }
 
+func TestLoadAgentConfig_IngressDomain(t *testing.T) {
+	tests := []struct {
+		name    string
+		value   string
+		want    string
+		wantErr bool
+	}{
+		{name: "valid", value: "example.com", want: "example.com"},
+		{name: "multi-label", value: "gcp.example.com", want: "gcp.example.com"},
+		{name: "trailing dot normalized", value: "example.com.", want: "example.com"},
+		{name: "uppercase normalized", value: "Example.COM", want: "example.com"},
+		{name: "scheme rejected", value: "https://example.com", wantErr: true},
+		{name: "port rejected", value: "example.com:443", wantErr: true},
+		{name: "path rejected", value: "example.com/foo", wantErr: true},
+		{name: "wildcard rejected", value: "*.example.com", wantErr: true},
+		{name: "empty label rejected", value: "example..com", wantErr: true},
+		{name: "leading hyphen rejected", value: "-example.com", wantErr: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			yaml := "node_name: my-node\nstore_type: git\nstore_url: https://example.com/repo.git\ningress_domain: \"" + tt.value + "\"\n"
+			dir := t.TempDir()
+			cfgPath := filepath.Join(dir, "agent.yaml")
+			if err := os.WriteFile(cfgPath, []byte(yaml), 0o644); err != nil {
+				t.Fatalf("writing test config: %v", err)
+			}
+			cfg, err := LoadAgentConfig(cfgPath)
+			if (err != nil) != tt.wantErr {
+				t.Fatalf("LoadAgentConfig ingress_domain=%q err=%v wantErr=%v", tt.value, err, tt.wantErr)
+			}
+			if !tt.wantErr && cfg.IngressDomain != tt.want {
+				t.Fatalf("IngressDomain=%q want %q", cfg.IngressDomain, tt.want)
+			}
+		})
+	}
+}
+
+func TestLoadAgentConfig_IngressDomainOmittedDefaultsEmpty(t *testing.T) {
+	yaml := "node_name: my-node\nstore_type: git\nstore_url: https://example.com/repo.git\n"
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, "agent.yaml")
+	if err := os.WriteFile(cfgPath, []byte(yaml), 0o644); err != nil {
+		t.Fatalf("writing test config: %v", err)
+	}
+	cfg, err := LoadAgentConfig(cfgPath)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if cfg.IngressDomain != "" {
+		t.Fatalf("expected empty IngressDomain default, got %q", cfg.IngressDomain)
+	}
+}
+
 func TestLoadAgentConfig_S3Store(t *testing.T) {
 	yaml := `
 node_name: "my-node"

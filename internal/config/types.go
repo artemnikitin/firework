@@ -208,6 +208,12 @@ type AgentConfig struct {
 	// directory and picks up changes without a reload.
 	// If empty, Traefik config management is disabled.
 	TraefikConfigDir string `yaml:"traefik_config_dir,omitempty"`
+	// IngressDomain is the deployment-owned DNS suffix used to form the public
+	// hostname for a service that sets metadata.subdomain: the final hostname is
+	// "<subdomain>.<ingress_domain>". It is a bare DNS domain — no "*." prefix,
+	// URL scheme, port, or path. If empty, services must use an exact
+	// metadata.host instead. The loader normalizes and validates this value.
+	IngressDomain string `yaml:"ingress_domain,omitempty"`
 
 	// RegistryURL enables control-plane registry integration when set.
 	// The agent will enroll/renew mTLS certificates and send register/heartbeat

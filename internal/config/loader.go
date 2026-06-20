@@ -6,6 +6,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/artemnikitin/firework/internal/ingress"
 	"gopkg.in/yaml.v3"
 )
 
@@ -82,6 +83,17 @@ func LoadAgentConfig(path string) (AgentConfig, error) {
 	// reject an ambiguous configuration rather than silently ignoring one.
 	if cfg.S3ImagesBucket != "" && cfg.GCSImagesBucket != "" {
 		return cfg, fmt.Errorf("s3_images_bucket and gcs_images_bucket are mutually exclusive")
+	}
+
+	// Normalize and validate the deployment ingress domain (used to form the
+	// public hostname for services that set metadata.subdomain). A trailing
+	// root dot is tolerated and stripped for standalone-config compatibility.
+	if cfg.IngressDomain != "" {
+		normalized, err := ingress.NormalizeDomain(cfg.IngressDomain)
+		if err != nil {
+			return cfg, fmt.Errorf("ingress_domain: %w", err)
+		}
+		cfg.IngressDomain = normalized
 	}
 
 	if cfg.RegistryURL != "" {
