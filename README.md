@@ -11,9 +11,6 @@ You can use them to have everything working end-to-end:
 
 ## How It Works
 
-The control plane runs as a single binary (`firework-controlplane`) with role-based
-runtime modes: `registry`, `events`, `controller`, or `all`.
-
 ```mermaid
 flowchart TB
     subgraph external["External"]
@@ -58,14 +55,6 @@ flowchart TB
 - Configuration reference: [`docs/configs/README.md`](docs/configs/README.md)
 - Example agent configs: [`examples/`](examples/)
 - Development guide: [`DEVELOPMENT.md`](DEVELOPMENT.md)
-
-## Container Image
-
-Official control-plane container images are published to GitHub Container Registry:
-
-- `ghcr.io/artemnikitin/firework-controlplane:<tag>`
-
-For production deployments, prefer immutable digests (`@sha256:...`).
 
 ## License
 
