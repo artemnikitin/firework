@@ -37,7 +37,7 @@ func NewS3StateStore(ctx context.Context, cfg S3StateConfig) (StateStore, error)
 	if err != nil {
 		return nil, err
 	}
-	return &blobStateStore{store: store}, nil
+	return newBlobStateStore(store), nil
 }
 
 // NewGCSStateStore creates a native GCS-backed state store.
@@ -48,7 +48,7 @@ func NewGCSStateStore(ctx context.Context, cfg GCSStateConfig) (StateStore, erro
 	if err != nil {
 		return nil, err
 	}
-	return &blobStateStore{store: store}, nil
+	return newBlobStateStore(store), nil
 }
 
 func newBlobStateStore(store objectstorage.BlobStore) StateStore {

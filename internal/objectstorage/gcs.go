@@ -125,7 +125,11 @@ func (s *gcsBlobStore) PutIfMatch(ctx context.Context, key string, expected Writ
 }
 
 func (s *gcsBlobStore) write(ctx context.Context, obj *storage.ObjectHandle, r io.Reader, opts PutOptions, conditional bool) (BlobMeta, error) {
-	w := obj.NewWriter(ctx)
+	// Canceling the writer's context aborts the upload without committing the
+	// object. This replaces the deprecated Writer.CloseWithError.
+	writeCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	w := obj.NewWriter(writeCtx)
 	if conditional {
 		// CAS objects are small. Non-resumable uploads preserve generation
 		// preconditions in fake-gcs-server and avoid misleading test failures.
@@ -135,7 +139,7 @@ func (s *gcsBlobStore) write(ctx context.Context, obj *storage.ObjectHandle, r i
 		w.ContentType = opts.ContentType
 	}
 	if _, err := io.Copy(w, r); err != nil {
-		_ = w.CloseWithError(err)
+		cancel()
 		return BlobMeta{}, err
 	}
 	if err := w.Close(); err != nil {

@@ -14,7 +14,7 @@ func newTestGCSStore(t *testing.T) BlobStore {
 	t.Helper()
 	server := fakestorage.NewServer(nil)
 	t.Cleanup(server.Stop)
-	server.CreateBucket("test-bucket")
+	server.CreateBucketWithOpts(fakestorage.CreateBucketOpts{Name: "test-bucket"})
 	store := NewGCSBlobStoreFromClient(server.Client(), "test-bucket")
 	t.Cleanup(func() { _ = store.Close() })
 	return store
