@@ -78,6 +78,12 @@ func LoadAgentConfig(path string) (AgentConfig, error) {
 		return cfg, fmt.Errorf("unsupported store_type: %q (expected \"git\", \"s3\", or \"gcs\")", cfg.StoreType)
 	}
 
+	// Image sync supports a single provider. The agent picks S3 before GCS, so
+	// reject an ambiguous configuration rather than silently ignoring one.
+	if cfg.S3ImagesBucket != "" && cfg.GCSImagesBucket != "" {
+		return cfg, fmt.Errorf("s3_images_bucket and gcs_images_bucket are mutually exclusive")
+	}
+
 	if cfg.RegistryURL != "" {
 		if cfg.RegistryCertFile == "" || cfg.RegistryKeyFile == "" || cfg.RegistryCAFile == "" {
 			return cfg, fmt.Errorf("registry_cert_file, registry_key_file and registry_ca_file are required when registry_url is set")

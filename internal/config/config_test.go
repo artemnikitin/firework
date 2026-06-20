@@ -306,6 +306,24 @@ func TestLoadAgentConfig_GCSMissingBucket(t *testing.T) {
 	}
 }
 
+func TestLoadAgentConfig_ImageBucketsMutuallyExclusive(t *testing.T) {
+	yaml := `
+node_name: "my-node"
+store_type: "s3"
+s3_bucket: "my-configs-bucket"
+s3_images_bucket: "my-images"
+gcs_images_bucket: "my-gcs-images"
+`
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, "agent.yaml")
+	if err := os.WriteFile(cfgPath, []byte(yaml), 0o644); err != nil {
+		t.Fatalf("writing test config: %v", err)
+	}
+	if _, err := LoadAgentConfig(cfgPath); err == nil {
+		t.Fatal("expected error when both image buckets are set")
+	}
+}
+
 func TestLoadAgentConfig_UnsupportedStoreType(t *testing.T) {
 	yaml := `
 node_name: "my-node"
