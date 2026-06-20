@@ -1,16 +1,70 @@
-# Firework agent configuration using native Google Cloud Storage.
-node_names:
-  - "firework-node-abc123"
+# Agent configuration (GCS store mode).
+# Place on each node at /etc/firework/agent.yaml.
+#
+# In this mode the control-plane controller writes enriched configs to GCS and
+# the agent polls the bucket for changes. The agent's node_name must
+# match a node_type used in the enricher input service specs.
+#
+# GCP credentials are resolved via Application Default Credentials:
+#   1. GOOGLE_APPLICATION_CREDENTIALS env var (service-account JSON)
+#   2. GCE/GKE metadata server attached service account (recommended in prod)
+#   3. gcs_credentials_file below (explicit service-account JSON path)
+node_name: "general-purpose"
+node_id: "node-1"
 
+# Multi-label support: a single node can pull configs for multiple node types.
+# The agent fetches and merges services from all listed labels.
+# Overrides node_name when set.
+# node_names:
+#   - "web"
+#   - "backend"
+
+# Config store settings
 store_type: "gcs"
 gcs_bucket: "my-firework-configs"
-gcs_prefix: "cp/v1/"
+gcs_prefix: ""             # optional, e.g. "prod/" to namespace configs
 gcs_project: "my-gcp-project"
-# gcs_credentials_file: "/etc/firework/gcp-service-account.json"
+# gcs_credentials_file: "/etc/firework/gcp-service-account.json"  # omit on GCE/GKE (uses ADC)
 
-gcs_images_bucket: "my-firework-images-amd64"
+# Image sync: if set, the agent downloads VM images from this GCS bucket
+# before starting VMs. Uses opaque object tokens to skip unchanged files.
+# gcs_images_bucket: "my-firework-images-amd64"
+
+# Local directory where VM images are stored
 images_dir: "/var/lib/images"
+
+# How often the agent polls GCS for config changes
 poll_interval: "30s"
+
+# Path to the Firecracker binary
 firecracker_bin: "/usr/bin/firecracker"
+
+# Where the agent stores runtime state (VM sockets, logs, etc.)
 state_dir: "/var/lib/firework"
+
+# Log level: debug, info, warn, error
 log_level: "info"
+
+# Status/health HTTP API
+api_listen_addr: ":8080"
+
+# Optional control-plane registry integration (mTLS).
+# When configured, the agent enrolls/renews client certs and sends
+# register/heartbeat updates for scheduling discovery.
+# registry_url: "https://controlplane.internal:9443"
+# registry_server_name: "controlplane.internal"
+# registry_cert_file: "/etc/firework/pki/node.crt"
+# registry_key_file: "/etc/firework/pki/node.key"
+# registry_ca_file: "/etc/firework/pki/node-ca.crt"  # must be pre-provisioned
+# registry_bootstrap_token: "${REGISTRY_BOOTSTRAP_TOKEN}"
+# registry_bootstrap_token_file: "/run/secrets/firework/registry_bootstrap_token"
+# registry_cert_renew_before: "6h"
+
+enable_health_checks: true
+enable_network_setup: true
+
+# Shared bridge networking: VMs share a bridge for inter-VM communication.
+vm_subnet: "172.16.0.0/24"
+vm_gateway: "172.16.0.1"
+vm_bridge: "br-firework"
+# out_interface: "eth0"  # host NIC for masquerade (internet access for VMs)
