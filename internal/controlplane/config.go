@@ -3,6 +3,7 @@ package controlplane
 import (
 	"fmt"
 	"os"
+	"strings"
 	"time"
 
 	"gopkg.in/yaml.v3"
@@ -33,8 +34,9 @@ type Config struct {
 	ConfigDir    string `yaml:"config_dir"`
 	GitRepoURL   string `yaml:"git_repo_url"`
 
-	ReconcileOnStart    bool   `yaml:"reconcile_on_start"`
-	GitHubWebhookSecret string `yaml:"github_webhook_secret"`
+	ReconcileOnStart        bool   `yaml:"reconcile_on_start"`
+	GitHubWebhookSecret     string `yaml:"github_webhook_secret"`
+	GitHubWebhookSecretFile string `yaml:"github_webhook_secret_file"`
 
 	TLS        TLSConfig        `yaml:"tls"`
 	Enrollment EnrollmentConfig `yaml:"enrollment"`
@@ -81,8 +83,9 @@ type EnrollmentConfig struct {
 
 // BootstrapToken authorizes a node to enroll.
 type BootstrapToken struct {
-	Token  string `yaml:"token"`
-	NodeID string `yaml:"node_id,omitempty"`
+	Token     string `yaml:"token"`
+	TokenFile string `yaml:"token_file,omitempty"`
+	NodeID    string `yaml:"node_id,omitempty"`
 }
 
 // DefaultConfig returns defaults for control-plane configuration.
@@ -117,10 +120,51 @@ func LoadConfig(path string) (Config, error) {
 	if err := yaml.Unmarshal(data, &cfg); err != nil {
 		return cfg, fmt.Errorf("parsing config %s: %w", path, err)
 	}
+	if err := cfg.resolve(); err != nil {
+		return cfg, err
+	}
 	if err := cfg.Validate(); err != nil {
 		return cfg, err
 	}
 	return cfg, nil
+}
+
+// resolve reads secret values from files specified by *_file fields and
+// populates the corresponding inline fields. It returns an error if both the
+// inline value and the file path are set simultaneously.
+func (c *Config) resolve() error {
+	if c.GitHubWebhookSecretFile != "" && c.GitHubWebhookSecret != "" {
+		return fmt.Errorf("github_webhook_secret and github_webhook_secret_file are mutually exclusive")
+	}
+	if c.GitHubWebhookSecretFile != "" {
+		val, err := readSecretFile(c.GitHubWebhookSecretFile)
+		if err != nil {
+			return fmt.Errorf("reading github_webhook_secret_file: %w", err)
+		}
+		c.GitHubWebhookSecret = val
+	}
+	for i := range c.Enrollment.BootstrapTokens {
+		bt := &c.Enrollment.BootstrapTokens[i]
+		if bt.TokenFile != "" && bt.Token != "" {
+			return fmt.Errorf("bootstrap_tokens[%d]: token and token_file are mutually exclusive", i)
+		}
+		if bt.TokenFile != "" {
+			val, err := readSecretFile(bt.TokenFile)
+			if err != nil {
+				return fmt.Errorf("bootstrap_tokens[%d]: reading token_file: %w", i, err)
+			}
+			bt.Token = val
+		}
+	}
+	return nil
+}
+
+func readSecretFile(path string) (string, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(string(data)), nil
 }
 
 // Validate validates runtime configuration.
