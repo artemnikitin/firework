@@ -16,6 +16,10 @@ health_check:
   port: 8080
   path: "/health"
 metadata:
-  host: "web-api.example.com"
+  # Portable, deployment-neutral routing: the final hostname is
+  # <subdomain>.<ingress_domain>, where ingress_domain is supplied by the
+  # deployed agent. Use the exact `host:` form only for custom/internal hosts
+  # that the deployment's DNS/TLS does not manage (see examples/nodes/node-1.yaml).
+  subdomain: "web-api"
   environment: "production"
   version: "1.2.3"

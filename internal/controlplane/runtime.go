@@ -11,10 +11,22 @@ import (
 
 // Run starts control-plane modules according to the configured role.
 func Run(ctx context.Context, cfg Config, logger *slog.Logger) error {
-	store, err := NewS3StateStore(ctx, cfg.State.S3)
-	if err != nil {
-		return err
+	var (
+		store StateStore
+		err   error
+	)
+	switch cfg.State.Backend {
+	case "s3":
+		store, err = NewS3StateStore(ctx, cfg.State.S3)
+	case "gcs":
+		store, err = NewGCSStateStore(ctx, cfg.State.GCS)
+	default:
+		return fmt.Errorf("unsupported state backend %q", cfg.State.Backend)
 	}
+	if err != nil {
+		return fmt.Errorf("creating %s state store: %w", cfg.State.Backend, err)
+	}
+	defer store.Close()
 
 	var servers []*http.Server
 	errCh := make(chan error, 4)

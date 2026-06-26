@@ -144,6 +144,61 @@ node_type: compute
 	}
 }
 
+func TestEnrich_RoutingValidationAfterTenantExpansion(t *testing.T) {
+	// Standalone-mode tenant files (no services/ dir). Two tenants request the
+	// same subdomain, which must be rejected only after tenant expansion.
+	dir := t.TempDir()
+	for _, tn := range []string{"tenant-1", "tenant-2"} {
+		td := filepath.Join(dir, "tenants", tn)
+		os.MkdirAll(td, 0o755)
+		writeFile(t, filepath.Join(td, "kibana.yaml"), `
+node_type: web
+image: /images/kibana.ext4
+vcpus: 1
+memory_mb: 256
+network: true
+port_forwards:
+  - host_port: 5611
+    vm_port: 5601
+metadata:
+  subdomain: shared
+`)
+	}
+
+	if _, err := Enrich(dir); err == nil {
+		t.Fatal("expected Enrich to reject duplicate subdomains after tenant expansion")
+	}
+}
+
+func TestEnrich_ValidSubdomainRouting(t *testing.T) {
+	dir := t.TempDir()
+	td := filepath.Join(dir, "tenants", "tenant-1")
+	os.MkdirAll(td, 0o755)
+	writeFile(t, filepath.Join(td, "kibana.yaml"), `
+node_type: web
+image: /images/kibana.ext4
+vcpus: 1
+memory_mb: 256
+network: true
+port_forwards:
+  - host_port: 5611
+    vm_port: 5601
+metadata:
+  subdomain: tenant-1
+`)
+
+	result, err := Enrich(dir)
+	if err != nil {
+		t.Fatalf("Enrich: %v", err)
+	}
+	if len(result.NodeConfigs) != 1 {
+		t.Fatalf("expected 1 node config, got %d", len(result.NodeConfigs))
+	}
+	if got := result.NodeConfigs[0].Services[0].Metadata["subdomain"]; got != "tenant-1" {
+		t.Errorf("expected subdomain tenant-1 preserved, got %q", got)
+	}
+}
+
 func TestEnrich_NoHealthCheck(t *testing.T) {
 	dir := t.TempDir()
 	writeFile(t, filepath.Join(dir, "defaults.yaml"), `

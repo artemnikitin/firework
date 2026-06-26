@@ -69,6 +69,8 @@ jobs:
             path: ./cmd/agent/
           - binary: controlplane
             path: ./cmd/controlplane/
+          - binary: configcheck
+            path: ./cmd/configcheck/
           - binary: fc-init
             path: ./cmd/fc-init/
             env: GOOS=linux GOARCH=arm64

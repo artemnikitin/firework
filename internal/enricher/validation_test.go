@@ -1,6 +1,7 @@
 package enricher
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/artemnikitin/firework/internal/config"
@@ -96,6 +97,96 @@ func TestValidateInput_InvalidHealthCheckType(t *testing.T) {
 	err := ValidateInput(input)
 	if err == nil {
 		t.Fatal("expected error for invalid health check type")
+	}
+}
+
+func routedSpec(name string, meta map[string]string) ServiceSpec {
+	return ServiceSpec{
+		Name:         name,
+		Image:        "/img/" + name + ".ext4",
+		NodeType:     "web",
+		Network:      true,
+		PortForwards: []config.PortForward{{HostPort: 8081, VMPort: 8080}},
+		Metadata:     meta,
+	}
+}
+
+func TestValidateInput_Routing(t *testing.T) {
+	tests := []struct {
+		name    string
+		specs   []ServiceSpec
+		wantErr bool
+	}{
+		{name: "valid subdomain", specs: []ServiceSpec{routedSpec("a", map[string]string{"subdomain": "tenant-1"})}},
+		{name: "valid host", specs: []ServiceSpec{routedSpec("a", map[string]string{"host": "a.example.com"})}},
+		{name: "both keys", specs: []ServiceSpec{routedSpec("a", map[string]string{"subdomain": "tenant-1", "host": "a.example.com"})}, wantErr: true},
+		{name: "invalid subdomain", specs: []ServiceSpec{routedSpec("a", map[string]string{"subdomain": "Bad.Label"})}, wantErr: true},
+		{name: "invalid host injection", specs: []ServiceSpec{routedSpec("a", map[string]string{"host": "a`b.example.com"})}, wantErr: true},
+		{name: "empty subdomain value", specs: []ServiceSpec{routedSpec("a", map[string]string{"subdomain": ""})}, wantErr: true},
+		{name: "duplicate subdomains", specs: []ServiceSpec{routedSpec("a", map[string]string{"subdomain": "t1"}), routedSpec("b", map[string]string{"subdomain": "t1"})}, wantErr: true},
+		{name: "duplicate hosts", specs: []ServiceSpec{routedSpec("a", map[string]string{"host": "x.example.com"}), routedSpec("b", map[string]string{"host": "x.example.com"})}, wantErr: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := ValidateInput(&InputConfig{Services: tt.specs})
+			if (err != nil) != tt.wantErr {
+				t.Fatalf("ValidateInput err=%v wantErr=%v", err, tt.wantErr)
+			}
+		})
+	}
+}
+
+func TestValidateInput_DuplicateSubdomainsNamesBothServices(t *testing.T) {
+	err := ValidateInput(&InputConfig{Services: []ServiceSpec{
+		routedSpec("svc-a", map[string]string{"subdomain": "t1"}),
+		routedSpec("svc-b", map[string]string{"subdomain": "t1"}),
+	}})
+	ve, ok := err.(*ValidationError)
+	if !ok {
+		t.Fatalf("expected *ValidationError, got %T", err)
+	}
+	joined := strings.Join(ve.Errors, "\n")
+	if !strings.Contains(joined, "svc-a") || !strings.Contains(joined, "svc-b") {
+		t.Errorf("expected both conflicting service names in error, got: %v", ve.Errors)
+	}
+}
+
+func TestValidateInput_RoutedWithoutNetworkOrBackend(t *testing.T) {
+	// No network, no port forward, no health check -> two errors.
+	err := ValidateInput(&InputConfig{Services: []ServiceSpec{
+		{Name: "a", Image: "/img/a", NodeType: "web", Metadata: map[string]string{"subdomain": "t1"}},
+	}})
+	if err == nil {
+		t.Fatal("expected error for routed service without network/backend")
+	}
+}
+
+// A routed service with only a health-check port (no port_forwards) must pass
+// validation but warn that it cannot do remote routing — the seam the agent
+// relies on must agree.
+func TestValidateInput_SubdomainWithHealthCheckPortValidWithWarning(t *testing.T) {
+	input := &InputConfig{Services: []ServiceSpec{
+		{
+			Name:        "a",
+			Image:       "/img/a",
+			NodeType:    "web",
+			Network:     true,
+			HealthCheck: &HealthCheckSpec{Type: "http", Port: 8080},
+			Metadata:    map[string]string{"subdomain": "t1"},
+		},
+	}}
+	if err := ValidateInput(input); err != nil {
+		t.Fatalf("expected valid, got: %v", err)
+	}
+	warns := CheckWarnings(input)
+	found := false
+	for _, w := range warns {
+		if w.Code == WarnRemoteRoutingNoHostPort {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("expected remote-routing-no-host-port warning, got: %v", warns)
 	}
 }
 

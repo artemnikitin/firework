@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -19,6 +21,29 @@ type fakeStore struct {
 	revisionOnFetch   string
 	fetchCount        int
 	revisionCallCount int
+
+	// listResult/listErr drive the optional NodeConfigLister behavior used by
+	// remote Traefik routing.
+	listResult []config.NodeConfig
+	listErr    error
+	listCount  int
+}
+
+func (f *fakeStore) ListAllNodeConfigs(context.Context) ([]config.NodeConfig, error) {
+	f.listCount++
+	return f.listResult, f.listErr
+}
+
+// fakeRouteSyncer is an injectable routeSyncer for exercising the agent's
+// retry and revision-advance behavior without touching the filesystem.
+type fakeRouteSyncer struct {
+	calls int
+	err   error
+}
+
+func (f *fakeRouteSyncer) Sync([]config.ServiceConfig, []config.NodeConfig) error {
+	f.calls++
+	return f.err
 }
 
 func (f *fakeStore) Fetch(_ context.Context, nodeName string) ([]byte, error) {
@@ -133,6 +158,81 @@ func TestTick_SingleLabelRefreshesRevisionAfterFetch(t *testing.T) {
 	}
 	if got := a.lastRevision; got != "rev-new" {
 		t.Fatalf("expected last revision to update to rev-new, got %q", got)
+	}
+}
+
+func TestTick_TraefikSyncFailureDoesNotAdvanceRevisionAndRetries(t *testing.T) {
+	s := &fakeStore{
+		data:     map[string][]byte{"web": []byte("node: web\nservices: []\n")},
+		revision: "rev-1",
+	}
+	a := New(testAgentConfig(t), s, testLogger())
+	rs := &fakeRouteSyncer{err: fmt.Errorf("route apply failed")}
+	a.traefikMgr = rs
+
+	a.tick(context.Background())
+	if a.lastRevision != "" {
+		t.Fatalf("expected lastRevision unchanged after sync failure, got %q", a.lastRevision)
+	}
+	if rs.calls != 1 {
+		t.Fatalf("expected one sync attempt, got %d", rs.calls)
+	}
+
+	// The next tick must retry the same revision rather than treat the
+	// unchanged revision as already applied.
+	a.tick(context.Background())
+	if rs.calls != 2 {
+		t.Fatalf("expected the next tick to retry the sync, got %d sync calls", rs.calls)
+	}
+}
+
+func TestTick_SuccessfulTraefikSyncAdvancesRevisionExactlyOnce(t *testing.T) {
+	s := &fakeStore{
+		data:     map[string][]byte{"web": []byte("node: web\nservices: []\n")},
+		revision: "rev-1",
+	}
+	a := New(testAgentConfig(t), s, testLogger())
+	rs := &fakeRouteSyncer{}
+	a.traefikMgr = rs
+
+	a.tick(context.Background())
+	if a.lastRevision != "rev-1" {
+		t.Fatalf("expected lastRevision rev-1 after success, got %q", a.lastRevision)
+	}
+	if rs.calls != 1 {
+		t.Fatalf("expected one sync call, got %d", rs.calls)
+	}
+
+	// Unchanged revision: the fast path should skip reconciliation and sync.
+	a.tick(context.Background())
+	if rs.calls != 1 {
+		t.Fatalf("expected no further sync for an unchanged revision, got %d", rs.calls)
+	}
+}
+
+func TestTick_PeerListFailurePreservesLastKnownGoodRoutes(t *testing.T) {
+	traefikDir := t.TempDir()
+	lkg := filepath.Join(traefikDir, "remote-tenant-1-kibana.yaml")
+	if err := os.WriteFile(lkg, []byte("http: {}\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	s := &fakeStore{
+		data:     map[string][]byte{"web": []byte("node: web\nservices: []\n")},
+		revision: "rev-1",
+		listErr:  fmt.Errorf("transient peer-list failure"),
+	}
+	cfg := testAgentConfig(t)
+	cfg.TraefikConfigDir = traefikDir
+	a := New(cfg, s, testLogger())
+
+	a.tick(context.Background())
+
+	if _, err := os.Stat(lkg); err != nil {
+		t.Fatalf("expected last-known-good remote route preserved on peer-list failure: %v", err)
+	}
+	if a.lastRevision != "" {
+		t.Fatalf("expected revision not advanced on peer-list failure, got %q", a.lastRevision)
 	}
 }
 

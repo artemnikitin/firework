@@ -88,6 +88,18 @@ func run(configPath string) error {
 		}
 		defer ss.Close()
 		s = ss
+	case "gcs":
+		gs, err := store.NewGCSStore(ctx, store.GCSStoreConfig{
+			Bucket:          cfg.GCSBucket,
+			Prefix:          cfg.GCSPrefix,
+			CredentialsFile: cfg.GCSCredentialsFile,
+			Project:         cfg.GCSProject,
+		})
+		if err != nil {
+			return fmt.Errorf("creating gcs store: %w", err)
+		}
+		defer gs.Close()
+		s = gs
 	default:
 		return fmt.Errorf("unsupported store type: %s", cfg.StoreType)
 	}

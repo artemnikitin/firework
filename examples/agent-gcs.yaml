@@ -1,14 +1,14 @@
-# Agent configuration (S3 store mode).
+# Agent configuration (GCS store mode).
 # Place on each node at /etc/firework/agent.yaml.
 #
-# In this mode the control-plane controller writes enriched configs to S3 and
+# In this mode the control-plane controller writes enriched configs to GCS and
 # the agent polls the bucket for changes. The agent's node_name must
 # match a node_type used in the enricher input service specs.
 #
-# AWS credentials are resolved from the standard chain:
-#   1. Environment variables (AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY)
-#   2. EC2 instance profile / IAM role (recommended for production)
-#   3. Shared credentials file (~/.aws/credentials)
+# GCP credentials are resolved via Application Default Credentials:
+#   1. GOOGLE_APPLICATION_CREDENTIALS env var (service-account JSON)
+#   2. GCE/GKE metadata server attached service account (recommended in prod)
+#   3. gcs_credentials_file below (explicit service-account JSON path)
 node_name: "general-purpose"
 node_id: "node-1"
 
@@ -20,20 +20,20 @@ node_id: "node-1"
 #   - "backend"
 
 # Config store settings
-store_type: "s3"
-s3_bucket: "my-firework-configs"
-s3_prefix: ""              # optional, e.g. "prod/" to namespace configs
-s3_region: "us-east-1"     # optional, resolved from env/instance metadata if empty
-# s3_endpoint_url: "http://localhost:4566"  # uncomment for LocalStack testing
+store_type: "gcs"
+gcs_bucket: "my-firework-configs"
+gcs_prefix: ""             # optional, e.g. "prod/" to namespace configs
+gcs_project: "my-gcp-project"
+# gcs_credentials_file: "/etc/firework/gcp-service-account.json"  # omit on GCE/GKE (uses ADC)
 
-# Image sync: if set, the agent downloads VM images from this S3 bucket
+# Image sync: if set, the agent downloads VM images from this GCS bucket
 # before starting VMs. Uses opaque object tokens to skip unchanged files.
-# s3_images_bucket: "my-firework-images"
+# gcs_images_bucket: "my-firework-images-amd64"
 
 # Local directory where VM images are stored
 images_dir: "/var/lib/images"
 
-# How often the agent polls S3 for config changes
+# How often the agent polls GCS for config changes
 poll_interval: "30s"
 
 # Path to the Firecracker binary
@@ -68,9 +68,8 @@ enable_network_setup: true
 # traefik_config_dir: "/etc/traefik/dynamic"
 # ingress_domain is the deployment-owned DNS suffix used to form the public
 # hostname for a service that sets metadata.subdomain: <subdomain>.<ingress_domain>.
-# It is a bare domain — no "*.", scheme, port, or path. Services that instead set
-# an exact metadata.host do not need it.
-# ingress_domain: "example.com"
+# On GCP this is typically the data-plane base_domain (e.g. gcp.example.com).
+# ingress_domain: "gcp.example.com"
 
 # Shared bridge networking: VMs share a bridge for inter-VM communication.
 vm_subnet: "172.16.0.0/24"

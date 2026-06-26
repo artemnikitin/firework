@@ -2,7 +2,6 @@ package imagesync
 
 import (
 	"context"
-	"fmt"
 	"io"
 	"log/slog"
 	"os"
@@ -12,40 +11,68 @@ import (
 	"time"
 
 	"github.com/artemnikitin/firework/internal/config"
-	"github.com/aws/aws-sdk-go-v2/aws"
-	"github.com/aws/aws-sdk-go-v2/service/s3"
+	"github.com/artemnikitin/firework/internal/objectstorage"
 )
 
-// fakeS3 implements s3API for testing.
+// fakeS3 implements objectstorage.BlobStore for testing.
 type fakeS3 struct {
 	objects map[string]fakeObject
 }
 
 type fakeObject struct {
-	body string
-	etag string
+	body  string
+	token string
 }
 
-func (f *fakeS3) HeadObject(_ context.Context, input *s3.HeadObjectInput, _ ...func(*s3.Options)) (*s3.HeadObjectOutput, error) {
-	obj, ok := f.objects[*input.Key]
+func (f *fakeS3) Head(_ context.Context, key string) (objectstorage.BlobMeta, bool, error) {
+	obj, ok := f.objects[key]
 	if !ok {
-		return nil, fmt.Errorf("NoSuchKey: %s", *input.Key)
+		return objectstorage.BlobMeta{}, false, nil
 	}
-	return &s3.HeadObjectOutput{
-		ETag: aws.String(obj.etag),
-	}, nil
+	return objectstorage.BlobMeta{WriteToken: objectstorage.WriteToken(obj.token)}, true, nil
 }
 
-func (f *fakeS3) GetObject(_ context.Context, input *s3.GetObjectInput, _ ...func(*s3.Options)) (*s3.GetObjectOutput, error) {
-	obj, ok := f.objects[*input.Key]
+func (f *fakeS3) Get(_ context.Context, key string) (io.ReadCloser, objectstorage.BlobMeta, error) {
+	obj, ok := f.objects[key]
 	if !ok {
-		return nil, fmt.Errorf("NoSuchKey: %s", *input.Key)
+		return nil, objectstorage.BlobMeta{}, objectstorage.ErrNotFound
 	}
-	return &s3.GetObjectOutput{
-		Body: io.NopCloser(strings.NewReader(obj.body)),
-		ETag: aws.String(obj.etag),
-	}, nil
+	return io.NopCloser(strings.NewReader(obj.body)), objectstorage.BlobMeta{WriteToken: objectstorage.WriteToken(obj.token)}, nil
 }
+
+func (f *fakeS3) GetBytes(_ context.Context, key string) ([]byte, objectstorage.BlobMeta, bool, error) {
+	obj, ok := f.objects[key]
+	return []byte(obj.body), objectstorage.BlobMeta{WriteToken: objectstorage.WriteToken(obj.token)}, ok, nil
+}
+
+func (f *fakeS3) Put(_ context.Context, key string, r io.Reader, _ objectstorage.PutOptions) (objectstorage.BlobMeta, error) {
+	data, err := io.ReadAll(r)
+	if err != nil {
+		return objectstorage.BlobMeta{}, err
+	}
+	f.objects[key] = fakeObject{body: string(data), token: "new-token"}
+	return objectstorage.BlobMeta{WriteToken: "new-token"}, nil
+}
+
+func (f *fakeS3) PutIfAbsent(ctx context.Context, key string, r io.Reader, opts objectstorage.PutOptions) (bool, objectstorage.BlobMeta, error) {
+	if _, exists := f.objects[key]; exists {
+		return false, objectstorage.BlobMeta{}, nil
+	}
+	meta, err := f.Put(ctx, key, r, opts)
+	return err == nil, meta, err
+}
+
+func (f *fakeS3) PutIfMatch(ctx context.Context, key string, expected objectstorage.WriteToken, r io.Reader, opts objectstorage.PutOptions) (bool, objectstorage.BlobMeta, error) {
+	if objectstorage.WriteToken(f.objects[key].token) != expected {
+		return false, objectstorage.BlobMeta{}, nil
+	}
+	meta, err := f.Put(ctx, key, r, opts)
+	return err == nil, meta, err
+}
+
+func (f *fakeS3) Delete(_ context.Context, key string) error         { delete(f.objects, key); return nil }
+func (f *fakeS3) ListKeys(context.Context, string) ([]string, error) { return nil, nil }
+func (f *fakeS3) Close() error                                       { return nil }
 
 func testLogger() *slog.Logger {
 	return slog.New(slog.NewTextHandler(io.Discard, nil))
@@ -55,11 +82,11 @@ func TestSync_DownloadsNewImage(t *testing.T) {
 	dir := t.TempDir()
 	fake := &fakeS3{
 		objects: map[string]fakeObject{
-			"web-rootfs.ext4": {body: "rootfs-content", etag: `"abc123"`},
+			"web-rootfs.ext4": {body: "rootfs-content", token: `"abc123"`},
 		},
 	}
 
-	syncer := newSyncerWithAPI(fake, "images-bucket", dir, testLogger())
+	syncer := NewSyncer("images-bucket", dir, fake, testLogger())
 
 	services := []config.ServiceConfig{
 		{Name: "web", Image: "/var/lib/images/web-rootfs.ext4"},
@@ -78,34 +105,34 @@ func TestSync_DownloadsNewImage(t *testing.T) {
 		t.Errorf("expected rootfs-content, got %s", string(data))
 	}
 
-	// Verify ETag sidecar was written.
-	etag, err := os.ReadFile(filepath.Join(dir, "web-rootfs.ext4.etag"))
+	// Verify token sidecar was written.
+	token, err := os.ReadFile(filepath.Join(dir, "web-rootfs.ext4.token"))
 	if err != nil {
-		t.Fatalf("reading etag sidecar: %v", err)
+		t.Fatalf("reading token sidecar: %v", err)
 	}
-	if string(etag) != `"abc123"` {
-		t.Errorf("expected etag \"abc123\", got %s", string(etag))
+	if string(token) != `"abc123"` {
+		t.Errorf("expected token \"abc123\", got %s", string(token))
 	}
 }
 
 func TestSync_SkipsUnchangedImage(t *testing.T) {
 	dir := t.TempDir()
 
-	// Pre-populate the file and ETag sidecar.
+	// Pre-populate the file and token sidecar.
 	os.WriteFile(filepath.Join(dir, "web-rootfs.ext4"), []byte("existing-content"), 0o644)
-	os.WriteFile(filepath.Join(dir, "web-rootfs.ext4.etag"), []byte(`"abc123"`), 0o644)
+	os.WriteFile(filepath.Join(dir, "web-rootfs.ext4.token"), []byte(`"abc123"`), 0o644)
 
 	callCount := 0
 	fake := &countingFakeS3{
 		fakeS3: &fakeS3{
 			objects: map[string]fakeObject{
-				"web-rootfs.ext4": {body: "new-content", etag: `"abc123"`},
+				"web-rootfs.ext4": {body: "new-content", token: `"abc123"`},
 			},
 		},
 		getObjectCalls: &callCount,
 	}
 
-	syncer := newSyncerWithAPI(fake, "images-bucket", dir, testLogger())
+	syncer := NewSyncer("images-bucket", dir, fake, testLogger())
 
 	services := []config.ServiceConfig{
 		{Name: "web", Image: "/var/lib/images/web-rootfs.ext4"},
@@ -115,9 +142,9 @@ func TestSync_SkipsUnchangedImage(t *testing.T) {
 		t.Fatalf("Sync: %v", err)
 	}
 
-	// GetObject should NOT have been called (ETag matched).
+	// Get should NOT have been called (token matched).
 	if callCount != 0 {
-		t.Errorf("expected 0 GetObject calls, got %d", callCount)
+		t.Errorf("expected 0 Get calls, got %d", callCount)
 	}
 
 	// File should still have old content.
@@ -130,20 +157,20 @@ func TestSync_SkipsUnchangedImage(t *testing.T) {
 	}
 }
 
-func TestSync_RedownloadsOnETagChange(t *testing.T) {
+func TestSync_RedownloadsOnTokenChange(t *testing.T) {
 	dir := t.TempDir()
 
-	// Pre-populate with old ETag.
+	// Pre-populate with old token.
 	os.WriteFile(filepath.Join(dir, "web-rootfs.ext4"), []byte("old-content"), 0o644)
-	os.WriteFile(filepath.Join(dir, "web-rootfs.ext4.etag"), []byte(`"old-etag"`), 0o644)
+	os.WriteFile(filepath.Join(dir, "web-rootfs.ext4.token"), []byte(`"old-token"`), 0o644)
 
 	fake := &fakeS3{
 		objects: map[string]fakeObject{
-			"web-rootfs.ext4": {body: "new-content", etag: `"new-etag"`},
+			"web-rootfs.ext4": {body: "new-content", token: `"new-token"`},
 		},
 	}
 
-	syncer := newSyncerWithAPI(fake, "images-bucket", dir, testLogger())
+	syncer := NewSyncer("images-bucket", dir, fake, testLogger())
 
 	services := []config.ServiceConfig{
 		{Name: "web", Image: "/var/lib/images/web-rootfs.ext4"},
@@ -162,13 +189,13 @@ func TestSync_RedownloadsOnETagChange(t *testing.T) {
 		t.Errorf("expected new-content, got %s", string(data))
 	}
 
-	// ETag sidecar should be updated.
-	etag, err := os.ReadFile(filepath.Join(dir, "web-rootfs.ext4.etag"))
+	// Token sidecar should be updated.
+	token, err := os.ReadFile(filepath.Join(dir, "web-rootfs.ext4.token"))
 	if err != nil {
-		t.Fatalf("reading etag: %v", err)
+		t.Fatalf("reading token: %v", err)
 	}
-	if string(etag) != `"new-etag"` {
-		t.Errorf("expected new-etag, got %s", string(etag))
+	if string(token) != `"new-token"` {
+		t.Errorf("expected new-token, got %s", string(token))
 	}
 }
 
@@ -176,12 +203,12 @@ func TestSync_MultipleImages(t *testing.T) {
 	dir := t.TempDir()
 	fake := &fakeS3{
 		objects: map[string]fakeObject{
-			"web-rootfs.ext4": {body: "web-data", etag: `"e1"`},
-			"vmlinux-5.10":    {body: "kernel-data", etag: `"e2"`},
+			"web-rootfs.ext4": {body: "web-data", token: `"e1"`},
+			"vmlinux-5.10":    {body: "kernel-data", token: `"e2"`},
 		},
 	}
 
-	syncer := newSyncerWithAPI(fake, "images-bucket", dir, testLogger())
+	syncer := NewSyncer("images-bucket", dir, fake, testLogger())
 
 	services := []config.ServiceConfig{
 		{
@@ -209,15 +236,15 @@ func TestSync_DeduplicatesSharedKernel(t *testing.T) {
 	fake := &countingFakeS3{
 		fakeS3: &fakeS3{
 			objects: map[string]fakeObject{
-				"web-rootfs.ext4":    {body: "web", etag: `"e1"`},
-				"worker-rootfs.ext4": {body: "worker", etag: `"e2"`},
-				"vmlinux-5.10":       {body: "kernel", etag: `"e3"`},
+				"web-rootfs.ext4":    {body: "web", token: `"e1"`},
+				"worker-rootfs.ext4": {body: "worker", token: `"e2"`},
+				"vmlinux-5.10":       {body: "kernel", token: `"e3"`},
 			},
 		},
 		getObjectCalls: &callCount,
 	}
 
-	syncer := newSyncerWithAPI(fake, "images-bucket", dir, testLogger())
+	syncer := NewSyncer("images-bucket", dir, fake, testLogger())
 
 	services := []config.ServiceConfig{
 		{Name: "web", Image: "/var/lib/images/web-rootfs.ext4", Kernel: "/var/lib/images/vmlinux-5.10"},
@@ -228,9 +255,9 @@ func TestSync_DeduplicatesSharedKernel(t *testing.T) {
 		t.Fatalf("Sync: %v", err)
 	}
 
-	// 3 GetObject calls (web rootfs, vmlinux, worker rootfs) — kernel NOT downloaded twice.
+	// 3 Get calls (web rootfs, vmlinux, worker rootfs) — kernel is not downloaded twice.
 	if callCount != 3 {
-		t.Errorf("expected 3 GetObject calls (dedup kernel), got %d", callCount)
+		t.Errorf("expected 3 Get calls (dedup kernel), got %d", callCount)
 	}
 }
 
@@ -242,12 +269,12 @@ func TestSync_NotFoundInS3_LocalExists(t *testing.T) {
 
 	fake := &fakeS3{
 		objects: map[string]fakeObject{
-			"web-rootfs.ext4": {body: "rootfs-content", etag: `"abc123"`},
+			"web-rootfs.ext4": {body: "rootfs-content", token: `"abc123"`},
 			// vmlinux-5.10 intentionally absent from S3
 		},
 	}
 
-	syncer := newSyncerWithAPI(fake, "images-bucket", dir, testLogger())
+	syncer := NewSyncer("images-bucket", dir, fake, testLogger())
 
 	services := []config.ServiceConfig{
 		{
@@ -277,7 +304,7 @@ func TestSync_NotFoundInS3_NoLocalCopy(t *testing.T) {
 		objects: map[string]fakeObject{},
 	}
 
-	syncer := newSyncerWithAPI(fake, "images-bucket", dir, testLogger())
+	syncer := NewSyncer("images-bucket", dir, fake, testLogger())
 
 	services := []config.ServiceConfig{
 		{Name: "web", Image: "/var/lib/images/missing.ext4"},
@@ -287,7 +314,7 @@ func TestSync_NotFoundInS3_NoLocalCopy(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected error when image missing from S3 and locally, got nil")
 	}
-	if !strings.Contains(err.Error(), "not found in S3") {
+	if !strings.Contains(err.Error(), "not found in object storage") {
 		t.Errorf("unexpected error message: %v", err)
 	}
 }
@@ -314,12 +341,12 @@ func TestSync_NotFoundInS3_ResolvesUnversionedKernelAlias(t *testing.T) {
 
 	fake := &fakeS3{
 		objects: map[string]fakeObject{
-			"web-rootfs.ext4": {body: "rootfs-content", etag: `"abc123"`},
+			"web-rootfs.ext4": {body: "rootfs-content", token: `"abc123"`},
 			// vmlinux-5.10 intentionally absent from S3
 		},
 	}
 
-	syncer := newSyncerWithAPI(fake, "images-bucket", dir, testLogger())
+	syncer := NewSyncer("images-bucket", dir, fake, testLogger())
 	services := []config.ServiceConfig{
 		{
 			Name:   "web",
@@ -345,7 +372,7 @@ func TestSync_NotFoundInS3_ResolvesUnversionedKernelAlias(t *testing.T) {
 func TestSync_NoServices(t *testing.T) {
 	dir := t.TempDir()
 	fake := &fakeS3{objects: map[string]fakeObject{}}
-	syncer := newSyncerWithAPI(fake, "images-bucket", dir, testLogger())
+	syncer := NewSyncer("images-bucket", dir, fake, testLogger())
 
 	if err := syncer.Sync(context.Background(), nil); err != nil {
 		t.Fatalf("Sync with nil services: %v", err)
@@ -367,13 +394,13 @@ func TestCollectImagePaths(t *testing.T) {
 	}
 }
 
-// countingFakeS3 wraps fakeS3 to count GetObject calls.
+// countingFakeS3 wraps fakeS3 to count streaming Get calls.
 type countingFakeS3 struct {
 	*fakeS3
 	getObjectCalls *int
 }
 
-func (c *countingFakeS3) GetObject(ctx context.Context, input *s3.GetObjectInput, opts ...func(*s3.Options)) (*s3.GetObjectOutput, error) {
+func (c *countingFakeS3) Get(ctx context.Context, key string) (io.ReadCloser, objectstorage.BlobMeta, error) {
 	*c.getObjectCalls++
-	return c.fakeS3.GetObject(ctx, input, opts...)
+	return c.fakeS3.Get(ctx, key)
 }
