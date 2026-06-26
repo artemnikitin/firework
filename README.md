@@ -1,6 +1,6 @@
 # <img src="logo.svg" alt="firework logo" height="48"/>
 
-A lightweight, pull-based orchestrator for services running in [Firecracker](https://firecracker-microvm.github.io/) microVMs.
+A lightweight orchestrator for [Firecracker](https://firecracker-microvm.github.io/) microVMs.
 
 ## Related Repositories
 
@@ -10,9 +10,6 @@ You can use them to have everything working end-to-end:
 - [firework-gitops-example](https://github.com/artemnikitin/firework-gitops-example) - example GitOps input repo and rootfs image build pipeline
 
 ## How It Works
-
-The control plane runs as a single binary (`firework-controlplane`) with role-based
-runtime modes: `registry`, `events`, `controller`, or `all`.
 
 ```mermaid
 flowchart TB
@@ -58,14 +55,6 @@ flowchart TB
 - Configuration reference: [`docs/configs/README.md`](docs/configs/README.md)
 - Example agent configs: [`examples/`](examples/)
 - Development guide: [`DEVELOPMENT.md`](DEVELOPMENT.md)
-
-## Container Image
-
-Official control-plane container images are published to GitHub Container Registry:
-
-- `ghcr.io/artemnikitin/firework-controlplane:<tag>`
-
-For production deployments, prefer immutable digests (`@sha256:...`).
 
 ## License
 
