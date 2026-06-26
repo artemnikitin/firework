@@ -1,6 +1,6 @@
 # <img src="logo.svg" alt="firework logo" height="48"/>
 
-A lightweight, pull-based orchestrator for services running in [Firecracker](https://firecracker-microvm.github.io/) microVMs.
+A lightweight orchestrator for [Firecracker](https://firecracker-microvm.github.io/) microVMs.
 
 ## Related Repositories
 
