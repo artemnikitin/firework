@@ -3,7 +3,6 @@ package store
 import (
 	"context"
 	"fmt"
-	"log/slog"
 	"strings"
 	"sync"
 	"time"
@@ -121,7 +120,9 @@ func (s *blobStore) LastEnrichmentTimestamp(nodeName string) (time.Time, bool) {
 
 func (s *blobStore) Close() error { return s.store.Close() }
 
-// ListAllNodeConfigs returns all valid YAML node configs under nodes/.
+// ListAllNodeConfigs returns every YAML node config under nodes/. It fails as a
+// whole if any listed config cannot be read or parsed: omitting one peer would
+// make the route sync treat that peer as removed and delete its live route.
 func (s *blobStore) ListAllNodeConfigs(ctx context.Context) ([]config.NodeConfig, error) {
 	prefix := objectstorage.JoinKey(s.prefix, "nodes/")
 	keys, err := s.store.ListKeys(ctx, prefix)
@@ -135,14 +136,15 @@ func (s *blobStore) ListAllNodeConfigs(ctx context.Context) ([]config.NodeConfig
 			continue
 		}
 		data, _, exists, err := s.store.GetBytes(ctx, key)
-		if err != nil || !exists {
-			slog.Warn("failed to fetch node config", "key", key, "error", err)
-			continue
+		if err != nil {
+			return nil, fmt.Errorf("fetching node config %s: %w", key, err)
+		}
+		if !exists {
+			return nil, fmt.Errorf("fetching node config %s: %w", key, objectstorage.ErrNotFound)
 		}
 		nc, err := config.ParseNodeConfig(data)
 		if err != nil {
-			slog.Warn("failed to parse node config", "key", key, "error", err)
-			continue
+			return nil, fmt.Errorf("parsing node config %s: %w", key, err)
 		}
 		configs = append(configs, nc)
 	}

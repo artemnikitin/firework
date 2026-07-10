@@ -37,12 +37,16 @@ func (f *fakeStore) ListAllNodeConfigs(context.Context) ([]config.NodeConfig, er
 // fakeRouteSyncer is an injectable routeSyncer for exercising the agent's
 // retry and revision-advance behavior without touching the filesystem.
 type fakeRouteSyncer struct {
-	calls int
-	err   error
+	calls       int
+	err         error
+	services    [][]config.ServiceConfig
+	remoteNodes [][]config.NodeConfig
 }
 
-func (f *fakeRouteSyncer) Sync([]config.ServiceConfig, []config.NodeConfig) error {
+func (f *fakeRouteSyncer) Sync(services []config.ServiceConfig, remoteNodes []config.NodeConfig) error {
 	f.calls++
+	f.services = append(f.services, append([]config.ServiceConfig(nil), services...))
+	f.remoteNodes = append(f.remoteNodes, append([]config.NodeConfig(nil), remoteNodes...))
 	return f.err
 }
 
@@ -186,14 +190,31 @@ func TestTick_TraefikSyncFailureDoesNotAdvanceRevisionAndRetries(t *testing.T) {
 	}
 }
 
-func TestTick_SuccessfulTraefikSyncAdvancesRevisionExactlyOnce(t *testing.T) {
+func TestTick_UnchangedRevisionRefreshesTraefikRoutes(t *testing.T) {
 	s := &fakeStore{
-		data:     map[string][]byte{"web": []byte("node: web\nservices: []\n")},
+		data: map[string][]byte{"web": []byte(`node: web
+services:
+  - name: local
+    network: {}
+    port_forwards:
+      - host_port: 8080
+        vm_port: 8080
+    metadata:
+      subdomain: local
+`)},
 		revision: "rev-1",
+		listResult: []config.NodeConfig{{
+			Node:   "node-2",
+			HostIP: "10.0.1.5",
+		}},
 	}
-	a := New(testAgentConfig(t), s, testLogger())
+	cfg := testAgentConfig(t)
+	cfg.VMSubnet = "172.16.0.0/24"
+	cfg.VMGateway = "172.16.0.1"
+	a := New(cfg, s, testLogger())
 	rs := &fakeRouteSyncer{}
 	a.traefikMgr = rs
+	a.lastRevision = "rev-1"
 
 	a.tick(context.Background())
 	if a.lastRevision != "rev-1" {
@@ -203,10 +224,18 @@ func TestTick_SuccessfulTraefikSyncAdvancesRevisionExactlyOnce(t *testing.T) {
 		t.Fatalf("expected one sync call, got %d", rs.calls)
 	}
 
-	// Unchanged revision: the fast path should skip reconciliation and sync.
+	// The local revision is unchanged, but a peer host IP changed. The fast path
+	// must still refresh the remote route set and recreate local guest IPs.
+	s.listResult[0].HostIP = "10.0.1.9"
 	a.tick(context.Background())
-	if rs.calls != 1 {
-		t.Fatalf("expected no further sync for an unchanged revision, got %d", rs.calls)
+	if rs.calls != 2 {
+		t.Fatalf("expected route refresh for unchanged local revision, got %d sync calls", rs.calls)
+	}
+	if got := rs.services[1][0].Network.GuestIP; got != "172.16.0.2" {
+		t.Fatalf("expected route refresh to assign local guest IP, got %q", got)
+	}
+	if got := rs.remoteNodes[1][0].HostIP; got != "10.0.1.9" {
+		t.Fatalf("expected refreshed peer host IP, got %q", got)
 	}
 }
 

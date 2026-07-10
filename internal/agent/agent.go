@@ -313,7 +313,16 @@ func (a *Agent) tick(ctx context.Context) {
 		if err != nil {
 			a.logger.Error("failed to get store revision", "error", err)
 		} else if rev != "" && rev == a.lastRevision {
-			a.logger.Debug("config unchanged, skipping reconciliation", "revision", rev)
+			// A local revision does not describe the peer node configs used for
+			// remote Traefik routes. Refresh routes on every poll even when the
+			// local VM configuration is unchanged, but avoid the expensive image
+			// sync and reconcile work. assignNetworking is needed because fetched
+			// node configs do not persist the agent-assigned guest IPs.
+			a.assignNetworking(merged.Services)
+			if err := a.syncTraefikConfigs(ctx, merged.Services); err != nil {
+				a.logger.Error("traefik route refresh failed", "error", err)
+			}
+			a.logger.Debug("config unchanged, skipped reconciliation after route refresh", "revision", rev)
 			a.refreshRuntimeMetrics()
 			return
 		}

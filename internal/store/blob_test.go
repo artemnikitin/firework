@@ -15,6 +15,7 @@ import (
 
 type fakeBlob struct {
 	objects map[string]fakeBlobObject
+	getErr  map[string]error
 }
 
 type fakeBlobObject struct {
@@ -36,6 +37,9 @@ func (f *fakeBlob) Get(_ context.Context, key string) (io.ReadCloser, objectstor
 }
 
 func (f *fakeBlob) GetBytes(_ context.Context, key string) ([]byte, objectstorage.BlobMeta, bool, error) {
+	if err := f.getErr[key]; err != nil {
+		return nil, objectstorage.BlobMeta{}, false, err
+	}
 	obj, ok := f.objects[key]
 	return obj.data, obj.meta, ok, nil
 }
@@ -108,7 +112,6 @@ func TestBlobStoreListAllNodeConfigs(t *testing.T) {
 	backend := &fakeBlob{objects: map[string]fakeBlobObject{
 		"nodes/node-1.yaml": {data: []byte("node: node-1\nhost_ip: 10.0.0.1\nservices: []\n")},
 		"nodes/node-2.yaml": {data: []byte("node: node-2\nhost_ip: 10.0.0.2\nservices: []\n")},
-		"nodes/bad.yaml":    {data: []byte("{bad")},
 		"nodes/ignore.json": {data: []byte("{}")},
 	}}
 	s := newBlobStore(backend, "")
@@ -118,6 +121,32 @@ func TestBlobStoreListAllNodeConfigs(t *testing.T) {
 	}
 	if len(configs) != 2 || configs[0].Node != "node-1" || configs[1].Node != "node-2" {
 		t.Fatalf("unexpected configs: %#v", configs)
+	}
+}
+
+func TestBlobStoreListAllNodeConfigsFailsOnIncompletePeerSet(t *testing.T) {
+	tests := map[string]*fakeBlob{
+		"read failure": {
+			objects: map[string]fakeBlobObject{
+				"nodes/node-1.yaml": {data: []byte("node: node-1\nservices: []\n")},
+				"nodes/node-2.yaml": {data: []byte("node: node-2\nservices: []\n")},
+			},
+			getErr: map[string]error{"nodes/node-2.yaml": fmt.Errorf("transient object read failure")},
+		},
+		"invalid yaml": {
+			objects: map[string]fakeBlobObject{
+				"nodes/node-1.yaml": {data: []byte("node: node-1\nservices: []\n")},
+				"nodes/node-2.yaml": {data: []byte("{bad")},
+			},
+		},
+	}
+
+	for name, backend := range tests {
+		t.Run(name, func(t *testing.T) {
+			if _, err := newBlobStore(backend, "").ListAllNodeConfigs(context.Background()); err == nil {
+				t.Fatal("expected incomplete peer set to fail")
+			}
+		})
 	}
 }
 
