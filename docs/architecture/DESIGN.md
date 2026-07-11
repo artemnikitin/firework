@@ -117,9 +117,20 @@ label, resolved to `<subdomain>.<ingress_domain>` using the agent's deployment-o
 `ingress_domain`) or `metadata.host` (an exact hostname used verbatim, retained for
 backward compatibility and custom hosts). A single shared resolver turns metadata into the
 final hostname, so local and remote routes for the same service are identical regardless of
-scheduling. The route set is fully resolved and validated in memory — rejecting invalid
-metadata and duplicate hostnames — before any file is written; files are staged and renamed
-into place so Traefik never observes a partial document.
+scheduling. The route set is fully resolved and validated in memory before any file is
+written; files are staged and renamed into place so Traefik never observes a partial
+document.
+
+Route failures are scoped by fault domain. Invalid metadata on the node's own services
+fails the revision, so a bad config is retried rather than recorded as applied. Peer-derived
+problems never block local progress: if the peer configs cannot be listed in full, the agent
+keeps the existing `remote-*.yaml` files as last-known-good (syncing against an incomplete
+peer set would delete valid routes) and retries on the next poll, and a peer entry that
+cannot be rendered is skipped with a warning. Hostname conflicts resolve deterministically —
+local services first, then peers in node-name order — which makes the transient reschedule
+window (where a service briefly appears in both a stale peer config and its new node's
+config) converge without cluster-wide errors. Genuine duplicates are rejected earlier by
+enricher input validation.
 
 For multi-node routing, agents read S3 configs for all peer nodes and write `remote-{svc}.yaml`
 files for peer services that have a routing key (`metadata.subdomain` or `metadata.host`) and

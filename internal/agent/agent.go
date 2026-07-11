@@ -30,6 +30,9 @@ import (
 // agent's retry and last-known-good behavior can be tested with a fake.
 type routeSyncer interface {
 	Sync(services []config.ServiceConfig, remoteNodes []config.NodeConfig) error
+	// SyncLocal applies local routes only, leaving existing remote-* route
+	// files untouched. Used when the peer node configs cannot be listed.
+	SyncLocal(services []config.ServiceConfig) error
 }
 
 // Agent is the core component that runs on each node. It periodically pulls
@@ -137,7 +140,7 @@ func New(cfg config.AgentConfig, s store.Store, logger *slog.Logger) *Agent {
 	// (not a typed-nil) when disabled so the a.traefikMgr == nil checks hold.
 	var traefikMgr routeSyncer
 	if cfg.TraefikConfigDir != "" {
-		traefikMgr = traefik.NewManager(cfg.TraefikConfigDir, cfg.IngressDomain)
+		traefikMgr = traefik.NewManager(cfg.TraefikConfigDir, cfg.IngressDomain, logger)
 	}
 
 	a := &Agent{
@@ -383,9 +386,11 @@ func (a *Agent) tick(ctx context.Context) {
 		return
 	}
 
-	// Sync Traefik dynamic config files with desired services. A failure here
-	// must not advance the revision: leaving lastRevision unchanged lets the
-	// next tick retry instead of treating the unchanged revision as applied.
+	// Sync Traefik dynamic config files with desired services. An error here
+	// means the local routes were not applied and must not advance the
+	// revision: leaving lastRevision unchanged lets the next tick retry
+	// instead of treating the unchanged revision as applied. (Peer-side
+	// failures degrade inside syncTraefikConfigs without surfacing here.)
 	if err := a.syncTraefikConfigs(ctx, merged.Services); err != nil {
 		a.logger.Error("traefik route sync failed; not advancing revision", "error", err)
 		a.syncRegistry(ctx, nodeCap, used)
@@ -637,10 +642,15 @@ func envKernelArg(key, value string) string {
 // peer node configs are also fetched so that remote services can be proxied.
 // No-op when Traefik management is disabled.
 //
-// A failure to list peer node configs is returned as an error rather than
-// treated as an empty peer set: synchronizing with no peers would delete valid
-// remote routes. Returning early leaves the last-known-good files in place and
-// lets the next tick retry.
+// Error semantics are split by fault domain. A returned error means the local
+// routes could not be applied — the caller must not treat the revision as
+// applied, so the next tick retries. Peer-side failures (the peer list cannot
+// be fetched in full) never block local progress: local routes are still
+// synced via SyncLocal, existing remote-* files are preserved as last-known-
+// good (synchronizing against an incomplete peer set would delete valid
+// routes), a warning is logged, and the per-tick route refresh retries the
+// peer list automatically. The degraded state is exposed via the
+// firework_agent_remote_route_sync_degraded gauge.
 func (a *Agent) syncTraefikConfigs(ctx context.Context, services []config.ServiceConfig) error {
 	if a.traefikMgr == nil {
 		return nil
@@ -650,8 +660,15 @@ func (a *Agent) syncTraefikConfigs(ctx context.Context, services []config.Servic
 	if lister, ok := a.store.(store.NodeConfigLister); ok {
 		all, err := lister.ListAllNodeConfigs(ctx)
 		if err != nil {
-			return fmt.Errorf("listing peer node configs for remote routing: %w", err)
+			a.logger.Warn("failed to list peer node configs; keeping last-known-good remote routes",
+				"error", err)
+			a.metrics.setRemoteRouteSyncDegraded(true)
+			if err := a.traefikMgr.SyncLocal(services); err != nil {
+				return fmt.Errorf("syncing local traefik configs: %w", err)
+			}
+			return nil
 		}
+		a.metrics.setRemoteRouteSyncDegraded(false)
 		ownNames := make(map[string]bool, len(a.cfg.NodeNames))
 		for _, n := range a.cfg.NodeNames {
 			ownNames[n] = true

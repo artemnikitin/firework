@@ -224,8 +224,14 @@ Notes:
   no-op); `metadata.subdomain` is rejected in that mode.
 - The same resolver is used for local and remote routes, so a given service resolves to an
   identical `Host(...)` rule regardless of where it is scheduled. Two services that resolve
-  to the same hostname fail the sync rather than create nondeterministic equal-priority
-  routers.
+  to the same hostname are rejected by enricher input validation. At the agent, a hostname
+  conflict among the node's own services fails the revision; a conflict involving a peer
+  service is resolved deterministically (local services win, then peers in node-name order)
+  and the losing route is skipped with a warning, so a stale peer config from an in-flight
+  reschedule cannot fail the sync cluster-wide.
+- If the peer node configs cannot be listed, the agent keeps the existing `remote-*.yaml`
+  files as last-known-good, still applies local routes, and retries on the next poll. The
+  degraded state is exposed as the `firework_agent_remote_route_sync_degraded` gauge.
 - Remote Traefik routing is available when the config store can list peer node configs,
   such as the S3-backed control-plane flow.
 - `health_check.target` can be set directly, but enriched configs usually use `port`/`path` and let the agent compose the target from guest IP.

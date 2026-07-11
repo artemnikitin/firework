@@ -1,6 +1,8 @@
 package traefik
 
 import (
+	"io"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
@@ -8,6 +10,10 @@ import (
 
 	"github.com/artemnikitin/firework/internal/config"
 )
+
+func testLogger() *slog.Logger {
+	return slog.New(slog.NewTextHandler(io.Discard, nil))
+}
 
 // localSvc builds a routable local service with a guest IP and one port forward.
 func localSvc(name, ip string, hostPort, vmPort int, meta map[string]string) config.ServiceConfig {
@@ -30,7 +36,7 @@ func read(t *testing.T, dir, name string) string {
 
 func TestSync_LocalSubdomain(t *testing.T) {
 	dir := t.TempDir()
-	m := NewManager(dir, "gcp.example.com")
+	m := NewManager(dir, "gcp.example.com", testLogger())
 
 	svc := localSvc("kibana", "172.16.0.2", 5611, 5601, map[string]string{"subdomain": "tenant-1"})
 	if err := m.Sync([]config.ServiceConfig{svc}, nil); err != nil {
@@ -48,7 +54,7 @@ func TestSync_LocalSubdomain(t *testing.T) {
 
 func TestSync_RemoteSubdomain(t *testing.T) {
 	dir := t.TempDir()
-	m := NewManager(dir, "example.com")
+	m := NewManager(dir, "example.com", testLogger())
 
 	remote := []config.NodeConfig{{
 		Node:   "node-2",
@@ -73,7 +79,7 @@ func TestSync_RemoteSubdomain(t *testing.T) {
 func TestSync_ExactHostCompatibility(t *testing.T) {
 	for _, domain := range []string{"", "example.com"} {
 		dir := t.TempDir()
-		m := NewManager(dir, domain)
+		m := NewManager(dir, domain, testLogger())
 		svc := localSvc("kibana", "172.16.0.2", 5611, 5601, map[string]string{"host": "custom.example.net"})
 		if err := m.Sync([]config.ServiceConfig{svc}, nil); err != nil {
 			t.Fatalf("domain=%q unexpected error: %v", domain, err)
@@ -87,7 +93,7 @@ func TestSync_ExactHostCompatibility(t *testing.T) {
 
 func TestSync_NeitherKeyWritesNoFile(t *testing.T) {
 	dir := t.TempDir()
-	m := NewManager(dir, "example.com")
+	m := NewManager(dir, "example.com", testLogger())
 	svc := localSvc("elasticsearch", "172.16.0.3", 9200, 9200, nil)
 	if err := m.Sync([]config.ServiceConfig{svc}, nil); err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -99,7 +105,7 @@ func TestSync_NeitherKeyWritesNoFile(t *testing.T) {
 
 func TestSync_SubdomainWithoutIngressDomainErrors(t *testing.T) {
 	dir := t.TempDir()
-	m := NewManager(dir, "")
+	m := NewManager(dir, "", testLogger())
 	svc := localSvc("kibana", "172.16.0.2", 5611, 5601, map[string]string{"subdomain": "tenant-1"})
 	if err := m.Sync([]config.ServiceConfig{svc}, nil); err == nil {
 		t.Fatal("expected error for subdomain without ingress_domain")
@@ -108,7 +114,7 @@ func TestSync_SubdomainWithoutIngressDomainErrors(t *testing.T) {
 
 func TestSync_BothKeysErrors(t *testing.T) {
 	dir := t.TempDir()
-	m := NewManager(dir, "example.com")
+	m := NewManager(dir, "example.com", testLogger())
 	svc := localSvc("kibana", "172.16.0.2", 5611, 5601, map[string]string{"subdomain": "tenant-1", "host": "x.example.com"})
 	if err := m.Sync([]config.ServiceConfig{svc}, nil); err == nil {
 		t.Fatal("expected error when both subdomain and host are set")
@@ -124,7 +130,7 @@ func TestSync_EmptyAndWhitespaceRoutingValuesError(t *testing.T) {
 	}
 	for _, meta := range cases {
 		dir := t.TempDir()
-		m := NewManager(dir, "example.com")
+		m := NewManager(dir, "example.com", testLogger())
 		svc := localSvc("kibana", "172.16.0.2", 5611, 5601, meta)
 		if err := m.Sync([]config.ServiceConfig{svc}, nil); err == nil {
 			t.Errorf("meta=%v: expected error for present-but-empty routing value", meta)
@@ -136,7 +142,7 @@ func TestSync_InvalidSubdomainsError(t *testing.T) {
 	subs := []string{"a.b", "Tenant-1", "-tenant", "tenant-", strings.Repeat("a", 64)}
 	for _, s := range subs {
 		dir := t.TempDir()
-		m := NewManager(dir, "example.com")
+		m := NewManager(dir, "example.com", testLogger())
 		svc := localSvc("kibana", "172.16.0.2", 5611, 5601, map[string]string{"subdomain": s})
 		if err := m.Sync([]config.ServiceConfig{svc}, nil); err == nil {
 			t.Errorf("subdomain=%q: expected error", s)
@@ -148,7 +154,7 @@ func TestSync_InvalidExactHostInjectionError(t *testing.T) {
 	hosts := []string{"a`b.example.com", "x.com`) || Host(`y.com", "http://x.example.com", "x.example.com:8080", "*.example.com"}
 	for _, h := range hosts {
 		dir := t.TempDir()
-		m := NewManager(dir, "example.com")
+		m := NewManager(dir, "example.com", testLogger())
 		svc := localSvc("kibana", "172.16.0.2", 5611, 5601, map[string]string{"host": h})
 		if err := m.Sync([]config.ServiceConfig{svc}, nil); err == nil {
 			t.Errorf("host=%q: expected error", h)
@@ -158,7 +164,7 @@ func TestSync_InvalidExactHostInjectionError(t *testing.T) {
 
 func TestSync_TrailingDotDomainNormalization(t *testing.T) {
 	dir := t.TempDir()
-	m := NewManager(dir, "gcp.example.com.")
+	m := NewManager(dir, "gcp.example.com.", testLogger())
 	svc := localSvc("kibana", "172.16.0.2", 5611, 5601, map[string]string{"subdomain": "tenant-1"})
 	if err := m.Sync([]config.ServiceConfig{svc}, nil); err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -171,14 +177,14 @@ func TestSync_TrailingDotDomainNormalization(t *testing.T) {
 
 func TestSync_IdenticalLocalAndRemoteResolution(t *testing.T) {
 	localDir := t.TempDir()
-	lm := NewManager(localDir, "example.com")
+	lm := NewManager(localDir, "example.com", testLogger())
 	if err := lm.Sync([]config.ServiceConfig{localSvc("tenant-1-kibana", "172.16.0.2", 5611, 5601, map[string]string{"subdomain": "tenant-1"})}, nil); err != nil {
 		t.Fatalf("local sync: %v", err)
 	}
 	local := read(t, localDir, "tenant-1-kibana.yaml")
 
 	remoteDir := t.TempDir()
-	rm := NewManager(remoteDir, "example.com")
+	rm := NewManager(remoteDir, "example.com", testLogger())
 	remote := []config.NodeConfig{{Node: "node-2", HostIP: "10.0.1.5", Services: []config.ServiceConfig{
 		{Name: "tenant-1-kibana", PortForwards: []config.PortForward{{HostPort: 5611, VMPort: 5601}}, Metadata: map[string]string{"subdomain": "tenant-1"}},
 	}}}
@@ -195,7 +201,7 @@ func TestSync_IdenticalLocalAndRemoteResolution(t *testing.T) {
 
 func TestSync_DuplicateLocalHostnamesError(t *testing.T) {
 	dir := t.TempDir()
-	m := NewManager(dir, "example.com")
+	m := NewManager(dir, "example.com", testLogger())
 	svcs := []config.ServiceConfig{
 		localSvc("svc-a", "172.16.0.2", 5611, 5601, map[string]string{"subdomain": "tenant-1"}),
 		localSvc("svc-b", "172.16.0.3", 5612, 5601, map[string]string{"subdomain": "tenant-1"}),
@@ -205,21 +211,56 @@ func TestSync_DuplicateLocalHostnamesError(t *testing.T) {
 	}
 }
 
-func TestSync_DuplicateLocalRemoteHostnamesError(t *testing.T) {
+// A hostname claimed by a local service must win over a peer claim: during a
+// reschedule the stale peer file still lists the service this node now runs.
+// The remote entry is skipped with a warning instead of failing the sync.
+func TestSync_LocalWinsRemoteHostnameConflict(t *testing.T) {
 	dir := t.TempDir()
-	m := NewManager(dir, "example.com")
+	m := NewManager(dir, "example.com", testLogger())
 	local := []config.ServiceConfig{localSvc("svc-a", "172.16.0.2", 5611, 5601, map[string]string{"subdomain": "tenant-1"})}
 	remote := []config.NodeConfig{{Node: "node-2", HostIP: "10.0.1.5", Services: []config.ServiceConfig{
-		{Name: "svc-b", PortForwards: []config.PortForward{{HostPort: 5612, VMPort: 5601}}, Metadata: map[string]string{"subdomain": "tenant-1"}},
+		{Name: "svc-a", PortForwards: []config.PortForward{{HostPort: 5612, VMPort: 5601}}, Metadata: map[string]string{"subdomain": "tenant-1"}},
 	}}}
-	if err := m.Sync(local, remote); err == nil {
-		t.Fatal("expected duplicate hostname error across local and remote services")
+	if err := m.Sync(local, remote); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !strings.Contains(read(t, dir, "svc-a.yaml"), "172.16.0.2:5601") {
+		t.Error("expected local route to win the hostname claim")
+	}
+	if _, err := os.Stat(filepath.Join(dir, "remote-svc-a.yaml")); !os.IsNotExist(err) {
+		t.Error("expected conflicting remote route to be skipped")
+	}
+}
+
+// Two peers claiming the same hostname resolve deterministically: peers are
+// visited in node-name order and the first claim wins, regardless of the
+// order the peer configs were listed in.
+func TestSync_RemoteRemoteHostnameConflictDeterministic(t *testing.T) {
+	peerSvc := func() config.ServiceConfig {
+		return config.ServiceConfig{
+			Name:         "svc-a",
+			PortForwards: []config.PortForward{{HostPort: 5611, VMPort: 5601}},
+			Metadata:     map[string]string{"subdomain": "tenant-1"},
+		}
+	}
+	nodeA := config.NodeConfig{Node: "node-a", HostIP: "10.0.1.5", Services: []config.ServiceConfig{peerSvc()}}
+	nodeB := config.NodeConfig{Node: "node-b", HostIP: "10.0.1.9", Services: []config.ServiceConfig{peerSvc()}}
+
+	for _, remote := range [][]config.NodeConfig{{nodeA, nodeB}, {nodeB, nodeA}} {
+		dir := t.TempDir()
+		m := NewManager(dir, "example.com", testLogger())
+		if err := m.Sync(nil, remote); err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if !strings.Contains(read(t, dir, "remote-svc-a.yaml"), "10.0.1.5:5611") {
+			t.Error("expected node-a (first in node-name order) to win the claim")
+		}
 	}
 }
 
 func TestSync_RoutedWithoutGuestIPError(t *testing.T) {
 	dir := t.TempDir()
-	m := NewManager(dir, "example.com")
+	m := NewManager(dir, "example.com", testLogger())
 	svc := config.ServiceConfig{
 		Name:         "kibana",
 		Network:      &config.NetworkConfig{}, // no guest IP
@@ -233,7 +274,7 @@ func TestSync_RoutedWithoutGuestIPError(t *testing.T) {
 
 func TestSync_RoutedWithoutBackendPortError(t *testing.T) {
 	dir := t.TempDir()
-	m := NewManager(dir, "example.com")
+	m := NewManager(dir, "example.com", testLogger())
 	svc := config.ServiceConfig{
 		Name:     "kibana",
 		Network:  &config.NetworkConfig{GuestIP: "172.16.0.2"},
@@ -245,14 +286,66 @@ func TestSync_RoutedWithoutBackendPortError(t *testing.T) {
 	}
 }
 
-func TestSync_RoutedRemoteWithoutHostPortError(t *testing.T) {
+// Peer configs are authoritative but never fatal: a routed remote service
+// without a host port cannot be proxied, so it is skipped (and any stale route
+// for it removed) instead of failing the sync for every other route.
+func TestSync_RoutedRemoteWithoutHostPortSkipped(t *testing.T) {
 	dir := t.TempDir()
-	m := NewManager(dir, "example.com")
+	m := NewManager(dir, "example.com", testLogger())
+	stale := filepath.Join(dir, "remote-tenant-1-kibana.yaml")
+	if err := os.WriteFile(stale, []byte("http: {}\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
 	remote := []config.NodeConfig{{Node: "node-2", HostIP: "10.0.1.5", Services: []config.ServiceConfig{
 		{Name: "tenant-1-kibana", Metadata: map[string]string{"subdomain": "tenant-1"}}, // no port forwards
 	}}}
-	if err := m.Sync(nil, remote); err == nil {
-		t.Fatal("expected error for routed remote service without host port")
+	if err := m.Sync(nil, remote); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if _, err := os.Stat(stale); !os.IsNotExist(err) {
+		t.Error("expected route for unroutable remote service to be removed")
+	}
+}
+
+// SyncLocal keeps every existing remote-* file while still applying and
+// cleaning up local routes — the degraded mode used when the peer set is
+// unknown.
+func TestSyncLocal_PreservesRemoteRoutesAndSyncsLocal(t *testing.T) {
+	dir := t.TempDir()
+	m := NewManager(dir, "example.com", testLogger())
+
+	remoteLKG := filepath.Join(dir, "remote-peer-svc.yaml")
+	if err := os.WriteFile(remoteLKG, []byte("http: {}\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	staleLocal := filepath.Join(dir, "old-local.yaml")
+	if err := os.WriteFile(staleLocal, []byte("http: {}\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	svc := localSvc("kibana", "172.16.0.2", 5611, 5601, map[string]string{"subdomain": "tenant-1"})
+	if err := m.SyncLocal([]config.ServiceConfig{svc}); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if _, err := os.Stat(remoteLKG); err != nil {
+		t.Errorf("expected last-known-good remote route preserved: %v", err)
+	}
+	if _, err := os.Stat(staleLocal); !os.IsNotExist(err) {
+		t.Error("expected stale local route to be removed")
+	}
+	if !strings.Contains(read(t, dir, "kibana.yaml"), "Host(`tenant-1.example.com`)") {
+		t.Error("expected local route to be applied")
+	}
+}
+
+// SyncLocal enforces the same strict local validation as Sync.
+func TestSyncLocal_InvalidLocalMetadataErrors(t *testing.T) {
+	dir := t.TempDir()
+	m := NewManager(dir, "example.com", testLogger())
+	svc := localSvc("kibana", "172.16.0.2", 5611, 5601, map[string]string{"subdomain": "Bad.Label"})
+	if err := m.SyncLocal([]config.ServiceConfig{svc}); err == nil {
+		t.Fatal("expected error for invalid local routing metadata")
 	}
 }
 
@@ -261,7 +354,7 @@ func TestSync_RoutedRemoteWithoutHostPortError(t *testing.T) {
 // (no port_forwards) still renders a local route using that port.
 func TestSync_SubdomainWithHealthCheckPortBackend(t *testing.T) {
 	dir := t.TempDir()
-	m := NewManager(dir, "example.com")
+	m := NewManager(dir, "example.com", testLogger())
 	svc := config.ServiceConfig{
 		Name:        "kibana",
 		Network:     &config.NetworkConfig{GuestIP: "172.16.0.2"},
@@ -279,7 +372,7 @@ func TestSync_SubdomainWithHealthCheckPortBackend(t *testing.T) {
 
 func TestSync_SkipsRemoteServiceWithoutHostIP(t *testing.T) {
 	dir := t.TempDir()
-	m := NewManager(dir, "example.com")
+	m := NewManager(dir, "example.com", testLogger())
 	remote := []config.NodeConfig{{Node: "node-2", HostIP: "", Services: []config.ServiceConfig{
 		{Name: "tenant-1-kibana", PortForwards: []config.PortForward{{HostPort: 5611, VMPort: 5601}}, Metadata: map[string]string{"subdomain": "tenant-1"}},
 	}}}
@@ -293,7 +386,7 @@ func TestSync_SkipsRemoteServiceWithoutHostIP(t *testing.T) {
 
 func TestSync_DeletesStaleFiles(t *testing.T) {
 	dir := t.TempDir()
-	m := NewManager(dir, "example.com")
+	m := NewManager(dir, "example.com", testLogger())
 	stale := filepath.Join(dir, "old-service.yaml")
 	if err := os.WriteFile(stale, []byte("http: {}"), 0644); err != nil {
 		t.Fatal(err)
@@ -310,7 +403,7 @@ func TestSync_DeletesStaleFiles(t *testing.T) {
 
 func TestSync_PreservesNonYAMLFiles(t *testing.T) {
 	dir := t.TempDir()
-	m := NewManager(dir, "example.com")
+	m := NewManager(dir, "example.com", testLogger())
 	other := filepath.Join(dir, "traefik.toml")
 	if err := os.WriteFile(other, []byte("# static"), 0644); err != nil {
 		t.Fatal(err)
@@ -325,7 +418,7 @@ func TestSync_PreservesNonYAMLFiles(t *testing.T) {
 
 func TestSync_ValidationFailureMakesNoChanges(t *testing.T) {
 	dir := t.TempDir()
-	m := NewManager(dir, "example.com")
+	m := NewManager(dir, "example.com", testLogger())
 	// Seed a last-known-good file.
 	good := localSvc("kibana", "172.16.0.2", 5611, 5601, map[string]string{"subdomain": "tenant-1"})
 	if err := m.Sync([]config.ServiceConfig{good}, nil); err != nil {
@@ -351,7 +444,7 @@ func TestSync_ValidationFailureMakesNoChanges(t *testing.T) {
 
 func TestSync_WriteFailureKeepsStaleThenConverges(t *testing.T) {
 	dir := t.TempDir()
-	m := NewManager(dir, "example.com")
+	m := NewManager(dir, "example.com", testLogger())
 
 	// A stale file from a previous revision.
 	stale := filepath.Join(dir, "old-service.yaml")
@@ -386,7 +479,7 @@ func TestSync_WriteFailureKeepsStaleThenConverges(t *testing.T) {
 		t.Error("expected stale file preserved after apply failure")
 	}
 	// Staging directory must be cleaned up.
-	if _, err := os.Stat(filepath.Join(filepath.Dir(dir), stageDirName)); !os.IsNotExist(err) {
+	if _, err := os.Stat(filepath.Join(dir, stageDirName)); !os.IsNotExist(err) {
 		t.Error("expected staging dir cleaned up after failure")
 	}
 

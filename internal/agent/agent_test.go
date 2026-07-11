@@ -41,6 +41,10 @@ type fakeRouteSyncer struct {
 	err         error
 	services    [][]config.ServiceConfig
 	remoteNodes [][]config.NodeConfig
+
+	localCalls    int
+	localErr      error
+	localServices [][]config.ServiceConfig
 }
 
 func (f *fakeRouteSyncer) Sync(services []config.ServiceConfig, remoteNodes []config.NodeConfig) error {
@@ -48,6 +52,12 @@ func (f *fakeRouteSyncer) Sync(services []config.ServiceConfig, remoteNodes []co
 	f.services = append(f.services, append([]config.ServiceConfig(nil), services...))
 	f.remoteNodes = append(f.remoteNodes, append([]config.NodeConfig(nil), remoteNodes...))
 	return f.err
+}
+
+func (f *fakeRouteSyncer) SyncLocal(services []config.ServiceConfig) error {
+	f.localCalls++
+	f.localServices = append(f.localServices, append([]config.ServiceConfig(nil), services...))
+	return f.localErr
 }
 
 func (f *fakeStore) Fetch(_ context.Context, nodeName string) ([]byte, error) {
@@ -239,7 +249,10 @@ services:
 	}
 }
 
-func TestTick_PeerListFailurePreservesLastKnownGoodRoutes(t *testing.T) {
+// A peer-list failure must not block local progress: last-known-good remote
+// routes stay on disk, local routes still sync, and the revision advances —
+// the per-tick route refresh retries the peer list on the next poll.
+func TestTick_PeerListFailurePreservesRoutesAndAdvancesRevision(t *testing.T) {
 	traefikDir := t.TempDir()
 	lkg := filepath.Join(traefikDir, "remote-tenant-1-kibana.yaml")
 	if err := os.WriteFile(lkg, []byte("http: {}\n"), 0644); err != nil {
@@ -260,8 +273,38 @@ func TestTick_PeerListFailurePreservesLastKnownGoodRoutes(t *testing.T) {
 	if _, err := os.Stat(lkg); err != nil {
 		t.Fatalf("expected last-known-good remote route preserved on peer-list failure: %v", err)
 	}
-	if a.lastRevision != "" {
-		t.Fatalf("expected revision not advanced on peer-list failure, got %q", a.lastRevision)
+	if a.lastRevision != "rev-1" {
+		t.Fatalf("expected revision to advance despite peer-list failure, got %q", a.lastRevision)
+	}
+}
+
+// The degraded path applies local routes via SyncLocal instead of a full Sync,
+// so an unreachable peer list cannot delete remote routes or stall the node.
+func TestTick_PeerListFailureStillSyncsLocalRoutes(t *testing.T) {
+	s := &fakeStore{
+		data:     map[string][]byte{"web": []byte("node: web\nservices: []\n")},
+		revision: "rev-1",
+		listErr:  fmt.Errorf("transient peer-list failure"),
+	}
+	a := New(testAgentConfig(t), s, testLogger())
+	rs := &fakeRouteSyncer{}
+	a.traefikMgr = rs
+
+	a.tick(context.Background())
+
+	if rs.localCalls != 1 || rs.calls != 0 {
+		t.Fatalf("expected one SyncLocal and no full Sync, got local=%d full=%d", rs.localCalls, rs.calls)
+	}
+	if a.lastRevision != "rev-1" {
+		t.Fatalf("expected revision to advance despite peer-list failure, got %q", a.lastRevision)
+	}
+
+	// A local route failure in degraded mode still blocks the revision.
+	rs.localErr = fmt.Errorf("local route apply failed")
+	s.revisionOnFetch = "rev-2"
+	a.tick(context.Background())
+	if a.lastRevision != "rev-1" {
+		t.Fatalf("expected revision unchanged on local sync failure, got %q", a.lastRevision)
 	}
 }
 
