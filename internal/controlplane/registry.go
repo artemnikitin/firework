@@ -16,14 +16,14 @@ import (
 // RegistryServer serves node enrollment and registry APIs.
 type RegistryServer struct {
 	cfg         Config
-	store       *S3StateStore
+	store       StateStore
 	logger      *slog.Logger
 	signer      *NodeCertSigner
 	tokenToNode map[string]string
 }
 
 // NewRegistryServer creates a registry API server.
-func NewRegistryServer(cfg Config, store *S3StateStore, logger *slog.Logger) (*RegistryServer, error) {
+func NewRegistryServer(cfg Config, store StateStore, logger *slog.Logger) (*RegistryServer, error) {
 	signer, err := LoadNodeCertSigner(cfg.Enrollment.CAFile, cfg.Enrollment.CAKeyFile, cfg.Enrollment.NodeCertTTL)
 	if err != nil {
 		return nil, err
@@ -340,7 +340,7 @@ func (s *RegistryServer) upsertNodeRecord(ctx context.Context, nodeID string, mu
 
 	for i := 0; i < 6; i++ {
 		var current NodeRecord
-		etag, exists, err := s.store.GetJSON(ctx, key, &current)
+		token, exists, err := s.store.GetJSON(ctx, key, &current)
 		if err != nil {
 			return nil, err
 		}
@@ -361,7 +361,7 @@ func (s *RegistryServer) upsertNodeRecord(ctx context.Context, nodeID string, mu
 			}
 			continue
 		}
-		ok, _, err := s.store.PutJSONIfMatch(ctx, key, etag, current)
+		ok, _, err := s.store.PutJSONIfMatch(ctx, key, token, current)
 		if err != nil {
 			return nil, err
 		}

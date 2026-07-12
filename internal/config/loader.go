@@ -6,6 +6,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/artemnikitin/firework/internal/ingress"
 	"gopkg.in/yaml.v3"
 )
 
@@ -70,8 +71,29 @@ func LoadAgentConfig(path string) (AgentConfig, error) {
 		if cfg.S3Bucket == "" {
 			return cfg, fmt.Errorf("s3_bucket is required for s3 store")
 		}
+	case "gcs":
+		if cfg.GCSBucket == "" {
+			return cfg, fmt.Errorf("gcs_bucket is required for gcs store")
+		}
 	default:
-		return cfg, fmt.Errorf("unsupported store_type: %q (expected \"git\" or \"s3\")", cfg.StoreType)
+		return cfg, fmt.Errorf("unsupported store_type: %q (expected \"git\", \"s3\", or \"gcs\")", cfg.StoreType)
+	}
+
+	// Image sync supports a single provider. The agent picks S3 before GCS, so
+	// reject an ambiguous configuration rather than silently ignoring one.
+	if cfg.S3ImagesBucket != "" && cfg.GCSImagesBucket != "" {
+		return cfg, fmt.Errorf("s3_images_bucket and gcs_images_bucket are mutually exclusive")
+	}
+
+	// Normalize and validate the deployment ingress domain (used to form the
+	// public hostname for services that set metadata.subdomain). A trailing
+	// root dot is tolerated and stripped for standalone-config compatibility.
+	if cfg.IngressDomain != "" {
+		normalized, err := ingress.NormalizeDomain(cfg.IngressDomain)
+		if err != nil {
+			return cfg, fmt.Errorf("ingress_domain: %w", err)
+		}
+		cfg.IngressDomain = normalized
 	}
 
 	if cfg.RegistryURL != "" {

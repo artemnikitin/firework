@@ -29,6 +29,10 @@ services:
       timeout: "5s"
       retries: 3
     metadata:
+      # Exact-host form (used verbatim). Retained as the custom-host example;
+      # the deployment owns compatible DNS/TLS for this name. The portable
+      # alternative is `subdomain: web-api` plus an agent `ingress_domain`
+      # (see examples/enricher-input/services/web-api.yaml).
       host: "web-api.example.com"
       environment: "production"
       version: "1.2.3"

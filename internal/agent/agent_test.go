@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -19,6 +21,43 @@ type fakeStore struct {
 	revisionOnFetch   string
 	fetchCount        int
 	revisionCallCount int
+
+	// listResult/listErr drive the optional NodeConfigLister behavior used by
+	// remote Traefik routing.
+	listResult []config.NodeConfig
+	listErr    error
+	listCount  int
+}
+
+func (f *fakeStore) ListAllNodeConfigs(context.Context) ([]config.NodeConfig, error) {
+	f.listCount++
+	return f.listResult, f.listErr
+}
+
+// fakeRouteSyncer is an injectable routeSyncer for exercising the agent's
+// retry and revision-advance behavior without touching the filesystem.
+type fakeRouteSyncer struct {
+	calls       int
+	err         error
+	services    [][]config.ServiceConfig
+	remoteNodes [][]config.NodeConfig
+
+	localCalls    int
+	localErr      error
+	localServices [][]config.ServiceConfig
+}
+
+func (f *fakeRouteSyncer) Sync(services []config.ServiceConfig, remoteNodes []config.NodeConfig) error {
+	f.calls++
+	f.services = append(f.services, append([]config.ServiceConfig(nil), services...))
+	f.remoteNodes = append(f.remoteNodes, append([]config.NodeConfig(nil), remoteNodes...))
+	return f.err
+}
+
+func (f *fakeRouteSyncer) SyncLocal(services []config.ServiceConfig) error {
+	f.localCalls++
+	f.localServices = append(f.localServices, append([]config.ServiceConfig(nil), services...))
+	return f.localErr
 }
 
 func (f *fakeStore) Fetch(_ context.Context, nodeName string) ([]byte, error) {
@@ -133,6 +172,139 @@ func TestTick_SingleLabelRefreshesRevisionAfterFetch(t *testing.T) {
 	}
 	if got := a.lastRevision; got != "rev-new" {
 		t.Fatalf("expected last revision to update to rev-new, got %q", got)
+	}
+}
+
+func TestTick_TraefikSyncFailureDoesNotAdvanceRevisionAndRetries(t *testing.T) {
+	s := &fakeStore{
+		data:     map[string][]byte{"web": []byte("node: web\nservices: []\n")},
+		revision: "rev-1",
+	}
+	a := New(testAgentConfig(t), s, testLogger())
+	rs := &fakeRouteSyncer{err: fmt.Errorf("route apply failed")}
+	a.traefikMgr = rs
+
+	a.tick(context.Background())
+	if a.lastRevision != "" {
+		t.Fatalf("expected lastRevision unchanged after sync failure, got %q", a.lastRevision)
+	}
+	if rs.calls != 1 {
+		t.Fatalf("expected one sync attempt, got %d", rs.calls)
+	}
+
+	// The next tick must retry the same revision rather than treat the
+	// unchanged revision as already applied.
+	a.tick(context.Background())
+	if rs.calls != 2 {
+		t.Fatalf("expected the next tick to retry the sync, got %d sync calls", rs.calls)
+	}
+}
+
+func TestTick_UnchangedRevisionRefreshesTraefikRoutes(t *testing.T) {
+	s := &fakeStore{
+		data: map[string][]byte{"web": []byte(`node: web
+services:
+  - name: local
+    network: {}
+    port_forwards:
+      - host_port: 8080
+        vm_port: 8080
+    metadata:
+      subdomain: local
+`)},
+		revision: "rev-1",
+		listResult: []config.NodeConfig{{
+			Node:   "node-2",
+			HostIP: "10.0.1.5",
+		}},
+	}
+	cfg := testAgentConfig(t)
+	cfg.VMSubnet = "172.16.0.0/24"
+	cfg.VMGateway = "172.16.0.1"
+	a := New(cfg, s, testLogger())
+	rs := &fakeRouteSyncer{}
+	a.traefikMgr = rs
+	a.lastRevision = "rev-1"
+
+	a.tick(context.Background())
+	if a.lastRevision != "rev-1" {
+		t.Fatalf("expected lastRevision rev-1 after success, got %q", a.lastRevision)
+	}
+	if rs.calls != 1 {
+		t.Fatalf("expected one sync call, got %d", rs.calls)
+	}
+
+	// The local revision is unchanged, but a peer host IP changed. The fast path
+	// must still refresh the remote route set and recreate local guest IPs.
+	s.listResult[0].HostIP = "10.0.1.9"
+	a.tick(context.Background())
+	if rs.calls != 2 {
+		t.Fatalf("expected route refresh for unchanged local revision, got %d sync calls", rs.calls)
+	}
+	if got := rs.services[1][0].Network.GuestIP; got != "172.16.0.2" {
+		t.Fatalf("expected route refresh to assign local guest IP, got %q", got)
+	}
+	if got := rs.remoteNodes[1][0].HostIP; got != "10.0.1.9" {
+		t.Fatalf("expected refreshed peer host IP, got %q", got)
+	}
+}
+
+// A peer-list failure must not block local progress: last-known-good remote
+// routes stay on disk, local routes still sync, and the revision advances —
+// the per-tick route refresh retries the peer list on the next poll.
+func TestTick_PeerListFailurePreservesRoutesAndAdvancesRevision(t *testing.T) {
+	traefikDir := t.TempDir()
+	lkg := filepath.Join(traefikDir, "remote-tenant-1-kibana.yaml")
+	if err := os.WriteFile(lkg, []byte("http: {}\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	s := &fakeStore{
+		data:     map[string][]byte{"web": []byte("node: web\nservices: []\n")},
+		revision: "rev-1",
+		listErr:  fmt.Errorf("transient peer-list failure"),
+	}
+	cfg := testAgentConfig(t)
+	cfg.TraefikConfigDir = traefikDir
+	a := New(cfg, s, testLogger())
+
+	a.tick(context.Background())
+
+	if _, err := os.Stat(lkg); err != nil {
+		t.Fatalf("expected last-known-good remote route preserved on peer-list failure: %v", err)
+	}
+	if a.lastRevision != "rev-1" {
+		t.Fatalf("expected revision to advance despite peer-list failure, got %q", a.lastRevision)
+	}
+}
+
+// The degraded path applies local routes via SyncLocal instead of a full Sync,
+// so an unreachable peer list cannot delete remote routes or stall the node.
+func TestTick_PeerListFailureStillSyncsLocalRoutes(t *testing.T) {
+	s := &fakeStore{
+		data:     map[string][]byte{"web": []byte("node: web\nservices: []\n")},
+		revision: "rev-1",
+		listErr:  fmt.Errorf("transient peer-list failure"),
+	}
+	a := New(testAgentConfig(t), s, testLogger())
+	rs := &fakeRouteSyncer{}
+	a.traefikMgr = rs
+
+	a.tick(context.Background())
+
+	if rs.localCalls != 1 || rs.calls != 0 {
+		t.Fatalf("expected one SyncLocal and no full Sync, got local=%d full=%d", rs.localCalls, rs.calls)
+	}
+	if a.lastRevision != "rev-1" {
+		t.Fatalf("expected revision to advance despite peer-list failure, got %q", a.lastRevision)
+	}
+
+	// A local route failure in degraded mode still blocks the revision.
+	rs.localErr = fmt.Errorf("local route apply failed")
+	s.revisionOnFetch = "rev-2"
+	a.tick(context.Background())
+	if a.lastRevision != "rev-1" {
+		t.Fatalf("expected revision unchanged on local sync failure, got %q", a.lastRevision)
 	}
 }
 

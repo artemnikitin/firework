@@ -45,6 +45,7 @@ type runtimeMetrics struct {
 	enrichmentTimestampByLabel map[string]float64
 	lastAppliedAt              float64
 	lastAppliedRevision        string
+	remoteRouteSyncDegraded    float64
 
 	nodeCapacityVCPUs    int
 	nodeCapacityMemoryMB int
@@ -112,6 +113,18 @@ func (m *runtimeMetrics) recordEnrichmentTimestamp(label string, t time.Time) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.enrichmentTimestampByLabel[label] = float64(t.UTC().Unix())
+}
+
+// setRemoteRouteSyncDegraded flags whether remote Traefik routes are running on
+// last-known-good files because the peer node configs could not be listed.
+func (m *runtimeMetrics) setRemoteRouteSyncDegraded(degraded bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if degraded {
+		m.remoteRouteSyncDegraded = 1
+	} else {
+		m.remoteRouteSyncDegraded = 0
+	}
 }
 
 func (m *runtimeMetrics) recordConfigApply(revision string, t time.Time) {
@@ -266,6 +279,9 @@ func (m *runtimeMetrics) render() string {
 			m.node, m.lastAppliedRevision,
 		)
 	}
+
+	writeHelpType(&b, "firework_agent_remote_route_sync_degraded", "1 when peer node configs cannot be listed and remote Traefik routes run on last-known-good files.", "gauge")
+	fmt.Fprintf(&b, "firework_agent_remote_route_sync_degraded{node=%q} %.0f\n", m.node, m.remoteRouteSyncDegraded)
 
 	if m.nodeCapacityVCPUs > 0 {
 		writeHelpType(&b, "firework_node_capacity_vcpus", "Total vCPU capacity of the node.", "gauge")

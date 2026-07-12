@@ -20,7 +20,7 @@ import (
 // Controller runs scheduling and publishing loops.
 type Controller struct {
 	cfg    Config
-	store  *S3StateStore
+	store  StateStore
 	logger *slog.Logger
 
 	id                 string
@@ -30,7 +30,7 @@ type Controller struct {
 }
 
 // NewController creates a controller runtime.
-func NewController(cfg Config, store *S3StateStore, logger *slog.Logger) *Controller {
+func NewController(cfg Config, store StateStore, logger *slog.Logger) *Controller {
 	host, _ := os.Hostname()
 	return &Controller{
 		cfg:    cfg,
@@ -73,7 +73,7 @@ func (c *Controller) renewLeadership(ctx context.Context) error {
 	now := time.Now().UTC()
 
 	var current LeaderLock
-	etag, exists, err := c.store.GetJSON(ctx, key, &current)
+	token, exists, err := c.store.GetJSON(ctx, key, &current)
 	if err != nil {
 		return err
 	}
@@ -100,7 +100,7 @@ func (c *Controller) renewLeadership(ctx context.Context) error {
 	} else if current.HolderID == c.id {
 		current.LeaseExpiresAt = now.Add(c.cfg.LeaderLeaseTTL)
 		current.RenewedAt = now
-		ok, _, err := c.store.PutJSONIfMatch(ctx, key, etag, current)
+		ok, _, err := c.store.PutJSONIfMatch(ctx, key, token, current)
 		if err != nil {
 			return err
 		}
@@ -113,7 +113,7 @@ func (c *Controller) renewLeadership(ctx context.Context) error {
 			LeaseExpiresAt: now.Add(c.cfg.LeaderLeaseTTL),
 			RenewedAt:      now,
 		}
-		ok, _, err := c.store.PutJSONIfMatch(ctx, key, etag, lock)
+		ok, _, err := c.store.PutJSONIfMatch(ctx, key, token, lock)
 		if err != nil {
 			return err
 		}

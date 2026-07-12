@@ -16,12 +16,14 @@ Examples:
 
 - [`examples/agent.yaml`](../../examples/agent.yaml) (Git mode)
 - [`examples/agent-s3.yaml`](../../examples/agent-s3.yaml) (S3 mode)
+- [`examples/agent-gcs.yaml`](../../examples/agent-gcs.yaml) (GCS mode)
 - [`examples/agent-demo.yaml`](../../examples/agent-demo.yaml) (multi-label demo)
 
 ### Required rules
 
 - `store_type: "git"` requires `store_url`.
 - `store_type: "s3"` requires `s3_bucket`.
+- `store_type: "gcs"` requires `gcs_bucket`.
 - If `node_name` is empty and `node_names` is empty, hostname is used.
 - If `node_names` is empty but `node_name` is set, `node_names` becomes `[node_name]`.
 
@@ -32,18 +34,23 @@ Examples:
 | `node_id` | no | derived from `node_name` | Stable registry identity for mTLS control-plane integration |
 | `node_name` | no | host name | Display/identity name for this node |
 | `node_names` | no | derived from `node_name` | Labels to fetch and merge (`nodes/<label>.yaml`) |
-| `store_type` | no | `git` | `git` or `s3` |
+| `store_type` | no | `git` | `git`, `s3`, or `gcs` |
 | `store_url` | git mode | - | Git repository URL |
 | `store_branch` | no | `main` | Git branch |
 | `s3_bucket` | s3 mode | - | S3 config bucket |
 | `s3_prefix` | no | empty | Prefix before `nodes/` |
 | `s3_region` | no | AWS default chain | Region for config bucket |
 | `s3_endpoint_url` | no | empty | Custom S3 endpoint (LocalStack/MinIO) |
+| `gcs_bucket` | gcs mode | - | GCS config bucket |
+| `gcs_prefix` | no | empty | Prefix before `nodes/` |
+| `gcs_project` | no | ADC project | GCP project containing the bucket |
+| `gcs_credentials_file` | no | ADC | Service-account credentials file; omit on GCE |
 | `poll_interval` | no | `30s` | Poll cadence |
 | `firecracker_bin` | no | `/usr/bin/firecracker` | Firecracker binary path |
 | `state_dir` | no | `/var/lib/firework` | Runtime state (VM sockets/logs) |
 | `images_dir` | no | `/var/lib/images` | Local image cache directory |
 | `s3_images_bucket` | no | empty | Enables image sync from S3 |
+| `gcs_images_bucket` | no | empty | Enables native image sync from GCS |
 | `log_level` | no | `info` | `debug`, `info`, `warn`, `error` |
 | `api_listen_addr` | no | empty | Enables local API server when set |
 | `enable_health_checks` | no | `true` | Health monitor toggle |
@@ -56,6 +63,7 @@ Examples:
 | `update_strategy` | no | `all-at-once` | `all-at-once` or `rolling` |
 | `update_delay` | no | `0s` | Delay between updates in rolling mode |
 | `traefik_config_dir` | no | empty | Enables Traefik dynamic config management for local and remote service routes |
+| `ingress_domain` | no | empty | Deployment-owned DNS suffix for `metadata.subdomain`. Final hostname is `<subdomain>.<ingress_domain>`. A bare domain only — no `*.`, scheme, port, or path. Validated/normalized at load (a trailing root dot is stripped) |
 | `registry_url` | no | empty | Enables node register/heartbeat to control-plane registry |
 | `registry_server_name` | no | empty | Optional TLS server name override for registry endpoint |
 | `registry_cert_file` | when `registry_url` set | - | Node mTLS cert path |
@@ -131,7 +139,7 @@ Supported fields:
 | `health_check` | no | `type` supports `http` or `tcp` |
 | `env` | no | Env vars injected via kernel args; values with whitespace are encoded |
 | `links` | no | Same-node service links (`env` gets resolved URL) |
-| `metadata` | no | Arbitrary key/value tags; `host` enables Traefik host routing |
+| `metadata` | no | Arbitrary key/value tags. Public routing: set **either** `subdomain` (one DNS label; final host is `<subdomain>.<ingress_domain>`) **or** `host` (exact hostname, used verbatim). Setting both is an error |
 | `anti_affinity_group` | no | Scheduler anti-affinity preference |
 | `cross_node_links` | no | Cross-node env injection (`host_ip:host_port`) |
 | `node_host_ip_env` | no | Env var name to inject current node host IP |
@@ -199,9 +207,31 @@ Notes:
 
 - `host_ip` is optional and usually added in scheduled multi-node flows. It is used for
   cross-node links and for remote Traefik routes to services on peer nodes.
-- Traefik route generation requires `traefik_config_dir` on the agent and `metadata.host`
-  on the service. Local routes proxy to the VM guest IP; remote routes proxy to the peer
-  node's `host_ip` and the first `port_forwards[].host_port`.
+- Traefik route generation requires `traefik_config_dir` on the agent and a routing key on
+  the service — either `metadata.subdomain` or `metadata.host`. Local routes proxy to the
+  VM guest IP; remote routes proxy to the peer node's `host_ip` and the first
+  `port_forwards[].host_port`.
+- `metadata.subdomain` is the portable, deployment-neutral form: it is exactly one DNS
+  label and the agent forms the final hostname as `<subdomain>.<ingress_domain>`. It
+  requires the agent's `ingress_domain` to be set and `traefik_config_dir` to be enabled;
+  otherwise the revision fails rather than silently producing no route. Because deployments
+  provision a single-label wildcard certificate (`*.<ingress_domain>`), only one label is
+  allowed — `myservice.mysub` is rejected.
+- `metadata.host` is an exact hostname used verbatim, retained for backward compatibility
+  and custom/internal-host routing. Exact custom hosts require separately compatible DNS and
+  TLS configuration that the deployment does not manage. On an installation that leaves
+  Traefik management disabled, a legacy `metadata.host` generates no route (historical
+  no-op); `metadata.subdomain` is rejected in that mode.
+- The same resolver is used for local and remote routes, so a given service resolves to an
+  identical `Host(...)` rule regardless of where it is scheduled. Two services that resolve
+  to the same hostname are rejected by enricher input validation. At the agent, a hostname
+  conflict among the node's own services fails the revision; a conflict involving a peer
+  service is resolved deterministically (local services win, then peers in node-name order)
+  and the losing route is skipped with a warning, so a stale peer config from an in-flight
+  reschedule cannot fail the sync cluster-wide.
+- If the peer node configs cannot be listed, the agent keeps the existing `remote-*.yaml`
+  files as last-known-good, still applies local routes, and retries on the next poll. The
+  degraded state is exposed as the `firework_agent_remote_route_sync_degraded` gauge.
 - Remote Traefik routing is available when the config store can list peer node configs,
   such as the S3-backed control-plane flow.
 - `health_check.target` can be set directly, but enriched configs usually use `port`/`path` and let the agent compose the target from guest IP.

@@ -1,5 +1,6 @@
 AGENT_BINARY := firework-agent
 CONTROLPLANE_BINARY := firework-controlplane
+CONFIGCHECK_BINARY := configcheck
 FC_INIT_BINARY := fc-init
 AGENT_LINUX_AMD64_BINARY := firework-agent-linux-amd64
 AGENT_LINUX_ARM64_BINARY := firework-agent-linux-arm64
@@ -20,11 +21,11 @@ LDFLAGS   := -s -w \
 	-X '$(MODULE)/internal/version.Commit=$(COMMIT)' \
 	-X '$(MODULE)/internal/version.BuildTime=$(BUILD_TIME)'
 
-.PHONY: all build-all build-agent build-controlplane build-fc-init build-linux-amd64 build-linux-arm64 clean test test-verbose test-race lint vet fmt tidy run smoke-local docker-build-controlplane-image docker-push-controlplane-image push-controlplane-image install help
+.PHONY: all build-all build-agent build-controlplane build-configcheck build-fc-init build-linux-amd64 build-linux-arm64 clean test test-verbose test-race lint vet fmt tidy run smoke-local docker-build-controlplane-image docker-push-controlplane-image push-controlplane-image install help
 
 all: build-all ## Alias for build-all
 
-build-all: build-agent build-controlplane build-linux-amd64 build-linux-arm64 ## Build all binaries for native + linux amd64/arm64
+build-all: build-agent build-controlplane build-configcheck build-linux-amd64 build-linux-arm64 ## Build all binaries for native + linux amd64/arm64
 
 build-agent: ## Build the agent binary
 	@mkdir -p $(BUILD_DIR)
@@ -35,6 +36,11 @@ build-controlplane: ## Build the control-plane binary
 	@mkdir -p $(BUILD_DIR)
 	go build -ldflags "$(LDFLAGS)" -o $(BUILD_DIR)/$(CONTROLPLANE_BINARY) ./cmd/controlplane/
 	@echo "Built $(BUILD_DIR)/$(CONTROLPLANE_BINARY)"
+
+build-configcheck: ## Build the GitOps config validator binary
+	@mkdir -p $(BUILD_DIR)
+	go build -ldflags "$(LDFLAGS)" -o $(BUILD_DIR)/$(CONFIGCHECK_BINARY) ./cmd/configcheck/
+	@echo "Built $(BUILD_DIR)/$(CONFIGCHECK_BINARY)"
 
 build-fc-init: ## Build fc-init guest init binary (linux/arm64, static) + compatibility alias
 	@mkdir -p $(BUILD_DIR)

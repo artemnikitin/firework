@@ -46,6 +46,7 @@ builds:
       - linux
     goarch:
       - arm64
+      - amd64
 
 archives:
   - id: firework-agent-binaries

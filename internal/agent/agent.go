@@ -17,12 +17,23 @@ import (
 	"github.com/artemnikitin/firework/internal/config"
 	"github.com/artemnikitin/firework/internal/healthcheck"
 	"github.com/artemnikitin/firework/internal/imagesync"
+	"github.com/artemnikitin/firework/internal/ingress"
 	"github.com/artemnikitin/firework/internal/network"
 	"github.com/artemnikitin/firework/internal/reconciler"
 	"github.com/artemnikitin/firework/internal/store"
 	"github.com/artemnikitin/firework/internal/traefik"
 	"github.com/artemnikitin/firework/internal/vm"
 )
+
+// routeSyncer applies the desired Traefik route set for the local and remote
+// services. It is satisfied by *traefik.Manager and kept as an interface so the
+// agent's retry and last-known-good behavior can be tested with a fake.
+type routeSyncer interface {
+	Sync(services []config.ServiceConfig, remoteNodes []config.NodeConfig) error
+	// SyncLocal applies local routes only, leaving existing remote-* route
+	// files untouched. Used when the peer node configs cannot be listed.
+	SyncLocal(services []config.ServiceConfig) error
+}
 
 // Agent is the core component that runs on each node. It periodically pulls
 // the desired state from the config store and reconciles it with the actual
@@ -39,7 +50,7 @@ type Agent struct {
 	logger         *slog.Logger
 	metrics        *runtimeMetrics
 	capacityReader capacity.Reader
-	traefikMgr     *traefik.Manager
+	traefikMgr     routeSyncer
 	registryClient *registryClient
 
 	lastRevision         string
@@ -98,18 +109,24 @@ func New(cfg config.AgentConfig, s store.Store, logger *slog.Logger) *Agent {
 
 	// Set up optional image syncer.
 	var imgSyncer *imagesync.Syncer
-	if cfg.S3ImagesBucket != "" {
+	switch {
+	case cfg.S3ImagesBucket != "":
 		var err error
-		imgSyncer, err = imagesync.NewSyncer(
-			context.Background(),
-			cfg.S3ImagesBucket,
-			cfg.ImagesDir,
-			cfg.S3Region,
-			cfg.S3EndpointURL,
-			logger,
-		)
+		imgSyncer, err = imagesync.NewS3Syncer(context.Background(), imagesync.S3Config{
+			Bucket: cfg.S3ImagesBucket, Region: cfg.S3Region,
+			EndpointURL: cfg.S3EndpointURL, ForcePathStyle: cfg.S3EndpointURL != "",
+		}, cfg.ImagesDir, logger)
 		if err != nil {
-			logger.Error("failed to create image syncer", "error", err)
+			logger.Error("failed to create S3 image syncer", "error", err)
+		}
+	case cfg.GCSImagesBucket != "":
+		var err error
+		imgSyncer, err = imagesync.NewGCSSyncer(context.Background(), imagesync.GCSConfig{
+			Bucket: cfg.GCSImagesBucket, Project: cfg.GCSProject,
+			CredentialsFile: cfg.GCSCredentialsFile,
+		}, cfg.ImagesDir, logger)
+		if err != nil {
+			logger.Error("failed to create GCS image syncer", "error", err)
 		}
 	}
 
@@ -119,10 +136,11 @@ func New(cfg config.AgentConfig, s store.Store, logger *slog.Logger) *Agent {
 		capReader = capacity.NewOSReader()
 	}
 
-	// Set up optional Traefik config manager.
-	var traefikMgr *traefik.Manager
+	// Set up optional Traefik config manager. Keep traefikMgr a nil interface
+	// (not a typed-nil) when disabled so the a.traefikMgr == nil checks hold.
+	var traefikMgr routeSyncer
 	if cfg.TraefikConfigDir != "" {
-		traefikMgr = traefik.NewManager(cfg.TraefikConfigDir)
+		traefikMgr = traefik.NewManager(cfg.TraefikConfigDir, cfg.IngressDomain, logger)
 	}
 
 	a := &Agent{
@@ -237,6 +255,9 @@ func (a *Agent) getHeartbeatResources() (cap capacity.NodeCapacity, used capacit
 
 // shutdown cleans up all resources.
 func (a *Agent) shutdown() {
+	if a.imageSyncer != nil {
+		_ = a.imageSyncer.Close()
+	}
 	if a.registryClient != nil {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		a.registryClient.markDown(ctx, a.cfg.NodeID)
@@ -277,13 +298,15 @@ func (a *Agent) tick(ctx context.Context) {
 	if merged == nil {
 		// No local config, but still sync Traefik with remote nodes so that
 		// this node can proxy requests for services placed on peer nodes.
-		a.syncTraefikConfigs(ctx, nil)
+		if err := a.syncTraefikConfigs(ctx, nil); err != nil {
+			a.logger.Error("traefik route sync failed", "error", err)
+		}
 		a.syncRegistry(ctx, nodeCap, capacity.NodeCapacity{})
 		return
 	}
 
 	// Check revision only after fetch, so stores that update revision state
-	// during Fetch (Git pull, S3 ETag) are evaluated against fresh data.
+	// during Fetch (Git pull, object write token) are evaluated against fresh data.
 	// For multi-label nodes we skip this optimization because revision is
 	// store-scoped, not label-scoped.
 	var rev string
@@ -293,10 +316,28 @@ func (a *Agent) tick(ctx context.Context) {
 		if err != nil {
 			a.logger.Error("failed to get store revision", "error", err)
 		} else if rev != "" && rev == a.lastRevision {
-			a.logger.Debug("config unchanged, skipping reconciliation", "revision", rev)
+			// A local revision does not describe the peer node configs used for
+			// remote Traefik routes. Refresh routes on every poll even when the
+			// local VM configuration is unchanged, but avoid the expensive image
+			// sync and reconcile work. assignNetworking is needed because fetched
+			// node configs do not persist the agent-assigned guest IPs.
+			a.assignNetworking(merged.Services)
+			if err := a.syncTraefikConfigs(ctx, merged.Services); err != nil {
+				a.logger.Error("traefik route refresh failed", "error", err)
+			}
+			a.logger.Debug("config unchanged, skipped reconciliation after route refresh", "revision", rev)
 			a.refreshRuntimeMetrics()
 			return
 		}
+	}
+
+	// Preflight routing metadata before any reconciliation so an invalid
+	// direct node config or a missing ingress_domain fails the revision early
+	// instead of being recorded as applied.
+	if err := a.preflightRouting(merged.Services); err != nil {
+		a.logger.Error("routing preflight failed; not advancing revision", "error", err)
+		a.syncRegistry(ctx, nodeCap, capacity.NodeCapacity{})
+		return
 	}
 
 	// Assign networking (IPs, MACs, kernel args) to services that need it.
@@ -345,8 +386,16 @@ func (a *Agent) tick(ctx context.Context) {
 		return
 	}
 
-	// Sync Traefik dynamic config files with desired services.
-	a.syncTraefikConfigs(ctx, merged.Services)
+	// Sync Traefik dynamic config files with desired services. An error here
+	// means the local routes were not applied and must not advance the
+	// revision: leaving lastRevision unchanged lets the next tick retry
+	// instead of treating the unchanged revision as applied. (Peer-side
+	// failures degrade inside syncTraefikConfigs without surfacing here.)
+	if err := a.syncTraefikConfigs(ctx, merged.Services); err != nil {
+		a.logger.Error("traefik route sync failed; not advancing revision", "error", err)
+		a.syncRegistry(ctx, nodeCap, used)
+		return
+	}
 
 	// Update the last known revision on success.
 	if rev != "" {
@@ -592,32 +641,69 @@ func envKernelArg(key, value string) string {
 // the desired set of services. When the store implements NodeConfigLister,
 // peer node configs are also fetched so that remote services can be proxied.
 // No-op when Traefik management is disabled.
-func (a *Agent) syncTraefikConfigs(ctx context.Context, services []config.ServiceConfig) {
+//
+// Error semantics are split by fault domain. A returned error means the local
+// routes could not be applied — the caller must not treat the revision as
+// applied, so the next tick retries. Peer-side failures (the peer list cannot
+// be fetched in full) never block local progress: local routes are still
+// synced via SyncLocal, existing remote-* files are preserved as last-known-
+// good (synchronizing against an incomplete peer set would delete valid
+// routes), a warning is logged, and the per-tick route refresh retries the
+// peer list automatically. The degraded state is exposed via the
+// firework_agent_remote_route_sync_degraded gauge.
+func (a *Agent) syncTraefikConfigs(ctx context.Context, services []config.ServiceConfig) error {
 	if a.traefikMgr == nil {
-		return
+		return nil
 	}
 
 	var remoteNodes []config.NodeConfig
 	if lister, ok := a.store.(store.NodeConfigLister); ok {
 		all, err := lister.ListAllNodeConfigs(ctx)
 		if err != nil {
-			a.logger.Warn("failed to list peer node configs, remote routing skipped", "error", err)
-		} else {
-			ownNames := make(map[string]bool, len(a.cfg.NodeNames))
-			for _, n := range a.cfg.NodeNames {
-				ownNames[n] = true
+			a.logger.Warn("failed to list peer node configs; keeping last-known-good remote routes",
+				"error", err)
+			a.metrics.setRemoteRouteSyncDegraded(true)
+			if err := a.traefikMgr.SyncLocal(services); err != nil {
+				return fmt.Errorf("syncing local traefik configs: %w", err)
 			}
-			for _, nc := range all {
-				if !ownNames[nc.Node] {
-					remoteNodes = append(remoteNodes, nc)
-				}
+			return nil
+		}
+		a.metrics.setRemoteRouteSyncDegraded(false)
+		ownNames := make(map[string]bool, len(a.cfg.NodeNames))
+		for _, n := range a.cfg.NodeNames {
+			ownNames[n] = true
+		}
+		for _, nc := range all {
+			if !ownNames[nc.Node] {
+				remoteNodes = append(remoteNodes, nc)
 			}
 		}
 	}
 
 	if err := a.traefikMgr.Sync(services, remoteNodes); err != nil {
-		a.logger.Warn("failed to sync traefik configs", "error", err)
+		return fmt.Errorf("syncing traefik configs: %w", err)
 	}
+	return nil
+}
+
+// preflightRouting validates user-authored routing metadata for the local
+// services before any reconciliation, so a missing ingress_domain or an invalid
+// direct node config fails fast without advancing the revision. Exact
+// metadata.host on an installation with Traefik management disabled is left as a
+// historical no-op (no route is generated).
+func (a *Agent) preflightRouting(services []config.ServiceConfig) error {
+	for _, svc := range services {
+		if _, hasSub := svc.Metadata[ingress.MetadataSubdomain]; hasSub && a.traefikMgr == nil {
+			return fmt.Errorf("service %s sets metadata.subdomain but Traefik management is disabled (traefik_config_dir is empty)", svc.Name)
+		}
+		if a.traefikMgr == nil {
+			continue
+		}
+		if _, err := ingress.Resolve(svc.Name, svc.Metadata, a.cfg.IngressDomain); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // checkCapacity compares desired usage against host capacity. Returns false
