@@ -390,7 +390,11 @@ func applyHostIPAndCrossNodeLinks(nodeConfigs []config.NodeConfig, hostIPByNode 
 				if !ok || peerNC.HostIP == "" {
 					continue
 				}
-				svc.Env[link.Env] = fmt.Sprintf("%s:%d", peerNC.HostIP, link.HostPort)
+				address := fmt.Sprintf("%s:%d", peerNC.HostIP, link.HostPort)
+				if link.Protocol != "" {
+					address = fmt.Sprintf("%s://%s", link.Protocol, address)
+				}
+				svc.Env[link.Env] = address
 			}
 			if svc.NodeHostIPEnv != "" && nodeConfigs[i].HostIP != "" {
 				svc.Env[svc.NodeHostIPEnv] = nodeConfigs[i].HostIP

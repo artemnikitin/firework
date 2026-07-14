@@ -70,6 +70,8 @@ Per poll interval, the agent executes roughly this sequence:
 - Unplaced services are bin-packed to nodes with available capacity.
 - `anti_affinity_group` is treated as a preference.
 - `cross_node_links` and `node_host_ip_env` are resolved from registry host IPs.
+  A cross-node link keeps the legacy bare `host_ip:host_port` value unless its
+  optional `protocol` is set, in which case the controller injects a full URL.
 - Agents using a store that can list peer node configs, such as S3, also write remote
   Traefik configs so any node can proxy routed services scheduled on peer nodes.
 
