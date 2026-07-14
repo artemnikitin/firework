@@ -58,8 +58,9 @@ type ServiceConfig struct {
 }
 
 // CrossNodeLink declares a dependency on a peer service running on a different
-// EC2 instance. The enricher resolves the peer node's private IP and injects
-// an env var of the form "<ip>:<host_port>".
+// node. The controller resolves the peer node's host IP and injects an env var
+// of the form "<ip>:<host_port>". When Protocol is set, it prefixes the value
+// as "<protocol>://<ip>:<host_port>".
 type CrossNodeLink struct {
 	// Service is the fully-qualified peer service name.
 	Service string `yaml:"service"`
@@ -67,6 +68,10 @@ type CrossNodeLink struct {
 	Env string `yaml:"env"`
 	// HostPort is the forwarded port on the peer's host.
 	HostPort int `yaml:"host_port"`
+	// Protocol is an optional URL scheme. Empty preserves the legacy bare
+	// "<ip>:<host_port>" format; for example, "http" produces
+	// "http://<ip>:<host_port>".
+	Protocol string `yaml:"protocol,omitempty"`
 }
 
 // ServiceLink declares that this service needs connectivity to another
