@@ -141,7 +141,7 @@ Supported fields:
 | `links` | no | Same-node service links (`env` gets resolved URL) |
 | `metadata` | no | Arbitrary key/value tags. Public routing: set **either** `subdomain` (one DNS label; final host is `<subdomain>.<ingress_domain>`) **or** `host` (exact hostname, used verbatim). Setting both is an error |
 | `anti_affinity_group` | no | Scheduler anti-affinity preference |
-| `cross_node_links` | no | Cross-node env injection (`host_ip:host_port`); set `protocol` on a link to inject a full URL such as `http://host_ip:host_port` |
+| `cross_node_links` | no | Cross-node env injection (`host_ip:host_port`); set `protocol` on a link to inject a full URL such as `http://host_ip:host_port`. Links sharing the same `env` join into a comma-separated list in spec order (e.g. a multi-peer `discovery.seed_hosts`); unresolvable links are skipped |
 | `node_host_ip_env` | no | Env var name to inject current node host IP |
 
 ### 2.3 `tenants/*` (optional)

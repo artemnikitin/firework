@@ -385,6 +385,11 @@ func applyHostIPAndCrossNodeLinks(nodeConfigs []config.NodeConfig, hostIPByNode 
 			if svc.Env == nil {
 				svc.Env = make(map[string]string)
 			}
+			// Links sharing an env key join into a comma-separated list (in
+			// spec order), so a service can receive a multi-address value such
+			// as an Elasticsearch discovery.seed_hosts set. The first resolved
+			// link still replaces any same-named static env value.
+			linkSet := make(map[string]bool)
 			for _, link := range svc.CrossNodeLinks {
 				peerNC, ok := serviceNode[link.Service]
 				if !ok || peerNC.HostIP == "" {
@@ -394,7 +399,12 @@ func applyHostIPAndCrossNodeLinks(nodeConfigs []config.NodeConfig, hostIPByNode 
 				if link.Protocol != "" {
 					address = fmt.Sprintf("%s://%s", link.Protocol, address)
 				}
-				svc.Env[link.Env] = address
+				if linkSet[link.Env] {
+					svc.Env[link.Env] += "," + address
+				} else {
+					svc.Env[link.Env] = address
+					linkSet[link.Env] = true
+				}
 			}
 			if svc.NodeHostIPEnv != "" && nodeConfigs[i].HostIP != "" {
 				svc.Env[svc.NodeHostIPEnv] = nodeConfigs[i].HostIP
