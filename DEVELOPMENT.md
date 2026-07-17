@@ -11,7 +11,9 @@
 | `staticcheck` | linting (optional — `go install honnef.co/go/tools/cmd/staticcheck@latest`) |
 | Linux host with `/dev/kvm` | running actual Firecracker VMs |
 
-Most development (coding, unit tests, smoke test) works on macOS or Linux without KVM. You only need a real metal node to test actual VM lifecycle.
+Most development (coding, unit tests, smoke test) works on macOS or Linux
+without KVM. Testing the actual VM lifecycle requires a Linux host with
+`/dev/kvm`, either bare metal or supported nested virtualization.
 
 ## Repository Layout
 
@@ -31,8 +33,9 @@ internal/
   network/     bridge/TAP/iptables setup
   healthcheck/ HTTP and TCP health monitors
   traefik/     dynamic config file management
-  store/       Git and S3 config store backends
-  imagesync/   S3 image sync
+  store/       Git and object-storage config backends
+  objectstorage/ provider-neutral S3/GCS operations
+  imagesync/   S3/GCS image sync
   capacity/    node vCPU/memory discovery
   api/         HTTP status/health/metrics server
 examples/      example agent and control-plane configs
@@ -72,7 +75,9 @@ make test-race     # with race detector
 make test-cover    # with coverage report (outputs coverage.out)
 ```
 
-All unit tests run without AWS credentials, KVM, or network access. AWS interactions are mocked; the scheduler and reconciler are pure functions with no external dependencies.
+All unit tests run without cloud credentials, KVM, or external network access.
+Cloud-storage interactions use fakes; the scheduler and reconciler are pure
+functions with no external dependencies.
 
 ### Smoke test
 
@@ -80,7 +85,10 @@ All unit tests run without AWS credentials, KVM, or network access. AWS interact
 make smoke-local
 ```
 
-Runs a real `firework-agent` binary (built on the fly) against a local Git repo with a fake Firecracker binary. No KVM or AWS required. Covers the full reconcile loop: startup, config detection, VM launch, config update, reconciliation, and `/status` API.
+Runs a real `firework-agent` binary (built on the fly) against a local Git repo
+with a fake Firecracker binary. No KVM or cloud credentials are required. It
+covers the full reconcile loop: startup, config detection, VM launch, config
+update, reconciliation, and the `/status` API.
 
 Useful environment variables:
 
@@ -170,17 +178,26 @@ The deployment repo can then reference that tag (or digest) directly.
 
 See [firework-deployment-example](https://github.com/artemnikitin/firework-deployment-example) for Terraform and Packer sources. The high-level order:
 
-1. **Build AMI** — run Packer with the agent and Traefik binaries baked in.
-2. **Deploy control plane** — Terraform creates control-plane instances and S3 state bucket.
-3. **Deploy data plane** — Terraform creates the VPC, ALB, and Auto Scaling Group using the AMI from step 1.
+1. **Build node image** — run the provider-specific Packer configuration with
+   the agent and Traefik binaries baked in.
+2. **Deploy control plane** — Terraform creates the provider-specific control
+   plane and S3 or GCS state bucket.
+3. **Deploy data plane** — Terraform creates the provider-specific network,
+   load balancer, and node group using the image from step 1.
 4. **Configure GitHub webhook** — point the config repo's webhook at the control-plane `events` role endpoint with the shared secret.
-5. **Push a config** — GitHub webhook triggers the `events` role, controller schedules and publishes rendered `nodes/*.yaml` to S3. Agents pick it up on their next poll.
+5. **Push a config** — GitHub webhook triggers the `events` role; the controller
+   schedules and publishes rendered `nodes/*.yaml` to object storage. Agents
+   pick it up on their next poll.
 
-For IAM setup, refer to `iam-policies/` in the deployment repo. The policy for the deployment user has a ~6 KB size limit, so check coverage before adding new AWS resources to Terraform.
+For provider permission setup, refer to `iam-policies/` in the deployment repo.
+The AWS deployment-user policy has an approximately 6 KB size limit, so check
+coverage before adding new AWS resources to Terraform.
 
 ## Code Conventions
 
 - Format with `gofmt -s` (`make fmt`).
 - Tests are table-driven where multiple cases exist.
-- AWS-dependent code is behind interfaces so unit tests can substitute fakes (see `store.Store`, `vm.Manager`).
+- Cloud-storage and runtime integrations are behind interfaces so unit tests
+  can substitute fakes (see `objectstorage.BlobStore`, `store.Store`, and the
+  reconciler's VM manager interface).
 - The scheduler and enricher pipelines are pure functions — prefer keeping them that way.
