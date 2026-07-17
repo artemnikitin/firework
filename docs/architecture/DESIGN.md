@@ -1,6 +1,6 @@
 # Firework Design Decisions
 
-This document explains the key architectural choices behind Firework — what was considered,
+This document explains the key architectural choices behind Firework: what was considered,
 what was rejected, and why the current design is the way it is. It's intended for anyone
 who wants to understand the tradeoffs rather than just the mechanics.
 
@@ -8,15 +8,16 @@ who wants to understand the tradeoffs rather than just the mechanics.
 
 Firecracker provides VM-level isolation with startup times and resource overhead close to
 containers. The original use case for Firework was multi-tenant workloads where container
-isolation is not sufficient — different tenants running the same software stack on shared infrastructure, with a hard isolation boundary between them.
+isolation is not sufficient: different tenants running the same software stack on shared infrastructure, with a hard isolation boundary between them.
 
 Kubernetes with namespaces solves the scheduling and lifecycle problem, but the isolation
 boundary is the container, not the VM. Firecracker gives you both: the operational
 simplicity of a process + the isolation guarantee of a VM.
 
-The tradeoff is that Firecracker requires `/dev/kvm`, which on AWS means `.metal` instance
-types. That's a meaningful cost and limits the density of workloads compared to
-containers on general-purpose instances.
+The tradeoff is that Firecracker requires `/dev/kvm`. On AWS this means `.metal`
+instance types; on GCP it requires a machine type and image configuration that
+support nested virtualization. That is a meaningful cost and limits workload
+density compared with containers on general-purpose instances.
 
 ## Pull-Based Reconciliation
 
@@ -30,11 +31,11 @@ maintain a consistent view of the cluster state. That's a significant operationa
 Pull-based design means:
 - Nodes are self-healing by default. An agent that crashes, restarts, or misses a config
   update will converge on the next poll.
-- The control plane is stateless from the node's perspective. It writes config to S3 and
-  forgets about it.
+- The control plane is stateless from the node's perspective. It writes config
+  to object storage and forgets about it.
 - Nodes can be added or removed without coordinating with a controller.
 
-The cost is eventual consistency and a polling delay (30s by default). This is an acceptable tradeoff.
+The cost is eventual consistency and a polling delay (30s by default). 
 
 ## Role-Based Control Plane
 
@@ -62,11 +63,9 @@ Node discovery is based on explicit registry records with lease freshness:
 2. Nodes send periodic heartbeats with current capacity/usage.
 3. Controller schedules only nodes with `state=ready` and non-expired lease.
 
-Registry state is persisted in S3 objects under `cp/v1/registry/nodes/*.json`.
-This keeps discovery semantics cloud-agnostic and independent from telemetry pipelines.
-
-Observability metrics remain useful, but they are no longer the source of truth
-for control-plane membership decisions.
+Registry state is persisted in S3 or GCS objects under
+`cp/v1/registry/nodes/*.json`.
+This keeps discovery semantics cloud-agnostic.
 
 ## Deterministic Network Assignment
 
@@ -80,21 +79,23 @@ This means:
 - Adding or removing a service changes subsequent assignments predictably
 
 The implication is that renaming a service or changing the set of services can shift IP
-assignments for other services. It would be a problem for very dynamic workloads.
+assignments for other services. It could be a problem for very dynamic workloads.
 
 ## Static Service Linking
 
-Services that depend on each other (e.g. UI → backend) are linked at config
-resolution time, not at runtime. The enricher resolves the guest IP of the target service
-and injects it as an environment variable into the dependent service's kernel args.
+Services that depend on each other (e.g. UI → backend) are linked while desired
+state is resolved, not through a runtime discovery service. The agent resolves
+same-node links after assigning guest IPs; the controller resolves cross-node
+links after scheduling. The resulting addresses are injected as environment
+variables into the dependent service's kernel args.
 
 The alternative — runtime service discovery (DNS, Consul, etc.) — requires running
 additional infrastructure inside the VM network, adds latency to startup, and introduces
 a dependency on a service that must itself be highly available.
 
-Static linking is simpler and eliminates the runtime dependency entirely. The constraint
-is that service addresses are fixed at enrichment time — suitable for stable, long-running
-services, but the wrong fit for workloads where service addresses change frequently.
+Static linking is simpler and eliminates the runtime dependency entirely. The
+constraint is that service addresses are fixed during each reconciliation and
+are not looked up dynamically by the guest. 
 
 Environment injection uses kernel args (`firework.env.KEY=VALUE`, or
 `firework.env64.KEY=VALUE` for values that need whitespace encoding), which the guest
@@ -107,10 +108,10 @@ no dependency on the guest OS beyond a standard init binary.
 Each node runs Traefik as a reverse proxy. Firework writes Traefik dynamic config files
 (one per service) that Traefik watches and reloads automatically.
 
-The alternative — managing ALB listener rules programmatically — would require the control
-plane to call ALB APIs after scheduling changes, handle rule limits, and manage ordering.
-Traefik with file provider is simpler: the agent writes a file, Traefik picks it up, no API
-calls needed.
+The alternative: managing cloud load-balancer routing rules programmatically. It would require the control plane to call provider APIs after scheduling changes,
+handle rule limits, and manage ordering. Traefik with file provider is simpler:
+the agent writes a file, Traefik picks it up, and no provider API calls are
+needed.
 
 A service requests a public route via its metadata: `metadata.subdomain` (a single DNS
 label, resolved to `<subdomain>.<ingress_domain>` using the agent's deployment-owned
@@ -132,12 +133,13 @@ window (where a service briefly appears in both a stale peer config and its new 
 config) converge without cluster-wide errors. Genuine duplicates are rejected earlier by
 enricher input validation.
 
-For multi-node routing, agents read S3 configs for all peer nodes and write `remote-{svc}.yaml`
-files for peer services that have a routing key (`metadata.subdomain` or `metadata.host`) and
-a `port_forwards` entry. Those files proxy to the peer node's `host_ip` and forwarded host
-port. This means every node can route to every routed service in the cluster, which avoids
-the problem of ALB round-robining requests to a node that doesn't have the target service
-scheduled.
+For multi-node routing, agents using an object-storage-backed config store read
+configs for all peer nodes and write `remote-{svc}.yaml` files for peer services
+that have a routing key (`metadata.subdomain` or `metadata.host`) and a
+`port_forwards` entry. Those files proxy to the peer node's `host_ip` and
+forwarded host port. This means every node can route to every routed service in
+the cluster, which avoids a load balancer sending requests to a node that does
+not have the target service scheduled.
 
 Traefik was chosen primarily for integration simplicity — since the agent already manages
 files on disk, a proxy that watches config files required no additional API surface compared
@@ -145,34 +147,40 @@ to alternatives like nginx or Envoy.
 
 ## VM Process Isolation
 
-Firecracker VM processes are started with `Setpgid: true`, placing them in their own
-process group. This means the agent can restart (crash, update, redeploy) without
-sending SIGHUP or SIGTERM to the VM processes it launched.
+Firecracker VM processes are started with `Setpgid: true`, placing them in their
+own process group and decoupling them from some parent-process signals.
 
-On restart, the agent reconciles: it reads the current list of running Firecracker
-processes, compares against the desired state, and only creates or deletes VMs that have
-diverged. VMs that are already in the desired state are left running.
-
-This makes agent updates non-disruptive to running workloads.
+The current VM manager keeps its instance inventory in memory. If a Firecracker
+process survives an abrupt agent failure, a restarted agent does not yet adopt
+that process into its new inventory. Safe discovery and adoption of survivors is
+tracked in [issue #22](https://github.com/artemnikitin/firework/issues/22).
+Agent restarts therefore must not yet be treated as guaranteed non-disruptive
+updates.
 
 ## What Was Left Out
 
 Several things were considered and deliberately not implemented in the initial version:
 
-**Rolling updates / canary deployments**: Firework applies all changes in a single
-reconciliation pass. There is no built-in mechanism for staged rollouts. 
+**Health-gated rolling updates / canary deployments**: The agent supports a
+`rolling` update strategy that applies service updates one at a time with an
+optional delay. It is still stop-then-start for each updated service: it does
+not wait for health before continuing, create surge capacity, or implement
+canary traffic shifting.
 
 **Automatic rollback**: A failed reconciliation leaves partial state; the system converges
 on the next tick rather than rolling back. Adding rollback would require snapshotting
 desired state before apply and tracking which operations succeeded — significant complexity
 for a marginal benefit given the pull-based self-healing loop.
 
-**Autoscaling**: Node count is managed externally (ASG desired capacity as in example). Firework
-doesn't scale the node fleet — it only schedules services onto existing nodes. Autoscaling
-would require the scheduler to reason about provisioning latency, node startup costs, and
-fleet topology, which is a separate problem.
+**Autoscaling**: Node count is managed externally, for example by an AWS Auto
+Scaling Group or a GCP managed instance group. Firework does not scale the node
+fleet — it only schedules services onto existing nodes. Autoscaling would
+require the scheduler to reason about provisioning latency, node startup costs,
+and fleet topology, which is a separate problem.
 
-**Service mesh / mTLS**: Communication between services is unencrypted within the VM
-network. For the current threat model (tenants on separate nodes, intra-node traffic is
-isolated to the bridge), this is acceptable. Adding mTLS would require a sidecar or
-library inside each VM.
+**Service mesh / workload mTLS**: Communication between services is unencrypted
+within the VM network. Networked VMs on a host currently share the Firework
+bridge, and the scheduler does not yet enforce tenant-to-node separation. Any
+deployment that requires network-level tenant isolation must provide additional
+controls. Adding workload mTLS would require a sidecar or library inside each
+VM.

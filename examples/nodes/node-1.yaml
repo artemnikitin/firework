@@ -1,7 +1,7 @@
 # Enriched node config — this is what the agent reads.
 #
 # In the S3 flow: the control-plane events/controller roles generate this file
-# from minimal service specs in enricher-input/ and write it to S3.
+# from minimal service specs in enricher-input/ and write it to object storage.
 #
 # In the Git flow: you write this file by hand and commit it to the
 # config repo at nodes/<node-name>.yaml.

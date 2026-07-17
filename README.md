@@ -6,7 +6,7 @@ A lightweight orchestrator for [Firecracker](https://firecracker-microvm.github.
 
 You can use them to have everything working end-to-end:
 
-- [firework-deployment-example](https://github.com/artemnikitin/firework-deployment-example) - Terraform + Packer deployment on AWS
+- [firework-deployment-example](https://github.com/artemnikitin/firework-deployment-example) - Terraform + Packer deployments on AWS and GCP
 - [firework-gitops-example](https://github.com/artemnikitin/firework-gitops-example) - example GitOps input repo and rootfs image build pipeline
 
 ## How It Works
@@ -25,10 +25,10 @@ flowchart TB
         CTRL["controller role\n(schedule + publish)"]
     end
 
-    subgraph storage["S3"]
-        S3STATE["cp/v1 state"]
-        S3CFG["nodes/*.yaml"]
-        S3IMG["images bucket"]
+    subgraph storage["Object Storage (S3 or GCS)"]
+        STATE["cp/v1 state"]
+        CFG["nodes/*.yaml"]
+        IMG["images bucket"]
     end
 
     subgraph data_plane["Firework Nodes"]
@@ -38,14 +38,14 @@ flowchart TB
 
     USER -->|HTTPS| N1 & N2
     GITHUB -->|push webhook| EV
-    EV --> S3STATE
-    REG --> S3STATE
-    CTRL --> S3STATE
-    CTRL -->|rendered configs| S3CFG
-    CI -->|upload| S3IMG
+    EV --> STATE
+    REG --> STATE
+    CTRL --> STATE
+    CTRL -->|rendered configs| CFG
+    CI -->|upload| IMG
     N1 & N2 -->|mTLS register + heartbeat| REG
-    N1 & N2 -->|poll configs| S3CFG
-    N1 & N2 -->|pull images| S3IMG
+    N1 & N2 -->|poll configs| CFG
+    N1 & N2 -->|pull images| IMG
 ```
 
 ## Documentation
