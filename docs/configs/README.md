@@ -135,7 +135,7 @@ Supported fields:
 | `memory_mb` | no | Memory in MiB |
 | `kernel_args` | no | Kernel boot args |
 | `network` | no | When true, networking is configured |
-| `port_forwards` | no | Host-to-guest DNAT mappings; required for remote Traefik routing |
+| `port_forwards` | no | Host-to-guest DNAT mappings; required for remote Traefik routing. Reachable from external traffic and from co-located guests addressing the host IP (hairpin) |
 | `health_check` | no | `type` supports `http` or `tcp` |
 | `env` | no | Env vars injected via kernel args; values with whitespace are encoded |
 | `links` | no | Same-node service links (`env` gets resolved URL) |

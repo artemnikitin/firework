@@ -53,6 +53,45 @@ func TestParseInterfaceIPv4Error(t *testing.T) {
 	}
 }
 
+func TestHairpinPortForwardSpec(t *testing.T) {
+	t.Parallel()
+
+	spec := hairpinPortForwardSpec("br0", "10.0.100.91", 19300, "172.16.0.6", 9300)
+	got := strings.Join(spec, " ")
+
+	wants := []string{
+		"-i br0",
+		"-d 10.0.100.91/32",
+		"--dport 19300",
+		"--to-destination 172.16.0.6:9300",
+	}
+	for _, want := range wants {
+		if !strings.Contains(got, want) {
+			t.Fatalf("hairpin spec missing %q: %s", want, got)
+		}
+	}
+}
+
+func TestHairpinMasqueradeSpec(t *testing.T) {
+	t.Parallel()
+
+	spec := hairpinMasqueradeSpec("172.16.0.0/24", "br0")
+	got := strings.Join(spec, " ")
+
+	wants := []string{
+		"-s 172.16.0.0/24",
+		"-d 172.16.0.0/24",
+		"-o br0",
+		"--ctstate DNAT",
+		"-j MASQUERADE",
+	}
+	for _, want := range wants {
+		if !strings.Contains(got, want) {
+			t.Fatalf("hairpin masquerade spec missing %q: %s", want, got)
+		}
+	}
+}
+
 func TestScopedPortForwardSpec(t *testing.T) {
 	t.Parallel()
 

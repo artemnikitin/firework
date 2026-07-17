@@ -115,6 +115,18 @@ func (m *Manager) SetupPortForward(hostPort int, guestIP string, vmPort int) err
 	if err := ensureIPTablesRule("nat", "PREROUTING", spec...); err != nil {
 		return fmt.Errorf("adding scoped port-forward rule: %w", err)
 	}
+
+	// Hairpin path: co-located guests address peers by this host's IP (the
+	// controller renders cross_node_links as host_ip:host_port regardless of
+	// placement), and that traffic enters via the bridge, not the external
+	// interface. Still scoped to the host IP, so guest-to-peer-host traffic
+	// on the same port is untouched.
+	if m.bridgeName != "" {
+		hairpin := hairpinPortForwardSpec(m.bridgeName, hostIP, hostPort, guestIP, vmPort)
+		if err := ensureIPTablesRule("nat", "PREROUTING", hairpin...); err != nil {
+			return fmt.Errorf("adding hairpin port-forward rule: %w", err)
+		}
+	}
 	return nil
 }
 
@@ -129,6 +141,12 @@ func (m *Manager) TeardownPortForward(hostPort int, guestIP string, vmPort int) 
 		spec := scopedPortForwardSpec(outInterface, hostIP, hostPort, guestIP, vmPort)
 		if err := removeIPTablesRule("nat", "PREROUTING", spec...); err != nil {
 			errs = append(errs, fmt.Errorf("removing scoped port-forward rule: %w", err))
+		}
+		if m.bridgeName != "" {
+			hairpin := hairpinPortForwardSpec(m.bridgeName, hostIP, hostPort, guestIP, vmPort)
+			if err := removeIPTablesRule("nat", "PREROUTING", hairpin...); err != nil {
+				errs = append(errs, fmt.Errorf("removing hairpin port-forward rule: %w", err))
+			}
 		}
 	} else {
 		m.logger.Warn("failed to resolve host ingress context for scoped cleanup, trying legacy rule only",
@@ -150,6 +168,22 @@ func (m *Manager) TeardownPortForward(hostPort int, guestIP string, vmPort int) 
 func scopedPortForwardSpec(outInterface, hostIP string, hostPort int, guestIP string, vmPort int) []string {
 	return []string{
 		"-i", outInterface,
+		"-d", hostIP + "/32",
+		"-p", "tcp",
+		"-m", "tcp",
+		"--dport", fmt.Sprintf("%d", hostPort),
+		"-j", "DNAT",
+		"--to-destination", fmt.Sprintf("%s:%d", guestIP, vmPort),
+	}
+}
+
+// hairpinPortForwardSpec matches guest-originated traffic addressed to this
+// host's own IP (arriving via the shared bridge) and DNATs it like external
+// traffic, so a co-located service is reachable at host_ip:host_port from
+// guests on the same host.
+func hairpinPortForwardSpec(bridgeName, hostIP string, hostPort int, guestIP string, vmPort int) []string {
+	return []string{
+		"-i", bridgeName,
 		"-d", hostIP + "/32",
 		"-p", "tcp",
 		"-m", "tcp",
@@ -417,6 +451,19 @@ func (m *Manager) SetupMasquerade(subnet, outInterface string) error {
 		return fmt.Errorf("setting up masquerade: %w", err)
 	}
 
+	// Hairpin return path: when a guest reaches a co-located guest through the
+	// host's DNATed port forward, the reply must flow back through the host or
+	// the client sees it from the peer's real address and drops the
+	// connection. Masquerade only DNATed guest-to-guest flows leaving via the
+	// bridge; direct guest-to-guest traffic is bridged at L2 and never hits
+	// this chain.
+	if m.bridgeName != "" {
+		if err := ensureIPTablesRule("nat", "POSTROUTING",
+			hairpinMasqueradeSpec(subnet, m.bridgeName)...); err != nil {
+			return fmt.Errorf("setting up hairpin masquerade: %w", err)
+		}
+	}
+
 	// Allow forwarding for the subnet.
 	if err := run("iptables", "-A", "FORWARD",
 		"-s", subnet, "-j", "ACCEPT"); err != nil {
@@ -428,6 +475,18 @@ func (m *Manager) SetupMasquerade(subnet, outInterface string) error {
 	}
 
 	return nil
+}
+
+// hairpinMasqueradeSpec builds the POSTROUTING rule that source-NATs DNATed
+// guest-to-guest hairpin flows so their return path stays symmetric.
+func hairpinMasqueradeSpec(subnet, bridgeName string) []string {
+	return []string{
+		"-s", subnet,
+		"-d", subnet,
+		"-o", bridgeName,
+		"-m", "conntrack", "--ctstate", "DNAT",
+		"-j", "MASQUERADE",
+	}
 }
 
 // deviceExists checks if a network device exists.
