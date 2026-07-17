@@ -129,7 +129,7 @@ Supported fields:
 |---|---|---|
 | `name` | yes | Service name (unique) |
 | `image` | yes | Rootfs path used by runtime |
-| `node_type` | yes | Group key used by enricher output |
+| `node_type` | yes | Group key used by direct enricher output. The control-plane scheduler does not yet enforce it against registry labels; see [issue #21](https://github.com/artemnikitin/firework/issues/21) |
 | `kernel` | no | Kernel path |
 | `vcpus` | no | vCPU count |
 | `memory_mb` | no | Memory in MiB |
@@ -163,21 +163,28 @@ Tenant expansions rewrite links to tenant-prefixed service names automatically.
 
 | Field | Required | Description |
 |---|---|---|
-| `role` | yes | `registry`, `events`, `controller`, or `all` |
+| `role` | no | `registry`, `events`, `controller`, or `all` (default `all`) |
 | `registry_listen_addr` | registry/all | HTTPS bind address for registry APIs |
 | `events_listen_addr` | events/all | HTTPS bind address for GitHub webhook API |
-| `state.backend` | yes | Currently `s3` |
-| `state.prefix` | yes | Prefix for control-plane state objects (for example `cp/v1`) |
-| `state.s3.bucket` | yes | Bucket for control-plane state and rendered configs |
+| `state.backend` | no | `s3` (default) or `gcs` |
+| `state.prefix` | no | Prefix for control-plane state objects (default `cp/v1`) |
+| `state.s3.bucket` | S3 mode | Bucket for control-plane state and rendered configs |
 | `state.s3.region` | no | S3 region |
 | `state.s3.endpoint_url` | no | Custom S3 endpoint (MinIO/LocalStack) |
+| `state.s3.force_path_style` | no | Force path-style S3 requests |
+| `state.gcs.bucket` | GCS mode | Bucket for control-plane state and rendered configs |
+| `state.gcs.project` | no | GCP project containing the state bucket |
+| `state.gcs.credentials_file` | no | Service-account credentials file; omit for Application Default Credentials |
 | `leader_lease_ttl` | controller/all | Controller leadership lease TTL |
 | `leader_renew_interval` | controller/all | Leadership renewal interval |
 | `node_stale_ttl` | controller/all | Freshness threshold for schedulable nodes |
 | `controller_tick` | controller/all | Scheduling/publish loop tick |
 | `target_branch` | events/all | Git branch filter (default `main`) |
 | `config_dir` | no | Optional subdirectory in cloned repo for enrichment input |
-| `github_webhook_secret` | events/all | Validates `X-Hub-Signature-256` |
+| `github_webhook_secret` | events/all | Validates `X-Hub-Signature-256`; mutually exclusive with `github_webhook_secret_file` |
+| `github_webhook_secret_file` | events/all | File containing the GitHub webhook secret; mutually exclusive with `github_webhook_secret` |
+| `reconcile_on_start` | no | Reconcile `git_repo_url` when the events role starts |
+| `git_repo_url` | when `reconcile_on_start` | Git repository used for startup reconciliation |
 | `tls.cert_file` | role with HTTPS | Server TLS cert |
 | `tls.key_file` | role with HTTPS | Server TLS key |
 | `tls.client_ca_file` | registry/all | Client cert CA for node mTLS validation |
@@ -232,8 +239,8 @@ Notes:
 - If the peer node configs cannot be listed, the agent keeps the existing `remote-*.yaml`
   files as last-known-good, still applies local routes, and retries on the next poll. The
   degraded state is exposed as the `firework_agent_remote_route_sync_degraded` gauge.
-- Remote Traefik routing is available when the config store can list peer node configs,
-  such as the S3-backed control-plane flow.
+- Remote Traefik routing is available when the config store can list peer node
+  configs, such as the S3- or GCS-backed control-plane flow.
 - `health_check.target` can be set directly, but enriched configs usually use `port`/`path` and let the agent compose the target from guest IP.
 
 ## 5) CI-Only Fields (Not Used By Firework Runtime)
