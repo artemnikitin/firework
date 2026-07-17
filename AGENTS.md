@@ -17,7 +17,8 @@ Firework is a lightweight pull-based orchestrator for Firecracker microVMs writt
 - `internal/vm`: VM lifecycle.
 - `internal/network`: host networking.
 - `internal/controlplane`: registry/events/controller runtime.
-- `internal/store`: Git and S3 config backends.
+- `internal/store`: Git and object-storage config backends.
+- `internal/objectstorage`: provider-neutral S3/GCS operations.
 - `docs/configs/`: source of truth for config formats.
 - `docs/architecture/`: contains the main design/architecture details on the project.
 - `examples/`: sample agent, control-plane, and node configs.
@@ -27,7 +28,8 @@ Firework is a lightweight pull-based orchestrator for Firecracker microVMs writt
 - Format Go with `gofmt -s` (run `make fmt`).
 - Prefer table-driven tests for multi-case tests.
 - The scheduler and enricher are pure functions — keep them that way.
-- Keep integrations/dependencies (AWS, Git, Firecracker, filesystem, etc) behind interfaces.
+- Keep integrations/dependencies (cloud object storage, Git, Firecracker,
+  filesystem, etc.) behind interfaces.
 - Version/commit/build time are injected via ldflags at build time; never hardcode them.
 - When changing config schemas, CLI behavior, APIs, or user-visible runtime behavior, update `docs/`, `examples/`, and relevant tests.
 
