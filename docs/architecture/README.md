@@ -6,7 +6,7 @@ This document explains how Firework components work together at runtime.
 
 ### `firework-agent` (runs on each node)
 
-- Polls S3 (or Git in direct mode) for desired `nodes/<node>.yaml`.
+- Polls S3 or GCS (or Git in direct mode) for desired `nodes/<node>.yaml`.
 - Reconciles local Firecracker microVMs to match desired state.
 - Manages networking, health checks, image sync, and Traefik dynamic routes.
 - Registers with control plane and sends periodic heartbeat over mTLS.
@@ -21,28 +21,30 @@ Roles:
 - `controller`: leader-elected scheduler/publisher loop.
 - `all`: runs all roles in one process.
 
-All roles use the same S3-backed state layout under `cp/v1/`.
+All roles use the same object-storage-backed state layout under `cp/v1/`.
+The configured backend can be S3 or GCS.
 
-## Control-Plane State Model (S3)
+## Control-Plane State Model (Object Storage)
 
 - `cp/v1/registry/nodes/<node>.json` — node records (state, generation, capacity, last seen).
 - `cp/v1/desired/revisions/<rev>.json` + `cp/v1/desired/current.json`.
 - `cp/v1/placements/revisions/<rev>.json` + `cp/v1/placements/current.json`.
 - `cp/v1/rendered/revisions/<rev>/nodes/<node>.yaml` + `cp/v1/rendered/current.json`.
+- `cp/v1/nodes/<node>.yaml` — current per-node configs polled by agents.
 - `cp/v1/locks/controller.json` — controller leader lease.
 
 The controller writes immutable revisions and flips pointer files atomically.
 
-## Recommended Production Flow (S3 Mode)
+## Recommended Production Flow (Object Storage Mode)
 
 ```mermaid
 flowchart LR
   GH[GitHub config repo] -->|push webhook| EV[events role]
-  EV -->|desired revision| S3[(S3 state)]
+  EV -->|desired revision| STATE[(S3 or GCS state)]
   AGENTS[firework agents] -->|mTLS register/heartbeat| REG[registry role]
-  REG --> S3
-  CTRL[controller role] -->|leader lease + schedule| S3
-  CTRL -->|render nodes/*.yaml| CFG[(S3 config objects)]
+  REG --> STATE
+  CTRL[controller role] -->|leader lease + schedule| STATE
+  CTRL -->|render nodes/*.yaml| CFG[(S3 or GCS config objects)]
   CFG -->|poll| AGENTS
   AGENTS --> FC[Firecracker microVMs]
 ```
@@ -58,7 +60,7 @@ Per poll interval, the agent executes roughly this sequence:
 5. Resolve service links into env vars (same-node service discovery).
 6. Inject env vars into kernel args (`firework.env.KEY=VALUE`).
 7. Optionally enforce capacity guardrails before apply.
-8. Optionally sync images from S3.
+8. Optionally sync images from S3 or GCS.
 9. Plan/apply VM changes (create/update/delete).
 10. Sync Traefik dynamic files.
 11. Send registry heartbeat (capacity + used resources).
@@ -66,14 +68,20 @@ Per poll interval, the agent executes roughly this sequence:
 ## Scheduling and Multi-Node Behavior
 
 - Controller discovers active nodes from registry records (`state=ready`, fresh lease).
-- Existing healthy placements are preserved where possible.
+- Existing placements on active nodes are preserved when capacity and
+  anti-affinity allow.
 - Unplaced services are bin-packed to nodes with available capacity.
 - `anti_affinity_group` is treated as a preference.
+- `node_type` is retained by the enricher for direct per-label output, but the
+  current control-plane scheduler does not enforce it against registry labels;
+  see [issue #21](https://github.com/artemnikitin/firework/issues/21).
 - `cross_node_links` and `node_host_ip_env` are resolved from registry host IPs.
   A cross-node link keeps the legacy bare `host_ip:host_port` value unless its
   optional `protocol` is set, in which case the controller injects a full URL.
-- Agents using a store that can list peer node configs, such as S3, also write remote
-  Traefik configs so any node can proxy routed services scheduled on peer nodes.
+  Links sharing the same env key are comma-joined in spec order.
+- Agents using a store that can list peer node configs, such as S3 or GCS, also
+  write remote Traefik configs so any node can proxy routed services scheduled
+  on peer nodes.
 
 ## Alternative Flow: Direct Git Mode
 
