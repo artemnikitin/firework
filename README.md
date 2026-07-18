@@ -56,6 +56,7 @@ flowchart TB
 - Design decisions and rationale: [`docs/architecture/DESIGN.md`](docs/architecture/DESIGN.md)
 - Configuration reference: [`docs/configs/README.md`](docs/configs/README.md)
 - Deployment visibility: [`docs/deployment-visibility.md`](docs/deployment-visibility.md)
+- `fireworkctl` user guide: [`docs/fireworkctl.md`](docs/fireworkctl.md)
 - Example agent configs: [`examples/`](examples/)
 - Development guide: [`DEVELOPMENT.md`](DEVELOPMENT.md)
 

@@ -66,6 +66,8 @@ actual service state is reported as `unknown` until the agent is upgraded.
 
 ## CLI
 
+For a first-time walkthrough, see the concise [`fireworkctl` user guide](fireworkctl.md).
+
 Run `fireworkctl` without a command, or with `--help`, to list the available
 commands and global options.
 
