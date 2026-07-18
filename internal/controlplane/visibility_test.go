@@ -2,6 +2,8 @@ package controlplane
 
 import (
 	"context"
+	"encoding/json"
+	"strings"
 	"testing"
 	"time"
 
@@ -88,6 +90,35 @@ func TestVisibilityDerivedStates(t *testing.T) {
 	}
 	if detail.DesiredImage != "a.ext4" || detail.DesiredKernel != "vmlinux" || detail.AppliedRevision != "rendered-1" {
 		t.Fatalf("unexpected detail: %#v", detail)
+	}
+	if detail.ServiceObservedAt.IsZero() || !detail.ServiceObservedAt.Equal(now) {
+		t.Fatalf("service observation timestamp = %v, want %v", detail.ServiceObservedAt, now)
+	}
+}
+
+func TestServiceDetailJSONUsesStableFieldNames(t *testing.T) {
+	detail := ServiceDetail{
+		ObservedAt:        time.Date(2026, time.January, 1, 12, 0, 0, 0, time.UTC),
+		ServiceObservedAt: time.Date(2025, time.December, 31, 12, 0, 0, 0, time.UTC),
+		PortForwards: []config.PortForward{{
+			HostPort: 8080,
+			VMPort:   80,
+		}},
+	}
+	payload, err := json.Marshal(detail)
+	if err != nil {
+		t.Fatal(err)
+	}
+	encoded := string(payload)
+	for _, field := range []string{`"observed_at"`, `"service_observed_at"`, `"host_port"`, `"vm_port"`} {
+		if !strings.Contains(encoded, field) {
+			t.Errorf("JSON payload does not contain %s: %s", field, encoded)
+		}
+	}
+	for _, field := range []string{`"HostPort"`, `"VMPort"`} {
+		if strings.Contains(encoded, field) {
+			t.Errorf("JSON payload contains unstable field %s: %s", field, encoded)
+		}
 	}
 }
 

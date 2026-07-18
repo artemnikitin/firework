@@ -108,9 +108,9 @@ type NetworkConfig struct {
 // PortForward maps a host port to a VM port via iptables DNAT.
 type PortForward struct {
 	// HostPort is the port on the host machine.
-	HostPort int `yaml:"host_port"`
+	HostPort int `yaml:"host_port" json:"host_port"`
 	// VMPort is the port inside the guest VM.
-	VMPort int `yaml:"vm_port"`
+	VMPort int `yaml:"vm_port" json:"vm_port"`
 }
 
 // HealthCheckConfig defines how to check if a service is healthy.

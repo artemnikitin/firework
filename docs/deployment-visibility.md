@@ -80,9 +80,12 @@ fireworkctl services --health unhealthy
 fireworkctl service <service-name> --output json
 ```
 
-Commands support `--output table|json`; list commands accept the API filters;
-all commands accept `--watch 5s`. Global configuration flags must precede the
-command:
+Commands support `--output table|json`; list commands accept the documented
+state and health values shown by their subcommand help. All commands accept
+`--watch 5s`. Table watch mode refreshes the terminal; JSON watch mode emits
+one compact JSON object per line without terminal control sequences. Global
+configuration flags must precede the command and support both `--config path`
+and `--config=path` forms:
 
 ```text
 fireworkctl --endpoint https://status.example.com \
@@ -101,6 +104,11 @@ token_file: /path/to/operator-token
 ```
 
 Authentication failures exit with code 3 and unknown resources with code 4.
+
+Service detail JSON exposes `observed_at` for the API snapshot and
+`service_observed_at` for the latest agent service observation. Port-forward
+objects use `host_port` and `vm_port` field names consistently with the rest of
+the API.
 
 ## Web UI
 

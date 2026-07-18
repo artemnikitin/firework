@@ -80,6 +80,7 @@ type ServiceDetail struct {
 	APIVersion string    `json:"api_version"`
 	ObservedAt time.Time `json:"observed_at"`
 	ServiceSummary
+	ServiceObservedAt time.Time            `json:"service_observed_at,omitempty"`
 	DesiredImage      string               `json:"desired_image,omitempty"`
 	DesiredKernel     string               `json:"desired_kernel,omitempty"`
 	DesiredNode       string               `json:"desired_node,omitempty"`
@@ -214,7 +215,8 @@ func (s *VisibilityService) Service(ctx context.Context, name string) (ServiceDe
 	summary := snapshot.serviceSummary(*desired)
 	detail := ServiceDetail{
 		APIVersion: visibilityAPIVersion, ObservedAt: snapshot.now, ServiceSummary: summary,
-		DesiredImage: safeIdentifier(desired.Image), DesiredKernel: safeIdentifier(desired.Kernel),
+		ServiceObservedAt: summary.ObservedAt,
+		DesiredImage:      safeIdentifier(desired.Image), DesiredKernel: safeIdentifier(desired.Kernel),
 		DesiredNode: summary.Node, PortForwards: append([]config.PortForward(nil), desired.PortForwards...),
 		HealthCheck: ServiceHealthDetail{State: summary.Health}, DesiredRevision: snapshot.desired.Revision,
 		RenderedRevision: snapshot.renderedRevision,

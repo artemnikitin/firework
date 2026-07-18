@@ -34,6 +34,12 @@ type apiClient struct {
 	http     *http.Client
 }
 
+var (
+	nodeStates    = []string{"ready", "draining", "down", "stale", "unknown"}
+	serviceStates = []string{"pending", "running", "stopped", "failed", "unknown"}
+	serviceHealth = []string{"healthy", "unhealthy", "unknown", "not_configured"}
+)
+
 type httpStatusError struct {
 	status int
 	body   string
@@ -59,12 +65,16 @@ func main() {
 }
 
 func run(args []string, out io.Writer) error {
-	if len(args) == 0 || (len(args) == 1 && (args[0] == "-h" || args[0] == "--help")) {
+	if len(args) == 0 || globalHelpRequested(args) {
 		printUsage(out)
 		return nil
 	}
-	if len(args) == 1 && args[0] == "--version" {
+	if versionRequested(args) {
 		fmt.Fprintln(out, "fireworkctl", version.String())
+		return nil
+	}
+	if command, ok := subcommandHelp(args); ok {
+		printCommandUsage(out, command)
 		return nil
 	}
 	configPath := configPathFromArgs(args)
@@ -92,26 +102,22 @@ func run(args []string, out io.Writer) error {
 		printUsage(out)
 		return nil
 	}
-	client, err := newAPIClient(cfg)
-	if err != nil {
-		return err
-	}
 	command, commandArgs := remaining[0], remaining[1:]
 	switch command {
 	case "nodes":
-		return runNodes(client, commandArgs, out)
+		return runNodes(cfg, commandArgs, out)
 	case "node":
-		return runNode(client, commandArgs, out)
+		return runNode(cfg, commandArgs, out)
 	case "services":
-		return runServices(client, commandArgs, out)
+		return runServices(cfg, commandArgs, out)
 	case "service":
-		return runService(client, commandArgs, out)
+		return runService(cfg, commandArgs, out)
 	default:
 		return usageError("unknown command " + command)
 	}
 }
 
-func runNodes(client *apiClient, args []string, out io.Writer) error {
+func runNodes(cfg cliConfig, args []string, out io.Writer) error {
 	flags := flag.NewFlagSet("nodes", flag.ContinueOnError)
 	flags.SetOutput(io.Discard)
 	state := flags.String("state", "", "filter by state")
@@ -120,27 +126,41 @@ func runNodes(client *apiClient, args []string, out io.Writer) error {
 	if err := flags.Parse(args); err != nil || flags.NArg() != 0 {
 		return usageError("usage: fireworkctl nodes [--state STATE] [--output table|json] [--watch 5s]")
 	}
-	return poll(out, *watch, func() error {
+	if err := validateFilter("state", *state, nodeStates); err != nil {
+		return err
+	}
+	if err := validateOutput(*output); err != nil {
+		return err
+	}
+	if err := validateWatch(*watch); err != nil {
+		return err
+	}
+	client, err := newAPIClient(cfg)
+	if err != nil {
+		return err
+	}
+	return poll(out, *watch, *output == "table", func() error {
 		var response controlplane.ListEnvelope[controlplane.NodeSummary]
 		if err := client.get(context.Background(), "/v1/nodes?"+url.Values{"state": []string{*state}}.Encode(), &response); err != nil {
 			return err
 		}
 		if *output == "json" {
-			return writeJSON(out, response)
-		}
-		if *output != "table" {
-			return usageError("output must be table or json")
+			return writeOutputJSON(out, response, *watch > 0)
 		}
 		w := tabwriter.NewWriter(out, 0, 4, 2, ' ', 0)
 		fmt.Fprintln(w, "NODE\tSTATE\tLAST SEEN\tSERVICES\tVCPU\tMEMORY")
 		for _, node := range response.Items {
-			fmt.Fprintf(w, "%s\t%s\t%ds ago\t%d/%d\t%d/%d\t%d/%d MB\n", node.NodeID, node.State, node.StatusAgeSeconds, node.RunningServices, node.DesiredServices, node.Allocated.VCPUs, node.Capacity.VCPUs, node.Allocated.MemoryMB, node.Capacity.MemoryMB)
+			lastSeen := formatAge(node.StatusAgeSeconds, node.LastSeenAt.IsZero())
+			if lastSeen != "unknown" {
+				lastSeen += " ago"
+			}
+			fmt.Fprintf(w, "%s\t%s\t%s\t%d/%d\t%d/%d\t%d/%d MB\n", node.NodeID, node.State, lastSeen, node.RunningServices, node.DesiredServices, node.Allocated.VCPUs, node.Capacity.VCPUs, node.Allocated.MemoryMB, node.Capacity.MemoryMB)
 		}
 		return w.Flush()
 	})
 }
 
-func runNode(client *apiClient, args []string, out io.Writer) error {
+func runNode(cfg cliConfig, args []string, out io.Writer) error {
 	flags := flag.NewFlagSet("node", flag.ContinueOnError)
 	flags.SetOutput(io.Discard)
 	output := flags.String("output", "table", "table or json")
@@ -148,31 +168,44 @@ func runNode(client *apiClient, args []string, out io.Writer) error {
 	if err := flags.Parse(reorderDetailArgs(args)); err != nil || flags.NArg() != 1 {
 		return usageError("usage: fireworkctl node <node-id> [--output table|json] [--watch 5s]")
 	}
+	if err := validateOutput(*output); err != nil {
+		return err
+	}
+	if err := validateWatch(*watch); err != nil {
+		return err
+	}
+	client, err := newAPIClient(cfg)
+	if err != nil {
+		return err
+	}
 	id := flags.Arg(0)
-	return poll(out, *watch, func() error {
+	return poll(out, *watch, *output == "table", func() error {
 		var response controlplane.NodeDetail
 		if err := client.get(context.Background(), "/v1/nodes/"+url.PathEscape(id), &response); err != nil {
 			return err
 		}
 		if *output == "json" {
-			return writeJSON(out, response)
-		}
-		if *output != "table" {
-			return usageError("output must be table or json")
+			return writeOutputJSON(out, response, *watch > 0)
 		}
 		w := tabwriter.NewWriter(out, 0, 4, 2, ' ', 0)
-		fmt.Fprintf(w, "NODE\t%s\nSTATE\t%s\nLAST SEEN\t%s\nAGENT\t%s\nREVISION\t%s\nSERVICES\t%d/%d running\nVCPU\t%d/%d allocated\nMEMORY\t%d/%d MB allocated\n", response.NodeID, response.State, response.LastSeenAt.Format(time.RFC3339), valueOrUnknown(response.AgentVersion), valueOrUnknown(response.AppliedRevision), response.RunningServices, response.DesiredServices, response.Allocated.VCPUs, response.Capacity.VCPUs, response.Allocated.MemoryMB, response.Capacity.MemoryMB)
+		fmt.Fprintf(w, "NODE\t%s\nSTATE\t%s\nRECONCILIATION\t%s\nLAST SEEN\t%s\nSTATUS AGE\t%s\nAGENT\t%s\nHOST IP\t%s\nREVISION\t%s\nSERVICES\t%d/%d running\nVCPU\t%d/%d allocated (%d available)\nMEMORY\t%d/%d MB allocated (%d MB available)\nSTATUS MISSING\t%s\nSTATUS STALE\t%s\nREASON\t%s\nMESSAGE\t%s\n", response.NodeID, response.State, valueOrUnknown(response.Reconciliation), formatTime(response.LastSeenAt), formatAge(response.StatusAgeSeconds, response.LastSeenAt.IsZero()), valueOrUnknown(response.AgentVersion), valueOrDash(response.HostIP), valueOrUnknown(response.AppliedRevision), response.RunningServices, response.DesiredServices, response.Allocated.VCPUs, response.Capacity.VCPUs, response.Available.VCPUs, response.Allocated.MemoryMB, response.Capacity.MemoryMB, response.Available.MemoryMB, formatBool(response.StatusMissing), formatBool(response.StatusStale), valueOrDash(response.ReasonCode), valueOrDash(response.Message))
 		if len(response.Services) > 0 {
 			fmt.Fprintln(w, "\nSERVICE\tSTATE\tHEALTH")
 			for _, service := range response.Services {
 				fmt.Fprintf(w, "%s\t%s\t%s\n", service.Name, service.State, service.Health)
 			}
 		}
+		if len(response.Conditions) > 0 {
+			fmt.Fprintln(w, "\nCONDITION\tSTATUS\tREASON\tMESSAGE\tLAST TRANSITION")
+			for _, condition := range response.Conditions {
+				fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\n", condition.Type, condition.Status, valueOrDash(condition.ReasonCode), valueOrDash(condition.Message), formatTime(condition.LastTransitionAt))
+			}
+		}
 		return w.Flush()
 	})
 }
 
-func runServices(client *apiClient, args []string, out io.Writer) error {
+func runServices(cfg cliConfig, args []string, out io.Writer) error {
 	flags := flag.NewFlagSet("services", flag.ContinueOnError)
 	flags.SetOutput(io.Discard)
 	state := flags.String("state", "", "filter by state")
@@ -183,17 +216,30 @@ func runServices(client *apiClient, args []string, out io.Writer) error {
 	if err := flags.Parse(args); err != nil || flags.NArg() != 0 {
 		return usageError("usage: fireworkctl services [--state STATE] [--health HEALTH] [--node NODE] [--output table|json] [--watch 5s]")
 	}
-	return poll(out, *watch, func() error {
+	if err := validateFilter("state", *state, serviceStates); err != nil {
+		return err
+	}
+	if err := validateFilter("health", *health, serviceHealth); err != nil {
+		return err
+	}
+	if err := validateOutput(*output); err != nil {
+		return err
+	}
+	if err := validateWatch(*watch); err != nil {
+		return err
+	}
+	client, err := newAPIClient(cfg)
+	if err != nil {
+		return err
+	}
+	return poll(out, *watch, *output == "table", func() error {
 		query := url.Values{"state": []string{*state}, "health": []string{*health}, "node": []string{*node}}
 		var response controlplane.ListEnvelope[controlplane.ServiceSummary]
 		if err := client.get(context.Background(), "/v1/services?"+query.Encode(), &response); err != nil {
 			return err
 		}
 		if *output == "json" {
-			return writeJSON(out, response)
-		}
-		if *output != "table" {
-			return usageError("output must be table or json")
+			return writeOutputJSON(out, response, *watch > 0)
 		}
 		w := tabwriter.NewWriter(out, 0, 4, 2, ' ', 0)
 		fmt.Fprintln(w, "SERVICE\tNODE\tSTATE\tHEALTH\tVCPU\tMEMORY")
@@ -204,7 +250,7 @@ func runServices(client *apiClient, args []string, out io.Writer) error {
 	})
 }
 
-func runService(client *apiClient, args []string, out io.Writer) error {
+func runService(cfg cliConfig, args []string, out io.Writer) error {
 	flags := flag.NewFlagSet("service", flag.ContinueOnError)
 	flags.SetOutput(io.Discard)
 	output := flags.String("output", "table", "table or json")
@@ -212,20 +258,36 @@ func runService(client *apiClient, args []string, out io.Writer) error {
 	if err := flags.Parse(reorderDetailArgs(args)); err != nil || flags.NArg() != 1 {
 		return usageError("usage: fireworkctl service <service-name> [--output table|json] [--watch 5s]")
 	}
+	if err := validateOutput(*output); err != nil {
+		return err
+	}
+	if err := validateWatch(*watch); err != nil {
+		return err
+	}
+	client, err := newAPIClient(cfg)
+	if err != nil {
+		return err
+	}
 	name := flags.Arg(0)
-	return poll(out, *watch, func() error {
+	return poll(out, *watch, *output == "table", func() error {
 		var response controlplane.ServiceDetail
 		if err := client.get(context.Background(), "/v1/services/"+url.PathEscape(name), &response); err != nil {
 			return err
 		}
 		if *output == "json" {
-			return writeJSON(out, response)
-		}
-		if *output != "table" {
-			return usageError("output must be table or json")
+			return writeOutputJSON(out, response, *watch > 0)
 		}
 		w := tabwriter.NewWriter(out, 0, 4, 2, ' ', 0)
-		fmt.Fprintf(w, "SERVICE\t%s\nNODE\t%s\nSTATE\t%s\nHEALTH\t%s\nVCPU\t%d\nMEMORY\t%d MB\nIMAGE\t%s\nKERNEL\t%s\nPID\t%d\nRESTARTS\t%d\n", response.Name, valueOrDash(response.Node), response.State, response.Health, response.VCPUs, response.MemoryMB, response.DesiredImage, response.DesiredKernel, response.PID, response.RestartCount)
+		fmt.Fprintf(w, "SERVICE\t%s\nNODE\t%s\nDESIRED NODE\t%s\nACTUAL NODE\t%s\nSTATE\t%s\nHEALTH\t%s\nVCPU\t%d\nMEMORY\t%d MB\nIMAGE\t%s\nKERNEL\t%s\nPID\t%d\nRESTARTS\t%d\nSERVICE OBSERVED\t%s\nLAST TRANSITION\t%s\nREASON\t%s\nMESSAGE\t%s\nNETWORK ADDRESS\t%s\nROUTING HOSTNAME\t%s\n", response.Name, valueOrDash(response.Node), valueOrDash(response.DesiredNode), valueOrDash(response.ActualNode), response.State, response.Health, response.VCPUs, response.MemoryMB, valueOrDash(response.DesiredImage), valueOrDash(response.DesiredKernel), response.PID, response.RestartCount, formatTime(response.ServiceObservedAt), formatTime(response.LastTransitionAt), valueOrDash(response.ReasonCode), valueOrDash(response.Message), valueOrDash(response.NetworkAddress), valueOrDash(response.RoutingHostname))
+		hc := response.HealthCheck
+		fmt.Fprintf(w, "HEALTH CHECK\t%s\nHEALTH CHECK STATE\t%s\nHEALTH CHECKED\t%s\nHEALTH FAILURES\t%d\nHEALTH LAST ERROR\t%s\n", valueOrDash(hc.Type), valueOrUnknown(hc.State), formatTime(hc.LastCheckedAt), hc.Failures, valueOrDash(hc.LastError))
+		fmt.Fprintf(w, "DESIRED REVISION\t%s\nPLACEMENT REVISION\t%s\nRENDERED REVISION\t%s\nAPPLIED REVISION\t%s\n", valueOrDash(response.DesiredRevision), valueOrDash(response.PlacementRevision), valueOrDash(response.RenderedRevision), valueOrDash(response.AppliedRevision))
+		if len(response.PortForwards) > 0 {
+			fmt.Fprintln(w, "\nHOST PORT\tVM PORT")
+			for _, port := range response.PortForwards {
+				fmt.Fprintf(w, "%d\t%d\n", port.HostPort, port.VMPort)
+			}
+		}
 		return w.Flush()
 	})
 }
@@ -316,6 +378,9 @@ func configPathFromArgs(args []string) string {
 		if args[i] == "--config" {
 			return args[i+1]
 		}
+		if strings.HasPrefix(args[i], "--config=") {
+			return strings.TrimPrefix(args[i], "--config=")
+		}
 	}
 	return path
 }
@@ -332,7 +397,7 @@ func applyEnv(cfg *cliConfig) {
 	}
 }
 
-func poll(out io.Writer, interval time.Duration, fn func() error) error {
+func poll(out io.Writer, interval time.Duration, clear bool, fn func() error) error {
 	for {
 		if err := fn(); err != nil {
 			return err
@@ -341,7 +406,9 @@ func poll(out io.Writer, interval time.Duration, fn func() error) error {
 			return nil
 		}
 		time.Sleep(interval)
-		fmt.Fprint(out, "\033[H\033[2J")
+		if clear {
+			fmt.Fprint(out, "\033[H\033[2J")
+		}
 	}
 }
 
@@ -349,6 +416,60 @@ func writeJSON(out io.Writer, value any) error {
 	encoder := json.NewEncoder(out)
 	encoder.SetIndent("", "  ")
 	return encoder.Encode(value)
+}
+
+func writeOutputJSON(out io.Writer, value any, stream bool) error {
+	if stream {
+		return json.NewEncoder(out).Encode(value)
+	}
+	return writeJSON(out, value)
+}
+
+func validateOutput(output string) error {
+	if output != "table" && output != "json" {
+		return usageError("output must be table or json")
+	}
+	return nil
+}
+
+func validateWatch(interval time.Duration) error {
+	if interval < 0 {
+		return usageError("watch interval must not be negative")
+	}
+	return nil
+}
+
+func validateFilter(name, value string, allowed []string) error {
+	if value == "" {
+		return nil
+	}
+	for _, candidate := range allowed {
+		if value == candidate {
+			return nil
+		}
+	}
+	return usageError(fmt.Sprintf("%s must be one of: %s", name, strings.Join(allowed, ", ")))
+}
+
+func formatTime(value time.Time) string {
+	if value.IsZero() {
+		return "unknown"
+	}
+	return value.UTC().Format(time.RFC3339)
+}
+
+func formatAge(age int64, missing bool) string {
+	if missing {
+		return "unknown"
+	}
+	return fmt.Sprintf("%ds", age)
+}
+
+func formatBool(value bool) string {
+	if value {
+		return "yes"
+	}
+	return "no"
 }
 
 func valueOrDash(value string) string {
@@ -383,6 +504,86 @@ Global options:
   --version             Print version
   -h, --help            Show this help
 `)
+}
+
+func printCommandUsage(out io.Writer, command string) {
+	usage := map[string]string{
+		"nodes":    "Usage: fireworkctl nodes [--state ready|draining|down|stale|unknown] [--output table|json] [--watch 5s]\n",
+		"node":     "Usage: fireworkctl node <node-id> [--output table|json] [--watch 5s]\n",
+		"services": "Usage: fireworkctl services [--state pending|running|stopped|failed|unknown] [--health healthy|unhealthy|unknown|not_configured] [--node NODE] [--output table|json] [--watch 5s]\n",
+		"service":  "Usage: fireworkctl service <service-name> [--output table|json] [--watch 5s]\n",
+	}
+	if text, ok := usage[command]; ok {
+		fmt.Fprint(out, text)
+		return
+	}
+	printUsage(out)
+}
+
+func globalHelpRequested(args []string) bool {
+	for i := 0; i < len(args); i++ {
+		arg := args[i]
+		if arg == "-h" || arg == "--help" {
+			return true
+		}
+		if isSubcommand(arg) {
+			return false
+		}
+		if isGlobalFlagWithValue(arg) && !strings.Contains(arg, "=") {
+			i++
+		}
+	}
+	return false
+}
+
+func subcommandHelp(args []string) (string, bool) {
+	for i := 0; i < len(args); i++ {
+		arg := args[i]
+		if isGlobalFlagWithValue(arg) && !strings.Contains(arg, "=") {
+			i++
+			continue
+		}
+		if !isSubcommand(arg) {
+			continue
+		}
+		for _, next := range args[i+1:] {
+			if next == "-h" || next == "--help" {
+				return arg, true
+			}
+		}
+		return "", false
+	}
+	return "", false
+}
+
+func isSubcommand(arg string) bool {
+	switch arg {
+	case "nodes", "node", "services", "service":
+		return true
+	default:
+		return false
+	}
+}
+
+func isGlobalFlagWithValue(arg string) bool {
+	if strings.Contains(arg, "=") {
+		arg = strings.SplitN(arg, "=", 2)[0]
+	}
+	switch arg {
+	case "--config", "--endpoint", "--ca-file", "--token-file":
+		return true
+	default:
+		return false
+	}
+}
+
+func versionRequested(args []string) bool {
+	for _, arg := range args {
+		if arg == "--version" {
+			return true
+		}
+	}
+	return false
 }
 
 func usageError(message string) error { return fmt.Errorf("%s", message) }
