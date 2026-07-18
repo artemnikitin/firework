@@ -541,6 +541,46 @@ func TestTick_StatusReportsStableRenderedRevision(t *testing.T) {
 	}
 }
 
+func TestTick_StatusReportsRuntimeAssignedNetworkAddress(t *testing.T) {
+	store := &fakeStore{data: map[string][]byte{"web": []byte("node: web\ndesired_revision: desired-1\nplacement_revision: placement-1\nrendered_revision: rendered-1\nservices:\n- name: service\n  image: /img/service\n  kernel: /kern\n  vcpus: 1\n  memory_mb: 128\n  network: {}\n")}, revision: "provider-token"}
+	cfg := testAgentConfig(t)
+	cfg.VMSubnet = "172.16.0.0/24"
+	cfg.VMGateway = "172.16.0.1/24"
+	a := New(cfg, store, testLogger())
+	a.tick(context.Background())
+	status := a.agentStatusSnapshot()
+	if len(status.Services) != 1 || status.Services[0].NetworkAddress != "172.16.0.2" {
+		t.Fatalf("runtime network address missing from status: %#v", status.Services)
+	}
+}
+
+func TestTick_StatusReportsVMProcessFailureWithoutExitedPID(t *testing.T) {
+	dir := t.TempDir()
+	binary := filepath.Join(dir, "fake-firecracker")
+	if err := os.WriteFile(binary, []byte("#!/bin/sh\nexit 1\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	store := &fakeStore{data: map[string][]byte{"web": []byte("node: web\ndesired_revision: desired-1\nplacement_revision: placement-1\nrendered_revision: rendered-1\nservices:\n- name: service\n  image: /img/service\n  kernel: /kern\n  vcpus: 1\n  memory_mb: 128\n")}, revision: "provider-token"}
+	cfg := testAgentConfig(t)
+	cfg.FirecrackerBin = binary
+	a := New(cfg, store, testLogger())
+	a.tick(context.Background())
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		status := a.agentStatusSnapshot()
+		if len(status.Services) == 1 && status.Services[0].VMState == "failed" {
+			service := status.Services[0]
+			if service.ReasonCode != "vm_failed" || service.Message == "" || service.PID != 0 {
+				t.Fatalf("unexpected VM failure status: %#v", service)
+			}
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("service did not report VM failure: %#v", a.agentStatusSnapshot().Services)
+}
+
 func TestTick_CapacityCheck_ProceedsWhenSufficient(t *testing.T) {
 	nodeYAML := []byte("node: web\nservices:\n- name: light\n  image: /img/light\n  kernel: /kern\n  vcpus: 1\n  memory_mb: 256\n")
 	s := &fakeStore{

@@ -44,6 +44,7 @@ type ServiceStatus struct {
 	Name                string    `json:"name"`
 	VMState             string    `json:"vm_state"`
 	PID                 int       `json:"pid,omitempty"`
+	NetworkAddress      string    `json:"network_address,omitempty"`
 	Health              string    `json:"health"`
 	HealthCheckType     string    `json:"health_check_type,omitempty"`
 	HealthLastCheckedAt time.Time `json:"health_last_checked_at,omitempty"`

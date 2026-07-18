@@ -29,6 +29,18 @@ const formatDate = value => value ? new Date(value).toLocaleString() : '<span cl
 const formatBoolean = value => value ? 'Yes' : 'No';
 const nodeLink = node => node ? `<a href="#node/${encodeURIComponent(node)}">${esc(node)}</a>` : '<span class="muted">—</span>';
 const serviceLink = service => `<a href="#service/${encodeURIComponent(service)}">${esc(service)}</a>`;
+const capacity = (used, total, available, unit = '') => {
+  const numericUsed = Math.max(0, Number(used) || 0);
+  const numericTotal = Math.max(0, Number(total) || 0);
+  const numericAvailable = Math.max(0, Number(available) || 0);
+  const progressMax = Math.max(1, numericTotal);
+  const progressValue = Math.min(numericUsed, progressMax);
+  return `<div class="capacity-value">
+    <span>${esc(numericUsed)}/${esc(numericTotal)}${esc(unit)}</span>
+    <progress max="${esc(progressMax)}" value="${esc(progressValue)}" aria-label="${esc(numericUsed)} of ${esc(numericTotal)}${esc(unit)} allocated"></progress>
+    <span class="muted">${esc(numericAvailable)}${esc(unit)} available</span>
+  </div>`;
+};
 
 async function api(path) {
   const response = await fetch(path, {credentials: 'same-origin'});
@@ -90,8 +102,8 @@ function renderList() {
       <td>${badge(node.state)}</td>
       <td>${node.last_seen_at ? formatDate(node.last_seen_at) : '<span class="muted">Never</span>'}</td>
       <td>${node.running_services}/${node.desired_services}</td>
-      <td>${node.allocated.vcpus}/${node.capacity.vcpus}</td>
-      <td>${node.allocated.memory_mb}/${node.capacity.memory_mb} MB</td>
+      <td>${capacity(node.allocated.vcpus, node.capacity.vcpus, node.available.vcpus)}</td>
+      <td>${capacity(node.allocated.memory_mb, node.capacity.memory_mb, node.available.memory_mb, ' MB')}</td>
     </tr>`);
     content.innerHTML = `<div class="page-heading"><div><p class="eyebrow">Infrastructure</p><h1>Nodes</h1></div><span class="result-count">${items.length} of ${data.length}</span></div>${table(['Node', 'State', 'Last seen', 'Services', 'vCPU', 'Memory'], rows, 'No nodes match the current filters.')}`;
     return;
@@ -154,7 +166,6 @@ function renderOverview(nodes, services) {
 }
 
 function renderNodeDetail(node) {
-  const resource = (used, total, available, unit = '') => `${used}/${total}${unit} allocated <span class="muted">(${available}${unit} available)</span>`;
   const summary = detailTable([
     ['State', badge(node.state)],
     ['Reconciliation', badge(node.reconciliation)],
@@ -163,8 +174,8 @@ function renderNodeDetail(node) {
     ['Host IP', display(node.host_ip)],
     ['Agent version', display(node.agent_version)],
     ['Services', `${node.running_services}/${node.desired_services} running`],
-    ['vCPU', resource(node.allocated.vcpus, node.capacity.vcpus, node.available.vcpus)],
-    ['Memory', resource(node.allocated.memory_mb, node.capacity.memory_mb, node.available.memory_mb, ' MB')],
+    ['vCPU', capacity(node.allocated.vcpus, node.capacity.vcpus, node.available.vcpus)],
+    ['Memory', capacity(node.allocated.memory_mb, node.capacity.memory_mb, node.available.memory_mb, ' MB')],
     ['Registered', formatDate(node.registered_at)],
     ['Updated', formatDate(node.updated_at)],
     ['Status missing', formatBoolean(node.status_missing)],
@@ -211,7 +222,7 @@ function renderServiceDetail(service) {
     ['State', badge(service.state)],
     ['Health', badge(service.health)],
     ['Desired node', nodeLink(service.desired_node)],
-    ['Actual node', nodeLink(service.actual_node || service.node)],
+    ['Actual node', nodeLink(service.actual_node)],
     ['vCPU', display(service.vcpus)],
     ['Memory', `${esc(service.memory_mb)} MB`],
     ['PID', display(service.pid)],
@@ -220,7 +231,7 @@ function renderServiceDetail(service) {
     ['Routing hostname', display(service.routing_hostname)],
     ['Desired image', display(service.desired_image)],
     ['Desired kernel', display(service.desired_kernel)],
-    ['Observed', formatDate(service.observed_at)],
+    ['Observed', formatDate(service.service_observed_at)],
     ['Last transition', formatDate(service.last_transition_at)],
     ['Reason', display(service.reason_code)],
     ['Message', display(service.message)],

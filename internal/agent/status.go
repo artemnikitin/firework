@@ -8,12 +8,25 @@ import (
 	"github.com/artemnikitin/firework/internal/healthcheck"
 	"github.com/artemnikitin/firework/internal/statusmodel"
 	"github.com/artemnikitin/firework/internal/version"
+	"github.com/artemnikitin/firework/internal/vm"
 )
 
 func (a *Agent) setStatusServices(node config.NodeConfig, fallbackRevision string) {
+	services := make([]config.ServiceConfig, len(node.Services))
+	for i := range node.Services {
+		services[i] = node.Services[i]
+		if node.Services[i].Network != nil {
+			network := *node.Services[i].Network
+			services[i].Network = &network
+		}
+		if node.Services[i].HealthCheck != nil {
+			healthCheck := *node.Services[i].HealthCheck
+			services[i].HealthCheck = &healthCheck
+		}
+	}
 	a.statusMu.Lock()
 	defer a.statusMu.Unlock()
-	a.statusServices = append([]config.ServiceConfig(nil), node.Services...)
+	a.statusServices = services
 	a.currentStatus.DesiredRevision = node.DesiredRevision
 	a.currentStatus.PlacementRevision = node.PlacementRevision
 	a.currentStatus.ObservedRevision = node.RenderedRevision
@@ -89,6 +102,9 @@ func (a *Agent) refreshAgentStatus(phase statusmodel.Phase, code, message string
 	ready := 0
 	for _, desired := range a.statusServices {
 		service := statusmodel.ServiceStatus{Name: desired.Name, VMState: "unknown", Health: "unknown"}
+		if desired.Network != nil {
+			service.NetworkAddress = desired.Network.GuestIP
+		}
 		if desired.HealthCheck == nil {
 			service.Health = "not_configured"
 		} else {
@@ -96,9 +112,15 @@ func (a *Agent) refreshAgentStatus(phase statusmodel.Phase, code, message string
 		}
 		if instance := instances[desired.Name]; instance != nil {
 			service.VMState = string(instance.State)
-			service.PID = instance.PID
+			if instance.State == vm.StateRunning {
+				service.PID = instance.PID
+			}
+			if instance.State == vm.StateFailed {
+				service.ReasonCode = "vm_failed"
+				service.Message = statusmodel.BoundedMessage(instance.LastError)
+			}
 		}
-		if result, ok := results[desired.Name]; ok {
+		if result, ok := results[desired.Name]; ok && service.VMState == string(vm.StateRunning) {
 			service.Health = string(result.Status)
 			service.HealthLastCheckedAt = result.LastChecked.UTC()
 			service.HealthFailures = result.Failures

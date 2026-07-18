@@ -133,6 +133,13 @@ thead th { color: #607080; background: #f8fafb; font-size: .72rem; letter-spacin
 tbody tr:last-child > * { border-bottom: 0; }
 tbody tr:hover { background: #fafcfd; }
 
+.capacity-value { display: grid; min-width: 8.5rem; gap: .25rem; }
+.capacity-value > span { font-size: .78rem; white-space: nowrap; }
+.capacity-value progress { width: 100%; height: .45rem; border: 0; border-radius: 1rem; overflow: hidden; background: #e4eaf0; }
+.capacity-value progress::-webkit-progress-bar { border-radius: 1rem; background: #e4eaf0; }
+.capacity-value progress::-webkit-progress-value { border-radius: 1rem; background: #2d7fc1; }
+.capacity-value progress::-moz-progress-bar { border-radius: 1rem; background: #2d7fc1; }
+
 .badge { display: inline-block; padding: .2rem .52rem; border-radius: 1rem; color: #425362; background: #e4eaf0; font-size: .76rem; line-height: 1.25; text-transform: capitalize; white-space: nowrap; }
 .ready, .running, .healthy, .true { color: #12623c; background: #d8f3e5; }
 .failed, .down, .unhealthy, .false { color: #8b1c1c; background: #ffe0e0; }

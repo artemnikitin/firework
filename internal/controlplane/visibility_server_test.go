@@ -5,6 +5,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 )
 
@@ -25,4 +26,20 @@ func TestVisibilityServerAuthentication(t *testing.T) {
 		t.Fatal("valid bearer token was rejected")
 	}
 
+}
+
+func TestVisibilityWebUsesServiceObservationAndCapacityBars(t *testing.T) {
+	data, err := visibilityWeb.ReadFile("web/app.js")
+	if err != nil {
+		t.Fatal(err)
+	}
+	script := string(data)
+	for _, want := range []string{"service.service_observed_at", "<progress", "service.actual_node"} {
+		if !strings.Contains(script, want) {
+			t.Errorf("embedded UI is missing %q", want)
+		}
+	}
+	if strings.Contains(script, "service.actual_node || service.node") {
+		t.Fatal("embedded UI still presents desired placement as the actual node")
+	}
 }

@@ -104,6 +104,7 @@ type visibilitySnapshot struct {
 	desired            DesiredRevision
 	placement          PlacementRevision
 	renderedRevision   string
+	placementCurrent   bool
 	placementByService map[string]placedService
 	nodeByID           map[string]NodeRecord
 }
@@ -235,14 +236,21 @@ func (s *VisibilityService) Service(ctx context.Context, name string) (ServiceDe
 		detail.PlacementRevision = snapshot.placement.Revision
 		record, nodeExists := snapshot.nodeByID[placed.node.Node]
 		if nodeExists {
-			status, fresh := snapshot.freshStatus(record)
-			if fresh {
-				detail.ActualNode = record.NodeID
+			status, current := snapshot.currentStatus(record)
+			if current {
 				detail.AppliedRevision = status.AppliedRevision
 				if actual, ok := findAgentService(status, name); ok {
+					detail.ActualNode = record.NodeID
 					detail.PID = actual.PID
 					detail.RestartCount = actual.RestartCount
-					detail.HealthCheck = ServiceHealthDetail{Type: actual.HealthCheckType, State: actual.Health, LastCheckedAt: actual.HealthLastCheckedAt, Failures: actual.HealthFailures, LastError: actual.Message}
+					if actual.NetworkAddress != "" {
+						detail.NetworkAddress = actual.NetworkAddress
+					}
+					lastHealthError := ""
+					if actual.ReasonCode == "health_check_failed" {
+						lastHealthError = actual.Message
+					}
+					detail.HealthCheck = ServiceHealthDetail{Type: actual.HealthCheckType, State: actual.Health, LastCheckedAt: actual.HealthLastCheckedAt, Failures: actual.HealthFailures, LastError: lastHealthError}
 				}
 			}
 		}
@@ -290,9 +298,12 @@ func (s *VisibilityService) load(ctx context.Context) (visibilitySnapshot, error
 	if exists {
 		snapshot.renderedRevision = rendered.Revision
 	}
-	for _, node := range snapshot.placement.NodeConfigs {
-		for _, service := range node.Services {
-			snapshot.placementByService[service.Name] = placedService{node: node, config: service}
+	snapshot.placementCurrent = snapshot.desired.Revision != "" && snapshot.placement.DesiredRevision == snapshot.desired.Revision
+	if snapshot.placementCurrent {
+		for _, node := range snapshot.placement.NodeConfigs {
+			for _, service := range node.Services {
+				snapshot.placementByService[service.Name] = placedService{node: node, config: service}
+			}
 		}
 	}
 	sort.Slice(snapshot.desired.Services, func(i, j int) bool { return snapshot.desired.Services[i].Name < snapshot.desired.Services[j].Name })
@@ -341,11 +352,15 @@ func (s visibilitySnapshot) nodeSummary(record NodeRecord) NodeSummary {
 		summary.ReasonCode = "node_down"
 	} else if status, fresh := s.freshStatus(record); fresh {
 		summary.AgentVersion = status.AgentVersion
-		summary.ReasonCode = status.ReasonCode
-		for _, service := range status.Services {
-			if service.VMState == "running" {
-				summary.RunningServices++
+		if s.statusMatchesCurrent(status) {
+			summary.ReasonCode = status.ReasonCode
+			for _, service := range status.Services {
+				if service.VMState == "running" {
+					summary.RunningServices++
+				}
 			}
+		} else {
+			summary.ReasonCode = "agent_status_revision_mismatch"
 		}
 	} else if record.AgentStatus == nil {
 		summary.ReasonCode = "agent_status_missing"
@@ -371,8 +386,30 @@ func (s visibilitySnapshot) freshStatus(record NodeRecord) (statusmodel.AgentSta
 	return *record.AgentStatus, true
 }
 
+func (s visibilitySnapshot) currentStatus(record NodeRecord) (statusmodel.AgentStatus, bool) {
+	status, fresh := s.freshStatus(record)
+	if !fresh || !s.statusMatchesCurrent(status) {
+		return statusmodel.AgentStatus{}, false
+	}
+	return status, true
+}
+
+func (s visibilitySnapshot) statusMatchesCurrent(status statusmodel.AgentStatus) bool {
+	if !s.placementCurrent || s.renderedRevision == "" {
+		return false
+	}
+	return status.DesiredRevision == s.desired.Revision &&
+		status.PlacementRevision == s.placement.Revision &&
+		status.ObservedRevision == s.renderedRevision &&
+		status.AppliedRevision == s.renderedRevision
+}
+
 func (s visibilitySnapshot) serviceSummary(desired config.ServiceConfig) ServiceSummary {
-	summary := ServiceSummary{Name: desired.Name, State: "pending", Health: "unknown", VCPUs: desired.VCPUs, MemoryMB: desired.MemoryMB, ReasonCode: "unplaced"}
+	reason := "unplaced"
+	if !s.placementCurrent {
+		reason = "placement_pending"
+	}
+	summary := ServiceSummary{Name: desired.Name, State: "pending", Health: "unknown", VCPUs: desired.VCPUs, MemoryMB: desired.MemoryMB, ReasonCode: reason}
 	placed, ok := s.placementByService[desired.Name]
 	if !ok {
 		return summary
@@ -389,10 +426,12 @@ func (s visibilitySnapshot) serviceSummary(desired config.ServiceConfig) Service
 		summary.ReasonCode = "node_down"
 		return summary
 	}
-	status, fresh := s.freshStatus(record)
-	if !fresh {
+	status, current := s.currentStatus(record)
+	if !current {
 		if record.LastSeenAt.IsZero() || s.now.Sub(record.LastSeenAt) > s.staleTTL {
 			summary.ReasonCode = "node_stale"
+		} else if _, fresh := s.freshStatus(record); fresh {
+			summary.ReasonCode = "agent_status_revision_mismatch"
 		}
 		return summary
 	}

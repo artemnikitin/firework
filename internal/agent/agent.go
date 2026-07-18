@@ -346,6 +346,7 @@ func (a *Agent) tick(ctx context.Context) {
 			// sync and reconcile work. assignNetworking is needed because fetched
 			// node configs do not persist the agent-assigned guest IPs.
 			a.assignNetworking(merged.Services)
+			a.setStatusServices(*merged, rev)
 			if err := a.syncTraefikConfigs(ctx, merged.Services); err != nil {
 				a.logger.Error("traefik route refresh failed", "error", err)
 				a.failAgentStatus("RoutesReady", "route_sync_failed", err.Error())
@@ -375,6 +376,7 @@ func (a *Agent) tick(ctx context.Context) {
 
 	// Assign networking (IPs, MACs, kernel args) to services that need it.
 	a.assignNetworking(merged.Services)
+	a.setStatusServices(*merged, rev)
 
 	// Resolve service links: look up each linked service's guest IP and
 	// inject the composed URL into the dependent service's Env map.

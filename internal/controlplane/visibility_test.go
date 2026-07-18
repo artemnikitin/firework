@@ -33,8 +33,9 @@ func TestVisibilityDerivedStates(t *testing.T) {
 	}}
 	putCurrentState(t, ctx, store, desired, placement, "rendered-1")
 	putNode(t, ctx, store, cfg, NodeRecord{NodeID: "node-1", State: NodeStateReady, Capacity: Resources{VCPUs: 8, MemoryMB: 4096}, LastSeenAt: now, AgentStatus: &statusmodel.AgentStatus{
-		SchemaVersion: 1, AgentVersion: "test", ObservedAt: now, Phase: statusmodel.PhaseFailed, AppliedRevision: "rendered-1", Services: []statusmodel.ServiceStatus{
-			{Name: "a-healthy", VMState: "running", Health: "healthy"},
+		SchemaVersion: 1, AgentVersion: "test", ObservedAt: now, Phase: statusmodel.PhaseFailed,
+		DesiredRevision: "desired-1", PlacementRevision: "placement-1", ObservedRevision: "rendered-1", AppliedRevision: "rendered-1", Services: []statusmodel.ServiceStatus{
+			{Name: "a-healthy", VMState: "running", Health: "healthy", NetworkAddress: "172.16.0.2"},
 			{Name: "b-unhealthy", VMState: "running", Health: "unhealthy", ReasonCode: "health_check_failed"},
 			{Name: "c-failed", VMState: "failed", Health: "not_configured", ReasonCode: "vm_failed"},
 		},
@@ -88,7 +89,7 @@ func TestVisibilityDerivedStates(t *testing.T) {
 	if err != nil || !found {
 		t.Fatalf("service detail found=%v err=%v", found, err)
 	}
-	if detail.DesiredImage != "a.ext4" || detail.DesiredKernel != "vmlinux" || detail.AppliedRevision != "rendered-1" {
+	if detail.DesiredImage != "a.ext4" || detail.DesiredKernel != "vmlinux" || detail.AppliedRevision != "rendered-1" || detail.NetworkAddress != "172.16.0.2" {
 		t.Fatalf("unexpected detail: %#v", detail)
 	}
 	if detail.ServiceObservedAt.IsZero() || !detail.ServiceObservedAt.Equal(now) {
@@ -129,7 +130,7 @@ func TestVisibilityStaleNodeRecovery(t *testing.T) {
 	cfg.NodeStaleTTL = time.Minute
 	now := time.Now().UTC()
 	desired := DesiredRevision{Revision: "d", Services: []config.ServiceConfig{{Name: "service", HealthCheck: &config.HealthCheckConfig{Type: "http"}}}}
-	placement := PlacementRevision{Revision: "p", NodeConfigs: []config.NodeConfig{{Node: "node", Services: desired.Services}}}
+	placement := PlacementRevision{Revision: "p", DesiredRevision: "d", NodeConfigs: []config.NodeConfig{{Node: "node", Services: desired.Services}}}
 	putCurrentState(t, ctx, store, desired, placement, "r")
 	putNode(t, ctx, store, cfg, NodeRecord{NodeID: "node", State: NodeStateReady, LastSeenAt: now.Add(-2 * time.Minute)})
 	service := NewVisibilityService(cfg, store)
@@ -137,10 +138,55 @@ func TestVisibilityStaleNodeRecovery(t *testing.T) {
 	if err != nil || before.Items[0].State != "unknown" {
 		t.Fatalf("before recovery = %#v, err %v", before, err)
 	}
-	putNode(t, ctx, store, cfg, NodeRecord{NodeID: "node", State: NodeStateReady, LastSeenAt: time.Now().UTC(), AgentStatus: &statusmodel.AgentStatus{SchemaVersion: 1, ObservedAt: time.Now().UTC(), Services: []statusmodel.ServiceStatus{{Name: "service", VMState: "running", Health: "healthy"}}}})
+	putNode(t, ctx, store, cfg, NodeRecord{NodeID: "node", State: NodeStateReady, LastSeenAt: time.Now().UTC(), AgentStatus: &statusmodel.AgentStatus{SchemaVersion: 1, ObservedAt: time.Now().UTC(), DesiredRevision: "d", PlacementRevision: "p", ObservedRevision: "r", AppliedRevision: "r", Services: []statusmodel.ServiceStatus{{Name: "service", VMState: "running", Health: "healthy"}}}})
 	after, err := service.Services(ctx, "", "", "")
 	if err != nil || after.Items[0].State != "running" || after.Items[0].Health != "healthy" {
 		t.Fatalf("after recovery = %#v, err %v", after, err)
+	}
+}
+
+func TestVisibilityFailsClosedAcrossRevisionTransitions(t *testing.T) {
+	ctx := context.Background()
+	store := newBlobStateStore(newMemBlob())
+	cfg := validConfigForRole(RoleAPI)
+	cfg.NodeStaleTTL = time.Minute
+	now := time.Now().UTC()
+	desired := DesiredRevision{Revision: "desired-2", Services: []config.ServiceConfig{{Name: "service", VCPUs: 1, MemoryMB: 128}}}
+	oldPlacement := PlacementRevision{Revision: "placement-1", DesiredRevision: "desired-1", NodeConfigs: []config.NodeConfig{{Node: "node", Services: desired.Services}}}
+	putCurrentState(t, ctx, store, desired, oldPlacement, "rendered-1")
+	putNode(t, ctx, store, cfg, NodeRecord{NodeID: "node", State: NodeStateReady, LastSeenAt: now, AgentStatus: &statusmodel.AgentStatus{
+		SchemaVersion: 1, ObservedAt: now, DesiredRevision: "desired-1", PlacementRevision: "placement-1", ObservedRevision: "rendered-1", AppliedRevision: "rendered-1",
+		Services: []statusmodel.ServiceStatus{{Name: "service", VMState: "running", Health: "healthy"}},
+	}})
+
+	service := NewVisibilityService(cfg, store)
+	list, err := service.Services(ctx, "", "", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := list.Items[0]; got.State != "pending" || got.Health != "unknown" || got.Node != "" || got.ReasonCode != "placement_pending" {
+		t.Fatalf("mismatched placement did not fail closed: %#v", got)
+	}
+
+	currentPlacement := PlacementRevision{Revision: "placement-2", DesiredRevision: "desired-2", NodeConfigs: []config.NodeConfig{{Node: "node", Services: desired.Services}}}
+	putCurrentState(t, ctx, store, desired, currentPlacement, "rendered-2")
+	putNode(t, ctx, store, cfg, NodeRecord{NodeID: "node", State: NodeStateReady, LastSeenAt: now, AgentStatus: &statusmodel.AgentStatus{
+		SchemaVersion: 1, ObservedAt: now, DesiredRevision: "desired-2", PlacementRevision: "placement-2", ObservedRevision: "rendered-2", AppliedRevision: "rendered-1",
+		Services: []statusmodel.ServiceStatus{{Name: "service", VMState: "running", Health: "healthy"}},
+	}})
+	list, err = service.Services(ctx, "", "", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := list.Items[0]; got.State != "unknown" || got.Health != "unknown" || got.Node != "node" || got.ReasonCode != "agent_status_revision_mismatch" {
+		t.Fatalf("unapplied agent status did not fail closed: %#v", got)
+	}
+	detail, found, err := service.Service(ctx, "service")
+	if err != nil || !found {
+		t.Fatalf("service detail found=%v err=%v", found, err)
+	}
+	if detail.ActualNode != "" || detail.AppliedRevision != "" || detail.PID != 0 {
+		t.Fatalf("unapplied runtime fields leaked into service detail: %#v", detail)
 	}
 }
 

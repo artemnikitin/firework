@@ -53,17 +53,13 @@ agent-local `/status` endpoint. It reports agent version, observation time,
 desired/placement/rendered/applied revisions, reconciliation phase, typed
 conditions, and fixed-shape service summaries.
 
-Revision states have these meanings:
-
-- `published`: the controller wrote desired, placement, and rendered state;
-- `progressing`: a fresh agent reports `reconciling` or has not yet applied the
-  rendered revision;
-- `converged`: every relevant fresh agent reports the rendered revision as
-  applied;
-- `degraded`: the revision is applied but one or more services are unhealthy;
-- `failed`: a fresh agent reports a bounded reconciliation failure;
-- stale/down nodes are separate lifecycle states and are never inferred to be
-  failed or healthy.
+Agent reconciliation phases are `unknown`, `reconciling`, `ready`, and
+`failed`. Desired service VM/health state is trusted only when the current
+desired and placement revisions match and the reporting agent has both observed
+and applied the current rendered revision. During publication or rollout
+transitions, mismatched data fails closed to `pending` or `unknown` instead of
+presenting an older VM as the current desired service. Stale/down nodes remain
+separate lifecycle states and are never inferred to be failed or healthy.
 
 Older heartbeats without `agent_status` continue to register normally. Their
 actual service state is reported as `unknown` until the agent is upgraded.
@@ -108,7 +104,8 @@ Authentication failures exit with code 3 and unknown resources with code 4.
 Service detail JSON exposes `observed_at` for the API snapshot and
 `service_observed_at` for the latest agent service observation. Port-forward
 objects use `host_port` and `vm_port` field names consistently with the rest of
-the API.
+the API. `network_address` reflects the runtime-assigned guest address only
+when the reporting agent has applied the current rendered revision.
 
 ## Web UI
 
@@ -116,8 +113,9 @@ Open the API origin in a browser and enter the operator token. The server
 derives an HTTP-only, secure, same-site session cookie; the token is not stored
 in local storage or exposed to JavaScript. The default overview groups node and
 service totals by lifecycle state. Each state links to its filtered list, and
-the Nodes and Services views link to fixed-order detail tables. All views
-refresh automatically.
+the Nodes and Services views link to fixed-order detail tables. Node capacity
+is shown with allocated/available values and capacity bars. All views refresh
+automatically.
 
 Rotate access by replacing the operator token secret and restarting the API
 role. Existing browser sessions become invalid because their derived session
