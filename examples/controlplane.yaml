@@ -1,9 +1,12 @@
 # Firework control-plane configuration.
-# Roles: registry | events | controller | all
+# Roles: registry | events | controller | api | all
 role: "all"
 
 registry_listen_addr: ":9443"
 events_listen_addr: ":9444"
+api_listen_addr: ":9445"
+# Use a distinct secret file for the read-only operator API and embedded UI.
+operator_token_file: "/run/secrets/firework/operator_token"
 
 state:
   backend: "s3"

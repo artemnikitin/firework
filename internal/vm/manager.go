@@ -33,6 +33,8 @@ type Instance struct {
 	State State
 	// PID is the Firecracker process ID (0 if not running).
 	PID int
+	// LastError is the bounded-at-publication process failure reported by Wait.
+	LastError string
 	// SocketPath is the path to the Firecracker API socket.
 	SocketPath string
 }
@@ -138,13 +140,15 @@ func (m *Manager) Stop(name string) error {
 		m.mu.Unlock()
 		return fmt.Errorf("service %s not found", name)
 	}
+	pid := inst.PID
+	socketPath := inst.SocketPath
 	m.mu.Unlock()
 
-	m.logger.Info("stopping microVM", "service", name, "pid", inst.PID)
+	m.logger.Info("stopping microVM", "service", name, "pid", pid)
 
-	proc, err := os.FindProcess(inst.PID)
+	proc, err := os.FindProcess(pid)
 	if err != nil {
-		return fmt.Errorf("finding process %d: %w", inst.PID, err)
+		return fmt.Errorf("finding process %d: %w", pid, err)
 	}
 
 	// Send SIGTERM first, giving the VM a chance to shut down.
@@ -155,19 +159,20 @@ func (m *Manager) Stop(name string) error {
 
 	// Wait for the process to actually exit so device handles (TAP, sockets)
 	// are released before a subsequent start.
-	if !waitForPIDExit(inst.PID, 5*time.Second) {
+	if !waitForPIDExit(pid, 5*time.Second) {
 		m.logger.Warn("microVM did not exit after SIGTERM, sending SIGKILL",
-			"service", name, "pid", inst.PID)
+			"service", name, "pid", pid)
 		_ = proc.Signal(syscall.SIGKILL)
-		_ = waitForPIDExit(inst.PID, 2*time.Second)
+		_ = waitForPIDExit(pid, 2*time.Second)
 	}
 
 	m.mu.Lock()
 	inst.State = StateStopped
+	inst.PID = 0
 	m.mu.Unlock()
 
 	// Clean up socket.
-	_ = os.Remove(inst.SocketPath)
+	_ = os.Remove(socketPath)
 
 	m.logger.Info("microVM stopped", "service", name)
 	return nil
@@ -239,10 +244,12 @@ func (m *Manager) monitor(name string, cmd *exec.Cmd, logFile *os.File) {
 		}
 		m.logger.Error("microVM exited with error", "service", name, "error", err)
 		inst.State = StateFailed
+		inst.LastError = err.Error()
 	} else {
 		m.logger.Info("microVM exited cleanly", "service", name)
 		inst.State = StateStopped
 	}
+	inst.PID = 0
 }
 
 func waitForPIDExit(pid int, timeout time.Duration) bool {

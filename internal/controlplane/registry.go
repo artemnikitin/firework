@@ -11,6 +11,8 @@ import (
 	"os"
 	"strings"
 	"time"
+
+	"github.com/artemnikitin/firework/internal/statusmodel"
 )
 
 // RegistryServer serves node enrollment and registry APIs.
@@ -184,8 +186,13 @@ func (s *RegistryServer) handleRegister(w http.ResponseWriter, r *http.Request) 
 			return errStaleGeneration
 		}
 		now := time.Now().UTC()
-		if cur.RegisteredAt.IsZero() || req.Generation > cur.Generation {
+		generationChanged := req.Generation > cur.Generation
+		if cur.RegisteredAt.IsZero() || generationChanged {
 			cur.RegisteredAt = now
+		}
+		if generationChanged {
+			cur.AgentStatus = nil
+			cur.Used = Resources{}
 		}
 		cur.NodeID = req.NodeID
 		cur.Generation = req.Generation
@@ -257,6 +264,9 @@ func (s *RegistryServer) handleHeartbeat(w http.ResponseWriter, r *http.Request)
 		if req.HostIP != "" {
 			cur.HostIP = req.HostIP
 		}
+		if err := applyHeartbeatAgentStatus(cur, req.NodeID, req.AgentStatus); err != nil {
+			return err
+		}
 		cur.LastSeenAt = now
 		cur.UpdatedAt = now
 		return nil
@@ -276,6 +286,32 @@ func (s *RegistryServer) handleHeartbeat(w http.ResponseWriter, r *http.Request)
 		State:      rec.State,
 		LastSeenAt: rec.LastSeenAt,
 	})
+}
+
+func applyHeartbeatAgentStatus(cur *NodeRecord, nodeID string, incoming *statusmodel.AgentStatus) error {
+	if incoming == nil {
+		// Older agents omit agent_status. Clear any value left by a newer
+		// process immediately instead of presenting cached runtime state as
+		// current until its observation timestamp expires.
+		cur.AgentStatus = nil
+		return nil
+	}
+	if incoming.SchemaVersion <= 0 {
+		return fmt.Errorf("agent_status.schema_version is required")
+	}
+	if incoming.NodeID != "" && incoming.NodeID != nodeID {
+		return fmt.Errorf("agent_status.node does not match node_id")
+	}
+	status := *incoming
+	status.Message = statusmodel.BoundedMessage(status.Message)
+	for i := range status.Conditions {
+		status.Conditions[i].Message = statusmodel.BoundedMessage(status.Conditions[i].Message)
+	}
+	for i := range status.Services {
+		status.Services[i].Message = statusmodel.BoundedMessage(status.Services[i].Message)
+	}
+	cur.AgentStatus = &status
+	return nil
 }
 
 func (s *RegistryServer) handleState(w http.ResponseWriter, r *http.Request) {

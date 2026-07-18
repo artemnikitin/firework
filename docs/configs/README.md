@@ -163,9 +163,12 @@ Tenant expansions rewrite links to tenant-prefixed service names automatically.
 
 | Field | Required | Description |
 |---|---|---|
-| `role` | no | `registry`, `events`, `controller`, or `all` (default `all`) |
+| `role` | no | `registry`, `events`, `controller`, `api`, or `all` (default `all`) |
 | `registry_listen_addr` | registry/all | HTTPS bind address for registry APIs |
 | `events_listen_addr` | events/all | HTTPS bind address for GitHub webhook API |
+| `api_listen_addr` | api/all | HTTPS bind address for the read-only operator API and UI |
+| `operator_token` | api/all | Dedicated operator bearer token; mutually exclusive with `operator_token_file` |
+| `operator_token_file` | api/all | File containing the dedicated operator token |
 | `state.backend` | no | `s3` (default) or `gcs` |
 | `state.prefix` | no | Prefix for control-plane state objects (default `cp/v1`) |
 | `state.s3.bucket` | S3 mode | Bucket for control-plane state and rendered configs |
@@ -202,6 +205,9 @@ Agents consume this schema:
 ```yaml
 node: "node-or-instance-id"
 host_ip: "10.0.1.42"   # optional, used for cross-node links and remote Traefik routing
+desired_revision: "desired-..."       # control-plane generated
+placement_revision: "placement-..."   # control-plane generated
+rendered_revision: "rendered-..."     # control-plane generated
 services:
   - name: "svc-a"
     image: "/var/lib/images/svc-a-rootfs.ext4"
@@ -218,6 +224,8 @@ Notes:
   the service — either `metadata.subdomain` or `metadata.host`. Local routes proxy to the
   VM guest IP; remote routes proxy to the peer node's `host_ip` and the first
   `port_forwards[].host_port`.
+- revision fields are emitted by the controller and let registry-enabled agents
+  acknowledge a stable rendered revision. Direct-Git configs may omit them.
 - `metadata.subdomain` is the portable, deployment-neutral form: it is exactly one DNS
   label and the agent forms the final hostname as `<subdomain>.<ingress_domain>`. It
   requires the agent's `ingress_domain` to be set and `traefik_config_dir` to be enabled;

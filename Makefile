@@ -1,6 +1,7 @@
 AGENT_BINARY := firework-agent
 CONTROLPLANE_BINARY := firework-controlplane
 CONFIGCHECK_BINARY := configcheck
+FIREWORKCTL_BINARY := fireworkctl
 FC_INIT_BINARY := fc-init
 AGENT_LINUX_AMD64_BINARY := firework-agent-linux-amd64
 AGENT_LINUX_ARM64_BINARY := firework-agent-linux-arm64
@@ -8,6 +9,10 @@ CONTROLPLANE_LINUX_AMD64_BINARY := firework-controlplane-linux-amd64
 CONTROLPLANE_LINUX_ARM64_BINARY := firework-controlplane-linux-arm64
 FC_INIT_LINUX_AMD64_BINARY := fc-init-linux-amd64
 FC_INIT_LINUX_ARM64_BINARY := fc-init-linux-arm64
+FIREWORKCTL_LINUX_AMD64_BINARY := fireworkctl-linux-amd64
+FIREWORKCTL_LINUX_ARM64_BINARY := fireworkctl-linux-arm64
+FIREWORKCTL_DARWIN_AMD64_BINARY := fireworkctl-darwin-amd64
+FIREWORKCTL_DARWIN_ARM64_BINARY := fireworkctl-darwin-arm64
 CONTROLPLANE_IMAGE ?= ghcr.io/artemnikitin/firework-controlplane
 IMAGE_TAG ?= dev
 CONTROLPLANE_PLATFORMS ?= linux/amd64,linux/arm64
@@ -21,11 +26,11 @@ LDFLAGS   := -s -w \
 	-X '$(MODULE)/internal/version.Commit=$(COMMIT)' \
 	-X '$(MODULE)/internal/version.BuildTime=$(BUILD_TIME)'
 
-.PHONY: all build-all build-agent build-controlplane build-configcheck build-fc-init build-linux-amd64 build-linux-arm64 clean test test-verbose test-race lint vet fmt tidy run smoke-local docker-build-controlplane-image docker-push-controlplane-image push-controlplane-image install help
+.PHONY: all build-all build-agent build-controlplane build-configcheck build-fireworkctl build-fireworkctl-release build-fc-init build-linux-amd64 build-linux-arm64 clean test test-verbose test-race lint vet fmt tidy run smoke-local docker-build-controlplane-image docker-push-controlplane-image push-controlplane-image install help
 
 all: build-all ## Alias for build-all
 
-build-all: build-agent build-controlplane build-configcheck build-linux-amd64 build-linux-arm64 ## Build all binaries for native + linux amd64/arm64
+build-all: build-agent build-controlplane build-configcheck build-fireworkctl build-linux-amd64 build-linux-arm64 ## Build all binaries for native + linux amd64/arm64
 
 build-agent: ## Build the agent binary
 	@mkdir -p $(BUILD_DIR)
@@ -42,6 +47,19 @@ build-configcheck: ## Build the GitOps config validator binary
 	go build -ldflags "$(LDFLAGS)" -o $(BUILD_DIR)/$(CONFIGCHECK_BINARY) ./cmd/configcheck/
 	@echo "Built $(BUILD_DIR)/$(CONFIGCHECK_BINARY)"
 
+build-fireworkctl: ## Build the operator CLI for the current platform
+	@mkdir -p $(BUILD_DIR)
+	go build -ldflags "$(LDFLAGS)" -o $(BUILD_DIR)/$(FIREWORKCTL_BINARY) ./cmd/fireworkctl/
+	@echo "Built $(BUILD_DIR)/$(FIREWORKCTL_BINARY)"
+
+build-fireworkctl-release: ## Build CLI releases for Linux/macOS on amd64/arm64
+	@mkdir -p $(BUILD_DIR)
+	GOOS=linux GOARCH=amd64 go build -ldflags "$(LDFLAGS)" -o $(BUILD_DIR)/$(FIREWORKCTL_LINUX_AMD64_BINARY) ./cmd/fireworkctl/
+	GOOS=linux GOARCH=arm64 go build -ldflags "$(LDFLAGS)" -o $(BUILD_DIR)/$(FIREWORKCTL_LINUX_ARM64_BINARY) ./cmd/fireworkctl/
+	GOOS=darwin GOARCH=amd64 go build -ldflags "$(LDFLAGS)" -o $(BUILD_DIR)/$(FIREWORKCTL_DARWIN_AMD64_BINARY) ./cmd/fireworkctl/
+	GOOS=darwin GOARCH=arm64 go build -ldflags "$(LDFLAGS)" -o $(BUILD_DIR)/$(FIREWORKCTL_DARWIN_ARM64_BINARY) ./cmd/fireworkctl/
+	@echo "Built fireworkctl releases for Linux and macOS (amd64/arm64)"
+
 build-fc-init: ## Build fc-init guest init binary (linux/arm64, static) + compatibility alias
 	@mkdir -p $(BUILD_DIR)
 	GOOS=linux GOARCH=arm64 CGO_ENABLED=0 go build -ldflags "-s -w" -o $(BUILD_DIR)/$(FC_INIT_LINUX_ARM64_BINARY) ./cmd/fc-init/
@@ -52,6 +70,7 @@ build-linux-amd64: ## Build all binaries for linux/amd64
 	@mkdir -p $(BUILD_DIR)
 	GOOS=linux GOARCH=amd64 go build -ldflags "$(LDFLAGS)" -o $(BUILD_DIR)/$(AGENT_LINUX_AMD64_BINARY) ./cmd/agent/
 	GOOS=linux GOARCH=amd64 go build -ldflags "$(LDFLAGS)" -o $(BUILD_DIR)/$(CONTROLPLANE_LINUX_AMD64_BINARY) ./cmd/controlplane/
+	GOOS=linux GOARCH=amd64 go build -ldflags "$(LDFLAGS)" -o $(BUILD_DIR)/$(FIREWORKCTL_LINUX_AMD64_BINARY) ./cmd/fireworkctl/
 	GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -ldflags "-s -w" -o $(BUILD_DIR)/$(FC_INIT_LINUX_AMD64_BINARY) ./cmd/fc-init/
 	@echo "Built $(BUILD_DIR)/$(AGENT_LINUX_AMD64_BINARY), $(BUILD_DIR)/$(CONTROLPLANE_LINUX_AMD64_BINARY) and $(BUILD_DIR)/$(FC_INIT_LINUX_AMD64_BINARY)"
 
@@ -59,6 +78,7 @@ build-linux-arm64: build-fc-init ## Build all binaries for linux/arm64 (for Pack
 	@mkdir -p $(BUILD_DIR)
 	GOOS=linux GOARCH=arm64 go build -ldflags "$(LDFLAGS)" -o $(BUILD_DIR)/$(AGENT_LINUX_ARM64_BINARY) ./cmd/agent/
 	GOOS=linux GOARCH=arm64 go build -ldflags "$(LDFLAGS)" -o $(BUILD_DIR)/$(CONTROLPLANE_LINUX_ARM64_BINARY) ./cmd/controlplane/
+	GOOS=linux GOARCH=arm64 go build -ldflags "$(LDFLAGS)" -o $(BUILD_DIR)/$(FIREWORKCTL_LINUX_ARM64_BINARY) ./cmd/fireworkctl/
 	@echo "Built $(BUILD_DIR)/$(AGENT_LINUX_ARM64_BINARY), $(BUILD_DIR)/$(CONTROLPLANE_LINUX_ARM64_BINARY) and $(BUILD_DIR)/$(FC_INIT_LINUX_ARM64_BINARY)"
 
 clean: ## Remove build artifacts
@@ -116,9 +136,9 @@ docker-push-controlplane-image: ## Build and push multi-arch control-plane image
 push-controlplane-image: ## Push image via helper script (requires image tag vars)
 	./scripts/push-controlplane-image.sh "$(CONTROLPLANE_IMAGE):$(IMAGE_TAG)"
 
-install: build-agent ## Install the binary to $GOPATH/bin
-	cp $(BUILD_DIR)/$(AGENT_BINARY) $(shell go env GOPATH)/bin/$(AGENT_BINARY)
-	@echo "Installed to $(shell go env GOPATH)/bin/$(AGENT_BINARY)"
+install: build-fireworkctl ## Install fireworkctl to $GOPATH/bin
+	cp $(BUILD_DIR)/$(FIREWORKCTL_BINARY) $(shell go env GOPATH)/bin/$(FIREWORKCTL_BINARY)
+	@echo "Installed to $(shell go env GOPATH)/bin/$(FIREWORKCTL_BINARY)"
 
 help: ## Show this help
 	@grep -E '^[a-zA-Z0-9_-]+:.*?## .*$$' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-15s\033[0m %s\n", $$1, $$2}'

@@ -25,6 +25,7 @@ import (
 
 	"github.com/artemnikitin/firework/internal/capacity"
 	"github.com/artemnikitin/firework/internal/config"
+	"github.com/artemnikitin/firework/internal/statusmodel"
 )
 
 type registryClient struct {
@@ -48,7 +49,7 @@ func newRegistryClient(cfg config.AgentConfig, logger *slog.Logger, generation i
 	}
 }
 
-func (c *registryClient) sync(ctx context.Context, nodeID string, labels []string, cap, used capacity.NodeCapacity) {
+func (c *registryClient) sync(ctx context.Context, nodeID string, labels []string, cap, used capacity.NodeCapacity, status *statusmodel.AgentStatus) {
 	if err := c.ensureCertificate(ctx, nodeID); err != nil {
 		c.logger.Warn("registry certificate setup failed", "error", err)
 		return
@@ -60,7 +61,7 @@ func (c *registryClient) sync(ctx context.Context, nodeID string, labels []strin
 		}
 		c.setRegistered(true)
 	}
-	if err := c.heartbeat(ctx, nodeID, cap, used); err != nil {
+	if err := c.heartbeat(ctx, nodeID, cap, used, status); err != nil {
 		c.logger.Warn("registry heartbeat failed", "error", err)
 		c.setRegistered(false)
 	}
@@ -76,11 +77,12 @@ type registerRequest struct {
 }
 
 type heartbeatRequest struct {
-	NodeID     string     `json:"node_id"`
-	Generation int64      `json:"generation"`
-	Capacity   capPayload `json:"capacity"`
-	Used       capPayload `json:"used"`
-	HostIP     string     `json:"host_ip,omitempty"`
+	NodeID      string                   `json:"node_id"`
+	Generation  int64                    `json:"generation"`
+	Capacity    capPayload               `json:"capacity"`
+	Used        capPayload               `json:"used"`
+	HostIP      string                   `json:"host_ip,omitempty"`
+	AgentStatus *statusmodel.AgentStatus `json:"agent_status,omitempty"`
 }
 
 type capPayload struct {
@@ -122,7 +124,7 @@ func (c *registryClient) register(ctx context.Context, nodeID string, labels []s
 	return c.postMTLS(ctx, "/v1/nodes/register", req, nil)
 }
 
-func (c *registryClient) heartbeat(ctx context.Context, nodeID string, cap, used capacity.NodeCapacity) error {
+func (c *registryClient) heartbeat(ctx context.Context, nodeID string, cap, used capacity.NodeCapacity, status *statusmodel.AgentStatus) error {
 	req := heartbeatRequest{
 		NodeID:     nodeID,
 		Generation: c.generation,
@@ -134,7 +136,8 @@ func (c *registryClient) heartbeat(ctx context.Context, nodeID string, cap, used
 			VCPUs:    used.VCPUs,
 			MemoryMB: used.MemoryMB,
 		},
-		HostIP: c.hostIP,
+		HostIP:      c.hostIP,
+		AgentStatus: status,
 	}
 	return c.postMTLS(ctx, "/v1/nodes/heartbeat", req, nil)
 }

@@ -203,8 +203,15 @@ func (c *Controller) runReconcile(ctx context.Context) {
 	nodeConfigs := scheduler.BuildNodeConfigs(assignments)
 	applyHostIPAndCrossNodeLinks(nodeConfigs, hostIPByNode)
 
+	renderRev := newRevision("rendered")
+	placementID := newRevision("placement")
+	for i := range nodeConfigs {
+		nodeConfigs[i].DesiredRevision = desired.Revision
+		nodeConfigs[i].PlacementRevision = placementID
+		nodeConfigs[i].RenderedRevision = renderRev
+	}
 	placementRev := PlacementRevision{
-		Revision:        newRevision("placement"),
+		Revision:        placementID,
 		DesiredRevision: desired.Revision,
 		LeaderEpoch:     c.epoch,
 		CreatedAt:       time.Now().UTC(),
@@ -215,7 +222,6 @@ func (c *Controller) runReconcile(ctx context.Context) {
 		return
 	}
 
-	renderRev := newRevision("rendered")
 	if err := c.publishRendered(ctx, renderRev, nodeConfigs); err != nil {
 		c.logger.Error("publishing rendered configs failed", "error", err)
 		return

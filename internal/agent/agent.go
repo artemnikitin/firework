@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/binary"
+	"encoding/json"
 	"fmt"
 	"log/slog"
 	"net"
@@ -20,6 +21,7 @@ import (
 	"github.com/artemnikitin/firework/internal/ingress"
 	"github.com/artemnikitin/firework/internal/network"
 	"github.com/artemnikitin/firework/internal/reconciler"
+	"github.com/artemnikitin/firework/internal/statusmodel"
 	"github.com/artemnikitin/firework/internal/store"
 	"github.com/artemnikitin/firework/internal/traefik"
 	"github.com/artemnikitin/firework/internal/vm"
@@ -63,12 +65,18 @@ type Agent struct {
 	heartbeatCap   capacity.NodeCapacity
 	heartbeatUsed  capacity.NodeCapacity
 	heartbeatReady bool // true once capacity has been read at least once
+
+	statusMu       sync.RWMutex
+	currentStatus  statusmodel.AgentStatus
+	statusServices []config.ServiceConfig
+	restartCounts  map[string]int
 }
 
 // New creates a new Agent with all its dependencies.
 func New(cfg config.AgentConfig, s store.Store, logger *slog.Logger) *Agent {
 	vmMgr := vm.NewManager(cfg.FirecrackerBin, cfg.StateDir, logger)
 	metrics := newRuntimeMetrics(cfg.NodeName)
+	var agentRef *Agent
 
 	// Set up optional health check monitor.
 	var healthMon *healthcheck.Monitor
@@ -79,6 +87,9 @@ func New(cfg config.AgentConfig, s store.Store, logger *slog.Logger) *Agent {
 				return nil
 			}
 			metrics.recordServiceRestart(name, tenantForService(inst.Config))
+			if agentRef != nil {
+				agentRef.recordRestart(name)
+			}
 			if err := vmMgr.Stop(name); err != nil {
 				logger.Warn("failed to stop service during health restart", "service", name, "error", err)
 			}
@@ -155,7 +166,15 @@ func New(cfg config.AgentConfig, s store.Store, logger *slog.Logger) *Agent {
 		metrics:        metrics,
 		capacityReader: capReader,
 		traefikMgr:     traefikMgr,
+		restartCounts:  make(map[string]int),
+		currentStatus: statusmodel.AgentStatus{
+			SchemaVersion: statusmodel.SchemaVersion,
+			NodeID:        cfg.NodeID,
+			ObservedAt:    time.Now().UTC(),
+			Phase:         statusmodel.PhaseUnknown,
+		},
 	}
+	agentRef = a
 	if cfg.RegistryURL != "" {
 		a.registryClient = newRegistryClient(cfg, logger, time.Now().UTC().UnixNano())
 	}
@@ -276,6 +295,7 @@ func (a *Agent) shutdown() {
 // tick performs a single reconciliation cycle.
 func (a *Agent) tick(ctx context.Context) {
 	a.logger.Debug("reconciliation tick starting")
+	a.refreshAgentStatus(statusmodel.PhaseReconciling, "", "")
 
 	var (
 		nodeCap capacity.NodeCapacity
@@ -296,6 +316,7 @@ func (a *Agent) tick(ctx context.Context) {
 	// Fetch and merge configs from all node labels.
 	merged := a.fetchAndMerge(ctx)
 	if merged == nil {
+		a.failAgentStatus("ConfigFetched", "config_fetch_failed", "all config fetches failed")
 		// No local config, but still sync Traefik with remote nodes so that
 		// this node can proxy requests for services placed on peer nodes.
 		if err := a.syncTraefikConfigs(ctx, nil); err != nil {
@@ -315,20 +336,31 @@ func (a *Agent) tick(ctx context.Context) {
 		rev, err = a.store.Revision(ctx)
 		if err != nil {
 			a.logger.Error("failed to get store revision", "error", err)
-		} else if rev != "" && rev == a.lastRevision {
+		}
+		a.setStatusServices(*merged, rev)
+		a.setStatusCondition("ConfigFetched", statusmodel.ConditionTrue, "", "")
+		if rev != "" && rev == a.lastRevision {
 			// A local revision does not describe the peer node configs used for
 			// remote Traefik routes. Refresh routes on every poll even when the
 			// local VM configuration is unchanged, but avoid the expensive image
 			// sync and reconcile work. assignNetworking is needed because fetched
 			// node configs do not persist the agent-assigned guest IPs.
 			a.assignNetworking(merged.Services)
+			a.setStatusServices(*merged, rev)
 			if err := a.syncTraefikConfigs(ctx, merged.Services); err != nil {
 				a.logger.Error("traefik route refresh failed", "error", err)
+				a.failAgentStatus("RoutesReady", "route_sync_failed", err.Error())
+			} else {
+				a.setStatusCondition("RoutesReady", statusmodel.ConditionTrue, "", "")
+				a.refreshAgentStatus(statusmodel.PhaseReady, "", "")
 			}
 			a.logger.Debug("config unchanged, skipped reconciliation after route refresh", "revision", rev)
 			a.refreshRuntimeMetrics()
 			return
 		}
+	} else {
+		a.setStatusServices(*merged, "")
+		a.setStatusCondition("ConfigFetched", statusmodel.ConditionTrue, "", "")
 	}
 
 	// Preflight routing metadata before any reconciliation so an invalid
@@ -336,12 +368,15 @@ func (a *Agent) tick(ctx context.Context) {
 	// instead of being recorded as applied.
 	if err := a.preflightRouting(merged.Services); err != nil {
 		a.logger.Error("routing preflight failed; not advancing revision", "error", err)
+		a.failAgentStatus("NetworkReady", "routing_preflight_failed", err.Error())
 		a.syncRegistry(ctx, nodeCap, capacity.NodeCapacity{})
 		return
 	}
+	a.setStatusCondition("NetworkReady", statusmodel.ConditionTrue, "", "")
 
 	// Assign networking (IPs, MACs, kernel args) to services that need it.
 	a.assignNetworking(merged.Services)
+	a.setStatusServices(*merged, rev)
 
 	// Resolve service links: look up each linked service's guest IP and
 	// inject the composed URL into the dependent service's Env map.
@@ -360,6 +395,7 @@ func (a *Agent) tick(ctx context.Context) {
 		a.setHeartbeatResources(nodeCap, used)
 	}
 	if !a.checkCapacity(nodeCap, used, hasCap) {
+		a.failAgentStatus("Reconciled", "capacity_exceeded", "desired services exceed node capacity")
 		a.syncRegistry(ctx, nodeCap, used)
 		return
 	}
@@ -371,9 +407,13 @@ func (a *Agent) tick(ctx context.Context) {
 		a.metrics.observeImageSync(time.Since(syncStart), err != nil)
 		if err != nil {
 			a.logger.Error("image sync failed", "error", err)
+			a.failAgentStatus("ImagesReady", "image_sync_failed", err.Error())
 			a.syncRegistry(ctx, nodeCap, used)
 			return
 		}
+		a.setStatusCondition("ImagesReady", statusmodel.ConditionTrue, "", "")
+	} else {
+		a.setStatusCondition("ImagesReady", statusmodel.ConditionTrue, "not_configured", "")
 	}
 
 	// Reconcile desired vs actual state.
@@ -382,9 +422,11 @@ func (a *Agent) tick(ctx context.Context) {
 	a.metrics.observeReconcile(time.Since(reconcileStart), err != nil)
 	if err != nil {
 		a.logger.Error("reconciliation failed", "error", err)
+		a.failAgentStatus("Reconciled", "reconcile_failed", err.Error())
 		a.syncRegistry(ctx, nodeCap, used)
 		return
 	}
+	a.setStatusCondition("Reconciled", statusmodel.ConditionTrue, "", "")
 
 	// Sync Traefik dynamic config files with desired services. An error here
 	// means the local routes were not applied and must not advance the
@@ -393,9 +435,11 @@ func (a *Agent) tick(ctx context.Context) {
 	// failures degrade inside syncTraefikConfigs without surfacing here.)
 	if err := a.syncTraefikConfigs(ctx, merged.Services); err != nil {
 		a.logger.Error("traefik route sync failed; not advancing revision", "error", err)
+		a.failAgentStatus("RoutesReady", "route_sync_failed", err.Error())
 		a.syncRegistry(ctx, nodeCap, used)
 		return
 	}
+	a.setStatusCondition("RoutesReady", statusmodel.ConditionTrue, "", "")
 
 	// Update the last known revision on success.
 	if rev != "" {
@@ -407,6 +451,7 @@ func (a *Agent) tick(ctx context.Context) {
 	}
 	a.metrics.recordConfigApply(appliedRevision, time.Now())
 	a.refreshRuntimeMetrics()
+	a.markAgentStatusApplied(appliedRevision)
 	a.syncRegistry(ctx, nodeCap, used)
 
 	a.logger.Debug("reconciliation tick completed", "revision", rev)
@@ -417,6 +462,7 @@ func (a *Agent) tick(ctx context.Context) {
 func (a *Agent) fetchAndMerge(ctx context.Context) *config.NodeConfig {
 	seen := make(map[string]config.ServiceConfig)
 	var fetchedAny bool
+	var desiredRevision, placementRevision, renderedRevision string
 
 	for _, name := range a.cfg.NodeNames {
 		data, err := a.store.Fetch(ctx, name)
@@ -438,6 +484,9 @@ func (a *Agent) fetchAndMerge(ctx context.Context) *config.NodeConfig {
 		}
 
 		fetchedAny = true
+		desiredRevision = mergeRevisionMetadata(desiredRevision, nc.DesiredRevision)
+		placementRevision = mergeRevisionMetadata(placementRevision, nc.PlacementRevision)
+		renderedRevision = mergeRevisionMetadata(renderedRevision, nc.RenderedRevision)
 		for _, svc := range nc.Services {
 			if _, dup := seen[svc.Name]; dup {
 				a.logger.Warn("duplicate service across labels, last wins",
@@ -462,9 +511,36 @@ func (a *Agent) fetchAndMerge(ctx context.Context) *config.NodeConfig {
 	})
 
 	return &config.NodeConfig{
-		Node:     a.cfg.NodeName,
-		Services: services,
+		Node:              a.cfg.NodeName,
+		Services:          services,
+		DesiredRevision:   usableRevisionMetadata(desiredRevision),
+		PlacementRevision: usableRevisionMetadata(placementRevision),
+		RenderedRevision:  usableRevisionMetadata(renderedRevision),
 	}
+}
+
+const revisionMetadataConflict = "\x00"
+
+func mergeRevisionMetadata(current, next string) string {
+	if current == revisionMetadataConflict {
+		return current
+	}
+	if current == "" {
+		return next
+	}
+	if next == "" || current == next {
+		return current
+	}
+	// Multiple label configs with different control-plane revisions do not
+	// describe one converged snapshot. Clear the value instead of guessing.
+	return revisionMetadataConflict
+}
+
+func usableRevisionMetadata(revision string) string {
+	if revision == revisionMetadataConflict {
+		return ""
+	}
+	return revision
 }
 
 // assignNetworking fills in IP, MAC, and kernel IP boot args for services
@@ -798,36 +874,13 @@ func insertKernelArg(kernelArgs, arg string) string {
 // Status returns a summary of the agent's current state.
 // Implements api.StatusProvider.
 func (a *Agent) Status() map[string]any {
-	instances := a.vmManager.List()
-	services := make([]map[string]any, 0, len(instances))
-
-	for _, inst := range instances {
-		svcInfo := map[string]any{
-			"name":  inst.Name,
-			"state": inst.State,
-			"pid":   inst.PID,
-		}
-
-		// Attach health status if available.
-		if a.healthMon != nil {
-			if result, ok := a.healthMon.GetResult(inst.Name); ok {
-				svcInfo["health"] = map[string]any{
-					"status":       result.Status,
-					"last_checked": result.LastChecked,
-					"failures":     result.Failures,
-					"last_error":   result.LastError,
-				}
-			}
-		}
-
-		services = append(services, svcInfo)
-	}
-
-	return map[string]any{
-		"node":          a.cfg.NodeName,
-		"last_revision": a.lastRevision,
-		"services":      services,
-	}
+	snapshot := a.agentStatusSnapshot()
+	data, _ := json.Marshal(snapshot)
+	var out map[string]any
+	_ = json.Unmarshal(data, &out)
+	// Preserve the legacy field during the status schema transition.
+	out["last_revision"] = snapshot.AppliedRevision
+	return out
 }
 
 // MetricsText returns the Prometheus text exposition for agent runtime metrics.
@@ -847,7 +900,8 @@ func (a *Agent) syncRegistry(ctx context.Context, cap, used capacity.NodeCapacit
 	if a.registryClient == nil {
 		return
 	}
-	a.registryClient.sync(ctx, a.cfg.NodeID, a.cfg.NodeNames, cap, used)
+	status := a.agentStatusSnapshot()
+	a.registryClient.sync(ctx, a.cfg.NodeID, a.cfg.NodeNames, cap, used, &status)
 }
 
 // healthAdapter wraps healthcheck.Monitor to satisfy api.HealthResultsProvider.
@@ -863,7 +917,7 @@ func (h *healthAdapter) Results() map[string]any {
 			"status":       v.Status,
 			"last_checked": v.LastChecked,
 			"failures":     v.Failures,
-			"last_error":   v.LastError,
+			"last_error":   statusmodel.BoundedMessage(v.LastError),
 		}
 	}
 	return out

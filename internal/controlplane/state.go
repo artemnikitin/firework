@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/artemnikitin/firework/internal/config"
+	"github.com/artemnikitin/firework/internal/statusmodel"
 )
 
 // NodeState is the lifecycle state of a node.
@@ -26,16 +27,17 @@ type Resources struct {
 
 // NodeRecord is the registry source-of-truth for a node.
 type NodeRecord struct {
-	NodeID       string    `json:"node_id"`
-	Generation   int64     `json:"generation"`
-	State        NodeState `json:"state"`
-	Labels       []string  `json:"labels,omitempty"`
-	Capacity     Resources `json:"capacity"`
-	Used         Resources `json:"used"`
-	HostIP       string    `json:"host_ip,omitempty"`
-	RegisteredAt time.Time `json:"registered_at,omitempty"`
-	LastSeenAt   time.Time `json:"last_seen_at"`
-	UpdatedAt    time.Time `json:"updated_at"`
+	NodeID       string                   `json:"node_id"`
+	Generation   int64                    `json:"generation"`
+	State        NodeState                `json:"state"`
+	Labels       []string                 `json:"labels,omitempty"`
+	Capacity     Resources                `json:"capacity"`
+	Used         Resources                `json:"used"`
+	HostIP       string                   `json:"host_ip,omitempty"`
+	RegisteredAt time.Time                `json:"registered_at,omitempty"`
+	LastSeenAt   time.Time                `json:"last_seen_at"`
+	UpdatedAt    time.Time                `json:"updated_at"`
+	AgentStatus  *statusmodel.AgentStatus `json:"agent_status,omitempty"`
 }
 
 // NodeRegisterRequest is the request payload for node registration.
@@ -50,11 +52,12 @@ type NodeRegisterRequest struct {
 
 // NodeHeartbeatRequest is the request payload for node heartbeat.
 type NodeHeartbeatRequest struct {
-	NodeID     string    `json:"node_id"`
-	Generation int64     `json:"generation"`
-	Capacity   Resources `json:"capacity,omitempty"`
-	Used       Resources `json:"used,omitempty"`
-	HostIP     string    `json:"host_ip,omitempty"`
+	NodeID      string                   `json:"node_id"`
+	Generation  int64                    `json:"generation"`
+	Capacity    Resources                `json:"capacity,omitempty"`
+	Used        Resources                `json:"used,omitempty"`
+	HostIP      string                   `json:"host_ip,omitempty"`
+	AgentStatus *statusmodel.AgentStatus `json:"agent_status,omitempty"`
 }
 
 // NodeStateRequest updates node state.
