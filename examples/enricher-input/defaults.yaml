@@ -11,3 +11,6 @@ health_check:
   interval: "10s"
   timeout: "5s"
   retries: 3
+volume_defaults:
+  local_size: "10Gi"
+  shared_size: "10Gi"

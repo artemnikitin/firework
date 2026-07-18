@@ -3,6 +3,7 @@ package config
 import (
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -111,7 +112,44 @@ func LoadAgentConfig(path string) (AgentConfig, error) {
 		}
 	}
 
+	if cfg.Storage.Local != nil {
+		if err := validateStoragePath("storage.local.path", cfg.Storage.Local.Path); err != nil {
+			return cfg, err
+		}
+		capacity, err := ParseStorageCapacity(cfg.Storage.Local.Capacity)
+		if err != nil {
+			return cfg, fmt.Errorf("storage.local.capacity: %w", err)
+		}
+		cfg.Storage.Local.CapacityBytes = capacity
+	}
+	if cfg.Storage.Shared != nil {
+		if strings.TrimSpace(cfg.Storage.Shared.BackendID) == "" {
+			return cfg, fmt.Errorf("storage.shared.backend_id is required")
+		}
+		if err := validateStoragePath("storage.shared.path", cfg.Storage.Shared.Path); err != nil {
+			return cfg, err
+		}
+		if cfg.Storage.Shared.Capacity != "" {
+			capacity, err := ParseStorageCapacity(cfg.Storage.Shared.Capacity)
+			if err != nil {
+				return cfg, fmt.Errorf("storage.shared.capacity: %w", err)
+			}
+			cfg.Storage.Shared.CapacityBytes = capacity
+		}
+	}
+
 	return cfg, nil
+}
+
+func validateStoragePath(field, value string) error {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return fmt.Errorf("%s is required", field)
+	}
+	if !filepath.IsAbs(value) || filepath.Clean(value) != value || value == "/" {
+		return fmt.Errorf("%s must be a clean absolute path below /", field)
+	}
+	return nil
 }
 
 // ParseNodeConfig parses a node configuration from raw YAML bytes.

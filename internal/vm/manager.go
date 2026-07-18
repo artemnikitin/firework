@@ -2,17 +2,24 @@ package vm
 
 import (
 	"context"
+	"encoding/base64"
+	"encoding/json"
 	"fmt"
 	"log/slog"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
 
 	"github.com/artemnikitin/firework/internal/config"
+	"github.com/artemnikitin/firework/internal/volume"
 )
+
+const maxKernelCommandLineBytes = 2047
 
 // State represents the lifecycle state of a microVM.
 type State string
@@ -37,6 +44,8 @@ type Instance struct {
 	LastError string
 	// SocketPath is the path to the Firecracker API socket.
 	SocketPath string
+	// Volumes is the last successfully prepared persistent-volume set.
+	Volumes []volume.PreparedVolume
 }
 
 // Manager manages the lifecycle of Firecracker microVMs on the local host.
@@ -44,19 +53,95 @@ type Manager struct {
 	firecrackerBin string
 	stateDir       string
 	logger         *slog.Logger
+	volumeManager  *volume.Manager
 
-	mu        sync.Mutex
-	instances map[string]*Instance
+	mu           sync.Mutex
+	instances    map[string]*Instance
+	volumeErrors map[string]string
 }
 
 // NewManager creates a new VM manager.
 func NewManager(firecrackerBin, stateDir string, logger *slog.Logger) *Manager {
+	return NewManagerWithVolumes(firecrackerBin, stateDir, logger, nil)
+}
+
+// NewManagerWithVolumes creates a VM manager with persistent-volume support.
+func NewManagerWithVolumes(firecrackerBin, stateDir string, logger *slog.Logger, volumeManager *volume.Manager) *Manager {
 	return &Manager{
 		firecrackerBin: firecrackerBin,
 		stateDir:       stateDir,
 		logger:         logger,
+		volumeManager:  volumeManager,
 		instances:      make(map[string]*Instance),
+		volumeErrors:   make(map[string]string),
 	}
+}
+
+// Preflight validates persistent volumes without changing them. Reconciliation
+// calls this before stopping an existing VM so a failed resize leaves it live.
+func (m *Manager) Preflight(ctx context.Context, svc config.ServiceConfig) error {
+	if len(svc.Volumes) == 0 {
+		m.setVolumeError(svc.Name, nil)
+		return nil
+	}
+	if err := validateVolumeKernelArgs(svc); err != nil {
+		m.setVolumeError(svc.Name, err)
+		return err
+	}
+	if m.volumeManager == nil {
+		err := fmt.Errorf("service %s declares volumes but agent storage is not configured", svc.Name)
+		m.setVolumeError(svc.Name, err)
+		return err
+	}
+	err := m.volumeManager.Preflight(ctx, svc)
+	m.setVolumeError(svc.Name, err)
+	return err
+}
+
+// VolumeError returns the latest persistent-volume preparation failure for a
+// service. It remains visible until a later successful preflight or start.
+func (m *Manager) VolumeError(service string) string {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.volumeErrors[service]
+}
+
+func (m *Manager) setVolumeError(service string, err error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if err == nil {
+		delete(m.volumeErrors, service)
+		return
+	}
+	m.volumeErrors[service] = err.Error()
+}
+
+func validateVolumeKernelArgs(svc config.ServiceConfig) error {
+	volumes := append([]config.VolumeConfig(nil), svc.Volumes...)
+	sort.Slice(volumes, func(i, j int) bool { return volumes[i].Name < volumes[j].Name })
+	guestVolumes := make([]guestVolume, 0, len(volumes))
+	for i, volume := range volumes {
+		device, err := guestBlockDevice(i)
+		if err != nil {
+			return err
+		}
+		guestVolumes = append(guestVolumes, guestVolume{
+			Name: volume.Name, Device: device, MountPath: volume.MountPath, Type: volume.Type,
+		})
+	}
+	payload, err := json.Marshal(guestVolumePayload{Version: 1, Volumes: guestVolumes})
+	if err != nil {
+		return fmt.Errorf("marshal guest volume payload: %w", err)
+	}
+	kernelArgs := svc.KernelArgs
+	if kernelArgs == "" {
+		kernelArgs = "console=ttyS0 reboot=k panic=1 pci=off"
+	}
+	kernelArgs = insertBeforeApplicationSeparator(kernelArgs, "firework.volumes64="+base64.RawURLEncoding.EncodeToString(payload))
+	if len(kernelArgs) > maxKernelCommandLineBytes {
+		return fmt.Errorf("service %s: kernel command line with volume payload is %d bytes; maximum is %d", svc.Name, len(kernelArgs), maxKernelCommandLineBytes)
+	}
+	return nil
 }
 
 // List returns a snapshot of all known VM instances.
@@ -92,7 +177,22 @@ func (m *Manager) Start(ctx context.Context, svc config.ServiceConfig) error {
 	// Remove stale socket if it exists.
 	_ = os.Remove(socketPath)
 
-	configPath, err := m.writeVMConfig(vmDir, svc)
+	var prepared []volume.PreparedVolume
+	var err error
+	if len(svc.Volumes) > 0 {
+		if m.volumeManager == nil {
+			err := fmt.Errorf("service %s declares volumes but agent storage is not configured", svc.Name)
+			m.volumeErrors[svc.Name] = err.Error()
+			return err
+		}
+		prepared, err = m.volumeManager.Prepare(ctx, svc)
+		if err != nil {
+			m.volumeErrors[svc.Name] = err.Error()
+			return fmt.Errorf("preparing volumes: %w", err)
+		}
+	}
+
+	configPath, err := m.writeVMConfig(vmDir, svc, prepared)
 	if err != nil {
 		return fmt.Errorf("writing vm config: %w", err)
 	}
@@ -123,7 +223,9 @@ func (m *Manager) Start(ctx context.Context, svc config.ServiceConfig) error {
 		State:      StateRunning,
 		PID:        cmd.Process.Pid,
 		SocketPath: socketPath,
+		Volumes:    append([]volume.PreparedVolume(nil), prepared...),
 	}
+	delete(m.volumeErrors, svc.Name)
 
 	// Monitor the process in a goroutine.
 	go m.monitor(svc.Name, cmd, logFile)
@@ -268,47 +370,126 @@ func waitForPIDExit(pid int, timeout time.Duration) bool {
 }
 
 // writeVMConfig writes a Firecracker JSON config file for the given service.
-func (m *Manager) writeVMConfig(vmDir string, svc config.ServiceConfig) (string, error) {
+func (m *Manager) writeVMConfig(vmDir string, svc config.ServiceConfig, prepared []volume.PreparedVolume) (string, error) {
 	kernelArgs := svc.KernelArgs
 	if kernelArgs == "" {
 		kernelArgs = "console=ttyS0 reboot=k panic=1 pci=off"
 	}
 
-	// Build network config snippet.
-	networkCfg := ""
+	sort.Slice(prepared, func(i, j int) bool { return prepared[i].LogicalID < prepared[j].LogicalID })
+	drives := []firecrackerDrive{{DriveID: "rootfs", PathOnHost: svc.Image, IsRootDevice: true, IsReadOnly: false}}
+	guestVolumes := make([]guestVolume, 0, len(prepared))
+	for i, preparedVolume := range prepared {
+		device, err := guestBlockDevice(i)
+		if err != nil {
+			return "", err
+		}
+		drives = append(drives, firecrackerDrive{
+			DriveID: fmt.Sprintf("volume-%d", i), PathOnHost: preparedVolume.PathOnHost,
+			IsRootDevice: false, IsReadOnly: false,
+		})
+		guestVolumes = append(guestVolumes, guestVolume{
+			Name: filepath.Base(preparedVolume.LogicalID), Device: device,
+			MountPath: preparedVolume.MountPath, Type: preparedVolume.Type,
+		})
+	}
+	if len(guestVolumes) > 0 {
+		payload, err := json.Marshal(guestVolumePayload{Version: 1, Volumes: guestVolumes})
+		if err != nil {
+			return "", fmt.Errorf("marshal guest volume payload: %w", err)
+		}
+		arg := "firework.volumes64=" + base64.RawURLEncoding.EncodeToString(payload)
+		kernelArgs = insertBeforeApplicationSeparator(kernelArgs, arg)
+	}
+
+	var networkInterfaces []firecrackerNetworkInterface
 	if svc.Network != nil {
 		guestMAC := svc.Network.GuestMAC
 		if guestMAC == "" {
 			guestMAC = "AA:FC:00:00:00:01"
 		}
-		networkCfg = fmt.Sprintf(`,
-  "network-interfaces": [{
-    "iface_id": "eth0",
-    "guest_mac": %q,
-    "host_dev_name": %q
-  }]`, guestMAC, svc.Network.Interface)
+		networkInterfaces = []firecrackerNetworkInterface{{IfaceID: "eth0", GuestMAC: guestMAC, HostDevName: svc.Network.Interface}}
 	}
 
-	configJSON := fmt.Sprintf(`{
-  "boot-source": {
-    "kernel_image_path": %q,
-    "boot_args": %q
-  },
-  "drives": [{
-    "drive_id": "rootfs",
-    "path_on_host": %q,
-    "is_root_device": true,
-    "is_read_only": false
-  }],
-  "machine-config": {
-    "vcpu_count": %d,
-    "mem_size_mib": %d
-  }%s
-}`, svc.Kernel, kernelArgs, svc.Image, svc.VCPUs, svc.MemoryMB, networkCfg)
+	vmConfig := firecrackerConfig{
+		BootSource:        firecrackerBootSource{KernelImagePath: svc.Kernel, BootArgs: kernelArgs},
+		Drives:            drives,
+		MachineConfig:     firecrackerMachineConfig{VCPUCount: svc.VCPUs, MemSizeMiB: svc.MemoryMB},
+		NetworkInterfaces: networkInterfaces,
+	}
+	configJSON, err := json.MarshalIndent(vmConfig, "", "  ")
+	if err != nil {
+		return "", fmt.Errorf("marshal firecracker config: %w", err)
+	}
 
 	configPath := filepath.Join(vmDir, "vm-config.json")
-	if err := os.WriteFile(configPath, []byte(configJSON), 0o644); err != nil {
+	if err := os.WriteFile(configPath, append(configJSON, '\n'), 0o644); err != nil {
 		return "", err
 	}
 	return configPath, nil
+}
+
+type firecrackerConfig struct {
+	BootSource        firecrackerBootSource         `json:"boot-source"`
+	Drives            []firecrackerDrive            `json:"drives"`
+	MachineConfig     firecrackerMachineConfig      `json:"machine-config"`
+	NetworkInterfaces []firecrackerNetworkInterface `json:"network-interfaces,omitempty"`
+}
+
+type firecrackerBootSource struct {
+	KernelImagePath string `json:"kernel_image_path"`
+	BootArgs        string `json:"boot_args"`
+}
+
+type firecrackerDrive struct {
+	DriveID      string `json:"drive_id"`
+	PathOnHost   string `json:"path_on_host"`
+	IsRootDevice bool   `json:"is_root_device"`
+	IsReadOnly   bool   `json:"is_read_only"`
+}
+
+type firecrackerMachineConfig struct {
+	VCPUCount  int `json:"vcpu_count"`
+	MemSizeMiB int `json:"mem_size_mib"`
+}
+
+type firecrackerNetworkInterface struct {
+	IfaceID     string `json:"iface_id"`
+	GuestMAC    string `json:"guest_mac"`
+	HostDevName string `json:"host_dev_name"`
+}
+
+type guestVolumePayload struct {
+	Version int           `json:"version"`
+	Volumes []guestVolume `json:"volumes"`
+}
+
+type guestVolume struct {
+	Name      string            `json:"name"`
+	Device    string            `json:"device"`
+	MountPath string            `json:"mount_path"`
+	Type      config.VolumeType `json:"type"`
+}
+
+func guestBlockDevice(index int) (string, error) {
+	if index < 0 || index >= 25 {
+		return "", fmt.Errorf("too many additional drives: %d", index+1)
+	}
+	return fmt.Sprintf("/dev/vd%c", 'b'+rune(index)), nil
+}
+
+func insertBeforeApplicationSeparator(args, value string) string {
+	fields := strings.Fields(args)
+	for i, field := range fields {
+		if field == "--" {
+			out := append([]string(nil), fields[:i]...)
+			out = append(out, value)
+			out = append(out, fields[i:]...)
+			return strings.Join(out, " ")
+		}
+	}
+	if args == "" {
+		return value
+	}
+	return args + " " + value
 }

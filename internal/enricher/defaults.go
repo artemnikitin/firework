@@ -3,6 +3,7 @@ package enricher
 import (
 	"fmt"
 	"hash/fnv"
+	"sort"
 	"time"
 
 	"github.com/artemnikitin/firework/internal/config"
@@ -13,6 +14,7 @@ const (
 	fallbackVCPUs      = 1
 	fallbackMemoryMB   = 256
 	fallbackKernelArgs = "console=ttyS0 reboot=k panic=1 pci=off init=/sbin/fc-init"
+	fallbackVolumeSize = "10Gi"
 
 	fallbackHealthCheckInterval = "10s"
 	fallbackHealthCheckTimeout  = "5s"
@@ -41,6 +43,7 @@ func EnrichService(spec ServiceSpec, defs Defaults) config.ServiceConfig {
 		svc.CrossNodeLinks = make([]config.CrossNodeLink, len(spec.CrossNodeLinks))
 		copy(svc.CrossNodeLinks, spec.CrossNodeLinks)
 	}
+	svc.Volumes = resolveVolumes(spec.Volumes, defs.VolumeDefaults)
 
 	svc.Kernel = coalesce(spec.Kernel, defs.Kernel, fallbackKernel)
 	svc.VCPUs = coalesceInt(spec.VCPUs, defs.VCPUs, fallbackVCPUs)
@@ -63,6 +66,27 @@ func EnrichService(spec ServiceSpec, defs Defaults) config.ServiceConfig {
 	}
 
 	return svc
+}
+
+func resolveVolumes(specs []VolumeSpec, defs VolumeDefaults) []config.VolumeConfig {
+	volumes := make([]config.VolumeConfig, 0, len(specs))
+	for _, spec := range specs {
+		size := spec.Size
+		if size == "" {
+			switch spec.Type {
+			case config.VolumeTypeLocal:
+				size = coalesce(defs.LocalSize, fallbackVolumeSize)
+			case config.VolumeTypeShared:
+				size = coalesce(defs.SharedSize, fallbackVolumeSize)
+			}
+		}
+		sizeBytes, _ := config.ParseVolumeSize(size) // ValidateInput owns errors.
+		volumes = append(volumes, config.VolumeConfig{
+			Name: spec.Name, Type: spec.Type, MountPath: spec.MountPath, SizeBytes: sizeBytes,
+		})
+	}
+	sort.Slice(volumes, func(i, j int) bool { return volumes[i].Name < volumes[j].Name })
+	return volumes
 }
 
 // mergeHealthCheck merges spec-level health check with defaults.

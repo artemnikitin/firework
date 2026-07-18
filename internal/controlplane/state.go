@@ -25,6 +25,14 @@ type Resources struct {
 	MemoryMB int `json:"memory_mb"`
 }
 
+// StorageResources is the provider-neutral storage admission information
+// reported by an agent. Paths are intentionally not sent to the control plane.
+type StorageResources struct {
+	LocalCapacityBytes  int64  `json:"local_capacity_bytes,omitempty"`
+	SharedBackendID     string `json:"shared_backend_id,omitempty"`
+	SharedCapacityBytes int64  `json:"shared_capacity_bytes,omitempty"`
+}
+
 // NodeRecord is the registry source-of-truth for a node.
 type NodeRecord struct {
 	NodeID       string                   `json:"node_id"`
@@ -38,16 +46,18 @@ type NodeRecord struct {
 	LastSeenAt   time.Time                `json:"last_seen_at"`
 	UpdatedAt    time.Time                `json:"updated_at"`
 	AgentStatus  *statusmodel.AgentStatus `json:"agent_status,omitempty"`
+	Storage      StorageResources         `json:"storage,omitempty"`
 }
 
 // NodeRegisterRequest is the request payload for node registration.
 type NodeRegisterRequest struct {
-	NodeID     string    `json:"node_id"`
-	Generation int64     `json:"generation"`
-	Labels     []string  `json:"labels,omitempty"`
-	Capacity   Resources `json:"capacity"`
-	State      NodeState `json:"state,omitempty"`
-	HostIP     string    `json:"host_ip,omitempty"`
+	NodeID     string           `json:"node_id"`
+	Generation int64            `json:"generation"`
+	Labels     []string         `json:"labels,omitempty"`
+	Capacity   Resources        `json:"capacity"`
+	State      NodeState        `json:"state,omitempty"`
+	HostIP     string           `json:"host_ip,omitempty"`
+	Storage    StorageResources `json:"storage,omitempty"`
 }
 
 // NodeHeartbeatRequest is the request payload for node heartbeat.
@@ -58,6 +68,7 @@ type NodeHeartbeatRequest struct {
 	Used        Resources                `json:"used,omitempty"`
 	HostIP      string                   `json:"host_ip,omitempty"`
 	AgentStatus *statusmodel.AgentStatus `json:"agent_status,omitempty"`
+	Storage     StorageResources         `json:"storage,omitempty"`
 }
 
 // NodeStateRequest updates node state.
@@ -80,6 +91,36 @@ type PlacementRevision struct {
 	LeaderEpoch     int64               `json:"leader_epoch"`
 	CreatedAt       time.Time           `json:"created_at"`
 	NodeConfigs     []config.NodeConfig `json:"node_configs"`
+	PendingServices []PendingPlacement  `json:"pending_services,omitempty"`
+}
+
+type PendingPlacement struct {
+	Service    string `json:"service"`
+	ReasonCode string `json:"reason_code"`
+	Message    string `json:"message,omitempty"`
+}
+
+type VolumeResizeState string
+
+const (
+	VolumeResizePending VolumeResizeState = "pending"
+	VolumeResizeApplied VolumeResizeState = "applied"
+	VolumeResizeFailed  VolumeResizeState = "failed"
+)
+
+// VolumeRecord retains volume identity and placement after workload removal.
+type VolumeRecord struct {
+	LogicalID        string            `json:"logical_id"`
+	Type             config.VolumeType `json:"type"`
+	BoundNode        string            `json:"bound_node,omitempty"`
+	SharedBackendID  string            `json:"shared_backend_id,omitempty"`
+	DesiredSizeBytes int64             `json:"desired_size_bytes"`
+	AppliedSizeBytes int64             `json:"applied_size_bytes"`
+	ResizeGeneration int64             `json:"resize_generation"`
+	ResizeState      VolumeResizeState `json:"resize_state"`
+	LastError        string            `json:"last_error,omitempty"`
+	CreatedAt        time.Time         `json:"created_at"`
+	UpdatedAt        time.Time         `json:"updated_at"`
 }
 
 // RevisionPointer points to the current immutable revision.
@@ -158,6 +199,17 @@ func placementRevisionKey(prefix, rev string) string {
 
 func placementCurrentKey(prefix string) string {
 	return path.Join(stateRoot(prefix), "placements", "current.json")
+}
+
+func volumeRecordKey(prefix, service, volume string) (string, error) {
+	if strings.TrimSpace(service) == "" || strings.Contains(service, "/") || strings.TrimSpace(volume) == "" || strings.Contains(volume, "/") {
+		return "", fmt.Errorf("invalid volume logical id %q/%q", service, volume)
+	}
+	return path.Join(stateRoot(prefix), "volumes", service, volume+".json"), nil
+}
+
+func volumeRecordsPrefix(prefix string) string {
+	return path.Join(stateRoot(prefix), "volumes") + "/"
 }
 
 func renderedNodeKey(prefix, rev, nodeID string) string {

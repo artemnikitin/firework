@@ -163,6 +163,33 @@ api_listen_addr: ":9090"
 	}
 }
 
+func TestLoadAgentConfigStorageBudgets(t *testing.T) {
+	yaml := `
+node_name: "node-1"
+store_type: "git"
+store_url: "https://example.invalid/config.git"
+storage:
+  local:
+    path: "/var/lib/firework/volumes"
+    capacity: "500Gi"
+  shared:
+    backend_id: "primary"
+    path: "/mnt/firework-shared"
+    capacity: "1Ti"
+`
+	path := filepath.Join(t.TempDir(), "agent.yaml")
+	if err := os.WriteFile(path, []byte(yaml), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := LoadAgentConfig(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Storage.Local.CapacityBytes != 500*GiB || cfg.Storage.Shared.CapacityBytes != TiB {
+		t.Fatalf("unexpected storage config: %#v", cfg.Storage)
+	}
+}
+
 func TestLoadAgentConfig_Defaults(t *testing.T) {
 	yaml := `
 store_url: "https://github.com/example/configs.git"

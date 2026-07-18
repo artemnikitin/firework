@@ -566,7 +566,9 @@ func TestTick_StatusReportsVMProcessFailureWithoutExitedPID(t *testing.T) {
 	a := New(cfg, store, testLogger())
 	a.tick(context.Background())
 
-	deadline := time.Now().Add(2 * time.Second)
+	// The race build can take several seconds to schedule the monitor goroutine
+	// while the full package suite is running concurrently.
+	deadline := time.Now().Add(10 * time.Second)
 	for time.Now().Before(deadline) {
 		status := a.agentStatusSnapshot()
 		if len(status.Services) == 1 && status.Services[0].VMState == "failed" {

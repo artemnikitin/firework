@@ -27,6 +27,18 @@ const badge = value => `<span class="badge ${esc(value)}">${esc(value || 'unknow
 const display = value => value === undefined || value === null || value === '' ? '<span class="muted">—</span>' : esc(value);
 const formatDate = value => value ? new Date(value).toLocaleString() : '<span class="muted">—</span>';
 const formatBoolean = value => value ? 'Yes' : 'No';
+const formatBytes = value => {
+  const bytes = Number(value) || 0;
+  if (!bytes) return '0 B';
+  const units = ['B', 'MiB', 'GiB', 'TiB'];
+  let amount = bytes;
+  let unit = 0;
+  while (amount >= 1024 && unit < units.length - 1) {
+    amount /= 1024;
+    unit += 1;
+  }
+  return `${amount.toFixed(amount < 10 && unit > 0 ? 1 : 0)} ${units[unit]}`;
+};
 const nodeLink = node => node ? `<a href="#node/${encodeURIComponent(node)}">${esc(node)}</a>` : '<span class="muted">—</span>';
 const serviceLink = service => `<a href="#service/${encodeURIComponent(service)}">${esc(service)}</a>`;
 const capacity = (used, total, available, unit = '') => {
@@ -258,6 +270,18 @@ function renderServiceDetail(service) {
     <td>${esc(port.VMPort ?? port.vm_port)}</td>
   </tr>`);
 
+  const volumeRows = (service.volumes || []).map(volume => `<tr>
+    <td>${esc(volume.logical_id)}</td>
+    <td>${badge(volume.type)}</td>
+    <td>${esc(volume.mount_path)}</td>
+    <td>${nodeLink(volume.bound_node)}</td>
+    <td>${display(volume.shared_backend_id)}</td>
+    <td>${esc(formatBytes(volume.desired_size_bytes))}</td>
+    <td>${esc(formatBytes(volume.applied_size_bytes))}</td>
+    <td>${badge(volume.state)}</td>
+    <td>${display(volume.last_error)}</td>
+  </tr>`);
+
   content.innerHTML = `<a class="back-link" href="#services">← Back to services</a>
     <div class="detail-heading"><div><p class="eyebrow">Service</p><h1>${esc(service.name)}</h1></div>${badge(service.state)}</div>
     <div class="detail-grid">
@@ -265,7 +289,8 @@ function renderServiceDetail(service) {
       ${section('Health check', healthCheck)}
       ${section('Revisions', revisions)}
     </div>
-    ${(service.port_forwards || []).length ? section('Port forwards', table(['Host port', 'VM port'], portRows, '')) : ''}`;
+    ${(service.port_forwards || []).length ? section('Port forwards', table(['Host port', 'VM port'], portRows, '')) : ''}
+    ${(service.volumes || []).length ? section('Persistent volumes', table(['Volume', 'Type', 'Mount path', 'Bound node', 'Backend', 'Desired', 'Applied', 'State', 'Last error'], volumeRows, '')) : ''}`;
 }
 
 async function detail(kind, id) {

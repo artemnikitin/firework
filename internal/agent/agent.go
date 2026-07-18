@@ -25,6 +25,7 @@ import (
 	"github.com/artemnikitin/firework/internal/store"
 	"github.com/artemnikitin/firework/internal/traefik"
 	"github.com/artemnikitin/firework/internal/vm"
+	"github.com/artemnikitin/firework/internal/volume"
 )
 
 // routeSyncer applies the desired Traefik route set for the local and remote
@@ -74,8 +75,9 @@ type Agent struct {
 
 // New creates a new Agent with all its dependencies.
 func New(cfg config.AgentConfig, s store.Store, logger *slog.Logger) *Agent {
-	vmMgr := vm.NewManager(cfg.FirecrackerBin, cfg.StateDir, logger)
 	metrics := newRuntimeMetrics(cfg.NodeName)
+	volumeMgr := volume.NewManagerWithObserver(cfg.NodeID, cfg.Storage, metrics)
+	vmMgr := vm.NewManagerWithVolumes(cfg.FirecrackerBin, cfg.StateDir, logger, volumeMgr)
 	var agentRef *Agent
 
 	// Set up optional health check monitor.

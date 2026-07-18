@@ -29,7 +29,23 @@ type ServiceSpec struct {
 	CrossNodeLinks    []config.CrossNodeLink `yaml:"cross_node_links,omitempty"`
 	// NodeHostIPEnv, when set, causes the enricher to inject this node's own
 	// host IP into the named env var (e.g. "transport.publish_host" for ES).
-	NodeHostIPEnv string `yaml:"node_host_ip_env,omitempty"`
+	NodeHostIPEnv string       `yaml:"node_host_ip_env,omitempty"`
+	Volumes       []VolumeSpec `yaml:"volumes,omitempty"`
+}
+
+// VolumeSpec is the application-facing persistent-volume declaration. Binding
+// and backend fields deliberately do not exist here; they are system-owned.
+type VolumeSpec struct {
+	Name      string            `yaml:"name"`
+	Type      config.VolumeType `yaml:"type"`
+	MountPath string            `yaml:"mount_path"`
+	Size      string            `yaml:"size,omitempty"`
+	// Resolved/system fields are decoded only so validation can reject attempts
+	// to set them in application input instead of silently ignoring them.
+	BoundNode        string `yaml:"bound_node,omitempty"`
+	SharedBackendID  string `yaml:"shared_backend_id,omitempty"`
+	SizeBytes        int64  `yaml:"size_bytes,omitempty"`
+	ResizeGeneration int64  `yaml:"resize_generation,omitempty"`
 }
 
 // HealthCheckSpec is the user-facing health check definition.
@@ -46,11 +62,18 @@ type HealthCheckSpec struct {
 
 // Defaults holds global default values applied to every service.
 type Defaults struct {
-	Kernel      string           `yaml:"kernel,omitempty"`
-	VCPUs       int              `yaml:"vcpus,omitempty"`
-	MemoryMB    int              `yaml:"memory_mb,omitempty"`
-	KernelArgs  string           `yaml:"kernel_args,omitempty"`
-	HealthCheck *HealthCheckSpec `yaml:"health_check,omitempty"`
+	Kernel         string           `yaml:"kernel,omitempty"`
+	VCPUs          int              `yaml:"vcpus,omitempty"`
+	MemoryMB       int              `yaml:"memory_mb,omitempty"`
+	KernelArgs     string           `yaml:"kernel_args,omitempty"`
+	HealthCheck    *HealthCheckSpec `yaml:"health_check,omitempty"`
+	VolumeDefaults VolumeDefaults   `yaml:"volume_defaults,omitempty"`
+}
+
+// VolumeDefaults provides type-specific application quota defaults.
+type VolumeDefaults struct {
+	LocalSize  string `yaml:"local_size,omitempty"`
+	SharedSize string `yaml:"shared_size,omitempty"`
 }
 
 // InputConfig is the fully parsed input from the user's Git repo.

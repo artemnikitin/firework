@@ -9,6 +9,7 @@ import (
 	"github.com/artemnikitin/firework/internal/statusmodel"
 	"github.com/artemnikitin/firework/internal/version"
 	"github.com/artemnikitin/firework/internal/vm"
+	"github.com/artemnikitin/firework/internal/volume"
 )
 
 func (a *Agent) setStatusServices(node config.NodeConfig, fallbackRevision string) {
@@ -23,6 +24,7 @@ func (a *Agent) setStatusServices(node config.NodeConfig, fallbackRevision strin
 			healthCheck := *node.Services[i].HealthCheck
 			services[i].HealthCheck = &healthCheck
 		}
+		services[i].Volumes = append([]config.VolumeConfig(nil), node.Services[i].Volumes...)
 	}
 	a.statusMu.Lock()
 	defer a.statusMu.Unlock()
@@ -119,6 +121,26 @@ func (a *Agent) refreshAgentStatus(phase statusmodel.Phase, code, message string
 				service.ReasonCode = "vm_failed"
 				service.Message = statusmodel.BoundedMessage(instance.LastError)
 			}
+			preparedByID := make(map[string]volume.PreparedVolume, len(instance.Volumes))
+			for _, prepared := range instance.Volumes {
+				preparedByID[prepared.LogicalID] = prepared
+			}
+			service.Volumes = buildVolumeStatuses(desired, preparedByID)
+		} else {
+			service.Volumes = buildVolumeStatuses(desired, nil)
+		}
+		if volumeError := a.vmManager.VolumeError(desired.Name); volumeError != "" {
+			service.ReasonCode = "volume_failed"
+			service.Message = statusmodel.BoundedMessage(volumeError)
+			desiredGeneration := make(map[string]int64, len(desired.Volumes))
+			for _, desiredVolume := range desired.Volumes {
+				desiredGeneration[desired.Name+"/"+desiredVolume.Name] = desiredVolume.ResizeGeneration
+			}
+			for i := range service.Volumes {
+				service.Volumes[i].State = "error"
+				service.Volumes[i].LastError = statusmodel.BoundedMessage(volumeError)
+				service.Volumes[i].ResizeGeneration = desiredGeneration[service.Volumes[i].LogicalID]
+			}
 		}
 		if result, ok := results[desired.Name]; ok && service.VMState == string(vm.StateRunning) {
 			service.Health = string(result.Status)
@@ -153,6 +175,27 @@ func (a *Agent) refreshAgentStatus(phase statusmodel.Phase, code, message string
 	a.currentStatus.ReasonCode = code
 	a.currentStatus.Message = statusmodel.BoundedMessage(message)
 	a.currentStatus.Services = services
+}
+
+func buildVolumeStatuses(service config.ServiceConfig, prepared map[string]volume.PreparedVolume) []statusmodel.VolumeStatus {
+	statuses := make([]statusmodel.VolumeStatus, 0, len(service.Volumes))
+	for _, desired := range service.Volumes {
+		logicalID := service.Name + "/" + desired.Name
+		status := statusmodel.VolumeStatus{
+			LogicalID: logicalID, Type: string(desired.Type), MountPath: desired.MountPath,
+			BoundNode: desired.BoundNode, SharedBackendID: desired.SharedBackendID,
+			DesiredSizeBytes: desired.SizeBytes, ResizeGeneration: desired.ResizeGeneration,
+			State: "pending",
+		}
+		if applied, ok := prepared[logicalID]; ok {
+			status.AppliedSizeBytes = applied.SizeBytes
+			status.ResizeGeneration = applied.ResizeGeneration
+			status.State = "prepared"
+		}
+		statuses = append(statuses, status)
+	}
+	sort.Slice(statuses, func(i, j int) bool { return statuses[i].LogicalID < statuses[j].LogicalID })
+	return statuses
 }
 
 func (a *Agent) agentStatusSnapshot() statusmodel.AgentStatus {

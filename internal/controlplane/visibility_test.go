@@ -123,6 +123,38 @@ func TestServiceDetailJSONUsesStableFieldNames(t *testing.T) {
 	}
 }
 
+func TestServiceDetailUsesRetainedVolumeRecordWhilePlacementIsPending(t *testing.T) {
+	ctx := context.Background()
+	store := newBlobStateStore(newMemBlob())
+	cfg := validConfigForRole(RoleAPI)
+	now := time.Now().UTC()
+	desired := DesiredRevision{Revision: "desired-1", CreatedAt: now, Services: []config.ServiceConfig{{
+		Name: "db", Volumes: []config.VolumeConfig{{
+			Name: "data", Type: config.VolumeTypeLocal, MountPath: "/data", SizeBytes: 20 * config.GiB,
+		}},
+	}}}
+	placement := PlacementRevision{Revision: "placement-1", DesiredRevision: desired.Revision, CreatedAt: now, PendingServices: []PendingPlacement{{
+		Service: "db", ReasonCode: "local_volume_node_unavailable", Message: "bound node unavailable",
+	}}}
+	putCurrentState(t, ctx, store, desired, placement, "rendered-1")
+	record := VolumeRecord{
+		LogicalID: "db/data", Type: config.VolumeTypeLocal, BoundNode: "node-gone",
+		DesiredSizeBytes: 20 * config.GiB, AppliedSizeBytes: 10 * config.GiB,
+		ResizeGeneration: 2, ResizeState: VolumeResizePending,
+	}
+	if _, err := store.PutJSON(ctx, mustVolumeRecordKey(cfg.State.Prefix, "db", "data"), record); err != nil {
+		t.Fatal(err)
+	}
+
+	detail, found, err := NewVisibilityService(cfg, store).Service(ctx, "db")
+	if err != nil || !found {
+		t.Fatalf("service detail found=%v err=%v", found, err)
+	}
+	if len(detail.Volumes) != 1 || detail.Volumes[0].BoundNode != "node-gone" || detail.Volumes[0].AppliedSizeBytes != 10*config.GiB || detail.Volumes[0].ResizeGeneration != 2 {
+		t.Fatalf("volume status did not use retained record: %#v", detail.Volumes)
+	}
+}
+
 func TestVisibilityStaleNodeRecovery(t *testing.T) {
 	ctx := context.Background()
 	store := newBlobStateStore(newMemBlob())

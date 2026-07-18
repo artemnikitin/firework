@@ -82,6 +82,13 @@ fireworkctl services --help
 - Service states: `pending`, `running`, `stopped`, `failed`, `unknown`.
 - Service health: `healthy`, `unhealthy`, `unknown`, `not_configured`.
 
+`fireworkctl service SERVICE_NAME` also prints a persistent-volume table when
+the service declares volumes. It shows the logical ID, type, guest mount path,
+local node binding or shared backend, desired/applied bytes, resize generation,
+and preparation state. `local_volume_node_unavailable` means retained data is
+still bound to a node that is not currently schedulable; Firework does not
+replace it with an empty volume elsewhere.
+
 `unknown` is intentional: it means the control plane cannot safely confirm the
 current state. For example, a stale node or an agent that has not converged to
 the current revision is not reported as healthy by inference.

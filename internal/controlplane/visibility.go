@@ -80,21 +80,22 @@ type ServiceDetail struct {
 	APIVersion string    `json:"api_version"`
 	ObservedAt time.Time `json:"observed_at"`
 	ServiceSummary
-	ServiceObservedAt time.Time            `json:"service_observed_at,omitempty"`
-	DesiredImage      string               `json:"desired_image,omitempty"`
-	DesiredKernel     string               `json:"desired_kernel,omitempty"`
-	DesiredNode       string               `json:"desired_node,omitempty"`
-	ActualNode        string               `json:"actual_node,omitempty"`
-	PID               int                  `json:"pid,omitempty"`
-	HealthCheck       ServiceHealthDetail  `json:"health_check"`
-	NetworkAddress    string               `json:"network_address,omitempty"`
-	PortForwards      []config.PortForward `json:"port_forwards,omitempty"`
-	RoutingHostname   string               `json:"routing_hostname,omitempty"`
-	RestartCount      int                  `json:"restart_count"`
-	DesiredRevision   string               `json:"desired_revision,omitempty"`
-	PlacementRevision string               `json:"placement_revision,omitempty"`
-	RenderedRevision  string               `json:"rendered_revision,omitempty"`
-	AppliedRevision   string               `json:"applied_revision,omitempty"`
+	ServiceObservedAt time.Time                  `json:"service_observed_at,omitempty"`
+	DesiredImage      string                     `json:"desired_image,omitempty"`
+	DesiredKernel     string                     `json:"desired_kernel,omitempty"`
+	DesiredNode       string                     `json:"desired_node,omitempty"`
+	ActualNode        string                     `json:"actual_node,omitempty"`
+	PID               int                        `json:"pid,omitempty"`
+	HealthCheck       ServiceHealthDetail        `json:"health_check"`
+	NetworkAddress    string                     `json:"network_address,omitempty"`
+	PortForwards      []config.PortForward       `json:"port_forwards,omitempty"`
+	RoutingHostname   string                     `json:"routing_hostname,omitempty"`
+	RestartCount      int                        `json:"restart_count"`
+	DesiredRevision   string                     `json:"desired_revision,omitempty"`
+	PlacementRevision string                     `json:"placement_revision,omitempty"`
+	RenderedRevision  string                     `json:"rendered_revision,omitempty"`
+	AppliedRevision   string                     `json:"applied_revision,omitempty"`
+	Volumes           []statusmodel.VolumeStatus `json:"volumes,omitempty"`
 }
 
 type visibilitySnapshot struct {
@@ -107,6 +108,8 @@ type visibilitySnapshot struct {
 	placementCurrent   bool
 	placementByService map[string]placedService
 	nodeByID           map[string]NodeRecord
+	pendingByService   map[string]PendingPlacement
+	volumeByID         map[string]VolumeRecord
 }
 
 type placedService struct {
@@ -220,7 +223,7 @@ func (s *VisibilityService) Service(ctx context.Context, name string) (ServiceDe
 		DesiredImage:      safeIdentifier(desired.Image), DesiredKernel: safeIdentifier(desired.Kernel),
 		DesiredNode: summary.Node, PortForwards: append([]config.PortForward(nil), desired.PortForwards...),
 		HealthCheck: ServiceHealthDetail{State: summary.Health}, DesiredRevision: snapshot.desired.Revision,
-		RenderedRevision: snapshot.renderedRevision,
+		RenderedRevision: snapshot.renderedRevision, Volumes: desiredVolumeStatuses(*desired, snapshot.volumeByID),
 	}
 	if desired.Network != nil {
 		detail.NetworkAddress = desired.Network.GuestIP
@@ -233,6 +236,7 @@ func (s *VisibilityService) Service(ctx context.Context, name string) (ServiceDe
 	}
 	placed, placedOK := snapshot.placementByService[name]
 	if placedOK {
+		detail.Volumes = desiredVolumeStatuses(placed.config, snapshot.volumeByID)
 		detail.PlacementRevision = snapshot.placement.Revision
 		record, nodeExists := snapshot.nodeByID[placed.node.Node]
 		if nodeExists {
@@ -243,6 +247,7 @@ func (s *VisibilityService) Service(ctx context.Context, name string) (ServiceDe
 					detail.ActualNode = record.NodeID
 					detail.PID = actual.PID
 					detail.RestartCount = actual.RestartCount
+					detail.Volumes = append([]statusmodel.VolumeStatus(nil), actual.Volumes...)
 					if actual.NetworkAddress != "" {
 						detail.NetworkAddress = actual.NetworkAddress
 					}
@@ -261,9 +266,32 @@ func (s *VisibilityService) Service(ctx context.Context, name string) (ServiceDe
 	return detail, true, nil
 }
 
+func desiredVolumeStatuses(service config.ServiceConfig, records map[string]VolumeRecord) []statusmodel.VolumeStatus {
+	volumes := make([]statusmodel.VolumeStatus, 0, len(service.Volumes))
+	for _, volume := range service.Volumes {
+		status := statusmodel.VolumeStatus{
+			LogicalID: service.Name + "/" + volume.Name, Type: string(volume.Type), MountPath: volume.MountPath,
+			BoundNode: volume.BoundNode, SharedBackendID: volume.SharedBackendID,
+			DesiredSizeBytes: volume.SizeBytes, ResizeGeneration: volume.ResizeGeneration, State: "pending",
+		}
+		if record, ok := records[status.LogicalID]; ok {
+			status.BoundNode = record.BoundNode
+			status.SharedBackendID = record.SharedBackendID
+			status.DesiredSizeBytes = record.DesiredSizeBytes
+			status.AppliedSizeBytes = record.AppliedSizeBytes
+			status.ResizeGeneration = record.ResizeGeneration
+			status.State = string(record.ResizeState)
+			status.LastError = record.LastError
+		}
+		volumes = append(volumes, status)
+	}
+	sort.Slice(volumes, func(i, j int) bool { return volumes[i].LogicalID < volumes[j].LogicalID })
+	return volumes
+}
+
 func (s *VisibilityService) load(ctx context.Context) (visibilitySnapshot, error) {
 	now := time.Now().UTC()
-	snapshot := visibilitySnapshot{now: now, staleTTL: s.cfg.NodeStaleTTL, placementByService: make(map[string]placedService), nodeByID: make(map[string]NodeRecord)}
+	snapshot := visibilitySnapshot{now: now, staleTTL: s.cfg.NodeStaleTTL, placementByService: make(map[string]placedService), nodeByID: make(map[string]NodeRecord), pendingByService: make(map[string]PendingPlacement), volumeByID: make(map[string]VolumeRecord)}
 	keys, err := s.store.ListKeys(ctx, registryNodesPrefix(s.cfg.State.Prefix))
 	if err != nil {
 		return snapshot, fmt.Errorf("listing nodes: %w", err)
@@ -298,8 +326,28 @@ func (s *VisibilityService) load(ctx context.Context) (visibilitySnapshot, error
 	if exists {
 		snapshot.renderedRevision = rendered.Revision
 	}
+	volumeKeys, err := s.store.ListKeys(ctx, volumeRecordsPrefix(s.cfg.State.Prefix))
+	if err != nil {
+		return snapshot, fmt.Errorf("listing volume records: %w", err)
+	}
+	for _, key := range volumeKeys {
+		if !strings.HasSuffix(key, ".json") {
+			continue
+		}
+		var record VolumeRecord
+		_, exists, err := s.store.GetJSON(ctx, key, &record)
+		if err != nil {
+			return snapshot, fmt.Errorf("reading volume record %s: %w", key, err)
+		}
+		if exists && record.LogicalID != "" {
+			snapshot.volumeByID[record.LogicalID] = record
+		}
+	}
 	snapshot.placementCurrent = snapshot.desired.Revision != "" && snapshot.placement.DesiredRevision == snapshot.desired.Revision
 	if snapshot.placementCurrent {
+		for _, pending := range snapshot.placement.PendingServices {
+			snapshot.pendingByService[pending.Service] = pending
+		}
 		for _, node := range snapshot.placement.NodeConfigs {
 			for _, service := range node.Services {
 				snapshot.placementByService[service.Name] = placedService{node: node, config: service}
@@ -410,6 +458,10 @@ func (s visibilitySnapshot) serviceSummary(desired config.ServiceConfig) Service
 		reason = "placement_pending"
 	}
 	summary := ServiceSummary{Name: desired.Name, State: "pending", Health: "unknown", VCPUs: desired.VCPUs, MemoryMB: desired.MemoryMB, ReasonCode: reason}
+	if pending, ok := s.pendingByService[desired.Name]; ok && s.placementCurrent {
+		summary.ReasonCode = pending.ReasonCode
+		summary.Message = pending.Message
+	}
 	placed, ok := s.placementByService[desired.Name]
 	if !ok {
 		return summary

@@ -166,17 +166,29 @@ func (c *Controller) runReconcile(ctx context.Context) {
 		c.logger.Warn("desired revision pointer targets missing object", "revision", desiredPtr.Revision)
 		return
 	}
+	if err := c.acknowledgeVolumeRecords(ctx); err != nil {
+		c.logger.Warn("acknowledging volume records failed", "error", err)
+	}
+	volumeRecords, err := c.loadVolumeRecords(ctx)
+	if err != nil {
+		c.logger.Error("loading retained volume records failed", "error", err)
+		return
+	}
+	services := append([]config.ServiceConfig(nil), desired.Services...)
+	for i := range services {
+		services[i].Volumes = append([]config.VolumeConfig(nil), desired.Services[i].Volumes...)
+	}
+	if err := c.applyExistingVolumeRecords(ctx, services, volumeRecords); err != nil {
+		c.logger.Error("reconciling volume records failed", "error", err)
+		return
+	}
 
 	activeNodes, hostIPByNode, err := c.discoverActiveNodes(ctx)
 	if err != nil {
 		c.logger.Error("discovering active nodes failed", "error", err)
 		return
 	}
-	if len(activeNodes) == 0 && len(desired.Services) > 0 {
-		c.logger.Warn("no active nodes available for scheduling", "services", len(desired.Services))
-		return
-	}
-	inputSig, err := schedulingInputSignature(desired.Revision, activeNodes, hostIPByNode)
+	inputSig, err := schedulingInputSignature(desired.Revision, activeNodes, hostIPByNode, volumeRecordsDigest(volumeRecords))
 	if err != nil {
 		c.logger.Error("failed to compute scheduling input signature; skipping signature cache optimization", "error", err)
 	}
@@ -194,13 +206,13 @@ func (c *Controller) runReconcile(ctx context.Context) {
 		existingAssignment = nil
 	}
 
-	assignments, err := scheduler.Schedule(desired.Services, activeNodes, existingAssignment)
-	if err != nil {
-		c.logger.Error("scheduling failed", "error", err, "services", len(desired.Services), "nodes", len(activeNodes))
-		return
-	}
+	assignments, pending := scheduler.ScheduleWithStorage(services, activeNodes, existingAssignment, storageReservations(volumeRecords))
 
 	nodeConfigs := scheduler.BuildNodeConfigs(assignments)
+	if err := c.createAssignedVolumeRecords(ctx, nodeConfigs, volumeRecords); err != nil {
+		c.logger.Warn("creating volume records conflicted; retrying on next tick", "error", err)
+		return
+	}
 	applyHostIPAndCrossNodeLinks(nodeConfigs, hostIPByNode)
 
 	renderRev := newRevision("rendered")
@@ -216,6 +228,11 @@ func (c *Controller) runReconcile(ctx context.Context) {
 		LeaderEpoch:     c.epoch,
 		CreatedAt:       time.Now().UTC(),
 		NodeConfigs:     nodeConfigs,
+	}
+	for _, item := range pending {
+		placementRev.PendingServices = append(placementRev.PendingServices, PendingPlacement{
+			Service: item.Service, ReasonCode: item.ReasonCode, Message: item.Message,
+		})
 	}
 	if err := c.publishPlacement(ctx, placementRev); err != nil {
 		c.logger.Error("publishing placement failed", "error", err)
@@ -234,6 +251,7 @@ func (c *Controller) runReconcile(ctx context.Context) {
 		"rendered_revision", renderRev,
 		"services", len(desired.Services),
 		"nodes", len(nodeConfigs),
+		"pending_services", len(pending),
 	)
 }
 
@@ -266,9 +284,12 @@ func (c *Controller) discoverActiveNodes(ctx context.Context) ([]scheduler.Node,
 			continue
 		}
 		nodes = append(nodes, scheduler.Node{
-			InstanceID:    rec.NodeID,
-			CapacityVCPUs: rec.Capacity.VCPUs,
-			CapacityMemMB: rec.Capacity.MemoryMB,
+			InstanceID:          rec.NodeID,
+			CapacityVCPUs:       rec.Capacity.VCPUs,
+			CapacityMemMB:       rec.Capacity.MemoryMB,
+			LocalCapacityBytes:  rec.Storage.LocalCapacityBytes,
+			SharedBackendID:     rec.Storage.SharedBackendID,
+			SharedCapacityBytes: rec.Storage.SharedCapacityBytes,
 		})
 		if rec.HostIP != "" {
 			hostIPByNode[rec.NodeID] = rec.HostIP
@@ -419,29 +440,37 @@ func applyHostIPAndCrossNodeLinks(nodeConfigs []config.NodeConfig, hostIPByNode 
 	}
 }
 
-func schedulingInputSignature(desiredRevision string, nodes []scheduler.Node, hostIPByNode map[string]string) (string, error) {
+func schedulingInputSignature(desiredRevision string, nodes []scheduler.Node, hostIPByNode map[string]string, volumeDigest string) (string, error) {
 	// Intentionally excludes runtime "used" resources from node heartbeats.
 	// Current scheduler decisions are based on node total capacity plus desired
 	// assignment bookkeeping, not host-reported instantaneous utilization.
 	type nodeInput struct {
-		ID         string `json:"id"`
-		CapacityV  int    `json:"capacity_v"`
-		CapacityMB int    `json:"capacity_mb"`
-		HostIP     string `json:"host_ip,omitempty"`
+		ID                  string `json:"id"`
+		CapacityV           int    `json:"capacity_v"`
+		CapacityMB          int    `json:"capacity_mb"`
+		HostIP              string `json:"host_ip,omitempty"`
+		LocalCapacityBytes  int64  `json:"local_capacity_bytes,omitempty"`
+		SharedBackendID     string `json:"shared_backend_id,omitempty"`
+		SharedCapacityBytes int64  `json:"shared_capacity_bytes,omitempty"`
 	}
 	payload := struct {
-		DesiredRevision string      `json:"desired_revision"`
-		Nodes           []nodeInput `json:"nodes"`
+		DesiredRevision     string      `json:"desired_revision"`
+		Nodes               []nodeInput `json:"nodes"`
+		VolumeRecordsDigest string      `json:"volume_records_digest,omitempty"`
 	}{
-		DesiredRevision: desiredRevision,
-		Nodes:           make([]nodeInput, 0, len(nodes)),
+		DesiredRevision:     desiredRevision,
+		Nodes:               make([]nodeInput, 0, len(nodes)),
+		VolumeRecordsDigest: volumeDigest,
 	}
 	for _, n := range nodes {
 		payload.Nodes = append(payload.Nodes, nodeInput{
-			ID:         n.InstanceID,
-			CapacityV:  n.CapacityVCPUs,
-			CapacityMB: n.CapacityMemMB,
-			HostIP:     hostIPByNode[n.InstanceID],
+			ID:                  n.InstanceID,
+			CapacityV:           n.CapacityVCPUs,
+			CapacityMB:          n.CapacityMemMB,
+			HostIP:              hostIPByNode[n.InstanceID],
+			LocalCapacityBytes:  n.LocalCapacityBytes,
+			SharedBackendID:     n.SharedBackendID,
+			SharedCapacityBytes: n.SharedCapacityBytes,
 		})
 	}
 	data, err := json.Marshal(payload)

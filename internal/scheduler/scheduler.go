@@ -23,7 +23,26 @@ type Node struct {
 	// CapacityVCPUs is the total number of vCPUs on the node.
 	CapacityVCPUs int
 	// CapacityMemMB is the total memory on the node in MB.
-	CapacityMemMB int
+	CapacityMemMB       int
+	LocalCapacityBytes  int64
+	SharedBackendID     string
+	SharedCapacityBytes int64
+}
+
+// StorageReservations contains retained quota that must remain admitted even
+// when its workload is absent. RecordedLogicalIDs prevents double counting
+// volumes that are currently desired.
+type StorageReservations struct {
+	LocalByNode        map[string]int64
+	SharedByBackend    map[string]int64
+	RecordedLogicalIDs map[string]bool
+	SharedEnabled      bool
+}
+
+type Pending struct {
+	Service    string
+	ReasonCode string
+	Message    string
 }
 
 // Schedule distributes services across nodes.
@@ -171,4 +190,170 @@ func BuildNodeConfigs(assignment map[string][]config.ServiceConfig) []config.Nod
 		return result[i].Node < result[j].Node
 	})
 	return result
+}
+
+// ScheduleWithStorage preserves the legacy CPU/memory behavior while adding
+// retained-volume constraints and per-service pending results. It is kept
+// separate from Schedule so existing direct callers retain error semantics.
+func ScheduleWithStorage(services []config.ServiceConfig, nodes []Node, existing map[string]string, reservations StorageReservations) (map[string][]config.ServiceConfig, []Pending) {
+	result := make(map[string][]config.ServiceConfig, len(nodes))
+	usedVCPU := make(map[string]int, len(nodes))
+	usedMem := make(map[string]int, len(nodes))
+	usedLocal := make(map[string]int64, len(nodes))
+	usedShared := make(map[string]int64)
+	groups := make(map[string]map[string]bool, len(nodes))
+	nodeByID := make(map[string]Node, len(nodes))
+	for _, node := range nodes {
+		result[node.InstanceID] = nil
+		groups[node.InstanceID] = make(map[string]bool)
+		nodeByID[node.InstanceID] = node
+	}
+
+	ordered := append([]config.ServiceConfig(nil), services...)
+	sort.SliceStable(ordered, func(i, j int) bool {
+		if ordered[i].VCPUs != ordered[j].VCPUs {
+			return ordered[i].VCPUs > ordered[j].VCPUs
+		}
+		return ordered[i].Name < ordered[j].Name
+	})
+
+	var pending []Pending
+	for _, service := range ordered {
+		boundNode, split := localBinding(service)
+		if split {
+			pending = append(pending, Pending{Service: service.Name, ReasonCode: "local_volume_binding_conflict", Message: "local volumes are retained on different nodes"})
+			continue
+		}
+		if hasSharedVolume(service) && !reservations.SharedEnabled {
+			pending = append(pending, Pending{Service: service.Name, ReasonCode: "shared_volume_runtime_unavailable", Message: "shared volumes await durable supervisor and fencing validation"})
+			continue
+		}
+
+		preferred := existing[service.Name]
+		if boundNode != "" {
+			preferred = boundNode
+			if _, active := nodeByID[boundNode]; !active {
+				pending = append(pending, Pending{Service: service.Name, ReasonCode: "local_volume_node_unavailable", Message: fmt.Sprintf("bound node %s is unavailable", boundNode)})
+				continue
+			}
+		}
+
+		candidates := append([]Node(nil), nodes...)
+		sort.SliceStable(candidates, func(i, j int) bool {
+			iConflict := service.AntiAffinityGroup != "" && groups[candidates[i].InstanceID][service.AntiAffinityGroup]
+			jConflict := service.AntiAffinityGroup != "" && groups[candidates[j].InstanceID][service.AntiAffinityGroup]
+			if iConflict != jConflict {
+				return !iConflict
+			}
+			iPreferred := candidates[i].InstanceID == preferred
+			jPreferred := candidates[j].InstanceID == preferred
+			if iPreferred != jPreferred {
+				return iPreferred
+			}
+			freeI := candidates[i].CapacityVCPUs - usedVCPU[candidates[i].InstanceID]
+			freeJ := candidates[j].CapacityVCPUs - usedVCPU[candidates[j].InstanceID]
+			if freeI != freeJ {
+				return freeI > freeJ
+			}
+			return candidates[i].InstanceID < candidates[j].InstanceID
+		})
+
+		chosen := ""
+		chosenService := service
+		for _, node := range candidates {
+			if boundNode != "" && node.InstanceID != boundNode {
+				continue
+			}
+			if usedVCPU[node.InstanceID]+service.VCPUs > node.CapacityVCPUs || usedMem[node.InstanceID]+service.MemoryMB > node.CapacityMemMB {
+				continue
+			}
+			candidateService, localDelta, sharedDelta, ok := fitStorage(service, node, reservations, usedLocal, usedShared)
+			if !ok {
+				continue
+			}
+			chosen = node.InstanceID
+			chosenService = candidateService
+			usedLocal[node.InstanceID] += localDelta
+			if node.SharedBackendID != "" {
+				usedShared[node.SharedBackendID] += sharedDelta
+			}
+			break
+		}
+		if chosen == "" {
+			reason := "insufficient_compute_capacity"
+			message := "no active node satisfies compute capacity"
+			if len(service.Volumes) > 0 {
+				reason = "volume_capacity_unavailable"
+				message = "no active node satisfies volume binding and capacity"
+			}
+			pending = append(pending, Pending{Service: service.Name, ReasonCode: reason, Message: message})
+			continue
+		}
+		result[chosen] = append(result[chosen], chosenService)
+		usedVCPU[chosen] += service.VCPUs
+		usedMem[chosen] += service.MemoryMB
+		if service.AntiAffinityGroup != "" {
+			groups[chosen][service.AntiAffinityGroup] = true
+		}
+	}
+	sort.Slice(pending, func(i, j int) bool { return pending[i].Service < pending[j].Service })
+	return result, pending
+}
+
+func localBinding(service config.ServiceConfig) (string, bool) {
+	bound := ""
+	for _, volume := range service.Volumes {
+		if volume.Type != config.VolumeTypeLocal || volume.BoundNode == "" {
+			continue
+		}
+		if bound != "" && bound != volume.BoundNode {
+			return "", true
+		}
+		bound = volume.BoundNode
+	}
+	return bound, false
+}
+
+func hasSharedVolume(service config.ServiceConfig) bool {
+	for _, volume := range service.Volumes {
+		if volume.Type == config.VolumeTypeShared {
+			return true
+		}
+	}
+	return false
+}
+
+func fitStorage(service config.ServiceConfig, node Node, reservations StorageReservations, usedLocal, usedShared map[string]int64) (config.ServiceConfig, int64, int64, bool) {
+	candidate := service
+	candidate.Volumes = append([]config.VolumeConfig(nil), service.Volumes...)
+	var localDelta, sharedDelta int64
+	for i := range candidate.Volumes {
+		volume := &candidate.Volumes[i]
+		logicalID := service.Name + "/" + volume.Name
+		switch volume.Type {
+		case config.VolumeTypeLocal:
+			if node.LocalCapacityBytes <= 0 || (volume.BoundNode != "" && volume.BoundNode != node.InstanceID) {
+				return service, 0, 0, false
+			}
+			volume.BoundNode = node.InstanceID
+			if !reservations.RecordedLogicalIDs[logicalID] {
+				localDelta += volume.SizeBytes
+			}
+		case config.VolumeTypeShared:
+			if node.SharedBackendID == "" || (volume.SharedBackendID != "" && volume.SharedBackendID != node.SharedBackendID) {
+				return service, 0, 0, false
+			}
+			volume.SharedBackendID = node.SharedBackendID
+			if !reservations.RecordedLogicalIDs[logicalID] {
+				sharedDelta += volume.SizeBytes
+			}
+		}
+	}
+	if reservations.LocalByNode[node.InstanceID]+usedLocal[node.InstanceID]+localDelta > node.LocalCapacityBytes {
+		return service, 0, 0, false
+	}
+	if sharedDelta > 0 && node.SharedCapacityBytes > 0 && reservations.SharedByBackend[node.SharedBackendID]+usedShared[node.SharedBackendID]+sharedDelta > node.SharedCapacityBytes {
+		return service, 0, 0, false
+	}
+	return candidate, localDelta, sharedDelta, true
 }

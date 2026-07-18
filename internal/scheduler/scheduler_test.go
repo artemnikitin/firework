@@ -246,3 +246,35 @@ func TestBuildNodeConfigs_DeterministicOrder(t *testing.T) {
 		t.Errorf("expected sorted order, got %v %v %v", ncs[0].Node, ncs[1].Node, ncs[2].Node)
 	}
 }
+
+func TestScheduleWithStorageBindsLocalVolumeAndHonorsRetainedBinding(t *testing.T) {
+	service := svc("db", 1, 256)
+	service.Volumes = []config.VolumeConfig{{Name: "data", Type: config.VolumeTypeLocal, MountPath: "/data", SizeBytes: 10 * config.GiB}}
+	nodes := []Node{
+		{InstanceID: "small", CapacityVCPUs: 4, CapacityMemMB: 1024, LocalCapacityBytes: 5 * config.GiB},
+		{InstanceID: "large", CapacityVCPUs: 4, CapacityMemMB: 1024, LocalCapacityBytes: 20 * config.GiB},
+	}
+	result, pending := ScheduleWithStorage([]config.ServiceConfig{service}, nodes, nil, StorageReservations{})
+	if len(pending) != 0 || len(result["large"]) != 1 {
+		t.Fatalf("unexpected placement result=%#v pending=%#v", result, pending)
+	}
+	if got := result["large"][0].Volumes[0].BoundNode; got != "large" {
+		t.Fatalf("bound_node = %q", got)
+	}
+
+	service.Volumes[0].BoundNode = "lost"
+	_, pending = ScheduleWithStorage([]config.ServiceConfig{service}, nodes, nil, StorageReservations{})
+	if len(pending) != 1 || pending[0].ReasonCode != "local_volume_node_unavailable" {
+		t.Fatalf("unexpected retained binding result: %#v", pending)
+	}
+}
+
+func TestScheduleWithStorageKeepsSharedPendingUntilSafetyGate(t *testing.T) {
+	service := svc("db", 1, 256)
+	service.Volumes = []config.VolumeConfig{{Name: "data", Type: config.VolumeTypeShared, MountPath: "/data", SizeBytes: config.GiB}}
+	nodes := []Node{{InstanceID: "node", CapacityVCPUs: 4, CapacityMemMB: 1024, SharedBackendID: "primary"}}
+	_, pending := ScheduleWithStorage([]config.ServiceConfig{service}, nodes, nil, StorageReservations{})
+	if len(pending) != 1 || pending[0].ReasonCode != "shared_volume_runtime_unavailable" {
+		t.Fatalf("unexpected pending result: %#v", pending)
+	}
+}

@@ -2,6 +2,8 @@ package enricher
 
 import (
 	"fmt"
+	"path/filepath"
+	"regexp"
 	"strings"
 
 	"github.com/artemnikitin/firework/internal/config"
@@ -52,6 +54,7 @@ type Warn struct {
 // ValidateInput checks the raw user config for errors.
 func ValidateInput(input *InputConfig) error {
 	ve := &ValidationError{}
+	validateVolumeDefaults(ve, input.Defaults.VolumeDefaults)
 
 	svcNames := make(map[string]bool)
 	subSeen := make(map[string]string)  // subdomain -> first service using it
@@ -81,12 +84,89 @@ func ValidateInput(input *InputConfig) error {
 		}
 
 		validateRouting(ve, s, input.Defaults, subSeen, hostSeen)
+		validateVolumes(ve, s)
 	}
 
 	if ve.hasErrors() {
 		return ve
 	}
 	return nil
+}
+
+var volumeNamePattern = regexp.MustCompile(`^[a-z0-9](?:[-a-z0-9]{0,61}[a-z0-9])?$`)
+
+func validateVolumeDefaults(ve *ValidationError, defs VolumeDefaults) {
+	for field, value := range map[string]string{
+		"volume_defaults.local_size":  defs.LocalSize,
+		"volume_defaults.shared_size": defs.SharedSize,
+	} {
+		if value == "" {
+			continue
+		}
+		if _, err := config.ParseVolumeSize(value); err != nil {
+			ve.addf("%s: %v", field, err)
+		}
+	}
+}
+
+func validateVolumes(ve *ValidationError, svc ServiceSpec) {
+	if len(svc.Volumes) > config.MaxServiceVolumes {
+		ve.addf("service %s: at most %d volumes are supported", svc.Name, config.MaxServiceVolumes)
+	}
+	names := make(map[string]struct{}, len(svc.Volumes))
+	paths := make(map[string]string, len(svc.Volumes))
+	for _, volume := range svc.Volumes {
+		prefix := fmt.Sprintf("service %s volume %s", svc.Name, volume.Name)
+		if !volumeNamePattern.MatchString(volume.Name) {
+			ve.addf("%s: name must be a DNS-label-like value of at most 63 characters", prefix)
+		}
+		if _, exists := names[volume.Name]; exists {
+			ve.addf("service %s: duplicate volume name %q", svc.Name, volume.Name)
+		}
+		names[volume.Name] = struct{}{}
+
+		if volume.Type != config.VolumeTypeLocal && volume.Type != config.VolumeTypeShared {
+			ve.addf("%s: type must be local or shared", prefix)
+		}
+		if volume.BoundNode != "" || volume.SharedBackendID != "" || volume.SizeBytes != 0 || volume.ResizeGeneration != 0 {
+			ve.addf("%s: bound_node, shared_backend_id, size_bytes, and resize_generation are system-owned", prefix)
+		}
+
+		cleaned := filepath.Clean(volume.MountPath)
+		if volume.MountPath == "" || !filepath.IsAbs(volume.MountPath) || cleaned != volume.MountPath {
+			ve.addf("%s: mount_path must be a clean absolute path", prefix)
+		} else if forbiddenVolumeMount(cleaned) {
+			ve.addf("%s: mount_path %q is reserved", prefix, cleaned)
+		}
+		if other, exists := paths[cleaned]; exists {
+			ve.addf("service %s volumes %s and %s: duplicate mount_path %q", svc.Name, other, volume.Name, cleaned)
+		}
+		for existingPath, existingName := range paths {
+			if pathContains(existingPath, cleaned) || pathContains(cleaned, existingPath) {
+				ve.addf("service %s volumes %s and %s: overlapping mount paths %q and %q", svc.Name, existingName, volume.Name, existingPath, cleaned)
+			}
+		}
+		paths[cleaned] = volume.Name
+
+		if volume.Size != "" {
+			if _, err := config.ParseVolumeSize(volume.Size); err != nil {
+				ve.addf("%s size: %v", prefix, err)
+			}
+		}
+	}
+}
+
+func forbiddenVolumeMount(path string) bool {
+	for _, reserved := range []string{"/", "/proc", "/sys", "/dev", "/run", "/tmp"} {
+		if path == reserved || pathContains(reserved, path) {
+			return true
+		}
+	}
+	return false
+}
+
+func pathContains(parent, child string) bool {
+	return parent != child && strings.HasPrefix(child, parent+string(filepath.Separator))
 }
 
 // validateRouting checks a service's public-routing metadata: at most one of
@@ -174,6 +254,11 @@ func ValidateOutput(nc config.NodeConfig) error {
 		}
 		if svc.MemoryMB == 0 {
 			ve.addf("service %s: zero memory", svc.Name)
+		}
+		for _, volume := range svc.Volumes {
+			if volume.SizeBytes <= 0 {
+				ve.addf("service %s volume %s: size_bytes must be positive", svc.Name, volume.Name)
+			}
 		}
 	}
 
