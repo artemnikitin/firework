@@ -106,8 +106,10 @@ Authentication failures exit with code 3 and unknown resources with code 4.
 
 Open the API origin in a browser and enter the operator token. The server
 derives an HTTP-only, secure, same-site session cookie; the token is not stored
-in local storage or exposed to JavaScript. Nodes and Services lists refresh
-automatically and link to their detail views.
+in local storage or exposed to JavaScript. The default overview groups node and
+service totals by lifecycle state. Each state links to its filtered list, and
+the Nodes and Services views link to fixed-order detail tables. All views
+refresh automatically.
 
 Rotate access by replacing the operator token secret and restarting the API
 role. Existing browser sessions become invalid because their derived session
