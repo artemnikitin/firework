@@ -11,6 +11,11 @@ type NodeConfig struct {
 	Services []ServiceConfig `yaml:"services"`
 	// HostIP is the EC2 instance private IP, resolved by the enricher.
 	HostIP string `yaml:"host_ip,omitempty"`
+	// Revision metadata is populated by the control plane so agents can report
+	// convergence using stable revision IDs instead of provider write tokens.
+	DesiredRevision   string `yaml:"desired_revision,omitempty"`
+	PlacementRevision string `yaml:"placement_revision,omitempty"`
+	RenderedRevision  string `yaml:"rendered_revision,omitempty"`
 }
 
 // ServiceConfig defines a single service (Firecracker microVM) to run.

@@ -14,6 +14,7 @@ const (
 	RoleRegistry   = "registry"
 	RoleEvents     = "events"
 	RoleController = "controller"
+	RoleAPI        = "api"
 )
 
 // Config configures the control plane runtime.
@@ -22,6 +23,9 @@ type Config struct {
 
 	RegistryListenAddr string `yaml:"registry_listen_addr"`
 	EventsListenAddr   string `yaml:"events_listen_addr"`
+	APIListenAddr      string `yaml:"api_listen_addr"`
+	OperatorToken      string `yaml:"operator_token"`
+	OperatorTokenFile  string `yaml:"operator_token_file"`
 
 	State StateConfig `yaml:"state"`
 
@@ -94,6 +98,7 @@ func DefaultConfig() Config {
 		Role:               RoleAll,
 		RegistryListenAddr: ":9443",
 		EventsListenAddr:   ":9444",
+		APIListenAddr:      ":9445",
 		State: StateConfig{
 			Backend: "s3",
 			Prefix:  "cp/v1",
@@ -133,6 +138,16 @@ func LoadConfig(path string) (Config, error) {
 // populates the corresponding inline fields. It returns an error if both the
 // inline value and the file path are set simultaneously.
 func (c *Config) resolve() error {
+	if c.OperatorTokenFile != "" && c.OperatorToken != "" {
+		return fmt.Errorf("operator_token and operator_token_file are mutually exclusive")
+	}
+	if c.OperatorTokenFile != "" {
+		val, err := readSecretFile(c.OperatorTokenFile)
+		if err != nil {
+			return fmt.Errorf("reading operator_token_file: %w", err)
+		}
+		c.OperatorToken = val
+	}
 	if c.GitHubWebhookSecretFile != "" && c.GitHubWebhookSecret != "" {
 		return fmt.Errorf("github_webhook_secret and github_webhook_secret_file are mutually exclusive")
 	}
@@ -170,7 +185,7 @@ func readSecretFile(path string) (string, error) {
 // Validate validates runtime configuration.
 func (c Config) Validate() error {
 	switch c.Role {
-	case RoleAll, RoleRegistry, RoleEvents, RoleController:
+	case RoleAll, RoleRegistry, RoleEvents, RoleController, RoleAPI:
 	default:
 		return fmt.Errorf("unsupported role %q", c.Role)
 	}
@@ -208,7 +223,7 @@ func (c Config) Validate() error {
 
 	// Controller-only role does not expose HTTPS endpoints, so server TLS
 	// cert/key are only required when registry and/or events APIs are enabled.
-	needsTLS := c.Role == RoleAll || c.Role == RoleRegistry || c.Role == RoleEvents
+	needsTLS := c.Role == RoleAll || c.Role == RoleRegistry || c.Role == RoleEvents || c.Role == RoleAPI
 	if needsTLS {
 		if c.TLS.CertFile == "" || c.TLS.KeyFile == "" {
 			return fmt.Errorf("tls.cert_file and tls.key_file are required for role %q", c.Role)
@@ -228,6 +243,15 @@ func (c Config) Validate() error {
 	needsEvents := c.Role == RoleAll || c.Role == RoleEvents
 	if needsEvents && c.GitHubWebhookSecret == "" {
 		return fmt.Errorf("github_webhook_secret is required for role %q", c.Role)
+	}
+	needsAPI := c.Role == RoleAll || c.Role == RoleAPI
+	if needsAPI {
+		if strings.TrimSpace(c.APIListenAddr) == "" {
+			return fmt.Errorf("api_listen_addr is required for role %q", c.Role)
+		}
+		if strings.TrimSpace(c.OperatorToken) == "" {
+			return fmt.Errorf("operator_token or operator_token_file is required for role %q", c.Role)
+		}
 	}
 	if c.ReconcileOnStart && c.GitRepoURL == "" {
 		return fmt.Errorf("git_repo_url is required when reconcile_on_start is enabled")

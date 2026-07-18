@@ -48,6 +48,20 @@ builds:
       - arm64
       - amd64
 
+  - id: fireworkctl
+    main: ./cmd/fireworkctl
+    binary: fireworkctl
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - linux
+      - darwin
+    goarch:
+      - amd64
+      - arm64
+    ldflags:
+      - -s -w -X github.com/artemnikitin/firework/internal/version.Version={{.Version}} -X github.com/artemnikitin/firework/internal/version.Commit={{.ShortCommit}} -X github.com/artemnikitin/firework/internal/version.BuildTime={{.Date}}
+
 archives:
   - id: firework-agent-binaries
     ids:
@@ -69,6 +83,14 @@ archives:
     ids:
       - fc-init
     name_template: "fc-init-{{ .Os }}-{{ .Arch }}"
+    formats:
+      - binary
+    files: []
+
+  - id: fireworkctl-binaries
+    ids:
+      - fireworkctl
+    name_template: "fireworkctl-{{ .Os }}-{{ .Arch }}"
     formats:
       - binary
     files: []

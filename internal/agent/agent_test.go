@@ -522,6 +522,23 @@ func TestTick_CapacityCheck_SkipsReconcile_WhenExceeded(t *testing.T) {
 	if len(instances) != 0 {
 		t.Errorf("expected no running VMs when capacity exceeded, got %d", len(instances))
 	}
+	status := a.agentStatusSnapshot()
+	if status.Phase != "failed" || status.ReasonCode != "capacity_exceeded" || len(status.Services) != 1 || status.Services[0].VMState != "unknown" {
+		t.Fatalf("unexpected bounded failure status: %#v", status)
+	}
+}
+
+func TestTick_StatusReportsStableRenderedRevision(t *testing.T) {
+	store := &fakeStore{data: map[string][]byte{"web": []byte("node: web\ndesired_revision: desired-1\nplacement_revision: placement-1\nrendered_revision: rendered-1\nservices: []\n")}, revision: "provider-token"}
+	a := New(testAgentConfig(t), store, testLogger())
+	a.tick(context.Background())
+	status := a.agentStatusSnapshot()
+	if status.Phase != "ready" || status.DesiredRevision != "desired-1" || status.PlacementRevision != "placement-1" || status.ObservedRevision != "rendered-1" || status.AppliedRevision != "rendered-1" {
+		t.Fatalf("unexpected convergence status: %#v", status)
+	}
+	if status.SchemaVersion != 1 || status.ObservedAt.IsZero() || status.LastAppliedAt.IsZero() {
+		t.Fatalf("missing version/timestamps: %#v", status)
+	}
 }
 
 func TestTick_CapacityCheck_ProceedsWhenSufficient(t *testing.T) {

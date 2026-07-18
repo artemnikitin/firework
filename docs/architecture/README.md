@@ -19,6 +19,7 @@ Roles:
 - `registry`: node enrollment (bootstrap token + CSR), register, heartbeat, node-state APIs.
 - `events`: GitHub webhook ingestion, repo clone, enrichment, desired revision publishing.
 - `controller`: leader-elected scheduler/publisher loop.
+- `api`: authenticated read-only node/service API and embedded web UI.
 - `all`: runs all roles in one process.
 
 All roles use the same object-storage-backed state layout under `cp/v1/`.
@@ -26,7 +27,8 @@ The configured backend can be S3 or GCS.
 
 ## Control-Plane State Model (Object Storage)
 
-- `cp/v1/registry/nodes/<node>.json` — node records (state, generation, capacity, last seen).
+- `cp/v1/registry/nodes/<node>.json` — node records (state, generation,
+  capacity, last seen, and optional bounded agent status).
 - `cp/v1/desired/revisions/<rev>.json` + `cp/v1/desired/current.json`.
 - `cp/v1/placements/revisions/<rev>.json` + `cp/v1/placements/current.json`.
 - `cp/v1/rendered/revisions/<rev>/nodes/<node>.yaml` + `cp/v1/rendered/current.json`.
@@ -45,6 +47,7 @@ flowchart LR
   REG --> STATE
   CTRL[controller role] -->|leader lease + schedule| STATE
   CTRL -->|render nodes/*.yaml| CFG[(S3 or GCS config objects)]
+  API[read-only API + UI] --> STATE
   CFG -->|poll| AGENTS
   AGENTS --> FC[Firecracker microVMs]
 ```
@@ -63,7 +66,8 @@ Per poll interval, the agent executes roughly this sequence:
 8. Optionally sync images from S3 or GCS.
 9. Plan/apply VM changes (create/update/delete).
 10. Sync Traefik dynamic files.
-11. Send registry heartbeat (capacity + used resources).
+11. Publish one bounded status snapshot to local `/status` and registry
+    heartbeat (capacity, desired usage, revisions, conditions, service state).
 
 ## Scheduling and Multi-Node Behavior
 
@@ -96,3 +100,4 @@ You can still run without control plane:
 - Design decisions and rationale: [`DESIGN.md`](DESIGN.md)
 - Main overview: [`../../README.md`](../../README.md)
 - Config reference: [`../configs/README.md`](../configs/README.md)
+- Deployment visibility API, CLI, and UI: [`../deployment-visibility.md`](../deployment-visibility.md)

@@ -51,6 +51,11 @@ find placement that respects constraints and publish rendered node configs.
 
 **Registry** is the node-lifecycle API: enrollment, register, heartbeat, state transitions.
 
+**API** is a read-only projection: join desired state, placement, registry
+leases, and bounded agent snapshots into authenticated node and service views.
+It never participates in reconciliation and needs only object-storage read
+permissions.
+
 This gives operational flexibility (you can run roles separately) without forcing a
 multi-service deployment model.
 

@@ -16,6 +16,7 @@ func validConfigForRole(role string) Config {
 	cfg.Enrollment.CAFile = "/tmp/ca.pem"
 	cfg.Enrollment.CAKeyFile = "/tmp/ca.key"
 	cfg.GitHubWebhookSecret = "secret"
+	cfg.OperatorToken = "operator-secret"
 	return cfg
 }
 
@@ -146,4 +147,21 @@ func TestConfigResolve_TokenFile(t *testing.T) {
 			t.Fatal("expected error for both token and token_file set")
 		}
 	})
+}
+
+func TestConfigResolve_OperatorTokenFile(t *testing.T) {
+	dir := t.TempDir()
+	file := filepath.Join(dir, "operator-token")
+	if err := os.WriteFile(file, []byte(" operator-token\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg := validConfigForRole(RoleAPI)
+	cfg.OperatorToken = ""
+	cfg.OperatorTokenFile = file
+	if err := cfg.resolve(); err != nil {
+		t.Fatal(err)
+	}
+	if cfg.OperatorToken != "operator-token" {
+		t.Fatalf("operator token = %q", cfg.OperatorToken)
+	}
 }

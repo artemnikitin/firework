@@ -11,6 +11,8 @@ import (
 	"os"
 	"strings"
 	"time"
+
+	"github.com/artemnikitin/firework/internal/statusmodel"
 )
 
 // RegistryServer serves node enrollment and registry APIs.
@@ -256,6 +258,20 @@ func (s *RegistryServer) handleHeartbeat(w http.ResponseWriter, r *http.Request)
 		cur.Used = req.Used
 		if req.HostIP != "" {
 			cur.HostIP = req.HostIP
+		}
+		if req.AgentStatus != nil {
+			if req.AgentStatus.SchemaVersion <= 0 {
+				return fmt.Errorf("agent_status.schema_version is required")
+			}
+			status := *req.AgentStatus
+			status.Message = statusmodel.BoundedMessage(status.Message)
+			for i := range status.Conditions {
+				status.Conditions[i].Message = statusmodel.BoundedMessage(status.Conditions[i].Message)
+			}
+			for i := range status.Services {
+				status.Services[i].Message = statusmodel.BoundedMessage(status.Services[i].Message)
+			}
+			cur.AgentStatus = &status
 		}
 		cur.LastSeenAt = now
 		cur.UpdatedAt = now
