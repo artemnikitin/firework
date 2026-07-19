@@ -77,6 +77,22 @@ func TestConfigValidate_NodeStaleTTL(t *testing.T) {
 	}
 }
 
+func TestConfigValidate_IngressDomain(t *testing.T) {
+	cfg := validConfigForRole(RoleAPI)
+	cfg.IngressDomain = "https://example.com"
+	if err := cfg.Validate(); err == nil {
+		t.Fatal("expected invalid ingress_domain error")
+	}
+
+	cfg.IngressDomain = "Example.COM."
+	if err := cfg.resolve(); err != nil {
+		t.Fatalf("resolve ingress_domain: %v", err)
+	}
+	if cfg.IngressDomain != "example.com" {
+		t.Fatalf("ingress domain = %q, want example.com", cfg.IngressDomain)
+	}
+}
+
 func TestConfigResolve_WebhookSecretFile(t *testing.T) {
 	dir := t.TempDir()
 

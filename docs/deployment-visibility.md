@@ -28,9 +28,16 @@ GET /v1/services/{service_name}
 `observed_at`, `count`, and a deterministically sorted `items` array. Supported
 filters are `state` for nodes and `state`, `health`, and `node` for services.
 
-Node capacity is requested capacity, not measured utilization. `allocated` is
-the sum of desired services assigned to the node, and `available` is total
-minus allocated with a floor of zero.
+Node capacity is requested capacity, not measured utilization. CPU and memory
+`allocated` values are the sum of desired services assigned to the node.
+Storage allocation is the durable persistent-volume reservation used by the
+scheduler, including retained volumes and the larger of desired/applied size
+during a shrink. `available` is capacity minus allocated with a floor of zero;
+these values do not represent filesystem I/O or blocks written by guests.
+Service list/detail responses aggregate local and shared volume counts plus
+desired, applied, and allocated bytes. Service detail also retains the durable
+per-volume view when an agent observation is empty or only contains a subset
+of the service's volumes.
 
 Missing data fails closed:
 
@@ -115,9 +122,14 @@ Open the API origin in a browser and enter the operator token. The server
 derives an HTTP-only, secure, same-site session cookie; the token is not stored
 in local storage or exposed to JavaScript. The default overview groups node and
 service totals by lifecycle state. Each state links to its filtered list, and
-the Nodes and Services views link to fixed-order detail tables. Node capacity
-is shown with allocated/available values and capacity bars. All views refresh
-automatically.
+the Nodes and Services views link to fixed-order detail tables. Node CPU,
+memory, and local-volume storage are shown with allocated/available values and
+capacity bars. Shared storage is a backend-level resource, so it is not
+duplicated on every node. Service lists show a prominent disk summary, and
+details show local/shared reservation and applied size plus the per-volume
+table. Service details also include a clickable HTTPS public URL when routing
+metadata resolves through the API role's `ingress_domain` (or uses an exact
+`metadata.host`). All views refresh automatically.
 
 Rotate access by replacing the operator token secret and restarting the API
 role. Existing browser sessions become invalid because their derived session

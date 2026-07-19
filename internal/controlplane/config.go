@@ -6,6 +6,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/artemnikitin/firework/internal/ingress"
 	"gopkg.in/yaml.v3"
 )
 
@@ -26,6 +27,7 @@ type Config struct {
 	APIListenAddr      string `yaml:"api_listen_addr"`
 	OperatorToken      string `yaml:"operator_token"`
 	OperatorTokenFile  string `yaml:"operator_token_file"`
+	IngressDomain      string `yaml:"ingress_domain"`
 
 	State StateConfig `yaml:"state"`
 
@@ -171,6 +173,13 @@ func (c *Config) resolve() error {
 			bt.Token = val
 		}
 	}
+	if c.IngressDomain != "" {
+		normalized, err := ingress.NormalizeDomain(c.IngressDomain)
+		if err != nil {
+			return fmt.Errorf("ingress_domain: %w", err)
+		}
+		c.IngressDomain = normalized
+	}
 	return nil
 }
 
@@ -251,6 +260,11 @@ func (c Config) Validate() error {
 		}
 		if strings.TrimSpace(c.OperatorToken) == "" {
 			return fmt.Errorf("operator_token or operator_token_file is required for role %q", c.Role)
+		}
+		if c.IngressDomain != "" {
+			if _, err := ingress.NormalizeDomain(c.IngressDomain); err != nil {
+				return fmt.Errorf("ingress_domain: %w", err)
+			}
 		}
 	}
 	if c.ReconcileOnStart && c.GitRepoURL == "" {

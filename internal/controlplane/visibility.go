@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/artemnikitin/firework/internal/config"
+	"github.com/artemnikitin/firework/internal/ingress"
 	"github.com/artemnikitin/firework/internal/statusmodel"
 )
 
@@ -22,18 +23,36 @@ type ListEnvelope[T any] struct {
 }
 
 type NodeSummary struct {
-	NodeID           string    `json:"node_id"`
-	Labels           []string  `json:"labels,omitempty"`
-	State            string    `json:"state"`
-	LastSeenAt       time.Time `json:"last_seen_at,omitempty"`
-	StatusAgeSeconds int64     `json:"status_age_seconds,omitempty"`
-	AgentVersion     string    `json:"agent_version,omitempty"`
-	Capacity         Resources `json:"capacity"`
-	Allocated        Resources `json:"allocated"`
-	Available        Resources `json:"available"`
-	DesiredServices  int       `json:"desired_services"`
-	RunningServices  int       `json:"running_services"`
-	ReasonCode       string    `json:"reason_code,omitempty"`
+	NodeID           string             `json:"node_id"`
+	Labels           []string           `json:"labels,omitempty"`
+	State            string             `json:"state"`
+	LastSeenAt       time.Time          `json:"last_seen_at,omitempty"`
+	StatusAgeSeconds int64              `json:"status_age_seconds,omitempty"`
+	AgentVersion     string             `json:"agent_version,omitempty"`
+	Capacity         Resources          `json:"capacity"`
+	Allocated        Resources          `json:"allocated"`
+	Available        Resources          `json:"available"`
+	Storage          NodeStorageSummary `json:"storage"`
+	DesiredServices  int                `json:"desired_services"`
+	RunningServices  int                `json:"running_services"`
+	ReasonCode       string             `json:"reason_code,omitempty"`
+}
+
+// StorageCapacitySummary describes storage reserved by persistent volumes
+// against the admission capacity reported by agents. It is allocation data,
+// not filesystem I/O or block-device utilization telemetry.
+type StorageCapacitySummary struct {
+	CapacityBytes  int64 `json:"capacity_bytes"`
+	AllocatedBytes int64 `json:"allocated_bytes"`
+	AvailableBytes int64 `json:"available_bytes"`
+}
+
+// NodeStorageSummary groups node-local capacity and the optional shared
+// backend capacity visible from a node.
+type NodeStorageSummary struct {
+	Local           StorageCapacitySummary `json:"local"`
+	Shared          StorageCapacitySummary `json:"shared"`
+	SharedBackendID string                 `json:"shared_backend_id,omitempty"`
 }
 
 type NodeDetail struct {
@@ -56,16 +75,33 @@ type NodeDetail struct {
 }
 
 type ServiceSummary struct {
-	Name             string    `json:"name"`
-	Node             string    `json:"node,omitempty"`
-	State            string    `json:"state"`
-	Health           string    `json:"health"`
-	VCPUs            int       `json:"vcpus"`
-	MemoryMB         int       `json:"memory_mb"`
-	ObservedAt       time.Time `json:"observed_at,omitempty"`
-	LastTransitionAt time.Time `json:"last_transition_at,omitempty"`
-	ReasonCode       string    `json:"reason_code,omitempty"`
-	Message          string    `json:"message,omitempty"`
+	Name             string                `json:"name"`
+	Node             string                `json:"node,omitempty"`
+	State            string                `json:"state"`
+	Health           string                `json:"health"`
+	VCPUs            int                   `json:"vcpus"`
+	MemoryMB         int                   `json:"memory_mb"`
+	Storage          ServiceStorageSummary `json:"storage"`
+	ObservedAt       time.Time             `json:"observed_at,omitempty"`
+	LastTransitionAt time.Time             `json:"last_transition_at,omitempty"`
+	ReasonCode       string                `json:"reason_code,omitempty"`
+	Message          string                `json:"message,omitempty"`
+}
+
+// VolumeAllocationSummary aggregates persistent-volume reservations for one
+// service and storage type. AllocatedBytes matches scheduler accounting by
+// taking the larger desired/applied size for each volume.
+type VolumeAllocationSummary struct {
+	Count          int   `json:"count"`
+	DesiredBytes   int64 `json:"desired_bytes"`
+	AppliedBytes   int64 `json:"applied_bytes"`
+	AllocatedBytes int64 `json:"allocated_bytes"`
+}
+
+// ServiceStorageSummary separates node-local and shared volume allocations.
+type ServiceStorageSummary struct {
+	Local  VolumeAllocationSummary `json:"local"`
+	Shared VolumeAllocationSummary `json:"shared"`
 }
 
 type ServiceHealthDetail struct {
@@ -90,6 +126,7 @@ type ServiceDetail struct {
 	NetworkAddress    string                     `json:"network_address,omitempty"`
 	PortForwards      []config.PortForward       `json:"port_forwards,omitempty"`
 	RoutingHostname   string                     `json:"routing_hostname,omitempty"`
+	PublicURL         string                     `json:"public_url,omitempty"`
 	RestartCount      int                        `json:"restart_count"`
 	DesiredRevision   string                     `json:"desired_revision,omitempty"`
 	PlacementRevision string                     `json:"placement_revision,omitempty"`
@@ -228,12 +265,7 @@ func (s *VisibilityService) Service(ctx context.Context, name string) (ServiceDe
 	if desired.Network != nil {
 		detail.NetworkAddress = desired.Network.GuestIP
 	}
-	if desired.Metadata != nil {
-		detail.RoutingHostname = strings.TrimSpace(desired.Metadata["host"])
-		if detail.RoutingHostname == "" {
-			detail.RoutingHostname = strings.TrimSpace(desired.Metadata["subdomain"])
-		}
-	}
+	detail.RoutingHostname, detail.PublicURL = servicePublicRoute(desired.Name, desired.Metadata, s.cfg.IngressDomain)
 	placed, placedOK := snapshot.placementByService[name]
 	if placedOK {
 		detail.Volumes = desiredVolumeStatuses(placed.config, snapshot.volumeByID)
@@ -247,7 +279,7 @@ func (s *VisibilityService) Service(ctx context.Context, name string) (ServiceDe
 					detail.ActualNode = record.NodeID
 					detail.PID = actual.PID
 					detail.RestartCount = actual.RestartCount
-					detail.Volumes = append([]statusmodel.VolumeStatus(nil), actual.Volumes...)
+					detail.Volumes = mergeVolumeStatuses(detail.Volumes, actual.Volumes)
 					if actual.NetworkAddress != "" {
 						detail.NetworkAddress = actual.NetworkAddress
 					}
@@ -263,6 +295,7 @@ func (s *VisibilityService) Service(ctx context.Context, name string) (ServiceDe
 	if desired.HealthCheck != nil && detail.HealthCheck.Type == "" {
 		detail.HealthCheck.Type = desired.HealthCheck.Type
 	}
+	detail.Storage = summarizeServiceStorage(detail.Volumes)
 	return detail, true, nil
 }
 
@@ -287,6 +320,68 @@ func desiredVolumeStatuses(service config.ServiceConfig, records map[string]Volu
 	}
 	sort.Slice(volumes, func(i, j int) bool { return volumes[i].LogicalID < volumes[j].LogicalID })
 	return volumes
+}
+
+func mergeVolumeStatuses(base, observed []statusmodel.VolumeStatus) []statusmodel.VolumeStatus {
+	merged := append([]statusmodel.VolumeStatus(nil), base...)
+	indexByID := make(map[string]int, len(merged))
+	for i := range merged {
+		indexByID[merged[i].LogicalID] = i
+	}
+	for _, status := range observed {
+		if index, exists := indexByID[status.LogicalID]; exists {
+			fallback := merged[index]
+			if status.Type == "" {
+				status.Type = fallback.Type
+			}
+			if status.MountPath == "" {
+				status.MountPath = fallback.MountPath
+			}
+			if status.BoundNode == "" {
+				status.BoundNode = fallback.BoundNode
+			}
+			if status.SharedBackendID == "" {
+				status.SharedBackendID = fallback.SharedBackendID
+			}
+			if status.DesiredSizeBytes <= 0 {
+				status.DesiredSizeBytes = fallback.DesiredSizeBytes
+			}
+			if status.ResizeGeneration <= 0 {
+				status.ResizeGeneration = fallback.ResizeGeneration
+			}
+			if status.State == "" {
+				status.State = fallback.State
+			}
+			merged[index] = status
+			continue
+		}
+		if status.LogicalID != "" {
+			indexByID[status.LogicalID] = len(merged)
+			merged = append(merged, status)
+		}
+	}
+	sort.Slice(merged, func(i, j int) bool { return merged[i].LogicalID < merged[j].LogicalID })
+	return merged
+}
+
+func summarizeServiceStorage(volumes []statusmodel.VolumeStatus) ServiceStorageSummary {
+	var summary ServiceStorageSummary
+	for _, volume := range volumes {
+		var target *VolumeAllocationSummary
+		switch volume.Type {
+		case string(config.VolumeTypeLocal):
+			target = &summary.Local
+		case string(config.VolumeTypeShared):
+			target = &summary.Shared
+		default:
+			continue
+		}
+		target.Count++
+		target.DesiredBytes += max64(volume.DesiredSizeBytes, 0)
+		target.AppliedBytes += max64(volume.AppliedSizeBytes, 0)
+		target.AllocatedBytes += max64(max64(volume.DesiredSizeBytes, volume.AppliedSizeBytes), 0)
+	}
+	return summary
 }
 
 func (s *VisibilityService) load(ctx context.Context) (visibilitySnapshot, error) {
@@ -392,7 +487,7 @@ func (s visibilitySnapshot) nodeSummary(record NodeRecord) NodeSummary {
 		}
 	}
 	available := Resources{VCPUs: max(record.Capacity.VCPUs-allocated.VCPUs, 0), MemoryMB: max(record.Capacity.MemoryMB-allocated.MemoryMB, 0)}
-	summary := NodeSummary{NodeID: record.NodeID, Labels: append([]string(nil), record.Labels...), State: state, LastSeenAt: record.LastSeenAt, Capacity: record.Capacity, Allocated: allocated, Available: available, DesiredServices: desiredCount}
+	summary := NodeSummary{NodeID: record.NodeID, Labels: append([]string(nil), record.Labels...), State: state, LastSeenAt: record.LastSeenAt, Capacity: record.Capacity, Allocated: allocated, Available: available, Storage: s.nodeStorageSummary(record), DesiredServices: desiredCount}
 	if !record.LastSeenAt.IsZero() {
 		summary.StatusAgeSeconds = max(int64(s.now.Sub(record.LastSeenAt).Seconds()), 0)
 	}
@@ -416,6 +511,38 @@ func (s visibilitySnapshot) nodeSummary(record NodeRecord) NodeSummary {
 		summary.ReasonCode = "agent_status_stale"
 	}
 	return summary
+}
+
+func (s visibilitySnapshot) nodeStorageSummary(record NodeRecord) NodeStorageSummary {
+	var localAllocated, sharedAllocated int64
+	for _, volume := range s.volumeByID {
+		size := max64(volume.DesiredSizeBytes, volume.AppliedSizeBytes)
+		size = max64(size, 0)
+		switch volume.Type {
+		case config.VolumeTypeLocal:
+			if volume.BoundNode == record.NodeID {
+				localAllocated += size
+			}
+		case config.VolumeTypeShared:
+			if record.Storage.SharedBackendID != "" && volume.SharedBackendID == record.Storage.SharedBackendID {
+				sharedAllocated += size
+			}
+		}
+	}
+	return NodeStorageSummary{
+		Local:           storageCapacitySummary(record.Storage.LocalCapacityBytes, localAllocated),
+		Shared:          storageCapacitySummary(record.Storage.SharedCapacityBytes, sharedAllocated),
+		SharedBackendID: record.Storage.SharedBackendID,
+	}
+}
+
+func storageCapacitySummary(capacity, allocated int64) StorageCapacitySummary {
+	capacity = max64(capacity, 0)
+	allocated = max64(allocated, 0)
+	return StorageCapacitySummary{
+		CapacityBytes: capacity, AllocatedBytes: allocated,
+		AvailableBytes: max64(capacity-allocated, 0),
+	}
 }
 
 func (s visibilitySnapshot) freshStatus(record NodeRecord) (statusmodel.AgentStatus, bool) {
@@ -457,7 +584,7 @@ func (s visibilitySnapshot) serviceSummary(desired config.ServiceConfig) Service
 	if !s.placementCurrent {
 		reason = "placement_pending"
 	}
-	summary := ServiceSummary{Name: desired.Name, State: "pending", Health: "unknown", VCPUs: desired.VCPUs, MemoryMB: desired.MemoryMB, ReasonCode: reason}
+	summary := ServiceSummary{Name: desired.Name, State: "pending", Health: "unknown", VCPUs: desired.VCPUs, MemoryMB: desired.MemoryMB, Storage: summarizeServiceStorage(desiredVolumeStatuses(desired, s.volumeByID)), ReasonCode: reason}
 	if pending, ok := s.pendingByService[desired.Name]; ok && s.placementCurrent {
 		summary.ReasonCode = pending.ReasonCode
 		summary.Message = pending.Message
@@ -524,4 +651,19 @@ func safeIdentifier(value string) string {
 	value = strings.SplitN(value, "?", 2)[0]
 	value = strings.SplitN(value, "#", 2)[0]
 	return filepath.Base(value)
+}
+
+func servicePublicRoute(serviceName string, metadata map[string]string, ingressDomain string) (string, string) {
+	if metadata == nil {
+		return "", ""
+	}
+	rawHostname := strings.TrimSpace(metadata[ingress.MetadataHost])
+	if rawHostname == "" {
+		rawHostname = strings.TrimSpace(metadata[ingress.MetadataSubdomain])
+	}
+	hostname, err := ingress.Resolve(serviceName, metadata, ingressDomain)
+	if err != nil || hostname == "" {
+		return rawHostname, ""
+	}
+	return hostname, "https://" + hostname
 }

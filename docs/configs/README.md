@@ -184,6 +184,7 @@ Tenant expansions rewrite links to tenant-prefixed service names automatically.
 | `api_listen_addr` | api/all | HTTPS bind address for the read-only operator API and UI |
 | `operator_token` | api/all | Dedicated operator bearer token; mutually exclusive with `operator_token_file` |
 | `operator_token_file` | api/all | File containing the dedicated operator token |
+| `ingress_domain` | no | Deployment-owned DNS suffix used by api/all to resolve `metadata.subdomain` into a public service URL; exact `metadata.host` values do not require it |
 | `state.backend` | no | `s3` (default) or `gcs` |
 | `state.prefix` | no | Prefix for control-plane state objects (default `cp/v1`) |
 | `state.s3.bucket` | S3 mode | Bucket for control-plane state and rendered configs |
