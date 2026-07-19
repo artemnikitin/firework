@@ -45,7 +45,7 @@ func TestVisibilityWebUsesServiceObservationAndCapacityBars(t *testing.T) {
 		t.Fatal(err)
 	}
 	script := string(data)
-	for _, want := range []string{"service.service_observed_at", "<progress", "service.actual_node", "node.storage?.local", "service.storage", "serviceDisk", "'B', 'KiB', 'MiB', 'GiB', 'TiB'", "service.public_url", "rel=\"noopener noreferrer\""} {
+	for _, want := range []string{"service.service_observed_at", "<progress", "service.actual_node", "node.storage?.local", "service.storage", "serviceDisk", "service-disk", "'B', 'KiB', 'MiB', 'GiB', 'TiB'", "service.public_url", "rel=\"noopener noreferrer\""} {
 		if !strings.Contains(script, want) {
 			t.Errorf("embedded UI is missing %q", want)
 		}

@@ -94,7 +94,7 @@ const serviceDisk = storage => {
     if (!count) continue;
     entries.push(`<span>${label}: ${esc(formatBytes(Math.max(0, Number(allocation.allocated_bytes) || 0)))} reserved</span>`);
   }
-  return entries.length ? `<div class="capacity-value">${entries.join('')}</div>` : '<span class="muted">—</span>';
+  return entries.length ? `<div class="service-disk">${entries.join('')}</div>` : '<span class="muted">—</span>';
 };
 
 async function api(path) {
