@@ -11,7 +11,9 @@ import (
 	"os"
 	"strings"
 	"time"
+	"unicode"
 
+	"github.com/artemnikitin/firework/internal/config"
 	"github.com/artemnikitin/firework/internal/statusmodel"
 )
 
@@ -65,7 +67,7 @@ func (s *RegistryServer) HTTPServer() (*http.Server, error) {
 
 	return &http.Server{
 		Addr:              s.cfg.RegistryListenAddr,
-		Handler:           mux,
+		Handler:           http.MaxBytesHandler(mux, 1<<20),
 		TLSConfig:         tlsCfg,
 		ReadHeaderTimeout: 10 * time.Second,
 		ReadTimeout:       15 * time.Second,
@@ -241,6 +243,14 @@ func (s *RegistryServer) handleHeartbeat(w http.ResponseWriter, r *http.Request)
 		writeJSON(w, http.StatusForbidden, map[string]string{"error": "node_id does not match mTLS identity"})
 		return
 	}
+	if req.AgentStatus != nil {
+		var validated NodeRecord
+		if err := applyHeartbeatAgentStatus(&validated, req.NodeID, req.AgentStatus); err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+			return
+		}
+		req.AgentStatus = validated.AgentStatus
+	}
 
 	rec, err := s.upsertNodeRecord(r.Context(), req.NodeID, func(cur *NodeRecord) error {
 		if cur.Generation > req.Generation {
@@ -305,15 +315,102 @@ func applyHeartbeatAgentStatus(cur *NodeRecord, nodeID string, incoming *statusm
 		return fmt.Errorf("agent_status.node does not match node_id")
 	}
 	status := *incoming
+	if status.Phase == "" {
+		status.Phase = statusmodel.PhaseUnknown
+	}
+	status.Conditions = append([]statusmodel.Condition(nil), incoming.Conditions...)
+	status.Services = append([]statusmodel.ServiceStatus(nil), incoming.Services...)
+	if err := validateAgentStatus(status); err != nil {
+		return err
+	}
 	status.Message = statusmodel.BoundedMessage(status.Message)
 	for i := range status.Conditions {
 		status.Conditions[i].Message = statusmodel.BoundedMessage(status.Conditions[i].Message)
 	}
 	for i := range status.Services {
 		status.Services[i].Message = statusmodel.BoundedMessage(status.Services[i].Message)
+		status.Services[i].Volumes = append([]statusmodel.VolumeStatus(nil), status.Services[i].Volumes...)
+		for j := range status.Services[i].Volumes {
+			status.Services[i].Volumes[j].LastError = statusmodel.BoundedMessage(status.Services[i].Volumes[j].LastError)
+		}
 	}
 	cur.AgentStatus = &status
 	return nil
+}
+
+func validateAgentStatus(status statusmodel.AgentStatus) error {
+	if status.SchemaVersion <= 0 {
+		return fmt.Errorf("agent_status.schema_version is required")
+	}
+	if len(status.Conditions) > statusmodel.MaxConditions {
+		return fmt.Errorf("agent_status has %d conditions; maximum is %d", len(status.Conditions), statusmodel.MaxConditions)
+	}
+	if len(status.Services) > statusmodel.MaxServices {
+		return fmt.Errorf("agent_status has %d services; maximum is %d", len(status.Services), statusmodel.MaxServices)
+	}
+	if status.DesiredServices < 0 || status.ReadyServices < 0 || status.ReadyServices > status.DesiredServices {
+		return fmt.Errorf("agent_status service counts are invalid")
+	}
+	if !validStatusPhase(status.Phase) {
+		return fmt.Errorf("agent_status phase %q is invalid", status.Phase)
+	}
+	for _, revision := range []string{status.DesiredRevision, status.PlacementRevision, status.ObservedRevision, status.AppliedRevision} {
+		if len(revision) > statusmodel.MaxRevisionLen {
+			return fmt.Errorf("agent_status revision exceeds %d bytes", statusmodel.MaxRevisionLen)
+		}
+	}
+	conditionTypes := make(map[string]struct{}, len(status.Conditions))
+	for _, condition := range status.Conditions {
+		if condition.Type == "" || len(condition.Type) > statusmodel.MaxConditionTypeLen {
+			return fmt.Errorf("agent_status condition type is invalid")
+		}
+		if _, duplicate := conditionTypes[condition.Type]; duplicate {
+			return fmt.Errorf("agent_status condition %q is duplicated", condition.Type)
+		}
+		conditionTypes[condition.Type] = struct{}{}
+		if condition.Status != statusmodel.ConditionTrue && condition.Status != statusmodel.ConditionFalse && condition.Status != statusmodel.ConditionUnknown {
+			return fmt.Errorf("agent_status condition %q has invalid status %q", condition.Type, condition.Status)
+		}
+		if !validReasonCode(condition.ReasonCode) {
+			return fmt.Errorf("agent_status condition %q has invalid reason code", condition.Type)
+		}
+	}
+	serviceNames := make(map[string]struct{}, len(status.Services))
+	for _, service := range status.Services {
+		if service.Name == "" || len(service.Name) > statusmodel.MaxServiceNameLen {
+			return fmt.Errorf("agent_status service name is invalid")
+		}
+		if _, duplicate := serviceNames[service.Name]; duplicate {
+			return fmt.Errorf("agent_status service %q is duplicated", service.Name)
+		}
+		serviceNames[service.Name] = struct{}{}
+		if !validReasonCode(service.ReasonCode) {
+			return fmt.Errorf("agent_status service %q has invalid reason code", service.Name)
+		}
+		if len(service.Volumes) > config.MaxServiceVolumes {
+			return fmt.Errorf("agent_status service %q has too many volumes", service.Name)
+		}
+	}
+	if !validReasonCode(status.ReasonCode) {
+		return fmt.Errorf("agent_status has invalid reason code")
+	}
+	return nil
+}
+
+func validStatusPhase(phase statusmodel.Phase) bool {
+	return phase == statusmodel.PhaseUnknown || phase == statusmodel.PhaseReconciling || phase == statusmodel.PhaseReady || phase == statusmodel.PhaseFailed
+}
+
+func validReasonCode(code string) bool {
+	if len(code) > statusmodel.MaxReasonCodeLen {
+		return false
+	}
+	for _, char := range code {
+		if unicode.IsControl(char) || unicode.IsSpace(char) {
+			return false
+		}
+	}
+	return true
 }
 
 func (s *RegistryServer) handleState(w http.ResponseWriter, r *http.Request) {

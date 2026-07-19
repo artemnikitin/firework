@@ -74,6 +74,28 @@ type NodeDetail struct {
 	Services          []ServiceSummary        `json:"services"`
 }
 
+// RevisionStatus is a point-in-time derivation from current desired,
+// placement, rendered, and registry state. It is observational and is never
+// persisted as a second reconciliation state machine.
+type RevisionStatus struct {
+	APIVersion        string    `json:"api_version"`
+	ObservedAt        time.Time `json:"observed_at"`
+	Phase             string    `json:"phase"`
+	DesiredRevision   string    `json:"desired_revision,omitempty"`
+	PlacementRevision string    `json:"placement_revision,omitempty"`
+	RenderedRevision  string    `json:"rendered_revision,omitempty"`
+	RelevantNodes     int       `json:"relevant_nodes"`
+	ConvergedNodes    []string  `json:"converged_nodes"`
+	DegradedNodes     []string  `json:"degraded_nodes"`
+	ProgressingNodes  []string  `json:"progressing_nodes"`
+	FailedNodes       []string  `json:"failed_nodes"`
+	StaleNodes        []string  `json:"stale_nodes"`
+	DownNodes         []string  `json:"down_nodes"`
+	UnknownNodes      []string  `json:"unknown_nodes"`
+	ReasonCode        string    `json:"reason_code,omitempty"`
+	Message           string    `json:"message,omitempty"`
+}
+
 type ServiceSummary struct {
 	Name             string                `json:"name"`
 	Node             string                `json:"node,omitempty"`
@@ -161,6 +183,15 @@ type VisibilityService struct {
 
 func NewVisibilityService(cfg Config, store StateStore) *VisibilityService {
 	return &VisibilityService{cfg: cfg, store: store}
+}
+
+// Revision derives fleet convergence for the current rendered revision.
+func (s *VisibilityService) Revision(ctx context.Context) (RevisionStatus, error) {
+	snapshot, err := s.load(ctx)
+	if err != nil {
+		return RevisionStatus{}, err
+	}
+	return snapshot.revisionStatus(), nil
 }
 
 func (s *VisibilityService) Nodes(ctx context.Context, stateFilter string) (ListEnvelope[NodeSummary], error) {
@@ -577,6 +608,164 @@ func (s visibilitySnapshot) statusMatchesCurrent(status statusmodel.AgentStatus)
 		status.PlacementRevision == s.placement.Revision &&
 		status.ObservedRevision == s.renderedRevision &&
 		status.AppliedRevision == s.renderedRevision
+}
+
+func (s visibilitySnapshot) revisionStatus() RevisionStatus {
+	status := RevisionStatus{
+		APIVersion: visibilityAPIVersion, ObservedAt: s.now, Phase: "unknown",
+		DesiredRevision: s.desired.Revision, PlacementRevision: s.placement.Revision,
+		RenderedRevision: s.renderedRevision,
+		ConvergedNodes:   []string{}, DegradedNodes: []string{}, ProgressingNodes: []string{},
+		FailedNodes: []string{}, StaleNodes: []string{}, DownNodes: []string{}, UnknownNodes: []string{},
+	}
+	if s.desired.Revision == "" {
+		status.ReasonCode = "desired_revision_missing"
+		return status
+	}
+	if !s.placementCurrent {
+		status.Phase = "published"
+		status.ReasonCode = "placement_pending"
+		return status
+	}
+	if len(s.placement.PendingServices) > 0 {
+		status.Phase = "failed"
+		status.ReasonCode = s.placement.PendingServices[0].ReasonCode
+		status.Message = statusmodel.BoundedMessage(s.placement.PendingServices[0].Message)
+		return status
+	}
+	expectedRendered := ""
+	for _, node := range s.placement.NodeConfigs {
+		if node.RenderedRevision == "" {
+			continue
+		}
+		if expectedRendered == "" {
+			expectedRendered = node.RenderedRevision
+			continue
+		}
+		if expectedRendered != node.RenderedRevision {
+			status.Phase = "unknown"
+			status.ReasonCode = "placement_rendered_revision_conflict"
+			return status
+		}
+	}
+	if expectedRendered != "" && s.renderedRevision != expectedRendered {
+		status.Phase = "progressing"
+		status.ReasonCode = "rendered_revision_pending"
+		return status
+	}
+	if s.renderedRevision == "" {
+		status.Phase = "progressing"
+		status.ReasonCode = "rendered_revision_pending"
+		return status
+	}
+
+	relevant := make(map[string]struct{}, len(s.placement.NodeConfigs))
+	for _, node := range s.placement.NodeConfigs {
+		if node.Node != "" {
+			relevant[node.Node] = struct{}{}
+		}
+	}
+	status.RelevantNodes = len(relevant)
+	if len(relevant) == 0 {
+		if len(s.desired.Services) == 0 {
+			status.Phase = "converged"
+			return status
+		}
+		status.Phase = "failed"
+		status.ReasonCode = "no_relevant_nodes"
+		status.Message = "non-empty desired revision has no rendered node assignments"
+		return status
+	}
+
+	observedCurrent := false
+	for nodeID := range relevant {
+		record, exists := s.nodeByID[nodeID]
+		if !exists {
+			status.UnknownNodes = append(status.UnknownNodes, nodeID)
+			continue
+		}
+		if record.State == NodeStateDown {
+			status.DownNodes = append(status.DownNodes, nodeID)
+			continue
+		}
+		if record.LastSeenAt.IsZero() || s.now.Sub(record.LastSeenAt) > s.staleTTL {
+			status.StaleNodes = append(status.StaleNodes, nodeID)
+			continue
+		}
+		agentStatus, fresh := s.freshStatus(record)
+		if !fresh || agentStatus.ServicesTruncated {
+			status.UnknownNodes = append(status.UnknownNodes, nodeID)
+			continue
+		}
+		observed := agentStatus.DesiredRevision == s.desired.Revision &&
+			agentStatus.PlacementRevision == s.placement.Revision &&
+			agentStatus.ObservedRevision == s.renderedRevision
+		if observed {
+			observedCurrent = true
+		}
+		if observed && agentStatus.Phase == statusmodel.PhaseFailed {
+			status.FailedNodes = append(status.FailedNodes, nodeID)
+			continue
+		}
+		if !observed || agentStatus.AppliedRevision != s.renderedRevision || agentStatus.Phase == statusmodel.PhaseReconciling {
+			status.ProgressingNodes = append(status.ProgressingNodes, nodeID)
+			continue
+		}
+		blockingFailure, unknownCondition, degraded := assessConditions(agentStatus.Conditions)
+		switch {
+		case blockingFailure:
+			status.FailedNodes = append(status.FailedNodes, nodeID)
+		case unknownCondition || agentStatus.Phase != statusmodel.PhaseReady:
+			status.UnknownNodes = append(status.UnknownNodes, nodeID)
+		case degraded:
+			status.DegradedNodes = append(status.DegradedNodes, nodeID)
+		default:
+			status.ConvergedNodes = append(status.ConvergedNodes, nodeID)
+		}
+	}
+	for _, nodes := range [][]string{status.ConvergedNodes, status.DegradedNodes, status.ProgressingNodes, status.FailedNodes, status.StaleNodes, status.DownNodes, status.UnknownNodes} {
+		sort.Strings(nodes)
+	}
+	switch {
+	case len(status.FailedNodes) > 0:
+		status.Phase = "failed"
+		status.ReasonCode = "node_apply_failed"
+	case len(status.StaleNodes)+len(status.DownNodes)+len(status.UnknownNodes) > 0:
+		status.Phase = "unknown"
+		status.ReasonCode = "node_status_unavailable"
+	case len(status.ProgressingNodes) > 0:
+		if observedCurrent {
+			status.Phase = "progressing"
+		} else {
+			status.Phase = "published"
+		}
+	case len(status.DegradedNodes) > 0:
+		status.Phase = "degraded"
+		status.ReasonCode = "peer_routes_degraded"
+	default:
+		status.Phase = "converged"
+	}
+	return status
+}
+
+func assessConditions(conditions []statusmodel.Condition) (blockingFailure, unknown, degraded bool) {
+	for _, condition := range conditions {
+		if condition.Type == "PeerRoutesReady" {
+			if condition.Status == statusmodel.ConditionFalse {
+				degraded = true
+			} else if condition.Status == statusmodel.ConditionUnknown {
+				unknown = true
+			}
+			continue
+		}
+		if condition.Status == statusmodel.ConditionFalse {
+			blockingFailure = true
+		}
+		if condition.Status == statusmodel.ConditionUnknown {
+			unknown = true
+		}
+	}
+	return blockingFailure, unknown, degraded
 }
 
 func (s visibilitySnapshot) serviceSummary(desired config.ServiceConfig) ServiceSummary {

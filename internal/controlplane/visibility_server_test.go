@@ -1,6 +1,7 @@
 package controlplane
 
 import (
+	"encoding/json"
 	"io"
 	"log/slog"
 	"net/http"
@@ -39,13 +40,30 @@ func TestVisibilityAssetsDisableBrowserCaching(t *testing.T) {
 	}
 }
 
+func TestVisibilityStatusEndpointReturnsRevisionDerivation(t *testing.T) {
+	cfg := validConfigForRole(RoleAPI)
+	server := NewVisibilityServer(cfg, newBlobStateStore(newMemBlob()), slog.New(slog.NewTextHandler(io.Discard, nil)))
+	recorder := httptest.NewRecorder()
+	server.handleStatus(recorder, httptest.NewRequest(http.MethodGet, "/v1/status", nil))
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status endpoint returned %d: %s", recorder.Code, recorder.Body.String())
+	}
+	var status RevisionStatus
+	if err := json.NewDecoder(recorder.Body).Decode(&status); err != nil {
+		t.Fatal(err)
+	}
+	if status.Phase != "unknown" || status.ReasonCode != "desired_revision_missing" {
+		t.Fatalf("unexpected empty deployment status: %#v", status)
+	}
+}
+
 func TestVisibilityWebUsesServiceObservationAndCapacityBars(t *testing.T) {
 	data, err := visibilityWeb.ReadFile("web/app.js")
 	if err != nil {
 		t.Fatal(err)
 	}
 	script := string(data)
-	for _, want := range []string{"service.service_observed_at", "<progress", "service.actual_node", "node.storage?.local", "service.storage", "serviceDisk", "service-disk", "'B', 'KiB', 'MiB', 'GiB', 'TiB'", "service.public_url", "rel=\"noopener noreferrer\""} {
+	for _, want := range []string{"service.service_observed_at", "<progress", "service.actual_node", "node.storage?.local", "service.storage", "serviceDisk", "service-disk", "'B', 'KiB', 'MiB', 'GiB', 'TiB'", "service.public_url", "rel=\"noopener noreferrer\"", "/v1/status", "Revision convergence"} {
 		if !strings.Contains(script, want) {
 			t.Errorf("embedded UI is missing %q", want)
 		}

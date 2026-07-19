@@ -2,6 +2,7 @@ package reconciler
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"sort"
@@ -139,7 +140,7 @@ func (r *Reconciler) applyAllAtOnce(ctx context.Context, actions []Action) error
 			r.logger.Info("updating service (stop + start)", "service", action.Service.Name)
 			if err := r.preflight(ctx, action.Service); err != nil {
 				r.logger.Error("volume preflight failed; keeping current VM running", "service", action.Service.Name, "error", err)
-				errs = append(errs, fmt.Errorf("preflight update %s: %w", action.Service.Name, err))
+				errs = append(errs, stageError(FailureStageVM, fmt.Errorf("preflight update %s: %w", action.Service.Name, err)))
 				continue
 			}
 			prev := action.Service
@@ -159,7 +160,7 @@ func (r *Reconciler) applyAllAtOnce(ctx context.Context, actions []Action) error
 	}
 
 	if len(errs) > 0 {
-		return fmt.Errorf("reconciliation had %d error(s): %v", len(errs), errs)
+		return fmt.Errorf("reconciliation had %d error(s): %w", len(errs), errors.Join(errs...))
 	}
 	return nil
 }
@@ -202,7 +203,7 @@ func (r *Reconciler) applyRolling(ctx context.Context, actions []Action) error {
 		r.logger.Info("updating service (stop + start)", "service", action.Service.Name)
 		if err := r.preflight(ctx, action.Service); err != nil {
 			r.logger.Error("volume preflight failed; keeping current VM running", "service", action.Service.Name, "error", err)
-			errs = append(errs, fmt.Errorf("preflight update %s: %w", action.Service.Name, err))
+			errs = append(errs, stageError(FailureStageVM, fmt.Errorf("preflight update %s: %w", action.Service.Name, err)))
 			break
 		}
 		prev := action.Service
@@ -225,7 +226,7 @@ func (r *Reconciler) applyRolling(ctx context.Context, actions []Action) error {
 	}
 
 	if len(errs) > 0 {
-		return fmt.Errorf("reconciliation had %d error(s): %v", len(errs), errs)
+		return fmt.Errorf("reconciliation had %d error(s): %w", len(errs), errors.Join(errs...))
 	}
 	return nil
 }
@@ -260,7 +261,7 @@ func (r *Reconciler) createService(ctx context.Context, svc config.ServiceConfig
 	// Set up network before starting the VM.
 	if r.networkMgr != nil {
 		if err := r.networkMgr.Setup(svc); err != nil {
-			return fmt.Errorf("network setup: %w", err)
+			return stageError(FailureStageNetwork, fmt.Errorf("network setup: %w", err))
 		}
 	}
 
@@ -270,7 +271,7 @@ func (r *Reconciler) createService(ctx context.Context, svc config.ServiceConfig
 		if r.networkMgr != nil {
 			_ = r.networkMgr.Teardown(svc)
 		}
-		return fmt.Errorf("starting VM: %w", err)
+		return stageError(FailureStageVM, fmt.Errorf("starting VM: %w", err))
 	}
 
 	// Set up port forwards.

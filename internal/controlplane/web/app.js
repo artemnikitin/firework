@@ -203,12 +203,31 @@ function overviewPanel(kind, items) {
   </section>`;
 }
 
-function renderOverview(nodes, services) {
+const nodeSet = values => (values || []).length ? esc(values.join(', ')) : '<span class="muted">—</span>';
+
+function renderOverview(nodes, services, status) {
+  const convergence = detailTable([
+    ['Phase', badge(status.phase)],
+    ['Desired revision', display(status.desired_revision)],
+    ['Placement revision', display(status.placement_revision)],
+    ['Rendered revision', display(status.rendered_revision)],
+    ['Relevant nodes', display(status.relevant_nodes)],
+    ['Converged', nodeSet(status.converged_nodes)],
+    ['Degraded', nodeSet(status.degraded_nodes)],
+    ['Progressing', nodeSet(status.progressing_nodes)],
+    ['Failed', nodeSet(status.failed_nodes)],
+    ['Stale', nodeSet(status.stale_nodes)],
+    ['Down', nodeSet(status.down_nodes)],
+    ['Unknown', nodeSet(status.unknown_nodes)],
+    ['Reason', display(status.reason_code)],
+    ['Message', display(status.message)],
+  ]);
   content.innerHTML = `<div class="overview-heading">
     <p class="eyebrow">Firework deployment</p>
     <h1>Platform overview</h1>
     <p>Current node availability and service lifecycle state across the platform.</p>
   </div>
+  ${section('Revision convergence', convergence)}
   <div class="overview-grid">
     ${overviewPanel('nodes', nodes)}
     ${overviewPanel('services', services)}
@@ -376,10 +395,10 @@ async function load() {
     }
 
     setActiveView('overview');
-    const [nodes, services] = await Promise.all([api('/v1/nodes'), api('/v1/services')]);
-    const observedAt = new Date(Math.max(new Date(nodes.observed_at), new Date(services.observed_at)));
+    const [status, nodes, services] = await Promise.all([api('/v1/status'), api('/v1/nodes'), api('/v1/services')]);
+    const observedAt = new Date(Math.max(new Date(status.observed_at), new Date(nodes.observed_at), new Date(services.observed_at)));
     updated.textContent = `Updated ${observedAt.toLocaleTimeString()}`;
-    renderOverview(nodes.items, services.items);
+    renderOverview(nodes.items, services.items, status);
   } catch (error) {
     errorBox.textContent = error.message;
     errorBox.hidden = false;

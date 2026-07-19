@@ -11,8 +11,14 @@ import (
 )
 
 const (
-	SchemaVersion = 1
-	MaxMessageLen = 256
+	SchemaVersion       = 1
+	MaxMessageLen       = 256
+	MaxConditions       = 16
+	MaxServices         = 256
+	MaxServiceNameLen   = 128
+	MaxConditionTypeLen = 64
+	MaxReasonCodeLen    = 64
+	MaxRevisionLen      = 256
 )
 
 type Phase string
@@ -82,6 +88,7 @@ type AgentStatus struct {
 	LastAppliedAt     time.Time       `json:"last_applied_at,omitempty"`
 	DesiredServices   int             `json:"desired_services"`
 	ReadyServices     int             `json:"ready_services"`
+	ServicesTruncated bool            `json:"services_truncated,omitempty"`
 	ReasonCode        string          `json:"reason_code,omitempty"`
 	Message           string          `json:"message,omitempty"`
 	Conditions        []Condition     `json:"conditions,omitempty"`

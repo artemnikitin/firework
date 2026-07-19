@@ -1,7 +1,8 @@
 # `fireworkctl` user guide
 
 `fireworkctl` is the read-only command-line client for the Firework deployment
-status API. It lists nodes and services, shows details, and can stream changes.
+status API. It shows revision convergence, lists nodes and services, shows
+details, and can stream changes.
 
 ## Install and configure
 
@@ -41,6 +42,7 @@ usually the best place to start:
 
 ```bash
 fireworkctl
+fireworkctl status
 fireworkctl nodes
 fireworkctl services
 ```
@@ -78,6 +80,9 @@ fireworkctl services --help
 
 ## Reading the result
 
+- Revision states from `fireworkctl status`: `published`, `progressing`,
+  `converged`, `degraded`, `failed`, `unknown`. The output separates nodes
+  which are stale or down from nodes actively reporting a failed apply.
 - Node states: `ready`, `draining`, `down`, `stale`, `unknown`.
 - Service states: `pending`, `running`, `stopped`, `failed`, `unknown`.
 - Service health: `healthy`, `unhealthy`, `unknown`, `not_configured`.
