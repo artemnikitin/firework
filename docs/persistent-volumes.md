@@ -33,10 +33,11 @@ missing or mismatched binding rather than treating a reusable node label as
 storage identity.
 
 `shared` is part of the provider-neutral schema and deployment contract, but
-runtime placement remains pending until the durable per-VM supervisor and the
-EFS/Filestore partition-fencing gates are complete. Firework deliberately does
-not use an agent-owned advisory lock, because that lock would be lost while a
-Firecracker process could survive an agent restart.
+runtime placement remains pending until the EFS/Filestore partition-fencing
+gates in [issue #32](https://github.com/artemnikitin/firework/issues/32) are
+complete. The durable per-VM supervisor preserves ownership across agent
+restarts, but that alone cannot prove exclusive access during cloud filesystem
+partitions, so Firework continues to fail closed for shared volumes.
 
 ## Agent configuration
 

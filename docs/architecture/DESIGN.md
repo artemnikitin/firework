@@ -152,15 +152,30 @@ to alternatives like nginx or Envoy.
 
 ## VM Process Isolation
 
-Firecracker VM processes are started with `Setpgid: true`, placing them in their
-own process group and decoupling them from some parent-process signals.
+On Linux hosts running systemd, each Firecracker process is launched as a
+transient `firework-vm-<instance-id>.service` in `firework-vms.slice`. This keeps
+the VM outside the agent service's process lifecycle. Local development and
+non-systemd hosts use a separate process group instead.
 
-The current VM manager keeps its instance inventory in memory. If a Firecracker
-process survives an abrupt agent failure, a restarted agent does not yet adopt
-that process into its new inventory. Safe discovery and adoption of survivors is
-tracked in [issue #22](https://github.com/artemnikitin/firework/issues/22).
-Agent restarts therefore must not yet be treated as guaranteed non-disruptive
-updates.
+Before launch, the agent atomically writes
+`<state_dir>/vms/<service>/instance.json`. The manifest records the resolved
+service config and hash, a unique Firecracker `--id`, launcher details, and a
+process identity composed of the host boot ID, PID start ticks, executable
+device/inode, and exact command-line paths. On restart the agent validates all
+of those fields plus the API socket before adopting a survivor. It then
+re-establishes idempotent TAP, forwarding, and health-monitor state without
+restarting a VM whose resolved configuration is unchanged.
+
+During the first upgrade from the pre-manifest runtime, the agent can migrate
+one legacy process when the configured Firecracker executable, resolved desired
+service, config path, socket path, and responsive Unix socket all match exactly.
+Any ambiguous legacy inventory is quarantined instead of guessed.
+
+Dead processes have their stale runtime directory cleaned. Ambiguous cases —
+including PID reuse, mismatched command lines, corrupt manifests, and a live
+process with a missing or invalid socket — enter `recovery_pending`. Firework
+does not signal the process, delete its files, or launch a duplicate in that
+state. The condition is exposed in agent status for operator investigation.
 
 ## What Was Left Out
 

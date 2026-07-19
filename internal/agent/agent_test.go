@@ -583,6 +583,32 @@ func TestTick_StatusReportsVMProcessFailureWithoutExitedPID(t *testing.T) {
 	t.Fatalf("service did not report VM failure: %#v", a.agentStatusSnapshot().Services)
 }
 
+func TestTick_StatusReportsAmbiguousVMRecovery(t *testing.T) {
+	cfg := testAgentConfig(t)
+	vmDir := filepath.Join(cfg.StateDir, "vms", "service")
+	if err := os.MkdirAll(vmDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(vmDir, "instance.json"), []byte("{not-json\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	store := &fakeStore{data: map[string][]byte{"web": []byte("node: web\nservices:\n- name: service\n  image: /img/service\n  kernel: /kern\n  vcpus: 1\n  memory_mb: 128\n")}, revision: "rev"}
+	a := New(cfg, store, testLogger())
+	a.tick(context.Background())
+
+	status := a.agentStatusSnapshot()
+	if len(status.Services) != 1 {
+		t.Fatalf("unexpected services: %#v", status.Services)
+	}
+	service := status.Services[0]
+	if service.VMState != "recovery_pending" || service.ReasonCode != "vm_recovery_pending" || service.Message == "" || service.PID != 0 {
+		t.Fatalf("unexpected recovery status: %#v", service)
+	}
+	if metrics := a.metrics.render(); !strings.Contains(metrics, `firework_agent_service_state{node="web",service="service",tenant="shared",state="recovery_pending"} 1`) {
+		t.Fatalf("recovery state missing from metrics:\n%s", metrics)
+	}
+}
+
 func TestTick_CapacityCheck_ProceedsWhenSufficient(t *testing.T) {
 	nodeYAML := []byte("node: web\nservices:\n- name: light\n  image: /img/light\n  kernel: /kern\n  vcpus: 1\n  memory_mb: 256\n")
 	s := &fakeStore{
