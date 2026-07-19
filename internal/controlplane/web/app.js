@@ -27,8 +27,30 @@ const badge = value => `<span class="badge ${esc(value)}">${esc(value || 'unknow
 const display = value => value === undefined || value === null || value === '' ? '<span class="muted">—</span>' : esc(value);
 const formatDate = value => value ? new Date(value).toLocaleString() : '<span class="muted">—</span>';
 const formatBoolean = value => value ? 'Yes' : 'No';
+const formatBytes = value => {
+  const bytes = Number(value) || 0;
+  if (!bytes) return '0 B';
+  const units = ['B', 'KiB', 'MiB', 'GiB', 'TiB'];
+  let amount = bytes;
+  let unit = 0;
+  while (amount >= 1024 && unit < units.length - 1) {
+    amount /= 1024;
+    unit += 1;
+  }
+  return `${amount.toFixed(amount < 10 && unit > 0 ? 1 : 0)} ${units[unit]}`;
+};
 const nodeLink = node => node ? `<a href="#node/${encodeURIComponent(node)}">${esc(node)}</a>` : '<span class="muted">—</span>';
 const serviceLink = service => `<a href="#service/${encodeURIComponent(service)}">${esc(service)}</a>`;
+const externalLink = value => {
+  if (!value) return '<span class="muted">—</span>';
+  try {
+    const parsed = new URL(value);
+    if (parsed.protocol !== 'https:') return display(value);
+    return `<a href="${esc(value)}" target="_blank" rel="noopener noreferrer">${esc(value)}</a>`;
+  } catch {
+    return display(value);
+  }
+};
 const capacity = (used, total, available, unit = '') => {
   const numericUsed = Math.max(0, Number(used) || 0);
   const numericTotal = Math.max(0, Number(total) || 0);
@@ -40,6 +62,39 @@ const capacity = (used, total, available, unit = '') => {
     <progress max="${esc(progressMax)}" value="${esc(progressValue)}" aria-label="${esc(numericUsed)} of ${esc(numericTotal)}${esc(unit)} allocated"></progress>
     <span class="muted">${esc(numericAvailable)}${esc(unit)} available</span>
   </div>`;
+};
+const byteCapacity = storage => {
+  const value = storage || {};
+  const allocated = Math.max(0, Number(value.allocated_bytes) || 0);
+  const total = Math.max(0, Number(value.capacity_bytes) || 0);
+  const available = Math.max(0, Number(value.available_bytes) || 0);
+  const progressMax = Math.max(1, total);
+  return `<div class="capacity-value">
+    <span>${esc(formatBytes(allocated))}/${esc(formatBytes(total))}</span>
+    <progress max="${esc(progressMax)}" value="${esc(Math.min(allocated, progressMax))}" aria-label="${esc(formatBytes(allocated))} of ${esc(formatBytes(total))} allocated"></progress>
+    <span class="muted">${esc(formatBytes(available))} available</span>
+  </div>`;
+};
+const volumeAllocation = storage => {
+  const value = storage || {};
+  const count = Math.max(0, Number(value.count) || 0);
+  if (!count) return '<span class="muted">—</span>';
+  const allocated = Math.max(0, Number(value.allocated_bytes) || 0);
+  const applied = Math.max(0, Number(value.applied_bytes) || 0);
+  return `<div class="capacity-value">
+    <span>${esc(formatBytes(allocated))} reserved</span>
+    <span class="muted">${esc(formatBytes(applied))} applied · ${esc(count)} ${count === 1 ? 'volume' : 'volumes'}</span>
+  </div>`;
+};
+const serviceDisk = storage => {
+  const value = storage || {};
+  const entries = [];
+  for (const [label, allocation] of [['Local', value.local], ['Shared', value.shared]]) {
+    const count = Math.max(0, Number(allocation?.count) || 0);
+    if (!count) continue;
+    entries.push(`<span>${label}: ${esc(formatBytes(Math.max(0, Number(allocation.allocated_bytes) || 0)))} reserved</span>`);
+  }
+  return entries.length ? `<div class="service-disk">${entries.join('')}</div>` : '<span class="muted">—</span>';
 };
 
 async function api(path) {
@@ -104,8 +159,9 @@ function renderList() {
       <td>${node.running_services}/${node.desired_services}</td>
       <td>${capacity(node.allocated.vcpus, node.capacity.vcpus, node.available.vcpus)}</td>
       <td>${capacity(node.allocated.memory_mb, node.capacity.memory_mb, node.available.memory_mb, ' MB')}</td>
+      <td>${byteCapacity(node.storage?.local)}</td>
     </tr>`);
-    content.innerHTML = `<div class="page-heading"><div><p class="eyebrow">Infrastructure</p><h1>Nodes</h1></div><span class="result-count">${items.length} of ${data.length}</span></div>${table(['Node', 'State', 'Last seen', 'Services', 'vCPU', 'Memory'], rows, 'No nodes match the current filters.')}`;
+    content.innerHTML = `<div class="page-heading"><div><p class="eyebrow">Infrastructure</p><h1>Nodes</h1></div><span class="result-count">${items.length} of ${data.length}</span></div>${table(['Node', 'State', 'Last seen', 'Services', 'vCPU', 'Memory', 'Local disk'], rows, 'No nodes match the current filters.')}`;
     return;
   }
 
@@ -116,8 +172,9 @@ function renderList() {
     <td>${badge(service.health)}</td>
     <td>${service.vcpus}</td>
     <td>${service.memory_mb} MB</td>
+    <td>${serviceDisk(service.storage)}</td>
   </tr>`);
-  content.innerHTML = `<div class="page-heading"><div><p class="eyebrow">Workloads</p><h1>Services</h1></div><span class="result-count">${items.length} of ${data.length}</span></div>${table(['Service', 'Node', 'State', 'Health', 'vCPU', 'Memory'], rows, 'No services match the current filters.')}`;
+  content.innerHTML = `<div class="page-heading"><div><p class="eyebrow">Workloads</p><h1>Services</h1></div><span class="result-count">${items.length} of ${data.length}</span></div>${table(['Service', 'Node', 'State', 'Health', 'vCPU', 'Memory', 'Disk'], rows, 'No services match the current filters.')}`;
 }
 
 function stateCounts(items, expectedStates) {
@@ -176,6 +233,7 @@ function renderNodeDetail(node) {
     ['Services', `${node.running_services}/${node.desired_services} running`],
     ['vCPU', capacity(node.allocated.vcpus, node.capacity.vcpus, node.available.vcpus)],
     ['Memory', capacity(node.allocated.memory_mb, node.capacity.memory_mb, node.available.memory_mb, ' MB')],
+    ['Local volumes', byteCapacity(node.storage?.local)],
     ['Registered', formatDate(node.registered_at)],
     ['Updated', formatDate(node.updated_at)],
     ['Status missing', formatBoolean(node.status_missing)],
@@ -225,10 +283,12 @@ function renderServiceDetail(service) {
     ['Actual node', nodeLink(service.actual_node)],
     ['vCPU', display(service.vcpus)],
     ['Memory', `${esc(service.memory_mb)} MB`],
+    ['Disk', serviceDisk(service.storage)],
     ['PID', display(service.pid)],
     ['Restart count', display(service.restart_count)],
     ['Network address', display(service.network_address)],
     ['Routing hostname', display(service.routing_hostname)],
+    ['Public URL', externalLink(service.public_url)],
     ['Desired image', display(service.desired_image)],
     ['Desired kernel', display(service.desired_kernel)],
     ['Observed', formatDate(service.service_observed_at)],
@@ -258,6 +318,18 @@ function renderServiceDetail(service) {
     <td>${esc(port.VMPort ?? port.vm_port)}</td>
   </tr>`);
 
+  const volumeRows = (service.volumes || []).map(volume => `<tr>
+    <td>${esc(volume.logical_id)}</td>
+    <td>${badge(volume.type)}</td>
+    <td>${esc(volume.mount_path)}</td>
+    <td>${nodeLink(volume.bound_node)}</td>
+    <td>${display(volume.shared_backend_id)}</td>
+    <td>${esc(formatBytes(volume.desired_size_bytes))}</td>
+    <td>${esc(formatBytes(volume.applied_size_bytes))}</td>
+    <td>${badge(volume.state)}</td>
+    <td>${display(volume.last_error)}</td>
+  </tr>`);
+
   content.innerHTML = `<a class="back-link" href="#services">← Back to services</a>
     <div class="detail-heading"><div><p class="eyebrow">Service</p><h1>${esc(service.name)}</h1></div>${badge(service.state)}</div>
     <div class="detail-grid">
@@ -265,7 +337,8 @@ function renderServiceDetail(service) {
       ${section('Health check', healthCheck)}
       ${section('Revisions', revisions)}
     </div>
-    ${(service.port_forwards || []).length ? section('Port forwards', table(['Host port', 'VM port'], portRows, '')) : ''}`;
+    ${(service.port_forwards || []).length ? section('Port forwards', table(['Host port', 'VM port'], portRows, '')) : ''}
+    ${(service.volumes || []).length ? section('Persistent volumes', table(['Volume', 'Type', 'Mount path', 'Bound node', 'Backend', 'Desired', 'Applied', 'State', 'Last error'], volumeRows, '')) : ''}`;
 }
 
 async function detail(kind, id) {

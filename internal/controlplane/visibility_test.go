@@ -123,6 +123,171 @@ func TestServiceDetailJSONUsesStableFieldNames(t *testing.T) {
 	}
 }
 
+func TestServiceDetailUsesRetainedVolumeRecordWhilePlacementIsPending(t *testing.T) {
+	ctx := context.Background()
+	store := newBlobStateStore(newMemBlob())
+	cfg := validConfigForRole(RoleAPI)
+	now := time.Now().UTC()
+	desired := DesiredRevision{Revision: "desired-1", CreatedAt: now, Services: []config.ServiceConfig{{
+		Name: "db", Volumes: []config.VolumeConfig{{
+			Name: "data", Type: config.VolumeTypeLocal, MountPath: "/data", SizeBytes: 20 * config.GiB,
+		}},
+	}}}
+	placement := PlacementRevision{Revision: "placement-1", DesiredRevision: desired.Revision, CreatedAt: now, PendingServices: []PendingPlacement{{
+		Service: "db", ReasonCode: "local_volume_node_unavailable", Message: "bound node unavailable",
+	}}}
+	putCurrentState(t, ctx, store, desired, placement, "rendered-1")
+	record := VolumeRecord{
+		LogicalID: "db/data", Type: config.VolumeTypeLocal, BoundNode: "node-gone",
+		DesiredSizeBytes: 20 * config.GiB, AppliedSizeBytes: 10 * config.GiB,
+		ResizeGeneration: 2, ResizeState: VolumeResizePending,
+	}
+	if _, err := store.PutJSON(ctx, mustVolumeRecordKey(cfg.State.Prefix, "db", "data"), record); err != nil {
+		t.Fatal(err)
+	}
+
+	detail, found, err := NewVisibilityService(cfg, store).Service(ctx, "db")
+	if err != nil || !found {
+		t.Fatalf("service detail found=%v err=%v", found, err)
+	}
+	if len(detail.Volumes) != 1 || detail.Volumes[0].BoundNode != "node-gone" || detail.Volumes[0].AppliedSizeBytes != 10*config.GiB || detail.Volumes[0].ResizeGeneration != 2 {
+		t.Fatalf("volume status did not use retained record: %#v", detail.Volumes)
+	}
+}
+
+func TestNodeStorageSummariesUseDurableReservations(t *testing.T) {
+	ctx := context.Background()
+	store := newBlobStateStore(newMemBlob())
+	cfg := validConfigForRole(RoleAPI)
+	now := time.Now().UTC()
+	putCurrentState(t, ctx, store, DesiredRevision{Revision: "desired-1"}, PlacementRevision{Revision: "placement-1", DesiredRevision: "desired-1"}, "rendered-1")
+	putNode(t, ctx, store, cfg, NodeRecord{
+		NodeID: "node-1", State: NodeStateReady, LastSeenAt: now,
+		Storage: StorageResources{LocalCapacityBytes: 100 * config.GiB, SharedBackendID: "shared-a", SharedCapacityBytes: 200 * config.GiB},
+	})
+	for _, record := range []VolumeRecord{
+		{
+			LogicalID: "removed/data", Type: config.VolumeTypeLocal, BoundNode: "node-1",
+			DesiredSizeBytes: 20 * config.GiB, AppliedSizeBytes: 30 * config.GiB,
+		},
+		{
+			LogicalID: "other/data", Type: config.VolumeTypeLocal, BoundNode: "node-2",
+			DesiredSizeBytes: 50 * config.GiB,
+		},
+		{
+			LogicalID: "shared/data", Type: config.VolumeTypeShared, SharedBackendID: "shared-a",
+			DesiredSizeBytes: 60 * config.GiB,
+		},
+		{
+			LogicalID: "shared-other/data", Type: config.VolumeTypeShared, SharedBackendID: "shared-b",
+			DesiredSizeBytes: 80 * config.GiB,
+		},
+	} {
+		parts := strings.Split(record.LogicalID, "/")
+		if _, err := store.PutJSON(ctx, mustVolumeRecordKey(cfg.State.Prefix, parts[0], parts[1]), record); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	nodes, err := NewVisibilityService(cfg, store).Nodes(ctx, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(nodes.Items) != 1 {
+		t.Fatalf("nodes = %#v", nodes.Items)
+	}
+	storage := nodes.Items[0].Storage
+	if storage.Local.CapacityBytes != 100*config.GiB || storage.Local.AllocatedBytes != 30*config.GiB || storage.Local.AvailableBytes != 70*config.GiB {
+		t.Fatalf("local storage = %#v", storage.Local)
+	}
+	if storage.SharedBackendID != "shared-a" || storage.Shared.CapacityBytes != 200*config.GiB || storage.Shared.AllocatedBytes != 60*config.GiB || storage.Shared.AvailableBytes != 140*config.GiB {
+		t.Fatalf("shared storage = %#v", storage)
+	}
+}
+
+func TestServiceStorageSummaryAndDetailPreserveDurableVolumes(t *testing.T) {
+	ctx := context.Background()
+	store := newBlobStateStore(newMemBlob())
+	cfg := validConfigForRole(RoleAPI)
+	cfg.NodeStaleTTL = time.Minute
+	now := time.Now().UTC()
+	serviceConfig := config.ServiceConfig{Name: "db", Volumes: []config.VolumeConfig{
+		{Name: "data", Type: config.VolumeTypeLocal, MountPath: "/data", SizeBytes: 20 * config.GiB, BoundNode: "node-1", ResizeGeneration: 2},
+		{Name: "shared", Type: config.VolumeTypeShared, MountPath: "/shared", SizeBytes: 10 * config.GiB, SharedBackendID: "shared-a", ResizeGeneration: 1},
+	}}
+	desired := DesiredRevision{Revision: "desired-1", Services: []config.ServiceConfig{serviceConfig}}
+	placement := PlacementRevision{Revision: "placement-1", DesiredRevision: desired.Revision, NodeConfigs: []config.NodeConfig{{Node: "node-1", Services: []config.ServiceConfig{serviceConfig}}}}
+	putCurrentState(t, ctx, store, desired, placement, "rendered-1")
+	for _, record := range []VolumeRecord{
+		{LogicalID: "db/data", Type: config.VolumeTypeLocal, BoundNode: "node-1", DesiredSizeBytes: 20 * config.GiB, AppliedSizeBytes: 15 * config.GiB, ResizeGeneration: 2, ResizeState: VolumeResizePending},
+		{LogicalID: "db/shared", Type: config.VolumeTypeShared, SharedBackendID: "shared-a", DesiredSizeBytes: 10 * config.GiB, AppliedSizeBytes: 10 * config.GiB, ResizeGeneration: 1, ResizeState: VolumeResizeApplied},
+	} {
+		parts := strings.Split(record.LogicalID, "/")
+		if _, err := store.PutJSON(ctx, mustVolumeRecordKey(cfg.State.Prefix, parts[0], parts[1]), record); err != nil {
+			t.Fatal(err)
+		}
+	}
+	putNode(t, ctx, store, cfg, NodeRecord{NodeID: "node-1", State: NodeStateReady, LastSeenAt: now, AgentStatus: &statusmodel.AgentStatus{
+		SchemaVersion: 1, ObservedAt: now, DesiredRevision: "desired-1", PlacementRevision: "placement-1", ObservedRevision: "rendered-1", AppliedRevision: "rendered-1",
+		Services: []statusmodel.ServiceStatus{{Name: "db", VMState: "running", Health: "not_configured", Volumes: []statusmodel.VolumeStatus{{
+			LogicalID: "db/data", Type: string(config.VolumeTypeLocal), MountPath: "/data", BoundNode: "node-1",
+			DesiredSizeBytes: 20 * config.GiB, AppliedSizeBytes: 20 * config.GiB, ResizeGeneration: 2, State: "prepared",
+		}}}},
+	}})
+
+	visibility := NewVisibilityService(cfg, store)
+	services, err := visibility.Services(ctx, "", "", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	storage := services.Items[0].Storage
+	if storage.Local.Count != 1 || storage.Local.DesiredBytes != 20*config.GiB || storage.Local.AppliedBytes != 15*config.GiB || storage.Local.AllocatedBytes != 20*config.GiB {
+		t.Fatalf("local service storage = %#v", storage.Local)
+	}
+	if storage.Shared.Count != 1 || storage.Shared.AppliedBytes != 10*config.GiB || storage.Shared.AllocatedBytes != 10*config.GiB {
+		t.Fatalf("shared service storage = %#v", storage.Shared)
+	}
+
+	detail, found, err := visibility.Service(ctx, "db")
+	if err != nil || !found {
+		t.Fatalf("service detail found=%v err=%v", found, err)
+	}
+	if len(detail.Volumes) != 2 {
+		t.Fatalf("partial agent observation erased durable volumes: %#v", detail.Volumes)
+	}
+	if detail.Storage.Local.AppliedBytes != 20*config.GiB || detail.Storage.Shared.AppliedBytes != 10*config.GiB {
+		t.Fatalf("detail storage did not merge agent and durable state: %#v", detail.Storage)
+	}
+}
+
+func TestServiceDetailPublicURL(t *testing.T) {
+	ctx := context.Background()
+	store := newBlobStateStore(newMemBlob())
+	cfg := validConfigForRole(RoleAPI)
+	cfg.IngressDomain = "gcp.example.com"
+	desired := DesiredRevision{Revision: "desired-1", Services: []config.ServiceConfig{
+		{Name: "portable", Metadata: map[string]string{"subdomain": "tenant-1"}},
+		{Name: "exact", Metadata: map[string]string{"host": "Custom.Example.net."}},
+		{Name: "private"},
+	}}
+	putCurrentState(t, ctx, store, desired, PlacementRevision{Revision: "placement-1", DesiredRevision: "desired-1"}, "rendered-1")
+
+	service := NewVisibilityService(cfg, store)
+	for name, want := range map[string][2]string{
+		"portable": {"tenant-1.gcp.example.com", "https://tenant-1.gcp.example.com"},
+		"exact":    {"custom.example.net", "https://custom.example.net"},
+		"private":  {"", ""},
+	} {
+		detail, found, err := service.Service(ctx, name)
+		if err != nil || !found {
+			t.Fatalf("service %s found=%v err=%v", name, found, err)
+		}
+		if got := [2]string{detail.RoutingHostname, detail.PublicURL}; got != want {
+			t.Errorf("service %s route = %v, want %v", name, got, want)
+		}
+	}
+}
+
 func TestVisibilityStaleNodeRecovery(t *testing.T) {
 	ctx := context.Background()
 	store := newBlobStateStore(newMemBlob())

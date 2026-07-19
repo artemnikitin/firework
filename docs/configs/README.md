@@ -72,6 +72,11 @@ Examples:
 | `registry_bootstrap_token` | no | empty | Bootstrap token used for automated cert enrollment (supports `${ENV_VAR}` expansion) |
 | `registry_bootstrap_token_file` | no | empty | File path containing bootstrap token (trimmed; mutually exclusive with `registry_bootstrap_token`) |
 | `registry_cert_renew_before` | no | `6h` | Proactive cert renewal window |
+| `storage.local.path` | local volumes | - | Operator-mounted local storage pool; must be an actual mount point |
+| `storage.local.capacity` | local volumes | - | Logical admission budget (`Mi`, `Gi`, or `Ti`) |
+| `storage.shared.backend_id` | shared volumes | - | Stable deployment-wide backend identity |
+| `storage.shared.path` | shared volumes | - | Operator-mounted shared storage root; must be an actual mount point |
+| `storage.shared.capacity` | no | empty | Optional aggregate shared admission budget |
 
 Notes for cert lifecycle:
 
@@ -100,6 +105,7 @@ Supported fields:
 - `memory_mb`
 - `kernel_args`
 - `health_check` (`type`, `port`, `path`, `interval`, `timeout`, `retries`)
+- `volume_defaults` (`local_size`, `shared_size`)
 
 Fallback precedence for each service field:
 
@@ -114,6 +120,8 @@ Built-in fallbacks:
 - `health_check.interval`: `10s`
 - `health_check.timeout`: `5s`
 - `health_check.retries`: `3`
+- `volume_defaults.local_size`: `10Gi`
+- `volume_defaults.shared_size`: `10Gi`
 
 ### 2.2 `services/*.yaml`
 
@@ -143,6 +151,13 @@ Supported fields:
 | `anti_affinity_group` | no | Scheduler anti-affinity preference |
 | `cross_node_links` | no | Cross-node env injection (`host_ip:host_port`); set `protocol` on a link to inject a full URL such as `http://host_ip:host_port`. Links sharing the same `env` join into a comma-separated list in spec order (e.g. a multi-peer `discovery.seed_hosts`); unresolvable links are skipped |
 | `node_host_ip_env` | no | Env var name to inject current node host IP |
+| `volumes` | no | Persistent-volume declarations (`name`, `type`, `mount_path`, optional `size`) |
+
+Volume `size` accepts positive integer `Mi` and `Gi` values. Names must be
+DNS-label-like, mount paths must be clean absolute paths, and duplicate or
+overlapping mount paths are rejected. A non-empty tenant `volumes` list
+replaces the inherited list. See [Persistent Volumes](../persistent-volumes.md)
+for lifecycle and safety semantics.
 
 ### 2.3 `tenants/*` (optional)
 
@@ -169,6 +184,7 @@ Tenant expansions rewrite links to tenant-prefixed service names automatically.
 | `api_listen_addr` | api/all | HTTPS bind address for the read-only operator API and UI |
 | `operator_token` | api/all | Dedicated operator bearer token; mutually exclusive with `operator_token_file` |
 | `operator_token_file` | api/all | File containing the dedicated operator token |
+| `ingress_domain` | no | Deployment-owned DNS suffix used by api/all to resolve `metadata.subdomain` into a public service URL; exact `metadata.host` values do not require it |
 | `state.backend` | no | `s3` (default) or `gcs` |
 | `state.prefix` | no | Prefix for control-plane state objects (default `cp/v1`) |
 | `state.s3.bucket` | S3 mode | Bucket for control-plane state and rendered configs |
@@ -214,6 +230,13 @@ services:
     kernel: "/var/lib/images/vmlinux-5.10"
     vcpus: 1
     memory_mb: 256
+    volumes:
+      - name: "data"
+        type: "local"
+        mount_path: "/var/lib/svc-a"
+        size_bytes: 10737418240
+        bound_node: "node-or-instance-id"
+        resize_generation: 1
 ```
 
 Notes:
@@ -226,6 +249,9 @@ Notes:
   `port_forwards[].host_port`.
 - revision fields are emitted by the controller and let registry-enabled agents
   acknowledge a stable rendered revision. Direct-Git configs may omit them.
+- `size_bytes`, `bound_node`, `shared_backend_id`, and `resize_generation` are
+  resolved/system-owned volume fields. Direct-Git local configs must contain a
+  `bound_node` matching the agent's stable `node_id`.
 - `metadata.subdomain` is the portable, deployment-neutral form: it is exactly one DNS
   label and the agent forms the final hostname as `<subdomain>.<ingress_domain>`. It
   requires the agent's `ingress_domain` to be set and `traefik_config_dir` to be enabled;

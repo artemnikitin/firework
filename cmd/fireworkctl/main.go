@@ -288,6 +288,15 @@ func runService(cfg cliConfig, args []string, out io.Writer) error {
 				fmt.Fprintf(w, "%d\t%d\n", port.HostPort, port.VMPort)
 			}
 		}
+		if len(response.Volumes) > 0 {
+			fmt.Fprintln(w, "\nVOLUME\tTYPE\tMOUNT PATH\tBOUND NODE\tBACKEND\tDESIRED BYTES\tAPPLIED BYTES\tGENERATION\tSTATE\tLAST ERROR")
+			for _, volume := range response.Volumes {
+				fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%d\t%d\t%d\t%s\t%s\n",
+					volume.LogicalID, volume.Type, volume.MountPath, valueOrDash(volume.BoundNode),
+					valueOrDash(volume.SharedBackendID), volume.DesiredSizeBytes, volume.AppliedSizeBytes,
+					volume.ResizeGeneration, volume.State, valueOrDash(volume.LastError))
+			}
+		}
 		return w.Flush()
 	})
 }

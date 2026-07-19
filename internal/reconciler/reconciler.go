@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"sort"
 	"time"
 
 	"github.com/artemnikitin/firework/internal/config"
@@ -33,6 +34,10 @@ type VMManager interface {
 	List() map[string]*vm.Instance
 	Start(context.Context, config.ServiceConfig) error
 	Remove(string) error
+}
+
+type volumePreflighter interface {
+	Preflight(context.Context, config.ServiceConfig) error
 }
 
 // Reconciler compares desired state from the config store with the actual
@@ -132,6 +137,11 @@ func (r *Reconciler) applyAllAtOnce(ctx context.Context, actions []Action) error
 
 		case ActionUpdate:
 			r.logger.Info("updating service (stop + start)", "service", action.Service.Name)
+			if err := r.preflight(ctx, action.Service); err != nil {
+				r.logger.Error("volume preflight failed; keeping current VM running", "service", action.Service.Name, "error", err)
+				errs = append(errs, fmt.Errorf("preflight update %s: %w", action.Service.Name, err))
+				continue
+			}
 			prev := action.Service
 			if action.PreviousService != nil {
 				prev = *action.PreviousService
@@ -190,6 +200,11 @@ func (r *Reconciler) applyRolling(ctx context.Context, actions []Action) error {
 
 	for i, action := range updates {
 		r.logger.Info("updating service (stop + start)", "service", action.Service.Name)
+		if err := r.preflight(ctx, action.Service); err != nil {
+			r.logger.Error("volume preflight failed; keeping current VM running", "service", action.Service.Name, "error", err)
+			errs = append(errs, fmt.Errorf("preflight update %s: %w", action.Service.Name, err))
+			break
+		}
 		prev := action.Service
 		if action.PreviousService != nil {
 			prev = *action.PreviousService
@@ -211,6 +226,13 @@ func (r *Reconciler) applyRolling(ctx context.Context, actions []Action) error {
 
 	if len(errs) > 0 {
 		return fmt.Errorf("reconciliation had %d error(s): %v", len(errs), errs)
+	}
+	return nil
+}
+
+func (r *Reconciler) preflight(ctx context.Context, svc config.ServiceConfig) error {
+	if manager, ok := r.vmManager.(volumePreflighter); ok {
+		return manager.Preflight(ctx, svc)
 	}
 	return nil
 }
@@ -326,6 +348,9 @@ func needsUpdate(inst *vm.Instance, desired config.ServiceConfig) bool {
 	if !portForwardsEqual(cur.PortForwards, desired.PortForwards) {
 		return true
 	}
+	if !volumesEqual(cur.Volumes, desired.Volumes) {
+		return true
+	}
 
 	// Check if the VM process is actually still running.
 	if inst.State != vm.StateRunning {
@@ -333,6 +358,22 @@ func needsUpdate(inst *vm.Instance, desired config.ServiceConfig) bool {
 	}
 
 	return false
+}
+
+func volumesEqual(a, b []config.VolumeConfig) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	ac := append([]config.VolumeConfig(nil), a...)
+	bc := append([]config.VolumeConfig(nil), b...)
+	sort.Slice(ac, func(i, j int) bool { return ac[i].Name < ac[j].Name })
+	sort.Slice(bc, func(i, j int) bool { return bc[i].Name < bc[j].Name })
+	for i := range ac {
+		if ac[i] != bc[i] {
+			return false
+		}
+	}
+	return true
 }
 
 // networkEqual compares two NetworkConfig pointers for equality.

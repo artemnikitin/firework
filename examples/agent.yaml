@@ -27,6 +27,17 @@ log_level: "info"
 # Status/health HTTP API (leave empty to disable)
 api_listen_addr: ":8080"
 
+# Optional persistent storage pools. Infrastructure must mount these paths
+# before the agent starts; Firework refuses a plain fallback directory.
+# storage:
+#   local:
+#     path: "/var/lib/firework/volumes"
+#     capacity: "500Gi"
+#   shared:
+#     backend_id: "primary"
+#     path: "/mnt/firework-shared"
+#     capacity: "1Ti"
+
 # Optional control-plane registry integration (mTLS).
 # registry_url: "https://controlplane.internal:9443"
 # registry_server_name: "controlplane.internal"

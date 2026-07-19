@@ -34,6 +34,7 @@ type TenantOverride struct {
 	AntiAffinityGroup string                 `yaml:"anti_affinity_group,omitempty"`
 	CrossNodeLinks    []config.CrossNodeLink `yaml:"cross_node_links,omitempty"`
 	NodeHostIPEnv     string                 `yaml:"node_host_ip_env,omitempty"`
+	Volumes           []VolumeSpec           `yaml:"volumes,omitempty"`
 }
 
 // TenantServiceFile is a parsed override file for one base service.
@@ -183,6 +184,10 @@ func ExpandTenants(base []ServiceSpec, tenants []TenantConfig) []ServiceSpec {
 			if len(ov.PortForwards) > 0 {
 				spec.PortForwards = ov.PortForwards
 			}
+			// A non-empty tenant list replaces the inherited list as one unit.
+			if len(ov.Volumes) > 0 {
+				spec.Volumes = append([]VolumeSpec(nil), ov.Volumes...)
+			}
 
 			// Rewrite Links so each points to the tenant-namespaced service.
 			for i := range spec.Links {
@@ -218,6 +223,7 @@ func standaloneSpec(tenantID string, tsf TenantServiceFile) ServiceSpec {
 		Metadata:          ov.Metadata,
 		AntiAffinityGroup: ov.AntiAffinityGroup,
 		NodeHostIPEnv:     ov.NodeHostIPEnv,
+		Volumes:           append([]VolumeSpec(nil), ov.Volumes...),
 	}
 
 	for _, link := range ov.Links {
@@ -248,6 +254,9 @@ func cloneServiceSpec(src ServiceSpec) ServiceSpec {
 	if src.CrossNodeLinks != nil {
 		dst.CrossNodeLinks = make([]config.CrossNodeLink, len(src.CrossNodeLinks))
 		copy(dst.CrossNodeLinks, src.CrossNodeLinks)
+	}
+	if src.Volumes != nil {
+		dst.Volumes = append([]VolumeSpec(nil), src.Volumes...)
 	}
 	if src.Env != nil {
 		dst.Env = make(map[string]string, len(src.Env))

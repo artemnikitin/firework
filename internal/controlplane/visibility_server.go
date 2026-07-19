@@ -44,7 +44,7 @@ func (s *VisibilityServer) HTTPServer() (*http.Server, error) {
 	if err != nil {
 		return nil, err
 	}
-	mux.Handle("GET /assets/", http.StripPrefix("/assets/", http.FileServer(http.FS(assets))))
+	mux.Handle("GET /assets/", noCache(http.StripPrefix("/assets/", http.FileServer(http.FS(assets)))))
 	mux.HandleFunc("GET /", s.handleIndex)
 
 	cert, err := tls.LoadX509KeyPair(s.cfg.TLS.CertFile, s.cfg.TLS.KeyFile)
@@ -56,6 +56,13 @@ func (s *VisibilityServer) HTTPServer() (*http.Server, error) {
 		TLSConfig:         &tls.Config{MinVersion: tls.VersionTLS12, Certificates: []tls.Certificate{cert}},
 		ReadHeaderTimeout: 10 * time.Second, ReadTimeout: 15 * time.Second, WriteTimeout: 30 * time.Second, IdleTimeout: 60 * time.Second,
 	}, nil
+}
+
+func noCache(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Cache-Control", "no-cache, must-revalidate")
+		next.ServeHTTP(w, r)
+	})
 }
 
 func (s *VisibilityServer) auth(next http.HandlerFunc) http.HandlerFunc {

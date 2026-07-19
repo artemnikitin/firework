@@ -200,6 +200,7 @@ func (s *RegistryServer) handleRegister(w http.ResponseWriter, r *http.Request) 
 		cur.Labels = req.Labels
 		cur.Capacity = req.Capacity
 		cur.HostIP = req.HostIP
+		cur.Storage = req.Storage
 		cur.LastSeenAt = now
 		cur.UpdatedAt = now
 		return nil
@@ -261,6 +262,7 @@ func (s *RegistryServer) handleHeartbeat(w http.ResponseWriter, r *http.Request)
 			cur.Capacity.MemoryMB = req.Capacity.MemoryMB
 		}
 		cur.Used = req.Used
+		cur.Storage = req.Storage
 		if req.HostIP != "" {
 			cur.HostIP = req.HostIP
 		}

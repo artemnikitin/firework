@@ -41,18 +41,32 @@ type Condition struct {
 }
 
 type ServiceStatus struct {
-	Name                string    `json:"name"`
-	VMState             string    `json:"vm_state"`
-	PID                 int       `json:"pid,omitempty"`
-	NetworkAddress      string    `json:"network_address,omitempty"`
-	Health              string    `json:"health"`
-	HealthCheckType     string    `json:"health_check_type,omitempty"`
-	HealthLastCheckedAt time.Time `json:"health_last_checked_at,omitempty"`
-	HealthFailures      int       `json:"health_failures,omitempty"`
-	RestartCount        int       `json:"restart_count,omitempty"`
-	LastTransitionAt    time.Time `json:"last_transition_at,omitempty"`
-	ReasonCode          string    `json:"reason_code,omitempty"`
-	Message             string    `json:"message,omitempty"`
+	Name                string         `json:"name"`
+	VMState             string         `json:"vm_state"`
+	PID                 int            `json:"pid,omitempty"`
+	NetworkAddress      string         `json:"network_address,omitempty"`
+	Health              string         `json:"health"`
+	HealthCheckType     string         `json:"health_check_type,omitempty"`
+	HealthLastCheckedAt time.Time      `json:"health_last_checked_at,omitempty"`
+	HealthFailures      int            `json:"health_failures,omitempty"`
+	RestartCount        int            `json:"restart_count,omitempty"`
+	LastTransitionAt    time.Time      `json:"last_transition_at,omitempty"`
+	ReasonCode          string         `json:"reason_code,omitempty"`
+	Message             string         `json:"message,omitempty"`
+	Volumes             []VolumeStatus `json:"volumes,omitempty"`
+}
+
+type VolumeStatus struct {
+	LogicalID        string `json:"logical_id"`
+	Type             string `json:"type"`
+	MountPath        string `json:"mount_path"`
+	BoundNode        string `json:"bound_node,omitempty"`
+	SharedBackendID  string `json:"shared_backend_id,omitempty"`
+	DesiredSizeBytes int64  `json:"desired_size_bytes"`
+	AppliedSizeBytes int64  `json:"applied_size_bytes,omitempty"`
+	ResizeGeneration int64  `json:"resize_generation,omitempty"`
+	State            string `json:"state"`
+	LastError        string `json:"last_error,omitempty"`
 }
 
 type AgentStatus struct {

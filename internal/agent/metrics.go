@@ -24,6 +24,18 @@ type serviceStateKey struct {
 	state   string
 }
 
+type volumeOperationKey struct {
+	volumeType string
+	operation  string
+	outcome    string
+}
+
+type volumePoolSnapshot struct {
+	reservedBytes  int64
+	capacityBytes  int64
+	availableBytes int64
+}
+
 // runtimeMetrics keeps in-memory counters/gauges exposed via /metrics.
 // It is intentionally lightweight and does not depend on external telemetry libs.
 type runtimeMetrics struct {
@@ -46,6 +58,9 @@ type runtimeMetrics struct {
 	lastAppliedAt              float64
 	lastAppliedRevision        string
 	remoteRouteSyncDegraded    float64
+	volumeOperations           map[volumeOperationKey]uint64
+	volumeOperationDuration    map[volumeOperationKey]float64
+	volumePools                map[string]volumePoolSnapshot
 
 	nodeCapacityVCPUs    int
 	nodeCapacityMemoryMB int
@@ -61,6 +76,29 @@ func newRuntimeMetrics(node string) *runtimeMetrics {
 		serviceState:               make(map[serviceStateKey]float64),
 		configFetchSuccessByLabel:  make(map[string]float64),
 		enrichmentTimestampByLabel: make(map[string]float64),
+		volumeOperations:           make(map[volumeOperationKey]uint64),
+		volumeOperationDuration:    make(map[volumeOperationKey]float64),
+		volumePools:                make(map[string]volumePoolSnapshot),
+	}
+}
+
+// ObserveVolumeOperation implements volume.Observer without introducing
+// service or logical-volume identifiers as high-cardinality labels.
+func (m *runtimeMetrics) ObserveVolumeOperation(volumeType, operation, outcome string, duration time.Duration) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	key := volumeOperationKey{volumeType: volumeType, operation: operation, outcome: outcome}
+	m.volumeOperations[key]++
+	m.volumeOperationDuration[key] += duration.Seconds()
+}
+
+// ObserveVolumePool records the latest provider-neutral admission and host
+// free-space snapshot for a storage pool type.
+func (m *runtimeMetrics) ObserveVolumePool(volumeType string, reservedBytes, capacityBytes, availableBytes int64) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.volumePools[volumeType] = volumePoolSnapshot{
+		reservedBytes: reservedBytes, capacityBytes: capacityBytes, availableBytes: availableBytes,
 	}
 }
 
@@ -283,6 +321,32 @@ func (m *runtimeMetrics) render() string {
 	writeHelpType(&b, "firework_agent_remote_route_sync_degraded", "1 when peer node configs cannot be listed and remote Traefik routes run on last-known-good files.", "gauge")
 	fmt.Fprintf(&b, "firework_agent_remote_route_sync_degraded{node=%q} %.0f\n", m.node, m.remoteRouteSyncDegraded)
 
+	writeHelpType(&b, "firework_agent_volume_operations_total", "Total persistent-volume operations by type, operation, and outcome.", "counter")
+	operationKeys := sortedVolumeOperationKeys(m.volumeOperations)
+	for _, key := range operationKeys {
+		fmt.Fprintf(&b, "firework_agent_volume_operations_total{node=%q,type=%q,operation=%q,outcome=%q} %d\n",
+			m.node, key.volumeType, key.operation, key.outcome, m.volumeOperations[key])
+	}
+	writeHelpType(&b, "firework_agent_volume_operation_duration_seconds_total", "Cumulative persistent-volume operation duration.", "counter")
+	for _, key := range operationKeys {
+		fmt.Fprintf(&b, "firework_agent_volume_operation_duration_seconds_total{node=%q,type=%q,operation=%q,outcome=%q} %.6f\n",
+			m.node, key.volumeType, key.operation, key.outcome, m.volumeOperationDuration[key])
+	}
+	writeHelpType(&b, "firework_agent_volume_reserved_bytes", "Retained logical volume bytes reserved in the storage pool.", "gauge")
+	writeHelpType(&b, "firework_agent_volume_capacity_bytes", "Configured logical admission capacity of the storage pool.", "gauge")
+	writeHelpType(&b, "firework_agent_volume_available_bytes", "Physical bytes currently available in the mounted storage pool.", "gauge")
+	poolTypes := make([]string, 0, len(m.volumePools))
+	for volumeType := range m.volumePools {
+		poolTypes = append(poolTypes, volumeType)
+	}
+	sort.Strings(poolTypes)
+	for _, volumeType := range poolTypes {
+		pool := m.volumePools[volumeType]
+		fmt.Fprintf(&b, "firework_agent_volume_reserved_bytes{node=%q,type=%q} %d\n", m.node, volumeType, pool.reservedBytes)
+		fmt.Fprintf(&b, "firework_agent_volume_capacity_bytes{node=%q,type=%q} %d\n", m.node, volumeType, pool.capacityBytes)
+		fmt.Fprintf(&b, "firework_agent_volume_available_bytes{node=%q,type=%q} %d\n", m.node, volumeType, pool.availableBytes)
+	}
+
 	if m.nodeCapacityVCPUs > 0 {
 		writeHelpType(&b, "firework_node_capacity_vcpus", "Total vCPU capacity of the node.", "gauge")
 		fmt.Fprintf(&b, "firework_node_capacity_vcpus{node=%q} %d\n", m.node, m.nodeCapacityVCPUs)
@@ -355,6 +419,23 @@ func sortedServiceStateKeys(m map[serviceStateKey]float64) []serviceStateKey {
 			return keys[i].tenant < keys[j].tenant
 		}
 		return keys[i].service < keys[j].service
+	})
+	return keys
+}
+
+func sortedVolumeOperationKeys(m map[volumeOperationKey]uint64) []volumeOperationKey {
+	keys := make([]volumeOperationKey, 0, len(m))
+	for key := range m {
+		keys = append(keys, key)
+	}
+	sort.Slice(keys, func(i, j int) bool {
+		if keys[i].volumeType != keys[j].volumeType {
+			return keys[i].volumeType < keys[j].volumeType
+		}
+		if keys[i].operation != keys[j].operation {
+			return keys[i].operation < keys[j].operation
+		}
+		return keys[i].outcome < keys[j].outcome
 	})
 	return keys
 }
