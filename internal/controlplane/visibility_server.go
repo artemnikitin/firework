@@ -33,6 +33,7 @@ func (s *VisibilityServer) HTTPServer() (*http.Server, error) {
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]any{"status": "ok", "time": time.Now().UTC()})
 	})
+	mux.HandleFunc("GET /v1/status", s.auth(s.handleStatus))
 	mux.HandleFunc("GET /v1/nodes", s.auth(s.handleNodes))
 	mux.HandleFunc("GET /v1/nodes/{id}", s.auth(s.handleNode))
 	mux.HandleFunc("GET /v1/services", s.auth(s.handleServices))
@@ -56,6 +57,11 @@ func (s *VisibilityServer) HTTPServer() (*http.Server, error) {
 		TLSConfig:         &tls.Config{MinVersion: tls.VersionTLS12, Certificates: []tls.Certificate{cert}},
 		ReadHeaderTimeout: 10 * time.Second, ReadTimeout: 15 * time.Second, WriteTimeout: 30 * time.Second, IdleTimeout: 60 * time.Second,
 	}, nil
+}
+
+func (s *VisibilityServer) handleStatus(w http.ResponseWriter, r *http.Request) {
+	status, err := s.service.Revision(r.Context())
+	respondVisibility(w, status, err)
 }
 
 func noCache(next http.Handler) http.Handler {

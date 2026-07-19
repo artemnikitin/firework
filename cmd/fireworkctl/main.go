@@ -104,6 +104,8 @@ func run(args []string, out io.Writer) error {
 	}
 	command, commandArgs := remaining[0], remaining[1:]
 	switch command {
+	case "status":
+		return runStatus(cfg, commandArgs, out)
 	case "nodes":
 		return runNodes(cfg, commandArgs, out)
 	case "node":
@@ -115,6 +117,50 @@ func run(args []string, out io.Writer) error {
 	default:
 		return usageError("unknown command " + command)
 	}
+}
+
+func runStatus(cfg cliConfig, args []string, out io.Writer) error {
+	flags := flag.NewFlagSet("status", flag.ContinueOnError)
+	flags.SetOutput(io.Discard)
+	output := flags.String("output", "table", "table or json")
+	watch := flags.Duration("watch", 0, "polling interval")
+	if err := flags.Parse(args); err != nil || flags.NArg() != 0 {
+		return usageError("usage: fireworkctl status [--output table|json] [--watch 5s]")
+	}
+	if err := validateOutput(*output); err != nil {
+		return err
+	}
+	if err := validateWatch(*watch); err != nil {
+		return err
+	}
+	client, err := newAPIClient(cfg)
+	if err != nil {
+		return err
+	}
+	return poll(out, *watch, *output == "table", func() error {
+		var response controlplane.RevisionStatus
+		if err := client.get(context.Background(), "/v1/status", &response); err != nil {
+			return err
+		}
+		if *output == "json" {
+			return writeOutputJSON(out, response, *watch > 0)
+		}
+		w := tabwriter.NewWriter(out, 0, 4, 2, ' ', 0)
+		fmt.Fprintf(w, "PHASE\t%s\nDESIRED REVISION\t%s\nPLACEMENT REVISION\t%s\nRENDERED REVISION\t%s\nRELEVANT NODES\t%d\nCONVERGED\t%s\nDEGRADED\t%s\nPROGRESSING\t%s\nFAILED\t%s\nSTALE\t%s\nDOWN\t%s\nUNKNOWN\t%s\nREASON\t%s\nMESSAGE\t%s\n",
+			response.Phase, valueOrDash(response.DesiredRevision), valueOrDash(response.PlacementRevision),
+			valueOrDash(response.RenderedRevision), response.RelevantNodes, formatNodeSet(response.ConvergedNodes),
+			formatNodeSet(response.DegradedNodes), formatNodeSet(response.ProgressingNodes), formatNodeSet(response.FailedNodes),
+			formatNodeSet(response.StaleNodes), formatNodeSet(response.DownNodes), formatNodeSet(response.UnknownNodes),
+			valueOrDash(response.ReasonCode), valueOrDash(response.Message))
+		return w.Flush()
+	})
+}
+
+func formatNodeSet(nodes []string) string {
+	if len(nodes) == 0 {
+		return "—"
+	}
+	return strings.Join(nodes, ", ")
 }
 
 func runNodes(cfg cliConfig, args []string, out io.Writer) error {
@@ -500,7 +546,8 @@ func printUsage(out io.Writer) {
   fireworkctl [global options] <command> [options]
 
 Commands:
-  nodes                 List deployment nodes
+	status                Show current revision convergence
+	nodes                 List deployment nodes
   node <node-id>        Show node details
   services              List deployment services
   service <name>        Show service details
@@ -517,6 +564,7 @@ Global options:
 
 func printCommandUsage(out io.Writer, command string) {
 	usage := map[string]string{
+		"status":   "Usage: fireworkctl status [--output table|json] [--watch 5s]\n",
 		"nodes":    "Usage: fireworkctl nodes [--state ready|draining|down|stale|unknown] [--output table|json] [--watch 5s]\n",
 		"node":     "Usage: fireworkctl node <node-id> [--output table|json] [--watch 5s]\n",
 		"services": "Usage: fireworkctl services [--state pending|running|stopped|failed|unknown] [--health healthy|unhealthy|unknown|not_configured] [--node NODE] [--output table|json] [--watch 5s]\n",
@@ -567,7 +615,7 @@ func subcommandHelp(args []string) (string, bool) {
 
 func isSubcommand(arg string) bool {
 	switch arg {
-	case "nodes", "node", "services", "service":
+	case "status", "nodes", "node", "services", "service":
 		return true
 	default:
 		return false

@@ -5,6 +5,7 @@ import (
 	"encoding/base64"
 	"encoding/binary"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net"
@@ -316,17 +317,28 @@ func (a *Agent) tick(ctx context.Context) {
 	}
 
 	// Fetch and merge configs from all node labels.
-	merged := a.fetchAndMerge(ctx)
-	if merged == nil {
-		a.failAgentStatus("ConfigFetched", "config_fetch_failed", "all config fetches failed")
+	merged, loadErr := a.fetchAndMerge(ctx)
+	if loadErr != nil {
+		if loadErr.fetchErr != nil {
+			a.failAgentStatus("ConfigFetched", "config_fetch_failed", loadErr.fetchErr.Error())
+		}
+		if loadErr.parseErr != nil {
+			if loadErr.fetchErr == nil {
+				a.setStatusCondition("ConfigFetched", statusmodel.ConditionTrue, "", "")
+			}
+			a.failAgentStatus("ConfigParsed", "config_parse_failed", loadErr.parseErr.Error())
+		}
 		// No local config, but still sync Traefik with remote nodes so that
 		// this node can proxy requests for services placed on peer nodes.
 		if err := a.syncTraefikConfigs(ctx, nil); err != nil {
 			a.logger.Error("traefik route sync failed", "error", err)
 		}
+		a.refreshRuntimeMetrics()
 		a.syncRegistry(ctx, nodeCap, capacity.NodeCapacity{})
 		return
 	}
+	a.setStatusCondition("ConfigFetched", statusmodel.ConditionTrue, "", "")
+	a.setStatusCondition("ConfigParsed", statusmodel.ConditionTrue, "", "")
 
 	// Check revision only after fetch, so stores that update revision state
 	// during Fetch (Git pull, object write token) are evaluated against fresh data.
@@ -340,7 +352,6 @@ func (a *Agent) tick(ctx context.Context) {
 			a.logger.Error("failed to get store revision", "error", err)
 		}
 		a.setStatusServices(*merged, rev)
-		a.setStatusCondition("ConfigFetched", statusmodel.ConditionTrue, "", "")
 		if rev != "" && rev == a.lastRevision {
 			// A local revision does not describe the peer node configs used for
 			// remote Traefik routes. Refresh routes on every poll even when the
@@ -351,9 +362,9 @@ func (a *Agent) tick(ctx context.Context) {
 			a.setStatusServices(*merged, rev)
 			if err := a.syncTraefikConfigs(ctx, merged.Services); err != nil {
 				a.logger.Error("traefik route refresh failed", "error", err)
-				a.failAgentStatus("RoutesReady", "route_sync_failed", err.Error())
+				a.failAgentStatus("LocalRoutesReady", "local_route_sync_failed", err.Error())
 			} else {
-				a.setStatusCondition("RoutesReady", statusmodel.ConditionTrue, "", "")
+				a.setStatusCondition("LocalRoutesReady", statusmodel.ConditionTrue, "", "")
 				a.refreshAgentStatus(statusmodel.PhaseReady, "", "")
 			}
 			a.logger.Debug("config unchanged, skipped reconciliation after route refresh", "revision", rev)
@@ -362,7 +373,6 @@ func (a *Agent) tick(ctx context.Context) {
 		}
 	} else {
 		a.setStatusServices(*merged, "")
-		a.setStatusCondition("ConfigFetched", statusmodel.ConditionTrue, "", "")
 	}
 
 	// Preflight routing metadata before any reconciliation so an invalid
@@ -370,7 +380,7 @@ func (a *Agent) tick(ctx context.Context) {
 	// instead of being recorded as applied.
 	if err := a.preflightRouting(merged.Services); err != nil {
 		a.logger.Error("routing preflight failed; not advancing revision", "error", err)
-		a.failAgentStatus("NetworkReady", "routing_preflight_failed", err.Error())
+		a.failAgentStatus("LocalRoutesReady", "invalid_routing_config", err.Error())
 		a.syncRegistry(ctx, nodeCap, capacity.NodeCapacity{})
 		return
 	}
@@ -397,9 +407,14 @@ func (a *Agent) tick(ctx context.Context) {
 		a.setHeartbeatResources(nodeCap, used)
 	}
 	if !a.checkCapacity(nodeCap, used, hasCap) {
-		a.failAgentStatus("Reconciled", "capacity_exceeded", "desired services exceed node capacity")
+		a.failAgentStatus("CapacityReady", "capacity_exceeded", "desired services exceed node capacity")
 		a.syncRegistry(ctx, nodeCap, used)
 		return
+	}
+	if hasCap {
+		a.setStatusCondition("CapacityReady", statusmodel.ConditionTrue, "", "")
+	} else {
+		a.setStatusCondition("CapacityReady", statusmodel.ConditionTrue, "not_configured", "")
 	}
 
 	// Sync images from S3 before reconciling (ensures rootfs/kernels are present).
@@ -424,10 +439,23 @@ func (a *Agent) tick(ctx context.Context) {
 	a.metrics.observeReconcile(time.Since(reconcileStart), err != nil)
 	if err != nil {
 		a.logger.Error("reconciliation failed", "error", err)
-		a.failAgentStatus("Reconciled", "reconcile_failed", err.Error())
+		networkFailed, vmFailed, code := classifyReconcileFailure(err)
+		if networkFailed {
+			a.setStatusCondition("NetworkReady", statusmodel.ConditionFalse, "network_setup_failed", err.Error())
+		} else {
+			a.setStatusCondition("NetworkReady", statusmodel.ConditionTrue, "", "")
+		}
+		if vmFailed || !networkFailed {
+			a.setStatusCondition("VMsReconciled", statusmodel.ConditionFalse, "vm_reconcile_failed", err.Error())
+		} else {
+			a.setStatusCondition("VMsReconciled", statusmodel.ConditionUnknown, "not_reached", "")
+		}
+		a.failAgentStatus("Reconciled", code, err.Error())
 		a.syncRegistry(ctx, nodeCap, used)
 		return
 	}
+	a.setStatusCondition("NetworkReady", statusmodel.ConditionTrue, "", "")
+	a.setStatusCondition("VMsReconciled", statusmodel.ConditionTrue, "", "")
 	a.setStatusCondition("Reconciled", statusmodel.ConditionTrue, "", "")
 
 	// Sync Traefik dynamic config files with desired services. An error here
@@ -437,11 +465,11 @@ func (a *Agent) tick(ctx context.Context) {
 	// failures degrade inside syncTraefikConfigs without surfacing here.)
 	if err := a.syncTraefikConfigs(ctx, merged.Services); err != nil {
 		a.logger.Error("traefik route sync failed; not advancing revision", "error", err)
-		a.failAgentStatus("RoutesReady", "route_sync_failed", err.Error())
+		a.failAgentStatus("LocalRoutesReady", "local_route_sync_failed", err.Error())
 		a.syncRegistry(ctx, nodeCap, used)
 		return
 	}
-	a.setStatusCondition("RoutesReady", statusmodel.ConditionTrue, "", "")
+	a.setStatusCondition("LocalRoutesReady", statusmodel.ConditionTrue, "", "")
 
 	// Update the last known revision on success.
 	if rev != "" {
@@ -452,24 +480,46 @@ func (a *Agent) tick(ctx context.Context) {
 		appliedRevision = a.lastRevision
 	}
 	a.metrics.recordConfigApply(appliedRevision, time.Now())
-	a.refreshRuntimeMetrics()
 	a.markAgentStatusApplied(appliedRevision)
+	a.refreshRuntimeMetrics()
 	a.syncRegistry(ctx, nodeCap, used)
 
 	a.logger.Debug("reconciliation tick completed", "revision", rev)
 }
 
-// fetchAndMerge fetches configs for all node labels and merges services.
-// Returns nil if all fetches fail.
-func (a *Agent) fetchAndMerge(ctx context.Context) *config.NodeConfig {
+func classifyReconcileFailure(err error) (networkFailed, vmFailed bool, reasonCode string) {
+	networkFailed = reconciler.HasFailureStage(err, reconciler.FailureStageNetwork)
+	vmFailed = reconciler.HasFailureStage(err, reconciler.FailureStageVM)
+	reasonCode = "vm_reconcile_failed"
+	if networkFailed && !vmFailed {
+		reasonCode = "network_setup_failed"
+	}
+	return networkFailed, vmFailed, reasonCode
+}
+
+// fetchAndMerge fetches and parses every configured node label. A partial
+// result fails closed because it cannot describe one applied merged revision.
+type configLoadError struct {
+	fetchErr error
+	parseErr error
+}
+
+func (e *configLoadError) Error() string {
+	return errors.Join(e.fetchErr, e.parseErr).Error()
+}
+
+func (a *Agent) fetchAndMerge(ctx context.Context) (*config.NodeConfig, *configLoadError) {
 	seen := make(map[string]config.ServiceConfig)
-	var fetchedAny bool
+	var loadErr configLoadError
 	var desiredRevision, placementRevision, renderedRevision string
 
 	for _, name := range a.cfg.NodeNames {
 		data, err := a.store.Fetch(ctx, name)
 		if err != nil {
 			a.logger.Error("failed to fetch config from store", "label", name, "error", err)
+			if loadErr.fetchErr == nil {
+				loadErr.fetchErr = fmt.Errorf("fetch label %s: %w", name, err)
+			}
 			continue
 		}
 		a.metrics.recordConfigFetchSuccess(name, time.Now())
@@ -482,10 +532,12 @@ func (a *Agent) fetchAndMerge(ctx context.Context) *config.NodeConfig {
 		nc, err := config.ParseNodeConfig(data)
 		if err != nil {
 			a.logger.Error("failed to parse node config", "label", name, "error", err)
+			if loadErr.parseErr == nil {
+				loadErr.parseErr = fmt.Errorf("parse label %s: %w", name, err)
+			}
 			continue
 		}
 
-		fetchedAny = true
 		desiredRevision = mergeRevisionMetadata(desiredRevision, nc.DesiredRevision)
 		placementRevision = mergeRevisionMetadata(placementRevision, nc.PlacementRevision)
 		renderedRevision = mergeRevisionMetadata(renderedRevision, nc.RenderedRevision)
@@ -498,9 +550,8 @@ func (a *Agent) fetchAndMerge(ctx context.Context) *config.NodeConfig {
 		}
 	}
 
-	if !fetchedAny {
-		a.logger.Error("all config fetches failed")
-		return nil
+	if loadErr.fetchErr != nil || loadErr.parseErr != nil {
+		return nil, &loadErr
 	}
 
 	// Sort by name for deterministic ordering (important for IP allocation).
@@ -518,7 +569,7 @@ func (a *Agent) fetchAndMerge(ctx context.Context) *config.NodeConfig {
 		DesiredRevision:   usableRevisionMetadata(desiredRevision),
 		PlacementRevision: usableRevisionMetadata(placementRevision),
 		RenderedRevision:  usableRevisionMetadata(renderedRevision),
-	}
+	}, nil
 }
 
 const revisionMetadataConflict = "\x00"
@@ -731,6 +782,7 @@ func envKernelArg(key, value string) string {
 // firework_agent_remote_route_sync_degraded gauge.
 func (a *Agent) syncTraefikConfigs(ctx context.Context, services []config.ServiceConfig) error {
 	if a.traefikMgr == nil {
+		a.setStatusCondition("PeerRoutesReady", statusmodel.ConditionTrue, "not_configured", "")
 		return nil
 	}
 
@@ -741,12 +793,14 @@ func (a *Agent) syncTraefikConfigs(ctx context.Context, services []config.Servic
 			a.logger.Warn("failed to list peer node configs; keeping last-known-good remote routes",
 				"error", err)
 			a.metrics.setRemoteRouteSyncDegraded(true)
+			a.setStatusCondition("PeerRoutesReady", statusmodel.ConditionFalse, "peer_route_sync_degraded", err.Error())
 			if err := a.traefikMgr.SyncLocal(services); err != nil {
 				return fmt.Errorf("syncing local traefik configs: %w", err)
 			}
 			return nil
 		}
 		a.metrics.setRemoteRouteSyncDegraded(false)
+		a.setStatusCondition("PeerRoutesReady", statusmodel.ConditionTrue, "", "")
 		ownNames := make(map[string]bool, len(a.cfg.NodeNames))
 		for _, n := range a.cfg.NodeNames {
 			ownNames[n] = true
@@ -756,6 +810,8 @@ func (a *Agent) syncTraefikConfigs(ctx context.Context, services []config.Servic
 				remoteNodes = append(remoteNodes, nc)
 			}
 		}
+	} else {
+		a.setStatusCondition("PeerRoutesReady", statusmodel.ConditionTrue, "not_configured", "")
 	}
 
 	if err := a.traefikMgr.Sync(services, remoteNodes); err != nil {
@@ -896,6 +952,7 @@ func (a *Agent) refreshRuntimeMetrics() {
 		results = a.healthMon.Results()
 	}
 	a.metrics.setServiceSnapshot(a.vmManager.List(), results)
+	a.metrics.setAgentStatusSnapshot(a.agentStatusSnapshot())
 }
 
 func (a *Agent) syncRegistry(ctx context.Context, cap, used capacity.NodeCapacity) {

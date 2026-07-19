@@ -10,6 +10,7 @@ import (
 	"github.com/artemnikitin/firework/internal/capacity"
 	"github.com/artemnikitin/firework/internal/config"
 	"github.com/artemnikitin/firework/internal/healthcheck"
+	"github.com/artemnikitin/firework/internal/statusmodel"
 	"github.com/artemnikitin/firework/internal/vm"
 )
 
@@ -58,6 +59,8 @@ type runtimeMetrics struct {
 	lastAppliedAt              float64
 	lastAppliedRevision        string
 	remoteRouteSyncDegraded    float64
+	statusPhase                string
+	statusConditions           map[string]string
 	volumeOperations           map[volumeOperationKey]uint64
 	volumeOperationDuration    map[volumeOperationKey]float64
 	volumePools                map[string]volumePoolSnapshot
@@ -79,6 +82,23 @@ func newRuntimeMetrics(node string) *runtimeMetrics {
 		volumeOperations:           make(map[volumeOperationKey]uint64),
 		volumeOperationDuration:    make(map[volumeOperationKey]float64),
 		volumePools:                make(map[string]volumePoolSnapshot),
+		statusConditions:           make(map[string]string),
+	}
+}
+
+func (m *runtimeMetrics) setAgentStatusSnapshot(status statusmodel.AgentStatus) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.statusPhase = string(status.Phase)
+	m.statusConditions = make(map[string]string, len(status.Conditions))
+	for _, condition := range status.Conditions {
+		m.statusConditions[condition.Type] = string(condition.Status)
+	}
+	if !status.LastAppliedAt.IsZero() {
+		m.lastAppliedAt = float64(status.LastAppliedAt.Unix())
+	}
+	if status.AppliedRevision != "" {
+		m.lastAppliedRevision = status.AppliedRevision
 	}
 }
 
@@ -279,6 +299,17 @@ func (m *runtimeMetrics) render() string {
 		)
 	}
 
+	writeHelpType(&b, "firework_agent_status_phase", "Current agent status phase (1 for the current bounded phase label).", "gauge")
+	if m.statusPhase != "" {
+		fmt.Fprintf(&b, "firework_agent_status_phase{node=%q,phase=%q} 1\n", m.node, m.statusPhase)
+	}
+	writeHelpType(&b, "firework_agent_status_condition", "Current typed agent condition (1 for the current bounded status label).", "gauge")
+	conditionTypes := sortedStringMapKeys(m.statusConditions)
+	for _, conditionType := range conditionTypes {
+		fmt.Fprintf(&b, "firework_agent_status_condition{node=%q,condition=%q,status=%q} 1\n",
+			m.node, conditionType, m.statusConditions[conditionType])
+	}
+
 	writeHelpType(&b, "firework_agent_config_last_fetch_success_timestamp_seconds", "Unix timestamp of last successful config fetch per node label.", "gauge")
 	labels := sortedMapKeys(m.configFetchSuccessByLabel)
 	for _, label := range labels {
@@ -444,6 +475,15 @@ func sortedMapKeys(m map[string]float64) []string {
 	keys := make([]string, 0, len(m))
 	for k := range m {
 		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	return keys
+}
+
+func sortedStringMapKeys(m map[string]string) []string {
+	keys := make([]string, 0, len(m))
+	for key := range m {
+		keys = append(keys, key)
 	}
 	sort.Strings(keys)
 	return keys

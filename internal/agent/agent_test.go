@@ -2,6 +2,7 @@ package agent
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -13,6 +14,8 @@ import (
 
 	"github.com/artemnikitin/firework/internal/capacity"
 	"github.com/artemnikitin/firework/internal/config"
+	"github.com/artemnikitin/firework/internal/reconciler"
+	"github.com/artemnikitin/firework/internal/statusmodel"
 )
 
 type fakeStore struct {
@@ -198,6 +201,14 @@ func TestTick_TraefikSyncFailureDoesNotAdvanceRevisionAndRetries(t *testing.T) {
 	if rs.calls != 2 {
 		t.Fatalf("expected the next tick to retry the sync, got %d sync calls", rs.calls)
 	}
+
+	rs.err = nil
+	a.tick(context.Background())
+	status := a.agentStatusSnapshot()
+	condition, ok := agentCondition(status, "LocalRoutesReady")
+	if a.lastRevision != "rev-1" || status.Phase != statusmodel.PhaseReady || !ok || condition.Status != statusmodel.ConditionTrue || condition.ReasonCode != "" {
+		t.Fatalf("recovered route apply did not clear current failure: revision=%q status=%#v", a.lastRevision, status)
+	}
 }
 
 func TestTick_UnchangedRevisionRefreshesTraefikRoutes(t *testing.T) {
@@ -275,6 +286,11 @@ func TestTick_PeerListFailurePreservesRoutesAndAdvancesRevision(t *testing.T) {
 	}
 	if a.lastRevision != "rev-1" {
 		t.Fatalf("expected revision to advance despite peer-list failure, got %q", a.lastRevision)
+	}
+	status := a.agentStatusSnapshot()
+	condition, ok := agentCondition(status, "PeerRoutesReady")
+	if status.Phase != statusmodel.PhaseReady || !ok || condition.Status != statusmodel.ConditionFalse || condition.ReasonCode != "peer_route_sync_degraded" {
+		t.Fatalf("peer route degradation missing from applied status: %#v", status)
 	}
 }
 
@@ -581,6 +597,84 @@ func TestTick_StatusReportsVMProcessFailureWithoutExitedPID(t *testing.T) {
 		time.Sleep(10 * time.Millisecond)
 	}
 	t.Fatalf("service did not report VM failure: %#v", a.agentStatusSnapshot().Services)
+}
+
+func TestTick_StatusDistinguishesConfigParseFailure(t *testing.T) {
+	store := &fakeStore{data: map[string][]byte{"web": []byte("node: [invalid\n")}, revision: "rev"}
+	a := New(testAgentConfig(t), store, testLogger())
+	a.tick(context.Background())
+	status := a.agentStatusSnapshot()
+	parsed, ok := agentCondition(status, "ConfigParsed")
+	if status.Phase != statusmodel.PhaseFailed || status.ReasonCode != "config_parse_failed" || !ok || parsed.Status != statusmodel.ConditionFalse {
+		t.Fatalf("parse failure was not typed: %#v", status)
+	}
+	fetched, ok := agentCondition(status, "ConfigFetched")
+	if !ok || fetched.Status != statusmodel.ConditionTrue {
+		t.Fatalf("successful fetch was not retained before parse failure: %#v", status.Conditions)
+	}
+}
+
+func TestTick_MultiLabelPartialFetchFailsClosed(t *testing.T) {
+	store := &fakeStore{data: map[string][]byte{"web": []byte("node: web\nservices: []\n")}, revision: "rev"}
+	cfg := testAgentConfig(t)
+	cfg.NodeNames = []string{"web", "missing"}
+	a := New(cfg, store, testLogger())
+	a.tick(context.Background())
+	status := a.agentStatusSnapshot()
+	condition, ok := agentCondition(status, "ConfigFetched")
+	if status.Phase != statusmodel.PhaseFailed || status.ReasonCode != "config_fetch_failed" || !ok || condition.Status != statusmodel.ConditionFalse {
+		t.Fatalf("partial multi-label fetch was not rejected: %#v", status)
+	}
+}
+
+func TestTick_StatusDistinguishesVMReconcileFailure(t *testing.T) {
+	store := &fakeStore{data: map[string][]byte{"web": []byte("node: web\nservices:\n- name: service\n  image: /image\n  kernel: /kernel\n  vcpus: 1\n  memory_mb: 128\n")}, revision: "rev"}
+	cfg := testAgentConfig(t)
+	cfg.FirecrackerBin = filepath.Join(t.TempDir(), "missing-firecracker")
+	a := New(cfg, store, testLogger())
+	a.tick(context.Background())
+	status := a.agentStatusSnapshot()
+	condition, ok := agentCondition(status, "VMsReconciled")
+	if status.Phase != statusmodel.PhaseFailed || status.ReasonCode != "vm_reconcile_failed" || !ok || condition.Status != statusmodel.ConditionFalse {
+		t.Fatalf("VM reconcile failure was not typed: %#v", status)
+	}
+	metrics := a.metrics.render()
+	if !strings.Contains(metrics, `firework_agent_status_phase{node="web",phase="failed"} 1`) ||
+		!strings.Contains(metrics, `firework_agent_status_condition{node="web",condition="VMsReconciled",status="false"} 1`) {
+		t.Fatalf("status model was not reflected in metrics:\n%s", metrics)
+	}
+}
+
+func TestClassifyReconcileFailureDistinguishesNetworkAndVMStages(t *testing.T) {
+	network, vmFailed, code := classifyReconcileFailure(&reconciler.StageError{Stage: reconciler.FailureStageNetwork, Err: errors.New("tap failed")})
+	if !network || vmFailed || code != "network_setup_failed" {
+		t.Fatalf("network failure classification = network:%v vm:%v code:%q", network, vmFailed, code)
+	}
+	network, vmFailed, code = classifyReconcileFailure(&reconciler.StageError{Stage: reconciler.FailureStageVM, Err: errors.New("launch failed")})
+	if network || !vmFailed || code != "vm_reconcile_failed" {
+		t.Fatalf("VM failure classification = network:%v vm:%v code:%q", network, vmFailed, code)
+	}
+}
+
+func TestAgentStatusTruncatesServiceSummaries(t *testing.T) {
+	a := New(testAgentConfig(t), &fakeStore{}, testLogger())
+	a.statusServices = make([]config.ServiceConfig, statusmodel.MaxServices+1)
+	for index := range a.statusServices {
+		a.statusServices[index].Name = fmt.Sprintf("service-%03d", index)
+	}
+	status := a.agentStatusSnapshot()
+	if !status.ServicesTruncated || status.DesiredServices != statusmodel.MaxServices+1 || len(status.Services) != statusmodel.MaxServices {
+		t.Fatalf("service status was not bounded: desired=%d summaries=%d truncated=%v", status.DesiredServices, len(status.Services), status.ServicesTruncated)
+	}
+}
+
+func agentCondition(status statusmodel.AgentStatus, kind string) (statusmodel.Condition, bool) {
+	for _, condition := range status.Conditions {
+		if condition.Type == kind {
+			return condition, true
+		}
+	}
+	return statusmodel.Condition{}, false
 }
 
 func TestTick_CapacityCheck_ProceedsWhenSufficient(t *testing.T) {

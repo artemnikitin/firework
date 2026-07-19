@@ -72,6 +72,7 @@ func (a *Agent) setStatusCondition(kind string, value statusmodel.ConditionStatu
 func (a *Agent) failAgentStatus(condition, code, message string) {
 	a.setStatusCondition(condition, statusmodel.ConditionFalse, code, message)
 	a.refreshAgentStatus(statusmodel.PhaseFailed, code, message)
+	a.metrics.setAgentStatusSnapshot(a.agentStatusSnapshot())
 }
 
 func (a *Agent) markAgentStatusApplied(revision string) {
@@ -83,6 +84,7 @@ func (a *Agent) markAgentStatusApplied(revision string) {
 	a.currentStatus.LastAppliedAt = time.Now().UTC()
 	a.statusMu.Unlock()
 	a.refreshAgentStatus(statusmodel.PhaseReady, "", "")
+	a.metrics.setAgentStatusSnapshot(a.agentStatusSnapshot())
 }
 
 func (a *Agent) refreshAgentStatus(phase statusmodel.Phase, code, message string) {
@@ -164,6 +166,10 @@ func (a *Agent) refreshAgentStatus(phase statusmodel.Phase, code, message string
 		services = append(services, service)
 	}
 	sort.Slice(services, func(i, j int) bool { return services[i].Name < services[j].Name })
+	servicesTruncated := len(services) > statusmodel.MaxServices
+	if servicesTruncated {
+		services = services[:statusmodel.MaxServices]
+	}
 
 	a.currentStatus.SchemaVersion = statusmodel.SchemaVersion
 	a.currentStatus.AgentVersion = version.Version
@@ -172,6 +178,7 @@ func (a *Agent) refreshAgentStatus(phase statusmodel.Phase, code, message string
 	a.currentStatus.Phase = phase
 	a.currentStatus.DesiredServices = len(a.statusServices)
 	a.currentStatus.ReadyServices = ready
+	a.currentStatus.ServicesTruncated = servicesTruncated
 	a.currentStatus.ReasonCode = code
 	a.currentStatus.Message = statusmodel.BoundedMessage(message)
 	a.currentStatus.Services = services
