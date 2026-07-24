@@ -3,6 +3,8 @@
 package main
 
 import (
+	"encoding/base64"
+	"encoding/json"
 	"reflect"
 	"testing"
 )
@@ -17,6 +19,29 @@ func TestResolveUserSpec_NumericUIDDefaultsGID(t *testing.T) {
 	}
 	if username != "" || home != "" {
 		t.Fatalf("expected empty username/home for numeric uid, got %q/%q", username, home)
+	}
+}
+
+func TestParseVolumePayload(t *testing.T) {
+	want := volumePayload{Version: 1, Volumes: []guestVolume{{Name: "data", Device: "/dev/vdb", MountPath: "/var/lib/app", Type: "local"}}}
+	data, err := json.Marshal(want)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := parseVolumePayload("console=ttyS0 firework.volumes64=" + base64.RawURLEncoding.EncodeToString(data) + " init=/sbin/fc-init")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 || got[0] != want.Volumes[0] {
+		t.Fatalf("unexpected volumes: %#v", got)
+	}
+}
+
+func TestParseVolumePayloadRejectsUnsafePath(t *testing.T) {
+	payload := volumePayload{Version: 1, Volumes: []guestVolume{{Name: "data", Device: "/dev/vdb", MountPath: "relative", Type: "local"}}}
+	data, _ := json.Marshal(payload)
+	if _, err := parseVolumePayload("firework.volumes64=" + base64.RawURLEncoding.EncodeToString(data)); err == nil {
+		t.Fatal("expected unsafe mount path to fail")
 	}
 }
 

@@ -33,9 +33,22 @@ import (
 const runtimeMetadataPath = "/etc/firework/runtime.json"
 
 const (
-	fireworkEnvPrefix   = "firework.env."
-	fireworkEnv64Prefix = "firework.env64."
+	fireworkEnvPrefix     = "firework.env."
+	fireworkEnv64Prefix   = "firework.env64."
+	fireworkVolumesPrefix = "firework.volumes64="
 )
+
+type volumePayload struct {
+	Version int           `json:"version"`
+	Volumes []guestVolume `json:"volumes"`
+}
+
+type guestVolume struct {
+	Name      string `json:"name"`
+	Device    string `json:"device"`
+	MountPath string `json:"mount_path"`
+	Type      string `json:"type"`
+}
 
 type runtimeMetadata struct {
 	User          string            `json:"user,omitempty"`
@@ -46,12 +59,98 @@ type runtimeMetadata struct {
 
 func main() {
 	mountAll()
+	volumes, err := mountPersistentVolumes()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "fc-init: mount persistent volumes: %v\n", err)
+		os.Exit(1)
+	}
 	applyKernelSettings()
 	setHostname()
 	meta := loadRuntimeMetadata()
 	applyImageEnv(meta.Env)
 	exportFireworkEnv()
-	execService(meta)
+	execService(meta, volumes)
+}
+
+func mountPersistentVolumes() ([]guestVolume, error) {
+	data, err := os.ReadFile("/proc/cmdline")
+	if err != nil {
+		return nil, fmt.Errorf("read /proc/cmdline: %w", err)
+	}
+	volumes, err := parseVolumePayload(string(data))
+	if err != nil {
+		return nil, err
+	}
+	for _, volume := range volumes {
+		if err := validateGuestVolume(volume); err != nil {
+			return nil, err
+		}
+		if err := os.MkdirAll(volume.MountPath, 0o755); err != nil {
+			return nil, fmt.Errorf("create mount path %s: %w", volume.MountPath, err)
+		}
+		if err := syscall.Mount(volume.Device, volume.MountPath, "ext4", syscall.MS_NOATIME, ""); err != nil {
+			return nil, fmt.Errorf("mount %s at %s: %w", volume.Device, volume.MountPath, err)
+		}
+	}
+	return volumes, nil
+}
+
+func parseVolumePayload(cmdline string) ([]guestVolume, error) {
+	for _, arg := range strings.Fields(cmdline) {
+		encoded, ok := strings.CutPrefix(arg, fireworkVolumesPrefix)
+		if !ok {
+			continue
+		}
+		data, err := base64.RawURLEncoding.DecodeString(encoded)
+		if err != nil {
+			return nil, fmt.Errorf("decode volume payload: %w", err)
+		}
+		var payload volumePayload
+		if err := json.Unmarshal(data, &payload); err != nil {
+			return nil, fmt.Errorf("parse volume payload: %w", err)
+		}
+		if payload.Version != 1 {
+			return nil, fmt.Errorf("unsupported volume payload version %d", payload.Version)
+		}
+		seenDevices := make(map[string]struct{}, len(payload.Volumes))
+		seenPaths := make(map[string]struct{}, len(payload.Volumes))
+		for _, volume := range payload.Volumes {
+			if err := validateGuestVolume(volume); err != nil {
+				return nil, err
+			}
+			if _, exists := seenDevices[volume.Device]; exists {
+				return nil, fmt.Errorf("duplicate volume device %s", volume.Device)
+			}
+			if _, exists := seenPaths[volume.MountPath]; exists {
+				return nil, fmt.Errorf("duplicate volume mount path %s", volume.MountPath)
+			}
+			seenDevices[volume.Device] = struct{}{}
+			seenPaths[volume.MountPath] = struct{}{}
+		}
+		return payload.Volumes, nil
+	}
+	return nil, nil
+}
+
+func validateGuestVolume(volume guestVolume) error {
+	if volume.Name == "" {
+		return fmt.Errorf("volume name is empty")
+	}
+	if len(volume.Device) != len("/dev/vdb") || !strings.HasPrefix(volume.Device, "/dev/vd") || volume.Device[len(volume.Device)-1] < 'b' || volume.Device[len(volume.Device)-1] > 'z' {
+		return fmt.Errorf("volume %s has invalid device %q", volume.Name, volume.Device)
+	}
+	if !filepath.IsAbs(volume.MountPath) || filepath.Clean(volume.MountPath) != volume.MountPath || volume.MountPath == "/" {
+		return fmt.Errorf("volume %s has invalid mount path %q", volume.Name, volume.MountPath)
+	}
+	for _, reserved := range []string{"/proc", "/sys", "/dev", "/run", "/tmp"} {
+		if volume.MountPath == reserved || strings.HasPrefix(volume.MountPath, reserved+"/") {
+			return fmt.Errorf("volume %s uses reserved mount path %q", volume.Name, volume.MountPath)
+		}
+	}
+	if volume.Type != "local" && volume.Type != "shared" {
+		return fmt.Errorf("volume %s has invalid type %q", volume.Name, volume.Type)
+	}
+	return nil
 }
 
 // mountAll mounts the virtual filesystems the guest needs.
@@ -193,7 +292,7 @@ func parseFireworkEnvArg(arg string) (key, val string, ok bool, err error) {
 }
 
 // execService execs argv[1:] if provided, otherwise /sbin/init.
-func execService(meta runtimeMetadata) {
+func execService(meta runtimeMetadata, volumes []guestVolume) {
 	argv := os.Args[1:]
 	if len(argv) == 0 {
 		argv = []string{"/sbin/init"}
@@ -206,7 +305,7 @@ func execService(meta runtimeMetadata) {
 	}
 
 	if spec := strings.TrimSpace(meta.User); spec != "" {
-		if err := applyUserSpec(spec, meta.WritablePaths); err != nil {
+		if err := applyUserSpec(spec, meta.WritablePaths, volumes); err != nil {
 			fmt.Fprintf(os.Stderr, "fc-init: apply user %q: %v\n", spec, err)
 			os.Exit(1)
 		}
@@ -235,14 +334,23 @@ func resolveBinary(bin string) string {
 	return bin
 }
 
-func applyUserSpec(spec string, writablePaths []string) error {
+func applyUserSpec(spec string, writablePaths []string, volumes []guestVolume) error {
 	uid, gid, username, home, err := resolveUserSpec(spec)
 	if err != nil {
 		return err
 	}
 
-	if err := ensureWritablePaths(writablePaths, uid, gid); err != nil {
+	volumePaths := make([]string, 0, len(volumes))
+	for _, volume := range volumes {
+		volumePaths = append(volumePaths, volume.MountPath)
+	}
+	if err := ensureWritablePaths(writablePaths, volumePaths, uid, gid); err != nil {
 		return err
+	}
+	for _, path := range volumePaths {
+		if err := os.Chown(path, uid, gid); err != nil {
+			return fmt.Errorf("chown volume root %s: %w", path, err)
+		}
 	}
 
 	if home != "" {
@@ -266,9 +374,12 @@ func applyUserSpec(spec string, writablePaths []string) error {
 
 // ensureWritablePaths recursively changes ownership for paths that apps need
 // write access to after dropping privileges. Missing paths are ignored.
-func ensureWritablePaths(paths []string, uid, gid int) error {
+func ensureWritablePaths(paths, volumePaths []string, uid, gid int) error {
 	var errs []string
 	for _, path := range normalizeWritablePaths(paths) {
+		if overlapsVolumePath(path, volumePaths) {
+			continue
+		}
 		if err := chownPathRecursive(path, uid, gid); err != nil {
 			if os.IsNotExist(err) {
 				continue
@@ -280,6 +391,15 @@ func ensureWritablePaths(paths []string, uid, gid int) error {
 		return fmt.Errorf("prepare writable paths: %s", strings.Join(errs, "; "))
 	}
 	return nil
+}
+
+func overlapsVolumePath(path string, volumePaths []string) bool {
+	for _, volumePath := range volumePaths {
+		if path == volumePath || strings.HasPrefix(path, volumePath+"/") || strings.HasPrefix(volumePath, path+"/") {
+			return true
+		}
+	}
+	return false
 }
 
 func chownPathRecursive(path string, uid, gid int) error {

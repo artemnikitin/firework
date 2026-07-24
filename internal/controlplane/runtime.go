@@ -59,6 +59,16 @@ func Run(ctx context.Context, cfg Config, logger *slog.Logger) error {
 		go serveTLS(srv, logger, "events", errCh)
 	}
 
+	if roleEnabled(cfg.Role, RoleAPI) {
+		api := NewVisibilityServer(cfg, store, logger)
+		srv, err := api.HTTPServer()
+		if err != nil {
+			return err
+		}
+		servers = append(servers, srv)
+		go serveTLS(srv, logger, "api", errCh)
+	}
+
 	if roleEnabled(cfg.Role, RoleController) {
 		controller := NewController(cfg, store, logger)
 		go func() {

@@ -11,6 +11,11 @@ type NodeConfig struct {
 	Services []ServiceConfig `yaml:"services"`
 	// HostIP is the EC2 instance private IP, resolved by the enricher.
 	HostIP string `yaml:"host_ip,omitempty"`
+	// Revision metadata is populated by the control plane so agents can report
+	// convergence using stable revision IDs instead of provider write tokens.
+	DesiredRevision   string `yaml:"desired_revision,omitempty"`
+	PlacementRevision string `yaml:"placement_revision,omitempty"`
+	RenderedRevision  string `yaml:"rendered_revision,omitempty"`
 }
 
 // ServiceConfig defines a single service (Firecracker microVM) to run.
@@ -55,6 +60,58 @@ type ServiceConfig struct {
 	// service needs to advertise its transport address as the host IP rather
 	// than the VM guest IP (e.g. Elasticsearch transport.publish_host).
 	NodeHostIPEnv string `yaml:"node_host_ip_env,omitempty"`
+	// Volumes are persistent ext4 images attached after the root filesystem.
+	// SizeBytes is always resolved by the enricher/controller; agents never
+	// apply application defaults independently.
+	Volumes []VolumeConfig `yaml:"volumes,omitempty"`
+}
+
+// VolumeType identifies the persistence and placement semantics of a volume.
+type VolumeType string
+
+const (
+	VolumeTypeLocal  VolumeType = "local"
+	VolumeTypeShared VolumeType = "shared"
+	// MaxServiceVolumes matches the additional virtio block-device range
+	// exposed as /dev/vdb through /dev/vdz. The rootfs occupies /dev/vda.
+	MaxServiceVolumes = 25
+)
+
+// VolumeConfig is the resolved, provider-neutral persistent-volume contract.
+// BoundNode and SharedBackendID are system-owned fields and are not accepted
+// in application input.
+type VolumeConfig struct {
+	Name             string     `yaml:"name" json:"name"`
+	Type             VolumeType `yaml:"type" json:"type"`
+	MountPath        string     `yaml:"mount_path" json:"mount_path"`
+	SizeBytes        int64      `yaml:"size_bytes" json:"size_bytes"`
+	BoundNode        string     `yaml:"bound_node,omitempty" json:"bound_node,omitempty"`
+	SharedBackendID  string     `yaml:"shared_backend_id,omitempty" json:"shared_backend_id,omitempty"`
+	ResizeGeneration int64      `yaml:"resize_generation,omitempty" json:"resize_generation,omitempty"`
+}
+
+// StorageConfig describes host storage pools supplied and mounted by the
+// deployment operator. Firework never provisions cloud storage resources.
+type StorageConfig struct {
+	Local  *LocalStorageConfig  `yaml:"local,omitempty"`
+	Shared *SharedStorageConfig `yaml:"shared,omitempty"`
+}
+
+// LocalStorageConfig configures a node-affine storage pool.
+type LocalStorageConfig struct {
+	Path          string `yaml:"path"`
+	Capacity      string `yaml:"capacity"`
+	CapacityBytes int64  `yaml:"-"`
+}
+
+// SharedStorageConfig configures one deployment-wide shared storage backend.
+// CapacityBytes may be zero when the operator intentionally omits aggregate
+// admission control (for example, elastic EFS).
+type SharedStorageConfig struct {
+	BackendID     string `yaml:"backend_id"`
+	Path          string `yaml:"path"`
+	Capacity      string `yaml:"capacity,omitempty"`
+	CapacityBytes int64  `yaml:"-"`
 }
 
 // CrossNodeLink declares a dependency on a peer service running on a different
@@ -103,9 +160,9 @@ type NetworkConfig struct {
 // PortForward maps a host port to a VM port via iptables DNAT.
 type PortForward struct {
 	// HostPort is the port on the host machine.
-	HostPort int `yaml:"host_port"`
+	HostPort int `yaml:"host_port" json:"host_port"`
 	// VMPort is the port inside the guest VM.
-	VMPort int `yaml:"vm_port"`
+	VMPort int `yaml:"vm_port" json:"vm_port"`
 }
 
 // HealthCheckConfig defines how to check if a service is healthy.
@@ -219,6 +276,8 @@ type AgentConfig struct {
 	// URL scheme, port, or path. If empty, services must use an exact
 	// metadata.host instead. The loader normalizes and validates this value.
 	IngressDomain string `yaml:"ingress_domain,omitempty"`
+	// Storage contains optional operator-provided persistent storage pools.
+	Storage StorageConfig `yaml:"storage,omitempty"`
 
 	// RegistryURL enables control-plane registry integration when set.
 	// The agent will enroll/renew mTLS certificates and send register/heartbeat

@@ -20,6 +20,8 @@ func TestRuntimeMetrics_RenderIncludesServiceAndFreshnessMetrics(t *testing.T) {
 	m.recordConfigFetchSuccess("web", time.Unix(1700000000, 0))
 	m.recordEnrichmentTimestamp("web", time.Unix(1700000010, 0))
 	m.recordConfigApply("rev-123", time.Now().Add(-10*time.Second))
+	m.ObserveVolumeOperation("local", "create", "success", 250*time.Millisecond)
+	m.ObserveVolumePool("local", 1024, 4096, 8192)
 
 	m.setServiceSnapshot(
 		map[string]*vm.Instance{
@@ -56,6 +58,8 @@ func TestRuntimeMetrics_RenderIncludesServiceAndFreshnessMetrics(t *testing.T) {
 	assertContains(t, out, `firework_agent_config_last_fetch_success_timestamp_seconds{node="web",label="web"} 1700000000`)
 	assertContains(t, out, `firework_agent_config_last_enrichment_timestamp_seconds{node="web",label="web"} 1700000010`)
 	assertContains(t, out, `firework_agent_config_last_applied_revision_info{node="web",revision="rev-123"} 1`)
+	assertContains(t, out, `firework_agent_volume_operations_total{node="web",type="local",operation="create",outcome="success"} 1`)
+	assertContains(t, out, `firework_agent_volume_reserved_bytes{node="web",type="local"} 1024`)
 }
 
 func TestTenantForService_DefaultsToShared(t *testing.T) {

@@ -25,6 +25,7 @@ import (
 
 	"github.com/artemnikitin/firework/internal/capacity"
 	"github.com/artemnikitin/firework/internal/config"
+	"github.com/artemnikitin/firework/internal/statusmodel"
 )
 
 type registryClient struct {
@@ -48,7 +49,7 @@ func newRegistryClient(cfg config.AgentConfig, logger *slog.Logger, generation i
 	}
 }
 
-func (c *registryClient) sync(ctx context.Context, nodeID string, labels []string, cap, used capacity.NodeCapacity) {
+func (c *registryClient) sync(ctx context.Context, nodeID string, labels []string, cap, used capacity.NodeCapacity, status *statusmodel.AgentStatus) {
 	if err := c.ensureCertificate(ctx, nodeID); err != nil {
 		c.logger.Warn("registry certificate setup failed", "error", err)
 		return
@@ -60,32 +61,41 @@ func (c *registryClient) sync(ctx context.Context, nodeID string, labels []strin
 		}
 		c.setRegistered(true)
 	}
-	if err := c.heartbeat(ctx, nodeID, cap, used); err != nil {
+	if err := c.heartbeat(ctx, nodeID, cap, used, status); err != nil {
 		c.logger.Warn("registry heartbeat failed", "error", err)
 		c.setRegistered(false)
 	}
 }
 
 type registerRequest struct {
-	NodeID     string     `json:"node_id"`
-	Generation int64      `json:"generation"`
-	Labels     []string   `json:"labels,omitempty"`
-	Capacity   capPayload `json:"capacity"`
-	State      string     `json:"state"`
-	HostIP     string     `json:"host_ip,omitempty"`
+	NodeID     string         `json:"node_id"`
+	Generation int64          `json:"generation"`
+	Labels     []string       `json:"labels,omitempty"`
+	Capacity   capPayload     `json:"capacity"`
+	State      string         `json:"state"`
+	HostIP     string         `json:"host_ip,omitempty"`
+	Storage    storagePayload `json:"storage,omitempty"`
 }
 
 type heartbeatRequest struct {
-	NodeID     string     `json:"node_id"`
-	Generation int64      `json:"generation"`
-	Capacity   capPayload `json:"capacity"`
-	Used       capPayload `json:"used"`
-	HostIP     string     `json:"host_ip,omitempty"`
+	NodeID      string                   `json:"node_id"`
+	Generation  int64                    `json:"generation"`
+	Capacity    capPayload               `json:"capacity"`
+	Used        capPayload               `json:"used"`
+	HostIP      string                   `json:"host_ip,omitempty"`
+	AgentStatus *statusmodel.AgentStatus `json:"agent_status,omitempty"`
+	Storage     storagePayload           `json:"storage,omitempty"`
 }
 
 type capPayload struct {
 	VCPUs    int `json:"vcpus"`
 	MemoryMB int `json:"memory_mb"`
+}
+
+type storagePayload struct {
+	LocalCapacityBytes  int64  `json:"local_capacity_bytes,omitempty"`
+	SharedBackendID     string `json:"shared_backend_id,omitempty"`
+	SharedCapacityBytes int64  `json:"shared_capacity_bytes,omitempty"`
 }
 
 type certRequest struct {
@@ -116,13 +126,14 @@ func (c *registryClient) register(ctx context.Context, nodeID string, labels []s
 			VCPUs:    cap.VCPUs,
 			MemoryMB: cap.MemoryMB,
 		},
-		State:  "ready",
-		HostIP: c.hostIP,
+		State:   "ready",
+		HostIP:  c.hostIP,
+		Storage: c.storagePayload(),
 	}
 	return c.postMTLS(ctx, "/v1/nodes/register", req, nil)
 }
 
-func (c *registryClient) heartbeat(ctx context.Context, nodeID string, cap, used capacity.NodeCapacity) error {
+func (c *registryClient) heartbeat(ctx context.Context, nodeID string, cap, used capacity.NodeCapacity, status *statusmodel.AgentStatus) error {
 	req := heartbeatRequest{
 		NodeID:     nodeID,
 		Generation: c.generation,
@@ -134,9 +145,23 @@ func (c *registryClient) heartbeat(ctx context.Context, nodeID string, cap, used
 			VCPUs:    used.VCPUs,
 			MemoryMB: used.MemoryMB,
 		},
-		HostIP: c.hostIP,
+		HostIP:      c.hostIP,
+		AgentStatus: status,
+		Storage:     c.storagePayload(),
 	}
 	return c.postMTLS(ctx, "/v1/nodes/heartbeat", req, nil)
+}
+
+func (c *registryClient) storagePayload() storagePayload {
+	var out storagePayload
+	if c.cfg.Storage.Local != nil {
+		out.LocalCapacityBytes = c.cfg.Storage.Local.CapacityBytes
+	}
+	if c.cfg.Storage.Shared != nil {
+		out.SharedBackendID = c.cfg.Storage.Shared.BackendID
+		out.SharedCapacityBytes = c.cfg.Storage.Shared.CapacityBytes
+	}
+	return out
 }
 
 func (c *registryClient) ensureCertificate(ctx context.Context, nodeID string) error {

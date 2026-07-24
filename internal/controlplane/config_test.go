@@ -16,6 +16,7 @@ func validConfigForRole(role string) Config {
 	cfg.Enrollment.CAFile = "/tmp/ca.pem"
 	cfg.Enrollment.CAKeyFile = "/tmp/ca.key"
 	cfg.GitHubWebhookSecret = "secret"
+	cfg.OperatorToken = "operator-secret"
 	return cfg
 }
 
@@ -73,6 +74,22 @@ func TestConfigValidate_NodeStaleTTL(t *testing.T) {
 	cfg.NodeStaleTTL = 0
 	if err := cfg.Validate(); err == nil {
 		t.Fatalf("expected node_stale_ttl validation error")
+	}
+}
+
+func TestConfigValidate_IngressDomain(t *testing.T) {
+	cfg := validConfigForRole(RoleAPI)
+	cfg.IngressDomain = "https://example.com"
+	if err := cfg.Validate(); err == nil {
+		t.Fatal("expected invalid ingress_domain error")
+	}
+
+	cfg.IngressDomain = "Example.COM."
+	if err := cfg.resolve(); err != nil {
+		t.Fatalf("resolve ingress_domain: %v", err)
+	}
+	if cfg.IngressDomain != "example.com" {
+		t.Fatalf("ingress domain = %q, want example.com", cfg.IngressDomain)
 	}
 }
 
@@ -146,4 +163,21 @@ func TestConfigResolve_TokenFile(t *testing.T) {
 			t.Fatal("expected error for both token and token_file set")
 		}
 	})
+}
+
+func TestConfigResolve_OperatorTokenFile(t *testing.T) {
+	dir := t.TempDir()
+	file := filepath.Join(dir, "operator-token")
+	if err := os.WriteFile(file, []byte(" operator-token\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg := validConfigForRole(RoleAPI)
+	cfg.OperatorToken = ""
+	cfg.OperatorTokenFile = file
+	if err := cfg.resolve(); err != nil {
+		t.Fatal(err)
+	}
+	if cfg.OperatorToken != "operator-token" {
+		t.Fatalf("operator token = %q", cfg.OperatorToken)
+	}
 }

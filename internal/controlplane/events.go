@@ -220,7 +220,15 @@ func (s *EventsServer) publishDesiredRevision(ctx context.Context, desired *Desi
 func flattenNodeConfigs(configs []config.NodeConfig) []config.ServiceConfig {
 	var out []config.ServiceConfig
 	for _, nc := range configs {
-		out = append(out, nc.Services...)
+		for _, service := range nc.Services {
+			service.Volumes = append([]config.VolumeConfig(nil), service.Volumes...)
+			for i := range service.Volumes {
+				// Enricher node groups are deployment classes, not stable node IDs.
+				// The controller creates the durable binding after placement.
+				service.Volumes[i].BoundNode = ""
+			}
+			out = append(out, service)
+		}
 	}
 	return out
 }

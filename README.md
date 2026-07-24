@@ -23,6 +23,7 @@ flowchart TB
         REG["registry role\n(enroll/register/heartbeat)"]
         EV["events role\n(GitHub webhook)"]
         CTRL["controller role\n(schedule + publish)"]
+        API["api role\n(read-only visibility)"]
     end
 
     subgraph storage["Object Storage (S3 or GCS)"]
@@ -41,6 +42,7 @@ flowchart TB
     EV --> STATE
     REG --> STATE
     CTRL --> STATE
+    API --> STATE
     CTRL -->|rendered configs| CFG
     CI -->|upload| IMG
     N1 & N2 -->|mTLS register + heartbeat| REG
@@ -53,6 +55,8 @@ flowchart TB
 - Architecture overview: [`docs/architecture/README.md`](docs/architecture/README.md)
 - Design decisions and rationale: [`docs/architecture/DESIGN.md`](docs/architecture/DESIGN.md)
 - Configuration reference: [`docs/configs/README.md`](docs/configs/README.md)
+- Deployment visibility: [`docs/deployment-visibility.md`](docs/deployment-visibility.md)
+- `fireworkctl` user guide: [`docs/fireworkctl.md`](docs/fireworkctl.md)
 - Example agent configs: [`examples/`](examples/)
 - Development guide: [`DEVELOPMENT.md`](DEVELOPMENT.md)
 

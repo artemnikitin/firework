@@ -71,6 +71,8 @@ jobs:
             path: ./cmd/controlplane/
           - binary: configcheck
             path: ./cmd/configcheck/
+          - binary: fireworkctl
+            path: ./cmd/fireworkctl/
           - binary: fc-init
             path: ./cmd/fc-init/
             env: GOOS=linux GOARCH=arm64
