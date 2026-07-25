@@ -132,16 +132,26 @@ func (l *systemdLauncher) Stop(manifest *instanceManifest, signal syscall.Signal
 }
 
 func chooseLauncher(binary string) processLauncher {
-	if runtime.GOOS == "linux" {
-		if _, err := os.Stat("/run/systemd/system"); err == nil {
-			systemdRun, runErr := exec.LookPath("systemd-run")
-			systemctl, ctlErr := exec.LookPath("systemctl")
-			if runErr == nil && ctlErr == nil {
-				return &systemdLauncher{binary: binary, systemdRun: systemdRun, systemctl: systemctl}
-			}
+	if systemdLaunchSupported(runtime.GOOS, os.Geteuid(), "/run/systemd/system") {
+		systemdRun, runErr := exec.LookPath("systemd-run")
+		systemctl, ctlErr := exec.LookPath("systemctl")
+		if runErr == nil && ctlErr == nil {
+			return &systemdLauncher{binary: binary, systemdRun: systemdRun, systemctl: systemctl}
 		}
 	}
 	return &directLauncher{binary: binary}
+}
+
+// systemdLaunchSupported reports whether system-scope transient units can be
+// created. Creating them as a non-root user is refused by polkit with
+// "Interactive authentication required", so an unprivileged agent must launch
+// VMs directly instead of failing every start.
+func systemdLaunchSupported(goos string, euid int, systemdDir string) bool {
+	if goos != "linux" || euid != 0 {
+		return false
+	}
+	_, err := os.Stat(systemdDir)
+	return err == nil
 }
 
 func launcherForManifest(binary string, manifest *instanceManifest) processLauncher {

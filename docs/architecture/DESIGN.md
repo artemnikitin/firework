@@ -152,10 +152,13 @@ to alternatives like nginx or Envoy.
 
 ## VM Process Isolation
 
-On Linux hosts running systemd, each Firecracker process is launched as a
-transient `firework-vm-<instance-id>.service` in `firework-vms.slice`. This keeps
-the VM outside the agent service's process lifecycle. Local development and
-non-systemd hosts use a separate process group instead.
+On Linux hosts where the agent runs as root under systemd, each Firecracker
+process is launched as a transient `firework-vm-<instance-id>.service` in
+`firework-vms.slice`. This keeps the VM outside the agent service's process
+lifecycle. Local development, non-systemd hosts, and unprivileged agents use a
+separate process group instead, because creating a system-scope transient unit
+as a non-root user is refused by polkit. The launcher actually used is recorded
+in the manifest, so stopping and adopting a VM never depends on re-deriving it.
 
 Before launch, the agent atomically writes
 `<state_dir>/vms/<service>/instance.json`. The manifest records the resolved
@@ -176,6 +179,14 @@ including PID reuse, mismatched command lines, corrupt manifests, and a live
 process with a missing or invalid socket — enter `recovery_pending`. Firework
 does not signal the process, delete its files, or launch a duplicate in that
 state. The condition is exposed in agent status for operator investigation.
+
+A process observed mid-exit is classified as exited, not ambiguous. Linux
+releases a process's address space, and with it its `exe` link and command line,
+before the task reaches the zombie state, so identity reads can legitimately
+come back partial. Firework treats that as an exit only after confirming a
+missing `/proc` entry or a dead process state within a short bound, which keeps
+a normally stopping VM out of `recovery_pending` without ever reporting a live
+process as gone.
 
 ## What Was Left Out
 

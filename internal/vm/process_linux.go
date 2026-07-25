@@ -10,6 +10,7 @@ import (
 	"strconv"
 	"strings"
 	"syscall"
+	"time"
 )
 
 func (osProcessInspector) Inspect(pid int) (processIdentity, error) {
@@ -20,6 +21,11 @@ func (osProcessInspector) Inspect(pid int) (processIdentity, error) {
 	}
 	if err != nil {
 		return processIdentity{}, fmt.Errorf("read process stat: %w", err)
+	}
+	if exited, stateErr := procStateIsExited(string(statData)); stateErr != nil {
+		return processIdentity{}, stateErr
+	} else if exited {
+		return processIdentity{}, errProcessNotFound
 	}
 	startTicks, err := parseProcStartTicks(string(statData))
 	if err != nil {
@@ -38,6 +44,9 @@ func (osProcessInspector) Inspect(pid int) (processIdentity, error) {
 	}
 	info, err := os.Stat(filepath.Join(procDir, "exe"))
 	if err != nil {
+		if procExitedWithin(procDir, procExitConfirmTimeout) {
+			return processIdentity{}, errProcessNotFound
+		}
 		return processIdentity{}, fmt.Errorf("stat process executable: %w", err)
 	}
 	stat, ok := info.Sys().(*syscall.Stat_t)
@@ -46,7 +55,19 @@ func (osProcessInspector) Inspect(pid int) (processIdentity, error) {
 	}
 	cmdline, err := os.ReadFile(filepath.Join(procDir, "cmdline"))
 	if err != nil {
+		if procExitedWithin(procDir, procExitConfirmTimeout) {
+			return processIdentity{}, errProcessNotFound
+		}
 		return processIdentity{}, fmt.Errorf("read process command line: %w", err)
+	}
+	// The kernel empties cmdline while a process tears down. Reporting a
+	// truncated identity would fail every argument comparison and quarantine a
+	// VM that merely exited, so confirm the exit before treating it as one.
+	if len(strings.Trim(string(cmdline), "\x00")) == 0 {
+		if procExitedWithin(procDir, procExitConfirmTimeout) {
+			return processIdentity{}, errProcessNotFound
+		}
+		return processIdentity{}, fmt.Errorf("process %d has no command line", pid)
 	}
 	args := strings.Split(strings.TrimSuffix(string(cmdline), "\x00"), "\x00")
 	return processIdentity{
@@ -84,13 +105,70 @@ func (inspector osProcessInspector) FindByArguments(socketPath, configPath strin
 	return matches, nil
 }
 
-func parseProcStartTicks(stat string) (uint64, error) {
+// procExitConfirmTimeout bounds how long a partially readable /proc entry is
+// given to finish exiting. Teardown is kernel-side and cannot be delayed by the
+// process itself, so a live process never stays unreadable for this long.
+const procExitConfirmTimeout = time.Second
+
+// procExitedWithin reports whether a process whose /proc entry became partially
+// unreadable has gone away. The kernel releases the address space, and with it
+// `exe` and `cmdline`, before the task reaches the zombie state, so a single
+// state read can still show a running task. Only a missing /proc entry or a
+// dead state counts as an exit, which keeps a live process — including one
+// whose PID was recycled during the wait — from ever being reported as gone.
+func procExitedWithin(procDir string, timeout time.Duration) bool {
+	deadline := time.Now().Add(timeout)
+	for {
+		statData, err := os.ReadFile(filepath.Join(procDir, "stat"))
+		if errors.Is(err, os.ErrNotExist) {
+			return true
+		}
+		if err == nil {
+			if exited, parseErr := procStateIsExited(string(statData)); parseErr == nil && exited {
+				return true
+			}
+		}
+		if !time.Now().Before(deadline) {
+			return false
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+func procStateIsExited(stat string) (bool, error) {
+	state, err := parseProcState(stat)
+	if err != nil {
+		return false, err
+	}
+	return state == 'Z' || state == 'X' || state == 'x', nil
+}
+
+// procStatSuffix returns the part of /proc/<pid>/stat that follows the comm
+// field, which may itself contain spaces and parentheses. It starts at the
+// state character, which is field 3.
+func procStatSuffix(stat string) (string, error) {
 	closing := strings.LastIndex(stat, ")")
 	if closing < 0 || closing+2 >= len(stat) {
-		return 0, fmt.Errorf("malformed process stat")
+		return "", fmt.Errorf("malformed process stat")
 	}
-	fields := strings.Fields(stat[closing+2:])
-	// The suffix starts at field 3 (state); starttime is field 22.
+	return stat[closing+2:], nil
+}
+
+func parseProcState(stat string) (byte, error) {
+	suffix, err := procStatSuffix(stat)
+	if err != nil {
+		return 0, err
+	}
+	return suffix[0], nil
+}
+
+func parseProcStartTicks(stat string) (uint64, error) {
+	suffix, err := procStatSuffix(stat)
+	if err != nil {
+		return 0, err
+	}
+	fields := strings.Fields(suffix)
+	// starttime is field 22, so index 19 within the suffix.
 	if len(fields) <= 19 {
 		return 0, fmt.Errorf("process stat has %d fields after comm", len(fields))
 	}
