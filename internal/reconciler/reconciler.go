@@ -40,28 +40,34 @@ type volumePreflighter interface {
 	Preflight(context.Context, config.ServiceConfig) error
 }
 
+type vmRecoverer interface {
+	Recover(context.Context, config.NodeConfig) ([]string, error)
+}
+
 // Reconciler compares desired state from the config store with the actual
 // state of running VMs and produces a plan to converge them.
 type Reconciler struct {
-	vmManager      VMManager
-	healthMon      *healthcheck.Monitor
-	networkMgr     *network.Manager
-	logger         *slog.Logger
-	updateStrategy string
-	updateDelay    time.Duration
-	sleepFn        func(context.Context, time.Duration) error
+	vmManager       VMManager
+	healthMon       *healthcheck.Monitor
+	networkMgr      *network.Manager
+	logger          *slog.Logger
+	updateStrategy  string
+	updateDelay     time.Duration
+	sleepFn         func(context.Context, time.Duration) error
+	pendingRecovery map[string]struct{}
 }
 
 // New creates a new Reconciler. The healthMon and networkMgr parameters are
 // optional and may be nil.
 func New(vmManager VMManager, logger *slog.Logger, healthMon *healthcheck.Monitor, networkMgr *network.Manager, updateStrategy string, updateDelay time.Duration) *Reconciler {
 	return &Reconciler{
-		vmManager:      vmManager,
-		healthMon:      healthMon,
-		networkMgr:     networkMgr,
-		logger:         logger,
-		updateStrategy: updateStrategy,
-		updateDelay:    updateDelay,
+		vmManager:       vmManager,
+		healthMon:       healthMon,
+		networkMgr:      networkMgr,
+		logger:          logger,
+		updateStrategy:  updateStrategy,
+		updateDelay:     updateDelay,
+		pendingRecovery: make(map[string]struct{}),
 		sleepFn: func(ctx context.Context, d time.Duration) error {
 			select {
 			case <-time.After(d):
@@ -146,7 +152,11 @@ func (r *Reconciler) applyAllAtOnce(ctx context.Context, actions []Action) error
 			if action.PreviousService != nil {
 				prev = *action.PreviousService
 			}
-			r.deleteService(prev)
+			if err := r.deleteService(prev); err != nil {
+				r.logger.Error("failed to stop existing service during update", "service", action.Service.Name, "error", err)
+				errs = append(errs, fmt.Errorf("remove previous %s: %w", action.Service.Name, err))
+				continue
+			}
 			if err := r.createService(ctx, action.Service); err != nil {
 				r.logger.Error("failed to start service during update", "service", action.Service.Name, "error", err)
 				errs = append(errs, fmt.Errorf("update %s: %w", action.Service.Name, err))
@@ -154,7 +164,9 @@ func (r *Reconciler) applyAllAtOnce(ctx context.Context, actions []Action) error
 
 		case ActionDelete:
 			r.logger.Info("deleting service", "service", action.Service.Name)
-			r.deleteService(action.Service)
+			if err := r.deleteService(action.Service); err != nil {
+				errs = append(errs, fmt.Errorf("delete %s: %w", action.Service.Name, err))
+			}
 		}
 	}
 
@@ -175,7 +187,9 @@ func (r *Reconciler) applyRolling(ctx context.Context, actions []Action) error {
 			continue
 		}
 		r.logger.Info("deleting service", "service", action.Service.Name)
-		r.deleteService(action.Service)
+		if err := r.deleteService(action.Service); err != nil {
+			errs = append(errs, fmt.Errorf("delete %s: %w", action.Service.Name, err))
+		}
 	}
 
 	// Apply all creates (new services, no disruption to existing ones).
@@ -209,7 +223,11 @@ func (r *Reconciler) applyRolling(ctx context.Context, actions []Action) error {
 		if action.PreviousService != nil {
 			prev = *action.PreviousService
 		}
-		r.deleteService(prev)
+		if err := r.deleteService(prev); err != nil {
+			r.logger.Error("failed to stop existing service during update", "service", action.Service.Name, "error", err)
+			errs = append(errs, fmt.Errorf("remove previous %s: %w", action.Service.Name, err))
+			break
+		}
 		if err := r.createService(ctx, action.Service); err != nil {
 			r.logger.Error("failed to start service during update", "service", action.Service.Name, "error", err)
 			errs = append(errs, fmt.Errorf("update %s: %w", action.Service.Name, err))
@@ -239,11 +257,24 @@ func (r *Reconciler) preflight(ctx context.Context, svc config.ServiceConfig) er
 
 // Reconcile is a convenience method that plans and applies in one step.
 func (r *Reconciler) Reconcile(ctx context.Context, desired config.NodeConfig) error {
+	var errs []error
+	if recoverer, ok := r.vmManager.(vmRecoverer); ok {
+		adopted, err := recoverer.Recover(ctx, desired)
+		for _, name := range adopted {
+			r.pendingRecovery[name] = struct{}{}
+		}
+		if err != nil {
+			errs = append(errs, fmt.Errorf("recover VMs: %w", err))
+		}
+	}
+	if err := r.restoreRecovered(ctx, desired); err != nil {
+		errs = append(errs, err)
+	}
 	actions := r.Plan(desired)
 
 	if len(actions) == 0 {
 		r.logger.Debug("no changes needed, state is converged")
-		return nil
+		return combineErrors(errs)
 	}
 
 	r.logger.Info("reconciliation plan",
@@ -252,7 +283,60 @@ func (r *Reconciler) Reconcile(ctx context.Context, desired config.NodeConfig) e
 		"deletes", countActions(actions, ActionDelete),
 	)
 
-	return r.Apply(ctx, actions)
+	if err := r.Apply(ctx, actions); err != nil {
+		errs = append(errs, err)
+	}
+	return combineErrors(errs)
+}
+
+func (r *Reconciler) restoreRecovered(ctx context.Context, desired config.NodeConfig) error {
+	if len(r.pendingRecovery) == 0 {
+		return nil
+	}
+	desiredByName := make(map[string]config.ServiceConfig, len(desired.Services))
+	for _, service := range desired.Services {
+		desiredByName[service.Name] = service
+	}
+	actual := r.vmManager.List()
+	var errs []error
+	for name := range r.pendingRecovery {
+		service, wanted := desiredByName[name]
+		instance := actual[name]
+		if !wanted || instance == nil || needsUpdate(instance, service) {
+			delete(r.pendingRecovery, name)
+			continue
+		}
+		if r.networkMgr != nil {
+			if err := r.networkMgr.Setup(service); err != nil {
+				errs = append(errs, fmt.Errorf("restore network for adopted %s: %w", name, err))
+				continue
+			}
+			if service.Network != nil {
+				failed := false
+				for _, forward := range service.PortForwards {
+					if err := r.networkMgr.SetupPortForward(forward.HostPort, service.Network.GuestIP, forward.VMPort); err != nil {
+						errs = append(errs, fmt.Errorf("restore port forward for adopted %s: %w", name, err))
+						failed = true
+					}
+				}
+				if failed {
+					continue
+				}
+			}
+		}
+		if r.healthMon != nil && service.HealthCheck != nil {
+			r.healthMon.Register(ctx, service)
+		}
+		delete(r.pendingRecovery, name)
+	}
+	return combineErrors(errs)
+}
+
+func combineErrors(errs []error) error {
+	if len(errs) == 0 {
+		return nil
+	}
+	return fmt.Errorf("%d error(s): %v", len(errs), errs)
 }
 
 // createService sets up networking, starts the VM, and registers health checks.
@@ -293,13 +377,17 @@ func (r *Reconciler) createService(ctx context.Context, svc config.ServiceConfig
 
 // deleteService deregisters health checks, tears down port forwards,
 // stops the VM, and tears down networking.
-func (r *Reconciler) deleteService(svc config.ServiceConfig) {
-	// Deregister health check first.
+func (r *Reconciler) deleteService(svc config.ServiceConfig) error {
+	// Prove ownership and stop the VM before removing host resources. If the
+	// process identity is ambiguous, keep the service quarantined and intact.
+	if err := r.vmManager.Remove(svc.Name); err != nil {
+		return fmt.Errorf("remove VM: %w", err)
+	}
+
 	if r.healthMon != nil {
 		r.healthMon.Deregister(svc.Name)
 	}
 
-	// Tear down port forwards before stopping VM.
 	if r.networkMgr != nil && svc.Network != nil && len(svc.PortForwards) > 0 {
 		for _, pf := range svc.PortForwards {
 			if err := r.networkMgr.TeardownPortForward(pf.HostPort, svc.Network.GuestIP, pf.VMPort); err != nil {
@@ -309,17 +397,13 @@ func (r *Reconciler) deleteService(svc config.ServiceConfig) {
 		}
 	}
 
-	// Stop/remove the VM.
-	if err := r.vmManager.Remove(svc.Name); err != nil {
-		r.logger.Warn("failed to remove VM", "service", svc.Name, "error", err)
-	}
-
 	// Tear down network.
 	if r.networkMgr != nil {
 		if err := r.networkMgr.Teardown(svc); err != nil {
 			r.logger.Warn("failed to tear down network", "service", svc.Name, "error", err)
 		}
 	}
+	return nil
 }
 
 // needsUpdate compares a running instance with its desired config to

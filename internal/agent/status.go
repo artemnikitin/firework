@@ -121,6 +121,10 @@ func (a *Agent) refreshAgentStatus(phase statusmodel.Phase, code, message string
 				service.ReasonCode = "vm_failed"
 				service.Message = statusmodel.BoundedMessage(instance.LastError)
 			}
+			if instance.State == vm.StateRecoveryPending {
+				service.ReasonCode = "vm_recovery_pending"
+				service.Message = statusmodel.BoundedMessage(instance.LastError)
+			}
 			preparedByID := make(map[string]volume.PreparedVolume, len(instance.Volumes))
 			for _, prepared := range instance.Volumes {
 				preparedByID[prepared.LogicalID] = prepared

@@ -17,6 +17,7 @@ type fakeVMManager struct {
 	instances   map[string]*vm.Instance
 	startCalls  []string
 	removeCalls []string
+	removeErr   error
 }
 
 func newFakeVMManager() *fakeVMManager {
@@ -39,8 +40,25 @@ func (f *fakeVMManager) Start(_ context.Context, svc config.ServiceConfig) error
 
 func (f *fakeVMManager) Remove(name string) error {
 	f.removeCalls = append(f.removeCalls, name)
+	if f.removeErr != nil {
+		return f.removeErr
+	}
 	delete(f.instances, name)
 	return nil
+}
+
+type recoveringVMManager struct {
+	*fakeVMManager
+	adopted     []string
+	recoverCall int
+}
+
+func (f *recoveringVMManager) Recover(_ context.Context, _ config.NodeConfig) ([]string, error) {
+	f.recoverCall++
+	if f.recoverCall > 1 {
+		return nil, nil
+	}
+	return f.adopted, nil
 }
 
 func newTestReconciler(strategy string, delay time.Duration) *Reconciler {
@@ -152,6 +170,41 @@ func TestPlan_NoChanges(t *testing.T) {
 
 	if len(actions) != 0 {
 		t.Fatalf("expected 0 actions, got %d", len(actions))
+	}
+}
+
+func TestReconcileAdoptsMatchingVMWithoutRestart(t *testing.T) {
+	service := config.ServiceConfig{Name: "svc-a", Image: "/img/a", Kernel: "/kern", VCPUs: 1, MemoryMB: 256}
+	manager := &recoveringVMManager{
+		fakeVMManager: newFakeVMManager(),
+		adopted:       []string{service.Name},
+	}
+	manager.instances[service.Name] = &vm.Instance{Name: service.Name, State: vm.StateRunning, Config: service, PID: 123}
+	reconciler := New(manager, slog.New(slog.NewTextHandler(io.Discard, nil)), nil, nil, "", 0)
+
+	if err := reconciler.Reconcile(context.Background(), config.NodeConfig{Services: []config.ServiceConfig{service}}); err != nil {
+		t.Fatal(err)
+	}
+	if len(manager.startCalls) != 0 || len(manager.removeCalls) != 0 {
+		t.Fatalf("adopted VM was restarted: starts=%v removes=%v", manager.startCalls, manager.removeCalls)
+	}
+}
+
+func TestUpdateDoesNotStartReplacementWhenOwnedVMCannotBeRemoved(t *testing.T) {
+	oldService := config.ServiceConfig{Name: "svc-a", Image: "/img/old", Kernel: "/kern", VCPUs: 1, MemoryMB: 256}
+	newService := oldService
+	newService.Image = "/img/new"
+	manager := newFakeVMManager()
+	manager.instances[oldService.Name] = &vm.Instance{Name: oldService.Name, State: vm.StateRecoveryPending, Config: oldService}
+	manager.removeErr = errors.New("ambiguous process ownership")
+	reconciler := New(manager, slog.New(slog.NewTextHandler(io.Discard, nil)), nil, nil, "", 0)
+
+	err := reconciler.Reconcile(context.Background(), config.NodeConfig{Services: []config.ServiceConfig{newService}})
+	if err == nil {
+		t.Fatal("expected update to fail closed")
+	}
+	if len(manager.startCalls) != 0 {
+		t.Fatalf("replacement started after unsafe removal failure: %v", manager.startCalls)
 	}
 }
 
