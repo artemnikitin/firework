@@ -204,15 +204,16 @@ func (a *Agent) Run(ctx context.Context) error {
 		"poll_interval", a.cfg.PollInterval,
 	)
 
-	// Start the API server if configured.
+	// Recover/adopt surviving VMs and run an initial reconciliation before
+	// exposing local status. This prevents a restart from briefly publishing an
+	// empty node while durable VM ownership is still being reconstructed.
+	a.tick(ctx)
+
 	if a.apiServer != nil {
 		if err := a.apiServer.Start(); err != nil {
 			return err
 		}
 	}
-
-	// Run an initial reconciliation immediately.
-	a.tick(ctx)
 
 	// Start the independent heartbeat goroutine after the first tick so that
 	// the registry client is already enrolled and capacity is known.
@@ -451,6 +452,7 @@ func (a *Agent) tick(ctx context.Context) {
 			a.setStatusCondition("VMsReconciled", statusmodel.ConditionUnknown, "not_reached", "")
 		}
 		a.failAgentStatus("Reconciled", code, err.Error())
+		a.refreshRuntimeMetrics()
 		a.syncRegistry(ctx, nodeCap, used)
 		return
 	}

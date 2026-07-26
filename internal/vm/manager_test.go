@@ -23,6 +23,10 @@ func TestManagerClearsPIDAndRecordsProcessFailure(t *testing.T) {
 		t.Fatal(err)
 	}
 	manager := NewManager(binary, dir, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	// This test asserts failure bookkeeping, not launcher selection. Pin the
+	// direct launcher so it never depends on whether the host running the suite
+	// can create systemd transient units.
+	manager.launcher = &directLauncher{binary: binary}
 	if err := manager.Start(context.Background(), config.ServiceConfig{Name: "service", Image: "/image", Kernel: "/kernel", VCPUs: 1, MemoryMB: 128}); err != nil {
 		t.Fatal(err)
 	}
