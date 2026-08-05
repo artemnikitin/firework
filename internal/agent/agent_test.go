@@ -367,6 +367,28 @@ func TestTick_UnchangedRevisionRefreshesAllSkippedConditions(t *testing.T) {
 	}
 }
 
+func TestTick_PreservesConditionTransitionTimeAcrossNoChange(t *testing.T) {
+	s := &fakeStore{
+		data:     map[string][]byte{"web": []byte("node: web\nservices: []\n")},
+		revision: "rev-1",
+	}
+	a := New(testAgentConfig(t), s, testLogger())
+
+	a.tick(context.Background())
+	first := a.agentStatusSnapshot()
+	time.Sleep(time.Millisecond)
+	a.tick(context.Background())
+	second := a.agentStatusSnapshot()
+
+	for _, kind := range []string{"ConfigFetched", "ImagesReady"} {
+		before, beforeOK := agentCondition(first, kind)
+		after, afterOK := agentCondition(second, kind)
+		if !beforeOK || !afterOK || !before.LastTransitionAt.Equal(after.LastTransitionAt) {
+			t.Fatalf("%s transition changed across no-op ticks: before=%#v after=%#v", kind, before, after)
+		}
+	}
+}
+
 func TestAssignNetworking_InsertsIPBeforeAppSeparator(t *testing.T) {
 	cfg := testAgentConfig(t)
 	cfg.VMSubnet = "172.16.0.0/24"

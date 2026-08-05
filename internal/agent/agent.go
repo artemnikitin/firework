@@ -72,6 +72,10 @@ type Agent struct {
 	currentStatus  statusmodel.AgentStatus
 	statusServices []config.ServiceConfig
 	restartCounts  map[string]int
+	// evaluatedConditions is initialized for each reconciliation tick and is
+	// guarded by statusMu. Conditions not reached by the tick are finalized as
+	// unknown without rewriting transitions that were actually observed.
+	evaluatedConditions map[string]struct{}
 }
 
 // New creates a new Agent with all its dependencies.
@@ -300,6 +304,7 @@ func (a *Agent) shutdown() {
 func (a *Agent) tick(ctx context.Context) {
 	a.logger.Debug("reconciliation tick starting")
 	a.beginTickStatus()
+	defer a.finishTickStatus()
 
 	var (
 		nodeCap capacity.NodeCapacity
@@ -334,7 +339,7 @@ func (a *Agent) tick(ctx context.Context) {
 		// last-known-good local and peer routes until every label is available.
 		a.logger.Warn("skipping traefik route sync because local config is incomplete")
 		a.refreshRuntimeMetrics()
-		a.syncRegistry(ctx, nodeCap, capacity.NodeCapacity{})
+		a.syncRegistryAfterTick(ctx, nodeCap, capacity.NodeCapacity{})
 		return
 	}
 	a.setStatusCondition("ConfigFetched", statusmodel.ConditionTrue, "", "")
@@ -382,7 +387,7 @@ func (a *Agent) tick(ctx context.Context) {
 	if err := a.preflightRouting(merged.Services); err != nil {
 		a.logger.Error("routing preflight failed; not advancing revision", "error", err)
 		a.failAgentStatus("LocalRoutesReady", "invalid_routing_config", err.Error())
-		a.syncRegistry(ctx, nodeCap, capacity.NodeCapacity{})
+		a.syncRegistryAfterTick(ctx, nodeCap, capacity.NodeCapacity{})
 		return
 	}
 	a.setStatusCondition("NetworkReady", statusmodel.ConditionTrue, "", "")
@@ -409,7 +414,7 @@ func (a *Agent) tick(ctx context.Context) {
 	}
 	if !a.checkCapacity(nodeCap, used, hasCap) {
 		a.failAgentStatus("CapacityReady", "capacity_exceeded", "desired services exceed node capacity")
-		a.syncRegistry(ctx, nodeCap, used)
+		a.syncRegistryAfterTick(ctx, nodeCap, used)
 		return
 	}
 	capacityReason := ""
@@ -426,7 +431,7 @@ func (a *Agent) tick(ctx context.Context) {
 		if err != nil {
 			a.logger.Error("image sync failed", "error", err)
 			a.failAgentStatus("ImagesReady", "image_sync_failed", err.Error())
-			a.syncRegistry(ctx, nodeCap, used)
+			a.syncRegistryAfterTick(ctx, nodeCap, used)
 			return
 		}
 		a.setStatusCondition("ImagesReady", statusmodel.ConditionTrue, "", "")
@@ -453,7 +458,7 @@ func (a *Agent) tick(ctx context.Context) {
 		}
 		a.failAgentStatus("Reconciled", code, err.Error())
 		a.refreshRuntimeMetrics()
-		a.syncRegistry(ctx, nodeCap, used)
+		a.syncRegistryAfterTick(ctx, nodeCap, used)
 		return
 	}
 	a.setStatusCondition("NetworkReady", statusmodel.ConditionTrue, "", "")
@@ -468,7 +473,7 @@ func (a *Agent) tick(ctx context.Context) {
 	if err := a.syncTraefikConfigs(ctx, merged.Services); err != nil {
 		a.logger.Error("traefik route sync failed; not advancing revision", "error", err)
 		a.failAgentStatus("LocalRoutesReady", "local_route_sync_failed", err.Error())
-		a.syncRegistry(ctx, nodeCap, used)
+		a.syncRegistryAfterTick(ctx, nodeCap, used)
 		return
 	}
 	a.setStatusCondition("LocalRoutesReady", statusmodel.ConditionTrue, "", "")
@@ -484,7 +489,7 @@ func (a *Agent) tick(ctx context.Context) {
 	a.metrics.recordConfigApply(appliedRevision, time.Now())
 	a.markAgentStatusApplied(appliedRevision)
 	a.refreshRuntimeMetrics()
-	a.syncRegistry(ctx, nodeCap, used)
+	a.syncRegistryAfterTick(ctx, nodeCap, used)
 
 	a.logger.Debug("reconciliation tick completed", "revision", rev)
 }
@@ -956,6 +961,7 @@ func (a *Agent) MetricsText() string {
 }
 
 func (a *Agent) refreshRuntimeMetrics() {
+	a.finishTickStatus()
 	results := make(map[string]healthcheck.Result)
 	if a.healthMon != nil {
 		results = a.healthMon.Results()
@@ -970,6 +976,11 @@ func (a *Agent) syncRegistry(ctx context.Context, cap, used capacity.NodeCapacit
 	}
 	status := a.agentStatusSnapshot()
 	a.registryClient.sync(ctx, a.cfg.NodeID, a.cfg.NodeNames, cap, used, &status)
+}
+
+func (a *Agent) syncRegistryAfterTick(ctx context.Context, cap, used capacity.NodeCapacity) {
+	a.finishTickStatus()
+	a.syncRegistry(ctx, cap, used)
 }
 
 // healthAdapter wraps healthcheck.Monitor to satisfy api.HealthResultsProvider.

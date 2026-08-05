@@ -24,13 +24,29 @@ var reconciliationConditionTypes = []string{
 	"PeerRoutesReady",
 }
 
-// beginTickStatus clears stage results from the previous tick. Conditions are
-// observations of the current attempt, not durable failure latches.
+// beginTickStatus starts tracking which conditions the current tick evaluates.
+// Conditions are observations of the current attempt, not durable failure
+// latches; unevaluated conditions are finalized as unknown at tick completion.
 func (a *Agent) beginTickStatus() {
-	for _, conditionType := range reconciliationConditionTypes {
-		a.setStatusCondition(conditionType, statusmodel.ConditionUnknown, "not_reached", "")
-	}
+	a.statusMu.Lock()
+	a.evaluatedConditions = make(map[string]struct{}, len(reconciliationConditionTypes))
+	a.statusMu.Unlock()
 	a.refreshAgentStatus(statusmodel.PhaseReconciling, "", "")
+}
+
+func (a *Agent) finishTickStatus() {
+	a.statusMu.Lock()
+	evaluated := a.evaluatedConditions
+	a.evaluatedConditions = nil
+	a.statusMu.Unlock()
+	if evaluated == nil {
+		return
+	}
+	for _, conditionType := range reconciliationConditionTypes {
+		if _, ok := evaluated[conditionType]; !ok {
+			a.setStatusCondition(conditionType, statusmodel.ConditionUnknown, "not_reached", "")
+		}
+	}
 }
 
 // markUnchangedRevisionReady records the stages covered by the unchanged
@@ -38,6 +54,10 @@ func (a *Agent) beginTickStatus() {
 // conditions from disagreeing after an earlier failed attempt.
 func (a *Agent) markUnchangedRevisionReady() {
 	for _, conditionType := range []string{"NetworkReady", "CapacityReady", "ImagesReady", "VMsReconciled", "Reconciled"} {
+		if a.statusConditionIs(conditionType, statusmodel.ConditionTrue) {
+			a.markConditionEvaluated(conditionType)
+			continue
+		}
 		a.setStatusCondition(conditionType, statusmodel.ConditionTrue, "unchanged_revision", "")
 	}
 }
@@ -78,6 +98,9 @@ func (a *Agent) setStatusCondition(kind string, value statusmodel.ConditionStatu
 	defer a.statusMu.Unlock()
 	now := time.Now().UTC()
 	message = statusmodel.BoundedMessage(message)
+	if a.evaluatedConditions != nil {
+		a.evaluatedConditions[kind] = struct{}{}
+	}
 	for i := range a.currentStatus.Conditions {
 		condition := &a.currentStatus.Conditions[i]
 		if condition.Type != kind {
@@ -97,6 +120,25 @@ func (a *Agent) setStatusCondition(kind string, value statusmodel.ConditionStatu
 	sort.Slice(a.currentStatus.Conditions, func(i, j int) bool {
 		return a.currentStatus.Conditions[i].Type < a.currentStatus.Conditions[j].Type
 	})
+}
+
+func (a *Agent) markConditionEvaluated(kind string) {
+	a.statusMu.Lock()
+	defer a.statusMu.Unlock()
+	if a.evaluatedConditions != nil {
+		a.evaluatedConditions[kind] = struct{}{}
+	}
+}
+
+func (a *Agent) statusConditionIs(kind string, want statusmodel.ConditionStatus) bool {
+	a.statusMu.RLock()
+	defer a.statusMu.RUnlock()
+	for _, condition := range a.currentStatus.Conditions {
+		if condition.Type == kind {
+			return condition.Status == want
+		}
+	}
+	return false
 }
 
 func (a *Agent) failAgentStatus(condition, code, message string) {
