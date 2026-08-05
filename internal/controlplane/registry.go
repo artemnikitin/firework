@@ -17,6 +17,8 @@ import (
 	"github.com/artemnikitin/firework/internal/statusmodel"
 )
 
+const maxRegistryRequestBytes = 4 << 20
+
 // RegistryServer serves node enrollment and registry APIs.
 type RegistryServer struct {
 	cfg         Config
@@ -66,8 +68,11 @@ func (s *RegistryServer) HTTPServer() (*http.Server, error) {
 	}
 
 	return &http.Server{
-		Addr:              s.cfg.RegistryListenAddr,
-		Handler:           http.MaxBytesHandler(mux, 1<<20),
+		Addr: s.cfg.RegistryListenAddr,
+		// The status bounds allow 256 services with up to 25 volume
+		// observations each. Keep the request cap above that worst-case JSON
+		// while retaining a finite registry request limit.
+		Handler:           http.MaxBytesHandler(mux, maxRegistryRequestBytes),
 		TLSConfig:         tlsCfg,
 		ReadHeaderTimeout: 10 * time.Second,
 		ReadTimeout:       15 * time.Second,
@@ -244,12 +249,17 @@ func (s *RegistryServer) handleHeartbeat(w http.ResponseWriter, r *http.Request)
 		return
 	}
 	if req.AgentStatus != nil {
-		var validated NodeRecord
-		if err := applyHeartbeatAgentStatus(&validated, req.NodeID, req.AgentStatus); err != nil {
-			writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
-			return
+		validated, err := validatedHeartbeatAgentStatus(req.NodeID, req.AgentStatus)
+		if err != nil {
+			// Runtime status is optional telemetry. Do not reject the liveness
+			// heartbeat when a newer or malformed status payload is unusable;
+			// clearing it also prevents stale status from being presented as
+			// current.
+			s.logger.Warn("invalid agent status; accepting heartbeat without status", "node", req.NodeID, "error", err)
+			req.AgentStatus = nil
+		} else {
+			req.AgentStatus = validated
 		}
-		req.AgentStatus = validated.AgentStatus
 	}
 
 	rec, err := s.upsertNodeRecord(r.Context(), req.NodeID, func(cur *NodeRecord) error {
@@ -276,9 +286,7 @@ func (s *RegistryServer) handleHeartbeat(w http.ResponseWriter, r *http.Request)
 		if req.HostIP != "" {
 			cur.HostIP = req.HostIP
 		}
-		if err := applyHeartbeatAgentStatus(cur, req.NodeID, req.AgentStatus); err != nil {
-			return err
-		}
+		cur.AgentStatus = req.AgentStatus
 		cur.LastSeenAt = now
 		cur.UpdatedAt = now
 		return nil
@@ -298,6 +306,17 @@ func (s *RegistryServer) handleHeartbeat(w http.ResponseWriter, r *http.Request)
 		State:      rec.State,
 		LastSeenAt: rec.LastSeenAt,
 	})
+}
+
+func validatedHeartbeatAgentStatus(nodeID string, incoming *statusmodel.AgentStatus) (*statusmodel.AgentStatus, error) {
+	if incoming == nil {
+		return nil, nil
+	}
+	var validated NodeRecord
+	if err := applyHeartbeatAgentStatus(&validated, nodeID, incoming); err != nil {
+		return nil, err
+	}
+	return validated.AgentStatus, nil
 }
 
 func applyHeartbeatAgentStatus(cur *NodeRecord, nodeID string, incoming *statusmodel.AgentStatus) error {

@@ -299,7 +299,7 @@ func (a *Agent) shutdown() {
 // tick performs a single reconciliation cycle.
 func (a *Agent) tick(ctx context.Context) {
 	a.logger.Debug("reconciliation tick starting")
-	a.refreshAgentStatus(statusmodel.PhaseReconciling, "", "")
+	a.beginTickStatus()
 
 	var (
 		nodeCap capacity.NodeCapacity
@@ -329,11 +329,10 @@ func (a *Agent) tick(ctx context.Context) {
 			}
 			a.failAgentStatus("ConfigParsed", "config_parse_failed", loadErr.parseErr.Error())
 		}
-		// No local config, but still sync Traefik with remote nodes so that
-		// this node can proxy requests for services placed on peer nodes.
-		if err := a.syncTraefikConfigs(ctx, nil); err != nil {
-			a.logger.Error("traefik route sync failed", "error", err)
-		}
+		// The merged local config is incomplete. A nil service slice means
+		// "unknown", not an empty desired route set, so preserve all
+		// last-known-good local and peer routes until every label is available.
+		a.logger.Warn("skipping traefik route sync because local config is incomplete")
 		a.refreshRuntimeMetrics()
 		a.syncRegistry(ctx, nodeCap, capacity.NodeCapacity{})
 		return
@@ -365,6 +364,7 @@ func (a *Agent) tick(ctx context.Context) {
 				a.logger.Error("traefik route refresh failed", "error", err)
 				a.failAgentStatus("LocalRoutesReady", "local_route_sync_failed", err.Error())
 			} else {
+				a.markUnchangedRevisionReady()
 				a.setStatusCondition("LocalRoutesReady", statusmodel.ConditionTrue, "", "")
 				a.refreshAgentStatus(statusmodel.PhaseReady, "", "")
 			}
@@ -412,11 +412,11 @@ func (a *Agent) tick(ctx context.Context) {
 		a.syncRegistry(ctx, nodeCap, used)
 		return
 	}
-	if hasCap {
-		a.setStatusCondition("CapacityReady", statusmodel.ConditionTrue, "", "")
-	} else {
-		a.setStatusCondition("CapacityReady", statusmodel.ConditionTrue, "not_configured", "")
+	capacityReason := ""
+	if !hasCap {
+		capacityReason = "not_configured"
 	}
+	a.setStatusCondition("CapacityReady", statusmodel.ConditionTrue, capacityReason, "")
 
 	// Sync images from S3 before reconciling (ensures rootfs/kernels are present).
 	if a.imageSyncer != nil {
@@ -507,7 +507,14 @@ type configLoadError struct {
 }
 
 func (e *configLoadError) Error() string {
-	return errors.Join(e.fetchErr, e.parseErr).Error()
+	if e == nil {
+		return ""
+	}
+	joined := errors.Join(e.fetchErr, e.parseErr)
+	if joined == nil {
+		return "configuration load failed"
+	}
+	return joined.Error()
 }
 
 func (a *Agent) fetchAndMerge(ctx context.Context) (*config.NodeConfig, *configLoadError) {

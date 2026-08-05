@@ -12,6 +12,36 @@ import (
 	"github.com/artemnikitin/firework/internal/volume"
 )
 
+var reconciliationConditionTypes = []string{
+	"ConfigFetched",
+	"ConfigParsed",
+	"NetworkReady",
+	"CapacityReady",
+	"ImagesReady",
+	"VMsReconciled",
+	"Reconciled",
+	"LocalRoutesReady",
+	"PeerRoutesReady",
+}
+
+// beginTickStatus clears stage results from the previous tick. Conditions are
+// observations of the current attempt, not durable failure latches.
+func (a *Agent) beginTickStatus() {
+	for _, conditionType := range reconciliationConditionTypes {
+		a.setStatusCondition(conditionType, statusmodel.ConditionUnknown, "not_reached", "")
+	}
+	a.refreshAgentStatus(statusmodel.PhaseReconciling, "", "")
+}
+
+// markUnchangedRevisionReady records the stages covered by the unchanged
+// revision fast path before it publishes PhaseReady. This keeps phase and
+// conditions from disagreeing after an earlier failed attempt.
+func (a *Agent) markUnchangedRevisionReady() {
+	for _, conditionType := range []string{"NetworkReady", "CapacityReady", "ImagesReady", "VMsReconciled", "Reconciled"} {
+		a.setStatusCondition(conditionType, statusmodel.ConditionTrue, "unchanged_revision", "")
+	}
+}
+
 func (a *Agent) setStatusServices(node config.NodeConfig, fallbackRevision string) {
 	services := make([]config.ServiceConfig, len(node.Services))
 	for i := range node.Services {

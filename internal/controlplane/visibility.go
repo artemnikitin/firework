@@ -618,6 +618,13 @@ func (s visibilitySnapshot) revisionStatus() RevisionStatus {
 		ConvergedNodes:   []string{}, DegradedNodes: []string{}, ProgressingNodes: []string{},
 		FailedNodes: []string{}, StaleNodes: []string{}, DownNodes: []string{}, UnknownNodes: []string{},
 	}
+	relevant := make(map[string]struct{}, len(s.placement.NodeConfigs))
+	for _, node := range s.placement.NodeConfigs {
+		if node.Node != "" {
+			relevant[node.Node] = struct{}{}
+		}
+	}
+	status.RelevantNodes = len(relevant)
 	if s.desired.Revision == "" {
 		status.ReasonCode = "desired_revision_missing"
 		return status
@@ -659,13 +666,6 @@ func (s visibilitySnapshot) revisionStatus() RevisionStatus {
 		return status
 	}
 
-	relevant := make(map[string]struct{}, len(s.placement.NodeConfigs))
-	for _, node := range s.placement.NodeConfigs {
-		if node.Node != "" {
-			relevant[node.Node] = struct{}{}
-		}
-	}
-	status.RelevantNodes = len(relevant)
 	if len(relevant) == 0 {
 		if len(s.desired.Services) == 0 {
 			status.Phase = "converged"
@@ -750,18 +750,23 @@ func (s visibilitySnapshot) revisionStatus() RevisionStatus {
 
 func assessConditions(conditions []statusmodel.Condition) (blockingFailure, unknown, degraded bool) {
 	for _, condition := range conditions {
-		if condition.Type == "PeerRoutesReady" {
+		switch condition.Type {
+		case "PeerRoutesReady":
 			if condition.Status == statusmodel.ConditionFalse {
 				degraded = true
 			} else if condition.Status == statusmodel.ConditionUnknown {
 				unknown = true
 			}
-			continue
-		}
-		if condition.Status == statusmodel.ConditionFalse {
-			blockingFailure = true
-		}
-		if condition.Status == statusmodel.ConditionUnknown {
+		case "ConfigFetched", "ConfigParsed", "NetworkReady", "CapacityReady", "ImagesReady", "VMsReconciled", "Reconciled", "LocalRoutesReady":
+			if condition.Status == statusmodel.ConditionFalse {
+				blockingFailure = true
+			} else if condition.Status == statusmodel.ConditionUnknown {
+				unknown = true
+			}
+		default:
+			// A condition added by a newer agent is not known to be
+			// non-blocking. Treat it as unknown until this control plane
+			// understands its semantics instead of making it fleet-fatal.
 			unknown = true
 		}
 	}

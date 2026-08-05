@@ -546,8 +546,8 @@ func printUsage(out io.Writer) {
   fireworkctl [global options] <command> [options]
 
 Commands:
-	status                Show current revision convergence
-	nodes                 List deployment nodes
+  status                Show current revision convergence
+  nodes                 List deployment nodes
   node <node-id>        Show node details
   services              List deployment services
   service <name>        Show service details

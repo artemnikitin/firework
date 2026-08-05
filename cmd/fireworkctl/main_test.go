@@ -14,6 +14,9 @@ func TestRunWithoutCommandPrintsUsage(t *testing.T) {
 	if err := run(nil, &out); err != nil {
 		t.Fatalf("run returned an error: %v", err)
 	}
+	if strings.Contains(out.String(), "\t") {
+		t.Fatalf("usage output contains tab indentation: %q", out.String())
+	}
 
 	for _, want := range []string{
 		"Usage:",

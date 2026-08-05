@@ -30,7 +30,9 @@ func stageError(stage FailureStage, err error) error {
 }
 
 // HasFailureStage reports whether any member of a wrapped or joined error is
-// tagged with stage.
+// tagged with stage. This walks every branch explicitly because errors.As
+// returns only the first matching value from a joined error, while one
+// reconciliation can contain both network and VM failures.
 func HasFailureStage(err error, stage FailureStage) bool {
 	if err == nil {
 		return false

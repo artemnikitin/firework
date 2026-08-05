@@ -395,7 +395,20 @@ async function load() {
     }
 
     setActiveView('overview');
-    const [status, nodes, services] = await Promise.all([api('/v1/status'), api('/v1/nodes'), api('/v1/services')]);
+    const [statusResult, nodesResult, servicesResult] = await Promise.allSettled([api('/v1/status'), api('/v1/nodes'), api('/v1/services')]);
+    if (nodesResult.status === 'rejected') throw nodesResult.reason;
+    if (servicesResult.status === 'rejected') throw servicesResult.reason;
+    const nodes = nodesResult.value;
+    const services = servicesResult.value;
+    const status = statusResult.status === 'fulfilled' ? statusResult.value : {
+      observed_at: new Date().toISOString(),
+      phase: 'unknown',
+      reason_code: 'status_unavailable',
+      message: 'Deployment convergence status is temporarily unavailable',
+      relevant_nodes: 0,
+      converged_nodes: [], degraded_nodes: [], progressing_nodes: [], failed_nodes: [],
+      stale_nodes: [], down_nodes: [], unknown_nodes: [],
+    };
     const observedAt = new Date(Math.max(new Date(status.observed_at), new Date(nodes.observed_at), new Date(services.observed_at)));
     updated.textContent = `Updated ${observedAt.toLocaleTimeString()}`;
     renderOverview(nodes.items, services.items, status);

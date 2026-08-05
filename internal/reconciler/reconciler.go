@@ -238,7 +238,7 @@ func (r *Reconciler) applyRolling(ctx context.Context, actions []Action) error {
 		// Sleep between updates, but not after the last one.
 		if i < len(updates)-1 && r.updateDelay > 0 {
 			if err := r.sleepFn(ctx, r.updateDelay); err != nil {
-				return fmt.Errorf("rolling update interrupted: %w", err)
+				return stageError(FailureStageVM, fmt.Errorf("rolling update interrupted: %w", err))
 			}
 		}
 	}
@@ -265,7 +265,7 @@ func (r *Reconciler) Reconcile(ctx context.Context, desired config.NodeConfig) e
 			r.pendingRecovery[name] = struct{}{}
 		}
 		if err != nil {
-			errs = append(errs, fmt.Errorf("recover VMs: %w", err))
+			errs = append(errs, stageError(FailureStageVM, fmt.Errorf("recover VMs: %w", err)))
 		}
 	}
 	if err := r.restoreRecovered(ctx, desired); err != nil {
@@ -309,14 +309,14 @@ func (r *Reconciler) restoreRecovered(ctx context.Context, desired config.NodeCo
 		}
 		if r.networkMgr != nil {
 			if err := r.networkMgr.Setup(service); err != nil {
-				errs = append(errs, fmt.Errorf("restore network for adopted %s: %w", name, err))
+				errs = append(errs, stageError(FailureStageNetwork, fmt.Errorf("restore network for adopted %s: %w", name, err)))
 				continue
 			}
 			if service.Network != nil {
 				failed := false
 				for _, forward := range service.PortForwards {
 					if err := r.networkMgr.SetupPortForward(forward.HostPort, service.Network.GuestIP, forward.VMPort); err != nil {
-						errs = append(errs, fmt.Errorf("restore port forward for adopted %s: %w", name, err))
+						errs = append(errs, stageError(FailureStageNetwork, fmt.Errorf("restore port forward for adopted %s: %w", name, err)))
 						failed = true
 					}
 				}
@@ -337,7 +337,7 @@ func combineErrors(errs []error) error {
 	if len(errs) == 0 {
 		return nil
 	}
-	return fmt.Errorf("%d error(s): %v", len(errs), errs)
+	return fmt.Errorf("%d error(s): %w", len(errs), errors.Join(errs...))
 }
 
 // createService sets up networking, starts the VM, and registers health checks.
@@ -382,7 +382,7 @@ func (r *Reconciler) deleteService(svc config.ServiceConfig) error {
 	// Prove ownership and stop the VM before removing host resources. If the
 	// process identity is ambiguous, keep the service quarantined and intact.
 	if err := r.vmManager.Remove(svc.Name); err != nil {
-		return fmt.Errorf("remove VM: %w", err)
+		return stageError(FailureStageVM, fmt.Errorf("remove VM: %w", err))
 	}
 
 	if r.healthMon != nil {

@@ -58,3 +58,13 @@ func TestApplyHeartbeatAgentStatusRejectsUnboundedAndAmbiguousPayloads(t *testin
 		t.Fatalf("duplicate conditions were accepted: %v", err)
 	}
 }
+
+func TestInvalidHeartbeatStatusCanBeDroppedWithoutRejectingLiveness(t *testing.T) {
+	status, err := validatedHeartbeatAgentStatus("node-1", &statusmodel.AgentStatus{
+		SchemaVersion: statusmodel.SchemaVersion,
+		NodeID:        "node-2",
+	})
+	if err == nil || status != nil {
+		t.Fatalf("invalid status normalization = %#v, %v; want discarded status and validation error", status, err)
+	}
+}

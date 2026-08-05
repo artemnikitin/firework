@@ -381,6 +381,11 @@ func TestRevisionStatusDerivesFleetConvergence(t *testing.T) {
 			status.ServicesTruncated = true
 			return status
 		}(), nodeState: NodeStateReady, wantPhase: "unknown", wantBucket: "unknown"},
+		{name: "future condition", agent: func() *statusmodel.AgentStatus {
+			status := currentAgentStatus(statusmodel.PhaseReady, "rendered-1")
+			status.Conditions = []statusmodel.Condition{{Type: "FutureNonBlockingCondition", Status: statusmodel.ConditionFalse}}
+			return status
+		}(), nodeState: NodeStateReady, wantPhase: "unknown", wantBucket: "unknown"},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -413,6 +418,22 @@ func TestRevisionStatusDerivesFleetConvergence(t *testing.T) {
 				t.Fatalf("node not classified in %s: %#v", test.wantBucket, got)
 			}
 		})
+	}
+}
+
+func TestRevisionStatusCountsRelevantNodesBeforeEarlyReturn(t *testing.T) {
+	snapshot := visibilitySnapshot{
+		now:     time.Now().UTC(),
+		desired: DesiredRevision{Revision: "desired-2"},
+		placement: PlacementRevision{
+			Revision:        "placement-1",
+			DesiredRevision: "desired-1",
+			NodeConfigs:     []config.NodeConfig{{Node: "node-1"}},
+		},
+	}
+	status := snapshot.revisionStatus()
+	if status.Phase != "published" || status.RelevantNodes != 1 {
+		t.Fatalf("early status omitted relevant node count: %#v", status)
 	}
 }
 

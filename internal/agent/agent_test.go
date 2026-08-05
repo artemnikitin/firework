@@ -324,6 +324,49 @@ func TestTick_PeerListFailureStillSyncsLocalRoutes(t *testing.T) {
 	}
 }
 
+func TestTick_IncompleteMultiLabelConfigPreservesLastKnownGoodRoutes(t *testing.T) {
+	s := &fakeStore{
+		data:     map[string][]byte{"web": []byte("node: web\nservices: []\n")},
+		revision: "rev-1",
+	}
+	cfg := testAgentConfig(t)
+	cfg.NodeNames = []string{"web", "missing"}
+	a := New(cfg, s, testLogger())
+	rs := &fakeRouteSyncer{}
+	a.traefikMgr = rs
+
+	a.tick(context.Background())
+
+	if rs.calls != 0 || rs.localCalls != 0 {
+		t.Fatalf("incomplete config mutated routes: full syncs=%d local syncs=%d", rs.calls, rs.localCalls)
+	}
+}
+
+func TestTick_UnchangedRevisionRefreshesAllSkippedConditions(t *testing.T) {
+	s := &fakeStore{
+		data:     map[string][]byte{"web": []byte("node: web\nservices: []\n")},
+		revision: "rev-1",
+	}
+	a := New(testAgentConfig(t), s, testLogger())
+	a.lastRevision = "rev-1"
+	a.setStatusCondition("ImagesReady", statusmodel.ConditionFalse, "image_sync_failed", "old failure")
+	a.setStatusCondition("VMsReconciled", statusmodel.ConditionFalse, "vm_reconcile_failed", "old failure")
+	a.refreshAgentStatus(statusmodel.PhaseFailed, "vm_reconcile_failed", "old failure")
+
+	a.tick(context.Background())
+
+	status := a.agentStatusSnapshot()
+	for _, kind := range []string{"ImagesReady", "VMsReconciled", "NetworkReady", "CapacityReady", "Reconciled"} {
+		condition, ok := agentCondition(status, kind)
+		if !ok || condition.Status != statusmodel.ConditionTrue {
+			t.Fatalf("unchanged revision left %s inconsistent with ready phase: %#v", kind, status)
+		}
+	}
+	if status.Phase != statusmodel.PhaseReady {
+		t.Fatalf("unchanged revision did not report ready: %#v", status)
+	}
+}
+
 func TestAssignNetworking_InsertsIPBeforeAppSeparator(t *testing.T) {
 	cfg := testAgentConfig(t)
 	cfg.VMSubnet = "172.16.0.0/24"
@@ -646,13 +689,32 @@ func TestTick_StatusDistinguishesVMReconcileFailure(t *testing.T) {
 }
 
 func TestClassifyReconcileFailureDistinguishesNetworkAndVMStages(t *testing.T) {
-	network, vmFailed, code := classifyReconcileFailure(&reconciler.StageError{Stage: reconciler.FailureStageNetwork, Err: errors.New("tap failed")})
+	failure := fmt.Errorf("reconcile: %w", errors.Join(
+		&reconciler.StageError{Stage: reconciler.FailureStageNetwork, Err: errors.New("tap failed")},
+		&reconciler.StageError{Stage: reconciler.FailureStageVM, Err: errors.New("launch failed")},
+	))
+	network, vmFailed, code := classifyReconcileFailure(failure)
+	if !network || !vmFailed || code != "vm_reconcile_failed" {
+		t.Fatalf("aggregate failure classification = network:%v vm:%v code:%q", network, vmFailed, code)
+	}
+
+	network, vmFailed, code = classifyReconcileFailure(&reconciler.StageError{Stage: reconciler.FailureStageNetwork, Err: errors.New("tap failed")})
 	if !network || vmFailed || code != "network_setup_failed" {
 		t.Fatalf("network failure classification = network:%v vm:%v code:%q", network, vmFailed, code)
 	}
 	network, vmFailed, code = classifyReconcileFailure(&reconciler.StageError{Stage: reconciler.FailureStageVM, Err: errors.New("launch failed")})
 	if network || !vmFailed || code != "vm_reconcile_failed" {
 		t.Fatalf("VM failure classification = network:%v vm:%v code:%q", network, vmFailed, code)
+	}
+}
+
+func TestConfigLoadErrorErrorIsSafeWithNoUnderlyingErrors(t *testing.T) {
+	var err *configLoadError
+	if got := err.Error(); got != "" {
+		t.Fatalf("nil config load error string = %q", got)
+	}
+	if got := (&configLoadError{}).Error(); got == "" {
+		t.Fatal("empty config load error did not describe the failure")
 	}
 }
 
