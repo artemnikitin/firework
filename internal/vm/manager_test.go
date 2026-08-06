@@ -75,6 +75,9 @@ func TestWriteVMConfigAddsDeterministicVolumeDrivesAndPayload(t *testing.T) {
 	if len(cfg.Drives) != 3 || cfg.Drives[1].PathOnHost != "/a.ext4" || cfg.Drives[2].PathOnHost != "/z.ext4" {
 		t.Fatalf("unexpected drives: %#v", cfg.Drives)
 	}
+	if cfg.Entropy == nil {
+		t.Fatal("expected a VirtIO-RNG entropy device")
+	}
 	fields := strings.Fields(cfg.BootSource.BootArgs)
 	var encoded string
 	for i, field := range fields {

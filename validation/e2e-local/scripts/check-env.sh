@@ -18,13 +18,6 @@ require_cmd openssl
 
 [[ -n "${AWS_REGION:-${AWS_DEFAULT_REGION:-}}" ]] || die "AWS_REGION or AWS_DEFAULT_REGION is required"
 
-[[ -n "${FIREWORK_E2E_FIRECRACKER_BIN:-}" ]] || die "FIREWORK_E2E_FIRECRACKER_BIN is required"
-[[ -x "${FIREWORK_E2E_FIRECRACKER_BIN}" ]] || die "Firecracker binary is not executable: ${FIREWORK_E2E_FIRECRACKER_BIN}"
-[[ -n "${FIREWORK_E2E_KERNEL:-}" ]] || die "FIREWORK_E2E_KERNEL is required"
-[[ -r "${FIREWORK_E2E_KERNEL}" ]] || die "kernel is not readable: ${FIREWORK_E2E_KERNEL}"
-[[ -n "${FIREWORK_E2E_ROOTFS:-}" ]] || die "FIREWORK_E2E_ROOTFS is required"
-[[ -r "${FIREWORK_E2E_ROOTFS}" ]] || die "rootfs is not readable: ${FIREWORK_E2E_ROOTFS}"
-
 case "$(uname -s)" in
   Darwin)
     require_cmd limactl

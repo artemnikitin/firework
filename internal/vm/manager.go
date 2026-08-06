@@ -538,6 +538,10 @@ func (m *Manager) writeVMConfig(vmDir string, svc config.ServiceConfig, prepared
 		Drives:            drives,
 		MachineConfig:     firecrackerMachineConfig{VCPUCount: svc.VCPUs, MemSizeMiB: svc.MemoryMB},
 		NetworkInterfaces: networkInterfaces,
+		// The VirtIO-RNG device prevents guests without a usable hardware
+		// random source from blocking application startup on /dev/random.
+		// This matters for arm64 guests nested inside Lima/VZ in particular.
+		Entropy: &firecrackerEntropyDevice{},
 	}
 	configJSON, err := json.MarshalIndent(vmConfig, "", "  ")
 	if err != nil {
@@ -556,6 +560,7 @@ type firecrackerConfig struct {
 	Drives            []firecrackerDrive            `json:"drives"`
 	MachineConfig     firecrackerMachineConfig      `json:"machine-config"`
 	NetworkInterfaces []firecrackerNetworkInterface `json:"network-interfaces,omitempty"`
+	Entropy           *firecrackerEntropyDevice     `json:"entropy,omitempty"`
 }
 
 type firecrackerBootSource struct {
@@ -574,6 +579,8 @@ type firecrackerMachineConfig struct {
 	VCPUCount  int `json:"vcpu_count"`
 	MemSizeMiB int `json:"mem_size_mib"`
 }
+
+type firecrackerEntropyDevice struct{}
 
 type firecrackerNetworkInterface struct {
 	IfaceID     string `json:"iface_id"`

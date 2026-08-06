@@ -1,67 +1,87 @@
-# Local two-node E2E validation
+# Local stateful two-node E2E validation
 
-This harness runs one complete local Firework setup:
+This harness runs one combined Firework setup inside an arm64 Lima Linux
+guest on Apple Silicon:
 
 ```text
-one control-plane process (registry + events + controller + API)
+one control plane (registry + events + controller + API)
                          |
-                 real AWS S3 bucket
+                 real per-run S3 bucket
                          |
-          node-a network namespace -- node-b network namespace
-             firework-agent             firework-agent
-                  |                            |
-             Firecracker VM               Firecracker VM
+       node-a namespace ---------------- node-b namespace
+       firework-agent                    firework-agent
+       Firecracker microVMs              Firecracker microVMs
 ```
 
-The control plane reconciles a disposable local Git repository. It publishes
-the desired state and rendered node configs into a unique real S3 bucket. Both
-agents enroll over mTLS, consume their rendered configs from that bucket, and
-run one Firecracker VM each. The caller VM is deliberately placed on the
-opposite node from the responder VM and reaches it through a rendered
-cross-node link.
+The workload uses the arm64 rootfs images produced by
+`firework-gitops-example`: Elasticsearch and Kibana start together on node-a,
+then the same desired state is changed to anti-affine placement and Kibana
+moves to node-b. Both phases require eventual `running`/`healthy` convergence;
+short startup or movement downtime is expected and allowed. Elasticsearch is
+also driven to cluster status `green` after its single-node replica setting is
+adjusted for this validation.
 
-This is local developer validation for now. CI and the unprivileged-build /
-privileged-lab handoff are the next milestone.
+The run additionally checks the real S3 state/rendered-config path, local
+volume creation and reuse, agent restart/adoption, explicit empty desired
+state, stale-node visibility and recovery, cross-node routing, and final
+per-node port ownership. CI, Linux-native execution, and hosted-KVM probing
+are Milestone 2 work and are not required by this local command today.
 
 ## Prerequisites
 
-- Linux with root, `/dev/kvm`, `/dev/net/tun`, `ip`, and `iptables`; or
-  Apple Silicon macOS with Lima, nested virtualization, and a Linux guest
-  that exposes `/dev/kvm`.
+- Apple Silicon macOS with Lima 2.x and a Lima `vz` guest that exposes
+  readable/writable `/dev/kvm` and `/dev/net/tun`.
 - Go and the repository build toolchain.
-- AWS credentials with permission to create, list, write, and delete a
-  disposable S3 bucket. The runner creates and deletes its own bucket on every
-  run; it refuses to reuse an existing bucket name.
-- A Linux Firecracker binary, an uncompressed Linux kernel, and an ext4
-  rootfs containing BusyBox. The runner copies `fc-init` and the disposable
-  E2E init script into a temporary copy of the rootfs, so the supplied rootfs
-  is not modified.
+- AWS credentials able to create/list/write/delete a disposable S3 bucket and
+  read the workload-image bucket.
+- Access to the existing arm64 GitOps image bucket. The default is
+  `artemnikitin-firework-images`; override it with
+  `FIREWORK_E2E_IMAGES_BUCKET` when needed.
 
-Set these paths before running:
+The harness downloads and verifies Firecracker 1.12.0 arm64 and uses the pinned
+Firecracker CI kernel `firecracker-ci/v1.12/aarch64/vmlinux-5.10.233`. The VM
+configuration enables Firecracker's VirtIO-RNG device so Java/Node workloads
+do not wait indefinitely for guest entropy. Override either asset pin only for
+an intentional compatibility investigation. The two workload rootfs images
+are not copied into the repository or manually modified: the agents download
+them through their production S3 image-sync path.
+
+## Run
 
 ```bash
-export FIREWORK_E2E_FIRECRACKER_BIN=/path/to/firecracker
-export FIREWORK_E2E_KERNEL=/path/to/vmlinux
-export FIREWORK_E2E_ROOTFS=/path/to/rootfs.ext4
 export AWS_REGION=us-east-1
+export FIREWORK_E2E_AWS_PROFILE=artemnikitin
 make validate-e2e-local
 ```
 
-When `AWS_PROFILE` is used instead of environment credentials, the host
-runner exports that profile's current credentials before entering Lima. This
-also supports short-lived credentials obtained through the AWS CLI.
+Useful local options:
 
-Useful local-only options:
+- `FIREWORK_E2E_KEEP=1` retains the Lima guest, logs, manifest and disposable
+  S3 bucket for inspection. Clean it with
+  `make validate-e2e-local-clean FIREWORK_E2E_MANIFEST=<manifest>`.
+- `FIREWORK_E2E_TIMEOUT=1800` changes the bounded scenario timeout. The default
+  is intentionally generous because these production-sized rootfs images can
+  take several minutes to initialize under nested virtualization.
+- `FIREWORK_E2E_LIMA_CPUS=8`, `FIREWORK_E2E_LIMA_MEMORY_GB=12`, and
+  `FIREWORK_E2E_LIMA_DISK_GB=60` size the local guest.
+- By default Elasticsearch gets 4 vCPUs and 6 GiB, while Kibana gets 2 vCPUs
+  and 4 GiB. Override these with `FIREWORK_E2E_ES_VCPUS`,
+  `FIREWORK_E2E_ES_MEMORY_MB`, `FIREWORK_E2E_KIBANA_VCPUS`, and
+  `FIREWORK_E2E_KIBANA_MEMORY_MB` when the host has different capacity.
+- `FIREWORK_E2E_HEALTH_RETRIES=80` controls the startup/restart threshold.
+  `FIREWORK_E2E_ES_JAVA_OPTS=-Xmx1g` is the compatibility default for the
+  currently published GitOps Elasticsearch image; a rebuilt image with the
+  current `fc-init` can use a normal multi-option value.
+- `FIREWORK_E2E_VOLUME_SIZE=2Gi` and
+  `FIREWORK_E2E_STORAGE_CAPACITY=8Gi` adjust the disposable local volume
+  pool.
+- `FIREWORK_E2E_ES_IMAGE_KEY` and `FIREWORK_E2E_KIBANA_IMAGE_KEY` select
+  alternate objects with the same GitOps rootfs contract.
+- `FIREWORK_E2E_FIRECRACKER_BIN` and `FIREWORK_E2E_KERNEL` optionally provide
+  local asset overrides; otherwise the pinned downloads are used.
 
-- `FIREWORK_E2E_MODE=linux` forces native Linux execution.
-- `FIREWORK_E2E_MODE=lima` forces the macOS Lima adapter.
-- `FIREWORK_E2E_KEEP=1` retains the lab and prints a manifest path and cleanup
-  command. Use `make validate-e2e-local-clean FIREWORK_E2E_MANIFEST=...` after
-  inspection.
-- `FIREWORK_E2E_TIMEOUT=600` changes the bounded scenario timeout.
-
-The runner writes logs, redacted configuration diagnostics, S3 object
-inventory, network state, and a run manifest under a temporary directory. AWS
-credentials are passed to the runtime through the process environment and are
-never written to the manifest or generated configuration files; the generated
-files do contain short-lived local mTLS/bootstrap tokens needed by the lab.
+The runner creates a unique real S3 bucket for control-plane state and
+rendered node configs, records image/asset provenance, collects diagnostics
+before teardown, and deletes the bucket and Lima guest unless retention is
+requested. AWS credentials are passed through the process environment and are
+not written to the manifest or generated configuration files.
