@@ -108,7 +108,14 @@ fleet — each node resolves the same logical image to its own build.
 
 An architecture that has not been published yet fails at sync time with a
 missing-object error, rather than booting a guest built for another
-architecture.
+architecture — but only on a node that has no local copy of the image. A node
+that already cached the image keeps using it and logs at debug level, because
+sync falls back to the local copy whenever an object is absent. That fallback
+predates the architecture prefix and is not specific to it.
+
+The practical consequence during a migration to this layout: a node carrying
+images from a previous layout will not report a missing prefix, so verify the
+bucket contents directly rather than relying on nodes to surface the gap.
 
 ## 2) Enricher Input Repository
 

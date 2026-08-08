@@ -55,10 +55,11 @@ func newSyncerForArch(bucket, imagesDir, arch string, store objectstorage.BlobSt
 // /var/lib/images/<tenant>-<service>-rootfs.ext4 with no architecture in them,
 // so one desired state serves a mixed-architecture fleet and each node
 // resolves it to its own images.
+// There is deliberately no unprefixed branch: falling back to a bare key would
+// let a node read another architecture's image, which is the failure this
+// prefix exists to prevent. runtime.GOARCH is never empty, so the prefix is
+// always present.
 func (s *Syncer) remoteKey(name string) string {
-	if s.arch == "" {
-		return name
-	}
 	return s.arch + "/" + name
 }
 
