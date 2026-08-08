@@ -28,6 +28,8 @@ s3_region: "us-east-1"     # optional, resolved from env/instance metadata if em
 
 # Image sync: if set, the agent downloads VM images from this S3 bucket
 # before starting VMs. Uses opaque object tokens to skip unchanged files.
+# One bucket holds every architecture: the agent reads objects under an
+# <arch>/ prefix matching the node it runs on, so this is not per-architecture.
 # s3_images_bucket: "my-firework-images"
 
 # Local directory where VM images are stored

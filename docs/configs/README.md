@@ -49,8 +49,8 @@ Examples:
 | `firecracker_bin` | no | `/usr/bin/firecracker` | Firecracker binary path |
 | `state_dir` | no | `/var/lib/firework` | Runtime state (VM sockets/logs) |
 | `images_dir` | no | `/var/lib/images` | Local image cache directory |
-| `s3_images_bucket` | no | empty | Enables image sync from S3 |
-| `gcs_images_bucket` | no | empty | Enables native image sync from GCS |
+| `s3_images_bucket` | no | empty | Enables image sync from S3. Holds every architecture; see [image object layout](#image-object-layout) |
+| `gcs_images_bucket` | no | empty | Enables native image sync from GCS. Holds every architecture; see [image object layout](#image-object-layout) |
 | `log_level` | no | `info` | `debug`, `info`, `warn`, `error` |
 | `api_listen_addr` | no | empty | Enables local API server when set |
 | `enable_health_checks` | no | `true` | Health monitor toggle |
@@ -82,6 +82,33 @@ Notes for cert lifecycle:
 
 - The bootstrap token is optional for steady-state renewals.
 - If mTLS renew is rejected and no bootstrap token is configured, automatic recovery is not possible; rotate/provision node certs manually.
+
+### Image object layout
+
+One images bucket per cloud holds every architecture. Objects are stored under
+an architecture prefix using the Go vocabulary (`amd64`, `arm64`) — not the AWS
+`x86_64` spelling:
+
+```text
+<images-bucket>/
+  amd64/tenant-1-kibana-rootfs.ext4
+  amd64/vmlinux-5.10
+  arm64/tenant-1-kibana-rootfs.ext4
+  arm64/vmlinux-5.10
+```
+
+The agent resolves that prefix from the architecture of the running agent
+binary, which is built for the node it runs on. It is not configurable: a node
+can only ever address images built for its own architecture.
+
+Local paths stay unprefixed. `images_dir` keeps the flat layout
+(`/var/lib/images/tenant-1-kibana-rootfs.ext4`), and image paths in node configs
+carry no architecture, so a single desired state serves a mixed-architecture
+fleet — each node resolves the same logical image to its own build.
+
+An architecture that has not been published yet fails at sync time with a
+missing-object error, rather than booting a guest built for another
+architecture.
 
 ## 2) Enricher Input Repository
 
