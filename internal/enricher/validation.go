@@ -8,6 +8,7 @@ import (
 
 	"github.com/artemnikitin/firework/internal/config"
 	"github.com/artemnikitin/firework/internal/ingress"
+	"github.com/artemnikitin/firework/internal/statusmodel"
 )
 
 // ValidationError holds multiple validation issues.
@@ -68,6 +69,16 @@ func ValidateInput(input *InputConfig) error {
 			ve.addf("duplicate service name: %s", s.Name)
 		}
 		svcNames[s.Name] = true
+
+		// The registry rejects any reported service name over this length and
+		// discards the whole agent_status with it. Accepting a longer name here
+		// would produce a service that runs while every heartbeat carrying it is
+		// dropped, leaving the node permanently unknown in fleet visibility.
+		// Checked after tenant expansion, so this is the composed name.
+		if len(s.Name) > statusmodel.MaxServiceNameLen {
+			ve.addf("service %s: name is %d bytes, exceeding the %d-byte limit for reported service names",
+				s.Name, len(s.Name), statusmodel.MaxServiceNameLen)
+		}
 
 		if s.Image == "" {
 			ve.addf("service %s: missing image", s.Name)
