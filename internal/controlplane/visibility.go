@@ -619,9 +619,13 @@ func (s visibilitySnapshot) revisionStatus() RevisionStatus {
 		FailedNodes: []string{}, StaleNodes: []string{}, DownNodes: []string{}, UnknownNodes: []string{},
 	}
 	relevant := make(map[string]struct{}, len(s.placement.NodeConfigs))
+	expectedServices := make(map[string][]string, len(s.placement.NodeConfigs))
 	for _, node := range s.placement.NodeConfigs {
 		if node.Node != "" {
 			relevant[node.Node] = struct{}{}
+			for _, svc := range node.Services {
+				expectedServices[node.Node] = append(expectedServices[node.Node], svc.Name)
+			}
 		}
 	}
 	status.RelevantNodes = len(relevant)
@@ -711,6 +715,19 @@ func (s visibilitySnapshot) revisionStatus() RevisionStatus {
 			status.ProgressingNodes = append(status.ProgressingNodes, nodeID)
 			continue
 		}
+		// Convergence is a positive claim, so it needs complete telemetry to
+		// make. A heartbeat can be current and carry matching revisions while
+		// reporting no services and no conditions at all; without this check
+		// that shape classifies as converged, and the endpoint reports a fleet
+		// as healthy on the strength of evidence it never received.
+		//
+		// This keeps the fleet view consistent with /v1/services, which already
+		// reports service_status_missing for a service absent from the same
+		// snapshot.
+		if !reportsAllServices(agentStatus, expectedServices[nodeID]) || !reportsBlockingConditions(agentStatus.Conditions) {
+			status.UnknownNodes = append(status.UnknownNodes, nodeID)
+			continue
+		}
 		blockingFailure, unknownCondition, degraded := assessConditions(agentStatus.Conditions)
 		switch {
 		case blockingFailure:
@@ -746,6 +763,48 @@ func (s visibilitySnapshot) revisionStatus() RevisionStatus {
 		status.Phase = "converged"
 	}
 	return status
+}
+
+// blockingConditionTypes are the conditions whose failure makes a node failed
+// rather than degraded. A node cannot be called converged unless it reported
+// all of them: a missing one hides an actual failure.
+//
+// PeerRoutesReady is deliberately not required. It is non-blocking, so its
+// absence can only mask a degraded classification, never a failed one, and
+// requiring it would make a node unknown over telemetry that cannot change
+// whether the node is broken.
+var blockingConditionTypes = []string{
+	"ConfigFetched", "ConfigParsed", "NetworkReady", "CapacityReady",
+	"ImagesReady", "VMsReconciled", "Reconciled", "LocalRoutesReady",
+}
+
+// reportsBlockingConditions reports whether every blocking condition is
+// present. An agent that completed a tick always sends all of them, because it
+// finalizes unevaluated conditions as unknown, so an incomplete set means the
+// telemetry does not describe a completed reconciliation.
+func reportsBlockingConditions(conditions []statusmodel.Condition) bool {
+	seen := make(map[string]struct{}, len(conditions))
+	for _, condition := range conditions {
+		seen[condition.Type] = struct{}{}
+	}
+	for _, required := range blockingConditionTypes {
+		if _, ok := seen[required]; !ok {
+			return false
+		}
+	}
+	return true
+}
+
+// reportsAllServices reports whether the node's status covers every service
+// placed on it. Uses the same lookup as the per-service view, so the two
+// endpoints cannot disagree about whether a service was reported.
+func reportsAllServices(status statusmodel.AgentStatus, expected []string) bool {
+	for _, name := range expected {
+		if _, ok := findAgentService(status, name); !ok {
+			return false
+		}
+	}
+	return true
 }
 
 func assessConditions(conditions []statusmodel.Condition) (blockingFailure, unknown, degraded bool) {

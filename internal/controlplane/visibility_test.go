@@ -367,7 +367,7 @@ func TestRevisionStatusDerivesFleetConvergence(t *testing.T) {
 		{name: "converged", agent: currentAgentStatus(statusmodel.PhaseReady, "rendered-1"), nodeState: NodeStateReady, wantPhase: "converged", wantBucket: "converged"},
 		{name: "degraded", agent: func() *statusmodel.AgentStatus {
 			status := currentAgentStatus(statusmodel.PhaseReady, "rendered-1")
-			status.Conditions = []statusmodel.Condition{{Type: "PeerRoutesReady", Status: statusmodel.ConditionFalse, ReasonCode: "peer_route_sync_degraded"}}
+			status.Conditions = append(status.Conditions, statusmodel.Condition{Type: "PeerRoutesReady", Status: statusmodel.ConditionFalse, ReasonCode: "peer_route_sync_degraded"})
 			return status
 		}(), nodeState: NodeStateReady, wantPhase: "degraded", wantBucket: "degraded"},
 		{name: "failed", agent: currentAgentStatus(statusmodel.PhaseFailed, ""), nodeState: NodeStateReady, wantPhase: "failed", wantBucket: "failed"},
@@ -381,9 +381,29 @@ func TestRevisionStatusDerivesFleetConvergence(t *testing.T) {
 			status.ServicesTruncated = true
 			return status
 		}(), nodeState: NodeStateReady, wantPhase: "unknown", wantBucket: "unknown"},
+		{name: "no services reported", agent: func() *statusmodel.AgentStatus {
+			status := currentAgentStatus(statusmodel.PhaseReady, "rendered-1")
+			status.Services = nil
+			return status
+		}(), nodeState: NodeStateReady, wantPhase: "unknown", wantBucket: "unknown"},
+		{name: "placed service missing from status", agent: func() *statusmodel.AgentStatus {
+			status := currentAgentStatus(statusmodel.PhaseReady, "rendered-1")
+			status.Services = []statusmodel.ServiceStatus{{Name: "other", VMState: "running", Health: "healthy"}}
+			return status
+		}(), nodeState: NodeStateReady, wantPhase: "unknown", wantBucket: "unknown"},
+		{name: "no conditions reported", agent: func() *statusmodel.AgentStatus {
+			status := currentAgentStatus(statusmodel.PhaseReady, "rendered-1")
+			status.Conditions = nil
+			return status
+		}(), nodeState: NodeStateReady, wantPhase: "unknown", wantBucket: "unknown"},
+		{name: "missing one blocking condition", agent: func() *statusmodel.AgentStatus {
+			status := currentAgentStatus(statusmodel.PhaseReady, "rendered-1")
+			status.Conditions = status.Conditions[:len(status.Conditions)-1]
+			return status
+		}(), nodeState: NodeStateReady, wantPhase: "unknown", wantBucket: "unknown"},
 		{name: "future condition", agent: func() *statusmodel.AgentStatus {
 			status := currentAgentStatus(statusmodel.PhaseReady, "rendered-1")
-			status.Conditions = []statusmodel.Condition{{Type: "FutureNonBlockingCondition", Status: statusmodel.ConditionFalse}}
+			status.Conditions = append(status.Conditions, statusmodel.Condition{Type: "FutureNonBlockingCondition", Status: statusmodel.ConditionFalse})
 			return status
 		}(), nodeState: NodeStateReady, wantPhase: "unknown", wantBucket: "unknown"},
 	}
@@ -471,12 +491,26 @@ func TestRevisionStatusReportsRenderedPublicationInProgress(t *testing.T) {
 	}
 }
 
+// currentAgentStatus builds the telemetry a healthy agent actually sends: every
+// placed service reported, and every blocking condition present. Convergence
+// now requires that completeness, so a helper that omitted it would assert the
+// fail-open shape this package must reject.
 func currentAgentStatus(phase statusmodel.Phase, applied string) *statusmodel.AgentStatus {
 	return &statusmodel.AgentStatus{
 		SchemaVersion: 1, ObservedAt: time.Now().UTC(), Phase: phase,
 		DesiredRevision: "desired-1", PlacementRevision: "placement-1",
 		ObservedRevision: "rendered-1", AppliedRevision: applied,
+		Services:   []statusmodel.ServiceStatus{{Name: "service", VMState: "running", Health: "healthy"}},
+		Conditions: allBlockingConditionsTrue(),
 	}
+}
+
+func allBlockingConditionsTrue() []statusmodel.Condition {
+	conditions := make([]statusmodel.Condition, 0, len(blockingConditionTypes))
+	for _, conditionType := range blockingConditionTypes {
+		conditions = append(conditions, statusmodel.Condition{Type: conditionType, Status: statusmodel.ConditionTrue})
+	}
+	return conditions
 }
 
 func putCurrentState(t *testing.T, ctx context.Context, store StateStore, desired DesiredRevision, placement PlacementRevision, rendered string) {
