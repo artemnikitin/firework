@@ -390,7 +390,13 @@ func (a *Agent) tick(ctx context.Context) {
 		a.syncRegistryAfterTick(ctx, nodeCap, capacity.NodeCapacity{})
 		return
 	}
-	a.setStatusCondition("NetworkReady", statusmodel.ConditionTrue, "", "")
+
+	// NetworkReady is deliberately not set here. Routing preflight only
+	// validates metadata; host networking is attempted later, inside Reconcile.
+	// Claiming it now reports NetworkReady=true on ticks that fail at capacity
+	// or image sync and never touch the network at all. Leaving it unevaluated
+	// lets finishTickStatus finalize it as unknown, which is what the per-tick
+	// condition contract says an unreached stage should be.
 
 	// Assign networking (IPs, MACs, kernel args) to services that need it.
 	a.assignNetworking(merged.Services)

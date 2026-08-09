@@ -47,6 +47,12 @@ func (a *Agent) finishTickStatus() {
 			a.setStatusCondition(conditionType, statusmodel.ConditionUnknown, "not_reached", "")
 		}
 	}
+	// Conditions just changed. failAgentStatus already snapshotted metrics
+	// earlier in the tick, before these were finalized, so without refreshing
+	// here Prometheus keeps reporting conditions that /status and the registry
+	// have since reported as unknown — or omits them entirely on a first
+	// failing tick. All three must describe the same tick.
+	a.metrics.setAgentStatusSnapshot(a.agentStatusSnapshot())
 }
 
 // markUnchangedRevisionReady records the stages covered by the unchanged
