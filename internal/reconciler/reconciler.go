@@ -45,22 +45,45 @@ type vmRecoverer interface {
 	Recover(context.Context, config.NodeConfig) ([]string, error)
 }
 
+// NetworkManager abstracts host networking so port-forward convergence can be
+// exercised without touching real iptables rules.
+type NetworkManager interface {
+	Setup(config.ServiceConfig) error
+	Teardown(config.ServiceConfig) error
+	SetupPortForward(hostPort int, guestIP string, vmPort int) error
+	TeardownPortForward(hostPort int, guestIP string, vmPort int) error
+}
+
 // Reconciler compares desired state from the config store with the actual
 // state of running VMs and produces a plan to converge them.
 type Reconciler struct {
 	vmManager       VMManager
 	healthMon       *healthcheck.Monitor
-	networkMgr      *network.Manager
+	networkMgr      NetworkManager
 	logger          *slog.Logger
 	updateStrategy  string
 	updateDelay     time.Duration
 	sleepFn         func(context.Context, time.Duration) error
 	pendingRecovery map[string]struct{}
+	// tickTeardownErrs collects non-blocking host-teardown failures for the
+	// current Reconcile call. Reset per tick; see deleteService.
+	tickTeardownErrs []error
 }
 
 // New creates a new Reconciler. The healthMon and networkMgr parameters are
 // optional and may be nil.
 func New(vmManager VMManager, logger *slog.Logger, healthMon *healthcheck.Monitor, networkMgr *network.Manager, updateStrategy string, updateDelay time.Duration) *Reconciler {
+	// A nil *network.Manager stored in an interface field is not a nil
+	// interface, so every `networkMgr != nil` guard below would pass and then
+	// dereference nil. Keep the typed nil out of the interface.
+	var netMgr NetworkManager
+	if networkMgr != nil {
+		netMgr = networkMgr
+	}
+	return newWithNetworkManager(vmManager, logger, healthMon, netMgr, updateStrategy, updateDelay)
+}
+
+func newWithNetworkManager(vmManager VMManager, logger *slog.Logger, healthMon *healthcheck.Monitor, networkMgr NetworkManager, updateStrategy string, updateDelay time.Duration) *Reconciler {
 	return &Reconciler{
 		vmManager:       vmManager,
 		healthMon:       healthMon,
@@ -259,6 +282,7 @@ func (r *Reconciler) preflight(ctx context.Context, svc config.ServiceConfig) er
 // Reconcile is a convenience method that plans and applies in one step.
 func (r *Reconciler) Reconcile(ctx context.Context, desired config.NodeConfig) error {
 	var errs []error
+	r.tickTeardownErrs = nil
 	if recoverer, ok := r.vmManager.(vmRecoverer); ok {
 		adopted, err := recoverer.Recover(ctx, desired)
 		for _, name := range adopted {
@@ -275,17 +299,60 @@ func (r *Reconciler) Reconcile(ctx context.Context, desired config.NodeConfig) e
 
 	if len(actions) == 0 {
 		r.logger.Debug("no changes needed, state is converged")
-		return combineErrors(errs)
+	} else {
+		r.logger.Info("reconciliation plan",
+			"creates", countActions(actions, ActionCreate),
+			"updates", countActions(actions, ActionUpdate),
+			"deletes", countActions(actions, ActionDelete),
+		)
+
+		if err := r.Apply(ctx, actions); err != nil {
+			errs = append(errs, err)
+		}
 	}
 
-	r.logger.Info("reconciliation plan",
-		"creates", countActions(actions, ActionCreate),
-		"updates", countActions(actions, ActionUpdate),
-		"deletes", countActions(actions, ActionDelete),
-	)
-
-	if err := r.Apply(ctx, actions); err != nil {
+	// Port forwards converge on every tick, not only when the plan has an
+	// action. A failure while creating a service used to be logged and dropped,
+	// and because an existing VM produces no further plan actions, nothing ever
+	// retried it: the node reported converged while cross-node routing stayed
+	// broken. Re-asserting the rules is cheap because the helper checks before
+	// it adds, it self-heals a transient failure, and a persistent one keeps
+	// surfacing instead of being reported once and lost.
+	//
+	// Deliberately not done by rolling the service back: a durable failure such
+	// as a host-port collision would then repeatedly destroy a running VM.
+	if err := r.syncPortForwards(desired); err != nil {
 		errs = append(errs, err)
+	}
+	errs = append(errs, r.tickTeardownErrs...)
+	return combineErrors(errs)
+}
+
+// syncPortForwards re-asserts the DNAT rules for every desired service that
+// currently has a VM. It only adds rules; obsolete rules left behind by a
+// failed teardown are not pruned, which would require enumerating existing
+// rules rather than asserting desired ones.
+func (r *Reconciler) syncPortForwards(desired config.NodeConfig) error {
+	if r.networkMgr == nil {
+		return nil
+	}
+	running := r.vmManager.List()
+	var errs []error
+	for _, svc := range desired.Services {
+		if svc.Network == nil || len(svc.PortForwards) == 0 {
+			continue
+		}
+		// A service still waiting to be created has no guest to forward to.
+		if running[svc.Name] == nil {
+			continue
+		}
+		for _, pf := range svc.PortForwards {
+			if err := r.networkMgr.SetupPortForward(pf.HostPort, svc.Network.GuestIP, pf.VMPort); err != nil {
+				errs = append(errs, stageError(FailureStageNetwork,
+					fmt.Errorf("port forward %d -> %s:%d for %s: %w",
+						pf.HostPort, svc.Network.GuestIP, pf.VMPort, svc.Name, err)))
+			}
+		}
 	}
 	return combineErrors(errs)
 }
@@ -358,11 +425,15 @@ func (r *Reconciler) createService(ctx context.Context, svc config.ServiceConfig
 		return stageError(FailureStageVM, fmt.Errorf("starting VM: %w", err))
 	}
 
-	// Set up port forwards.
+	// Set up port forwards. A failure here is logged rather than failing the
+	// create, because tearing a freshly started VM back down over a host-port
+	// collision would crash-loop the service. syncPortForwards re-asserts these
+	// rules later in the same tick and on every tick after, so the failure is
+	// retried and surfaced there instead of being lost here.
 	if r.networkMgr != nil && svc.Network != nil && len(svc.PortForwards) > 0 {
 		for _, pf := range svc.PortForwards {
 			if err := r.networkMgr.SetupPortForward(pf.HostPort, svc.Network.GuestIP, pf.VMPort); err != nil {
-				r.logger.Warn("failed to setup port forward",
+				r.logger.Warn("failed to setup port forward; will be retried by port-forward sync",
 					"service", svc.Name, "host_port", pf.HostPort, "error", err)
 			}
 		}
@@ -389,11 +460,18 @@ func (r *Reconciler) deleteService(svc config.ServiceConfig) error {
 		r.healthMon.Deregister(svc.Name)
 	}
 
+	// Teardown failures are recorded for the tick rather than returned. A DNAT
+	// rule left pointing at a dead guest silently misroutes traffic on that host
+	// port, so it must not stay invisible — but the update path skips the
+	// recreate when this function errors, and a transient teardown failure must
+	// not leave a service deleted. Reconcile folds these into the tick result.
 	if r.networkMgr != nil && svc.Network != nil && len(svc.PortForwards) > 0 {
 		for _, pf := range svc.PortForwards {
 			if err := r.networkMgr.TeardownPortForward(pf.HostPort, svc.Network.GuestIP, pf.VMPort); err != nil {
 				r.logger.Warn("failed to teardown port forward",
 					"service", svc.Name, "host_port", pf.HostPort, "error", err)
+				r.tickTeardownErrs = append(r.tickTeardownErrs, stageError(FailureStageNetwork,
+					fmt.Errorf("teardown port forward %d for %s: %w", pf.HostPort, svc.Name, err)))
 			}
 		}
 	}
@@ -402,6 +480,8 @@ func (r *Reconciler) deleteService(svc config.ServiceConfig) error {
 	if r.networkMgr != nil {
 		if err := r.networkMgr.Teardown(svc); err != nil {
 			r.logger.Warn("failed to tear down network", "service", svc.Name, "error", err)
+			r.tickTeardownErrs = append(r.tickTeardownErrs, stageError(FailureStageNetwork,
+				fmt.Errorf("teardown network for %s: %w", svc.Name, err)))
 		}
 	}
 	return nil
