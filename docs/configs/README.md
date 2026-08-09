@@ -113,9 +113,10 @@ that already cached the image keeps using it and logs at debug level, because
 sync falls back to the local copy whenever an object is absent. That fallback
 predates the architecture prefix and is not specific to it.
 
-The practical consequence during a migration to this layout: a node carrying
-images from a previous layout will not report a missing prefix, so verify the
-bucket contents directly rather than relying on nodes to surface the gap.
+The practical consequence: a node that already holds an image will not report
+that its prefix is missing or incomplete in the bucket, so verify bucket
+contents directly rather than relying on nodes to surface the gap. A freshly
+provisioned node has no cache and does fail loudly.
 
 ## 2) Enricher Input Repository
 
