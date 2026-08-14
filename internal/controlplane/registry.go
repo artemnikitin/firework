@@ -17,7 +17,19 @@ import (
 	"github.com/artemnikitin/firework/internal/statusmodel"
 )
 
-const maxRegistryRequestBytes = 4 << 20
+// maxRegistryRequestBytes must stay above the largest agent_status that
+// validateAgentStatus accepts. A heartbeat over the cap is truncated by
+// MaxBytesReader and fails JSON decoding, so the handler returns 400 before it
+// can reach validatedHeartbeatAgentStatus and drop just the telemetry — the
+// node's liveness heartbeat is rejected too, LastSeenAt stops advancing, and
+// the node goes stale and then down.
+//
+// The bound is driven by per-volume messages: MaxServices x MaxServiceVolumes
+// is 6400 volumes, each carrying a LastError that BoundedMessage limits to 256
+// runes rather than bytes, so up to 1 KiB apiece. Measured worst case is about
+// 11.8 MiB; see TestMaxRegistryRequestBytesExceedsLargestValidHeartbeat, which
+// fails if the bounds grow past this cap.
+const maxRegistryRequestBytes = 16 << 20
 
 // RegistryServer serves node enrollment and registry APIs.
 type RegistryServer struct {
