@@ -12,24 +12,12 @@ import (
 	"github.com/artemnikitin/firework/internal/volume"
 )
 
-var reconciliationConditionTypes = []string{
-	"ConfigFetched",
-	"ConfigParsed",
-	"NetworkReady",
-	"CapacityReady",
-	"ImagesReady",
-	"VMsReconciled",
-	"Reconciled",
-	"LocalRoutesReady",
-	"PeerRoutesReady",
-}
-
 // beginTickStatus starts tracking which conditions the current tick evaluates.
 // Conditions are observations of the current attempt, not durable failure
 // latches; unevaluated conditions are finalized as unknown at tick completion.
 func (a *Agent) beginTickStatus() {
 	a.statusMu.Lock()
-	a.evaluatedConditions = make(map[string]struct{}, len(reconciliationConditionTypes))
+	a.evaluatedConditions = make(map[string]struct{}, len(statusmodel.ReconciliationConditionTypes()))
 	a.statusMu.Unlock()
 	a.refreshAgentStatus(statusmodel.PhaseReconciling, "", "")
 }
@@ -42,7 +30,8 @@ func (a *Agent) finishTickStatus() {
 	if evaluated == nil {
 		return
 	}
-	for _, conditionType := range reconciliationConditionTypes {
+	// Shared with the control plane so the two cannot drift apart.
+	for _, conditionType := range statusmodel.ReconciliationConditionTypes() {
 		if _, ok := evaluated[conditionType]; !ok {
 			a.setStatusCondition(conditionType, statusmodel.ConditionUnknown, "not_reached", "")
 		}
@@ -58,6 +47,16 @@ func (a *Agent) finishTickStatus() {
 // markUnchangedRevisionReady records the stages covered by the unchanged
 // revision fast path before it publishes PhaseReady. This keeps phase and
 // conditions from disagreeing after an earlier failed attempt.
+//
+// The stages are not all verified equally, and the control plane treats every
+// one of them as positive evidence for convergence, so the difference matters:
+//   - NetworkReady is genuinely re-asserted — the fast path converges port
+//     forwards and only reaches here when that succeeded.
+//   - CapacityReady and ImagesReady are inferred from the revision being
+//     unchanged: the same revision demands the same capacity and the same
+//     images, both already satisfied when it was first applied.
+//   - VMsReconciled and Reconciled likewise describe work whose inputs have
+//     not changed.
 func (a *Agent) markUnchangedRevisionReady() {
 	for _, conditionType := range []string{"NetworkReady", "CapacityReady", "ImagesReady", "VMsReconciled", "Reconciled"} {
 		if a.statusConditionIs(conditionType, statusmodel.ConditionTrue) {

@@ -365,10 +365,30 @@ func (a *Agent) tick(ctx context.Context) {
 			// node configs do not persist the agent-assigned guest IPs.
 			a.assignNetworking(merged.Services)
 			a.setStatusServices(*merged, rev)
-			if err := a.syncTraefikConfigs(ctx, merged.Services); err != nil {
-				a.logger.Error("traefik route refresh failed", "error", err)
-				a.failAgentStatus("LocalRoutesReady", "local_route_sync_failed", err.Error())
-			} else {
+
+			// Host DNAT can be flushed by anything else on the box — a
+			// firewalld reload, a container runtime restart — without the
+			// config revision changing. Reconcile re-asserts port forwards,
+			// but this path returns before it and is the common case in
+			// steady state, so re-assert here too. Without this the rules
+			// converge only on ticks that change the revision, while
+			// markUnchangedRevisionReady below still reports NetworkReady.
+			portForwardErr := a.reconciler.SyncPortForwards(*merged)
+			if portForwardErr != nil {
+				a.logger.Error("port forward refresh failed", "error", portForwardErr)
+			}
+			// Run the route refresh regardless, so one failing subsystem does
+			// not stop the other from converging.
+			traefikErr := a.syncTraefikConfigs(ctx, merged.Services)
+			if traefikErr != nil {
+				a.logger.Error("traefik route refresh failed", "error", traefikErr)
+			}
+			switch {
+			case portForwardErr != nil:
+				a.failAgentStatus("NetworkReady", "port_forward_sync_failed", portForwardErr.Error())
+			case traefikErr != nil:
+				a.failAgentStatus("LocalRoutesReady", "local_route_sync_failed", traefikErr.Error())
+			default:
 				a.markUnchangedRevisionReady()
 				a.setStatusCondition("LocalRoutesReady", statusmodel.ConditionTrue, "", "")
 				a.refreshAgentStatus(statusmodel.PhaseReady, "", "")

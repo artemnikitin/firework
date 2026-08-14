@@ -42,7 +42,7 @@ func forwardedService(name string) config.ServiceConfig {
 func newNetworkTestReconciler(net NetworkManager) (*Reconciler, *fakeVMManager) {
 	vmMgr := newFakeVMManager()
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	return newWithNetworkManager(vmMgr, logger, nil, net, "", 0), vmMgr
+	return NewWithNetworkManager(vmMgr, logger, nil, net, "", 0), vmMgr
 }
 
 // The regression: a port forward that failed while creating the service was

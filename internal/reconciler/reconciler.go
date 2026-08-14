@@ -80,10 +80,13 @@ func New(vmManager VMManager, logger *slog.Logger, healthMon *healthcheck.Monito
 	if networkMgr != nil {
 		netMgr = networkMgr
 	}
-	return newWithNetworkManager(vmManager, logger, healthMon, netMgr, updateStrategy, updateDelay)
+	return NewWithNetworkManager(vmManager, logger, healthMon, netMgr, updateStrategy, updateDelay)
 }
 
-func newWithNetworkManager(vmManager VMManager, logger *slog.Logger, healthMon *healthcheck.Monitor, networkMgr NetworkManager, updateStrategy string, updateDelay time.Duration) *Reconciler {
+// NewWithNetworkManager builds a Reconciler over an arbitrary NetworkManager.
+// Callers outside tests should use New; this exists so host networking can be
+// faked when exercising the agent's tick paths.
+func NewWithNetworkManager(vmManager VMManager, logger *slog.Logger, healthMon *healthcheck.Monitor, networkMgr NetworkManager, updateStrategy string, updateDelay time.Duration) *Reconciler {
 	return &Reconciler{
 		vmManager:       vmManager,
 		healthMon:       healthMon,
@@ -326,6 +329,15 @@ func (r *Reconciler) Reconcile(ctx context.Context, desired config.NodeConfig) e
 	}
 	errs = append(errs, r.tickTeardownErrs...)
 	return combineErrors(errs)
+}
+
+// SyncPortForwards re-asserts host DNAT for the desired services without
+// planning or applying anything else. Reconcile calls it on ticks that do
+// reconcile; the agent's unchanged-revision fast path calls it directly,
+// because that path returns before Reconcile and is the common case in steady
+// state — which is exactly when host rules drift under the agent.
+func (r *Reconciler) SyncPortForwards(desired config.NodeConfig) error {
+	return r.syncPortForwards(desired)
 }
 
 // syncPortForwards re-asserts the DNAT rules for every desired service that

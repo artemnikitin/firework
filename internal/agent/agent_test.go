@@ -16,6 +16,7 @@ import (
 	"github.com/artemnikitin/firework/internal/config"
 	"github.com/artemnikitin/firework/internal/reconciler"
 	"github.com/artemnikitin/firework/internal/statusmodel"
+	"github.com/artemnikitin/firework/internal/vm"
 )
 
 type fakeStore struct {
@@ -857,5 +858,111 @@ func TestReadNodeCapacity_UsesLastKnownOnError(t *testing.T) {
 	}
 	if second != first {
 		t.Fatalf("expected last-known capacity %+v, got %+v", first, second)
+	}
+}
+
+// runningVMManager reports a service as already running, which is what steady
+// state looks like: port forwards are only asserted for services that have a
+// guest to forward to.
+type runningVMManager struct{ names []string }
+
+func (r *runningVMManager) List() map[string]*vm.Instance {
+	out := make(map[string]*vm.Instance, len(r.names))
+	for _, name := range r.names {
+		out[name] = &vm.Instance{Name: name, State: vm.StateRunning}
+	}
+	return out
+}
+func (r *runningVMManager) Start(context.Context, config.ServiceConfig) error { return nil }
+func (r *runningVMManager) Remove(string) error                               { return nil }
+
+// fakeNetwork lets the agent's tick paths exercise host networking without
+// touching real iptables rules.
+type fakeNetwork struct {
+	setupForwardCalls []int
+	setupForwardErr   error
+}
+
+func (f *fakeNetwork) Setup(config.ServiceConfig) error    { return nil }
+func (f *fakeNetwork) Teardown(config.ServiceConfig) error { return nil }
+func (f *fakeNetwork) TeardownPortForward(int, string, int) error {
+	return nil
+}
+
+func (f *fakeNetwork) SetupPortForward(hostPort int, _ string, _ int) error {
+	f.setupForwardCalls = append(f.setupForwardCalls, hostPort)
+	return f.setupForwardErr
+}
+
+// The regression: port-forward convergence lived only inside Reconcile, and the
+// unchanged-revision fast path returns before Reconcile. On a single-label node
+// in steady state the rules were therefore re-asserted only on ticks that
+// changed the revision — while the same path reported NetworkReady=true, so the
+// control plane called the node converged with host DNAT possibly flushed.
+func TestTick_UnchangedRevisionReassertsPortForwards(t *testing.T) {
+	s := &fakeStore{
+		data: map[string][]byte{"web": []byte(`node: web
+services:
+  - name: local
+    network: {}
+    port_forwards:
+      - host_port: 8080
+        vm_port: 8080
+`)},
+		revision: "rev-1",
+	}
+	cfg := testAgentConfig(t)
+	cfg.VMSubnet = "172.16.0.0/24"
+	cfg.VMGateway = "172.16.0.1"
+	a := New(cfg, s, testLogger())
+	net := &fakeNetwork{}
+	a.reconciler = reconciler.NewWithNetworkManager(&runningVMManager{names: []string{"local"}}, testLogger(), nil, net, "", 0)
+	a.traefikMgr = &fakeRouteSyncer{}
+	a.lastRevision = "rev-1"
+
+	a.tick(context.Background())
+	if len(net.setupForwardCalls) == 0 {
+		t.Fatal("unchanged-revision tick did not re-assert port forwards")
+	}
+
+	before := len(net.setupForwardCalls)
+	a.tick(context.Background())
+	if len(net.setupForwardCalls) <= before {
+		t.Fatal("port forwards were not re-asserted on a second unchanged-revision tick")
+	}
+}
+
+// A port-forward failure on the fast path must not be reported as ready.
+func TestTick_UnchangedRevisionPortForwardFailureIsNotReady(t *testing.T) {
+	s := &fakeStore{
+		data: map[string][]byte{"web": []byte(`node: web
+services:
+  - name: local
+    network: {}
+    port_forwards:
+      - host_port: 8080
+        vm_port: 8080
+`)},
+		revision: "rev-1",
+	}
+	cfg := testAgentConfig(t)
+	cfg.VMSubnet = "172.16.0.0/24"
+	cfg.VMGateway = "172.16.0.1"
+	a := New(cfg, s, testLogger())
+	a.reconciler = reconciler.NewWithNetworkManager(&runningVMManager{names: []string{"local"}}, testLogger(),
+		nil, &fakeNetwork{setupForwardErr: errors.New("nat table flushed")}, "", 0)
+	a.traefikMgr = &fakeRouteSyncer{}
+	a.lastRevision = "rev-1"
+
+	a.tick(context.Background())
+
+	status := a.agentStatusSnapshot()
+	if status.Phase == statusmodel.PhaseReady {
+		t.Fatal("node reported ready while its port forwards could not be applied")
+	}
+	for _, condition := range status.Conditions {
+		if condition.Type == "NetworkReady" && condition.Status == statusmodel.ConditionTrue {
+			t.Fatal("NetworkReady reported true while port forwards could not be applied")
+		}
 	}
 }
