@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -74,6 +75,14 @@ func (f *fakeS3) Delete(_ context.Context, key string) error         { delete(f.
 func (f *fakeS3) ListKeys(context.Context, string) ([]string, error) { return nil, nil }
 func (f *fakeS3) Close() error                                       { return nil }
 
+// testArch pins the architecture prefix so key expectations do not depend on
+// the architecture the test binary happens to be built for.
+const testArch = "testarch"
+
+func newTestSyncer(dir string, store objectstorage.BlobStore) *Syncer {
+	return newSyncerForArch("images-bucket", dir, testArch, store, testLogger())
+}
+
 func testLogger() *slog.Logger {
 	return slog.New(slog.NewTextHandler(io.Discard, nil))
 }
@@ -82,11 +91,11 @@ func TestSync_DownloadsNewImage(t *testing.T) {
 	dir := t.TempDir()
 	fake := &fakeS3{
 		objects: map[string]fakeObject{
-			"web-rootfs.ext4": {body: "rootfs-content", token: `"abc123"`},
+			testArch + "/web-rootfs.ext4": {body: "rootfs-content", token: `"abc123"`},
 		},
 	}
 
-	syncer := NewSyncer("images-bucket", dir, fake, testLogger())
+	syncer := newTestSyncer(dir, fake)
 
 	services := []config.ServiceConfig{
 		{Name: "web", Image: "/var/lib/images/web-rootfs.ext4"},
@@ -126,13 +135,13 @@ func TestSync_SkipsUnchangedImage(t *testing.T) {
 	fake := &countingFakeS3{
 		fakeS3: &fakeS3{
 			objects: map[string]fakeObject{
-				"web-rootfs.ext4": {body: "new-content", token: `"abc123"`},
+				testArch + "/web-rootfs.ext4": {body: "new-content", token: `"abc123"`},
 			},
 		},
 		getObjectCalls: &callCount,
 	}
 
-	syncer := NewSyncer("images-bucket", dir, fake, testLogger())
+	syncer := newTestSyncer(dir, fake)
 
 	services := []config.ServiceConfig{
 		{Name: "web", Image: "/var/lib/images/web-rootfs.ext4"},
@@ -166,11 +175,11 @@ func TestSync_RedownloadsOnTokenChange(t *testing.T) {
 
 	fake := &fakeS3{
 		objects: map[string]fakeObject{
-			"web-rootfs.ext4": {body: "new-content", token: `"new-token"`},
+			testArch + "/web-rootfs.ext4": {body: "new-content", token: `"new-token"`},
 		},
 	}
 
-	syncer := NewSyncer("images-bucket", dir, fake, testLogger())
+	syncer := newTestSyncer(dir, fake)
 
 	services := []config.ServiceConfig{
 		{Name: "web", Image: "/var/lib/images/web-rootfs.ext4"},
@@ -203,12 +212,12 @@ func TestSync_MultipleImages(t *testing.T) {
 	dir := t.TempDir()
 	fake := &fakeS3{
 		objects: map[string]fakeObject{
-			"web-rootfs.ext4": {body: "web-data", token: `"e1"`},
-			"vmlinux-5.10":    {body: "kernel-data", token: `"e2"`},
+			testArch + "/web-rootfs.ext4": {body: "web-data", token: `"e1"`},
+			testArch + "/vmlinux-5.10":    {body: "kernel-data", token: `"e2"`},
 		},
 	}
 
-	syncer := NewSyncer("images-bucket", dir, fake, testLogger())
+	syncer := newTestSyncer(dir, fake)
 
 	services := []config.ServiceConfig{
 		{
@@ -236,15 +245,15 @@ func TestSync_DeduplicatesSharedKernel(t *testing.T) {
 	fake := &countingFakeS3{
 		fakeS3: &fakeS3{
 			objects: map[string]fakeObject{
-				"web-rootfs.ext4":    {body: "web", token: `"e1"`},
-				"worker-rootfs.ext4": {body: "worker", token: `"e2"`},
-				"vmlinux-5.10":       {body: "kernel", token: `"e3"`},
+				testArch + "/web-rootfs.ext4":    {body: "web", token: `"e1"`},
+				testArch + "/worker-rootfs.ext4": {body: "worker", token: `"e2"`},
+				testArch + "/vmlinux-5.10":       {body: "kernel", token: `"e3"`},
 			},
 		},
 		getObjectCalls: &callCount,
 	}
 
-	syncer := NewSyncer("images-bucket", dir, fake, testLogger())
+	syncer := newTestSyncer(dir, fake)
 
 	services := []config.ServiceConfig{
 		{Name: "web", Image: "/var/lib/images/web-rootfs.ext4", Kernel: "/var/lib/images/vmlinux-5.10"},
@@ -269,12 +278,12 @@ func TestSync_NotFoundInS3_LocalExists(t *testing.T) {
 
 	fake := &fakeS3{
 		objects: map[string]fakeObject{
-			"web-rootfs.ext4": {body: "rootfs-content", token: `"abc123"`},
+			testArch + "/web-rootfs.ext4": {body: "rootfs-content", token: `"abc123"`},
 			// vmlinux-5.10 intentionally absent from S3
 		},
 	}
 
-	syncer := NewSyncer("images-bucket", dir, fake, testLogger())
+	syncer := newTestSyncer(dir, fake)
 
 	services := []config.ServiceConfig{
 		{
@@ -304,7 +313,7 @@ func TestSync_NotFoundInS3_NoLocalCopy(t *testing.T) {
 		objects: map[string]fakeObject{},
 	}
 
-	syncer := NewSyncer("images-bucket", dir, fake, testLogger())
+	syncer := newTestSyncer(dir, fake)
 
 	services := []config.ServiceConfig{
 		{Name: "web", Image: "/var/lib/images/missing.ext4"},
@@ -341,12 +350,12 @@ func TestSync_NotFoundInS3_ResolvesUnversionedKernelAlias(t *testing.T) {
 
 	fake := &fakeS3{
 		objects: map[string]fakeObject{
-			"web-rootfs.ext4": {body: "rootfs-content", token: `"abc123"`},
+			testArch + "/web-rootfs.ext4": {body: "rootfs-content", token: `"abc123"`},
 			// vmlinux-5.10 intentionally absent from S3
 		},
 	}
 
-	syncer := NewSyncer("images-bucket", dir, fake, testLogger())
+	syncer := newTestSyncer(dir, fake)
 	services := []config.ServiceConfig{
 		{
 			Name:   "web",
@@ -369,10 +378,76 @@ func TestSync_NotFoundInS3_ResolvesUnversionedKernelAlias(t *testing.T) {
 	}
 }
 
+// A single bucket holds every architecture, so a node must resolve only its
+// own. Reaching another architecture's object is the silent wrong-arch failure
+// that arch-prefixed keys exist to make impossible: it surfaces as a missing
+// image at sync time rather than as a guest kernel panic at boot.
+func TestSync_DoesNotResolveAnotherArchitecturesImage(t *testing.T) {
+	dir := t.TempDir()
+	fake := &fakeS3{
+		objects: map[string]fakeObject{
+			"otherarch/web-rootfs.ext4": {body: "wrong-arch-rootfs", token: `"abc123"`},
+		},
+	}
+
+	syncer := newTestSyncer(dir, fake)
+	services := []config.ServiceConfig{
+		{Name: "web", Image: "/var/lib/images/web-rootfs.ext4"},
+	}
+
+	err := syncer.Sync(context.Background(), services)
+	if err == nil {
+		t.Fatal("expected an error when only another architecture's image exists")
+	}
+	if !strings.Contains(err.Error(), "not found in object storage") {
+		t.Fatalf("expected a not-found error, got: %v", err)
+	}
+	if _, statErr := os.Stat(filepath.Join(dir, "web-rootfs.ext4")); statErr == nil {
+		t.Fatal("another architecture's image must not be downloaded")
+	}
+}
+
+// The local filename stays architecture-neutral so one desired state from the
+// control plane serves a mixed-architecture fleet.
+func TestSync_LocalPathIsNotArchitecturePrefixed(t *testing.T) {
+	dir := t.TempDir()
+	fake := &fakeS3{
+		objects: map[string]fakeObject{
+			testArch + "/web-rootfs.ext4": {body: "rootfs-content", token: `"abc123"`},
+		},
+	}
+
+	syncer := newTestSyncer(dir, fake)
+	services := []config.ServiceConfig{
+		{Name: "web", Image: "/var/lib/images/web-rootfs.ext4"},
+	}
+
+	if err := syncer.Sync(context.Background(), services); err != nil {
+		t.Fatalf("Sync: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "web-rootfs.ext4")); err != nil {
+		t.Fatalf("expected image at the unprefixed local path: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, testArch)); err == nil {
+		t.Fatal("architecture prefix must not appear in the local images directory")
+	}
+}
+
+// Production must derive the architecture from the running agent binary, which
+// is built for the node it runs on; nothing configurable may override it.
+func TestNewSyncer_UsesRuntimeArchitecture(t *testing.T) {
+	syncer := NewSyncer("images-bucket", t.TempDir(), &fakeS3{}, testLogger())
+
+	want := runtime.GOARCH + "/web-rootfs.ext4"
+	if got := syncer.remoteKey("web-rootfs.ext4"); got != want {
+		t.Fatalf("remoteKey = %q, want %q", got, want)
+	}
+}
+
 func TestSync_NoServices(t *testing.T) {
 	dir := t.TempDir()
 	fake := &fakeS3{objects: map[string]fakeObject{}}
-	syncer := NewSyncer("images-bucket", dir, fake, testLogger())
+	syncer := newTestSyncer(dir, fake)
 
 	if err := syncer.Sync(context.Background(), nil); err != nil {
 		t.Fatalf("Sync with nil services: %v", err)

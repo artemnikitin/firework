@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strings"
 
@@ -27,12 +28,39 @@ type Syncer struct {
 	store     objectstorage.BlobStore
 	bucket    string
 	imagesDir string
+	arch      string
 	logger    *slog.Logger
 }
 
-// NewSyncer creates a syncer over an existing BlobStore.
+// NewSyncer creates a syncer over an existing BlobStore. Every architecture
+// shares one bucket per cloud, so object keys are resolved under the
+// architecture of the node this agent runs on.
 func NewSyncer(bucket, imagesDir string, store objectstorage.BlobStore, logger *slog.Logger) *Syncer {
-	return &Syncer{store: store, bucket: bucket, imagesDir: imagesDir, logger: logger}
+	return newSyncerForArch(bucket, imagesDir, runtime.GOARCH, store, logger)
+}
+
+// newSyncerForArch exists so tests can pin an architecture. Production code
+// must go through NewSyncer: deriving the architecture from the running binary
+// is what makes it impossible to point a node at another architecture's images.
+func newSyncerForArch(bucket, imagesDir, arch string, store objectstorage.BlobStore, logger *slog.Logger) *Syncer {
+	return &Syncer{store: store, bucket: bucket, imagesDir: imagesDir, arch: arch, logger: logger}
+}
+
+// remoteKey maps a local image filename to its object key.
+//
+// Images for every architecture live in one bucket per cloud, separated by an
+// <arch>/ prefix using the Go architecture vocabulary (amd64, arm64) that the
+// image build pipeline publishes under. The local filename is deliberately
+// left unprefixed: the enricher derives image paths as
+// /var/lib/images/<tenant>-<service>-rootfs.ext4 with no architecture in them,
+// so one desired state serves a mixed-architecture fleet and each node
+// resolves it to its own images.
+// There is deliberately no unprefixed branch: falling back to a bare key would
+// let a node read another architecture's image, which is the failure this
+// prefix exists to prevent. runtime.GOARCH is never empty, so the prefix is
+// always present.
+func (s *Syncer) remoteKey(name string) string {
+	return s.arch + "/" + name
 }
 
 // NewS3Syncer creates an S3-backed image syncer.
@@ -60,9 +88,9 @@ func (s *Syncer) Close() error { return s.store.Close() }
 func (s *Syncer) Sync(ctx context.Context, services []config.ServiceConfig) error {
 	paths := collectImagePaths(services)
 	for _, path := range paths {
-		key := filepath.Base(path)
-		if err := s.syncOne(ctx, key, filepath.Join(s.imagesDir, key)); err != nil {
-			return fmt.Errorf("syncing %s: %w", key, err)
+		name := filepath.Base(path)
+		if err := s.syncOne(ctx, s.remoteKey(name), filepath.Join(s.imagesDir, name)); err != nil {
+			return fmt.Errorf("syncing %s: %w", name, err)
 		}
 	}
 	return nil
@@ -144,8 +172,13 @@ func collectImagePaths(services []config.ServiceConfig) []string {
 }
 
 func ensureLocalKernelAlias(localPath, key string) (string, error) {
-	prefix := strings.TrimPrefix(key, "vmlinux-")
-	if prefix == key || len(strings.Split(prefix, ".")) != 2 {
+	// Match on the object's basename: keys carry an <arch>/ prefix, and without
+	// stripping it no key would ever look like a kernel, silently disabling
+	// this fallback for nodes whose kernel is baked into the machine image
+	// under a versioned name.
+	name := filepath.Base(key)
+	prefix := strings.TrimPrefix(name, "vmlinux-")
+	if prefix == name || len(strings.Split(prefix, ".")) != 2 {
 		return "", nil
 	}
 	matches, err := filepath.Glob(localPath + ".*")
