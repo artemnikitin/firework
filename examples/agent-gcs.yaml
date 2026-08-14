@@ -28,7 +28,9 @@ gcs_project: "my-gcp-project"
 
 # Image sync: if set, the agent downloads VM images from this GCS bucket
 # before starting VMs. Uses opaque object tokens to skip unchanged files.
-# gcs_images_bucket: "my-firework-images-amd64"
+# One bucket holds every architecture: the agent reads objects under an
+# <arch>/ prefix matching the node it runs on, so this is not per-architecture.
+# gcs_images_bucket: "my-firework-images"
 
 # Local directory where VM images are stored
 images_dir: "/var/lib/images"
