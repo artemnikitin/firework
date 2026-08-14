@@ -94,12 +94,13 @@ func (m *runtimeMetrics) setAgentStatusSnapshot(status statusmodel.AgentStatus) 
 	for _, condition := range status.Conditions {
 		m.statusConditions[condition.Type] = string(condition.Status)
 	}
-	if !status.LastAppliedAt.IsZero() {
-		m.lastAppliedAt = float64(status.LastAppliedAt.Unix())
-	}
-	if status.AppliedRevision != "" {
-		m.lastAppliedRevision = status.AppliedRevision
-	}
+	// lastAppliedAt and lastAppliedRevision are deliberately not written here.
+	// They belong to recordConfigApply, which reports the store revision. This
+	// snapshot carries AppliedRevision, which markAgentStatusApplied has already
+	// rewritten to the rendered revision — writing it would silently change what
+	// firework_agent_config_last_applied_revision_info means, breaking any
+	// dashboard correlating that label with store revisions, with no other
+	// signal that the metric moved.
 }
 
 // ObserveVolumeOperation implements volume.Observer without introducing
