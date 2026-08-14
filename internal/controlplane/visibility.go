@@ -773,10 +773,7 @@ func (s visibilitySnapshot) revisionStatus() RevisionStatus {
 // absence can only mask a degraded classification, never a failed one, and
 // requiring it would make a node unknown over telemetry that cannot change
 // whether the node is broken.
-var blockingConditionTypes = []string{
-	"ConfigFetched", "ConfigParsed", "NetworkReady", "CapacityReady",
-	"ImagesReady", "VMsReconciled", "Reconciled", "LocalRoutesReady",
-}
+var blockingConditionTypes = statusmodel.BlockingConditionTypes()
 
 // reportsBlockingConditions reports whether every blocking condition is
 // present. An agent that completed a tick always sends all of them, because it
@@ -809,14 +806,14 @@ func reportsAllServices(status statusmodel.AgentStatus, expected []string) bool 
 
 func assessConditions(conditions []statusmodel.Condition) (blockingFailure, unknown, degraded bool) {
 	for _, condition := range conditions {
-		switch condition.Type {
-		case "PeerRoutesReady":
+		switch {
+		case statusmodel.IsNonBlockingCondition(condition.Type):
 			if condition.Status == statusmodel.ConditionFalse {
 				degraded = true
 			} else if condition.Status == statusmodel.ConditionUnknown {
 				unknown = true
 			}
-		case "ConfigFetched", "ConfigParsed", "NetworkReady", "CapacityReady", "ImagesReady", "VMsReconciled", "Reconciled", "LocalRoutesReady":
+		case statusmodel.IsBlockingCondition(condition.Type):
 			if condition.Status == statusmodel.ConditionFalse {
 				blockingFailure = true
 			} else if condition.Status == statusmodel.ConditionUnknown {

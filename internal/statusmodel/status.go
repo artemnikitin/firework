@@ -21,6 +21,56 @@ const (
 	MaxRevisionLen      = 256
 )
 
+// blockingConditionTypes are the reconciliation stages whose failure makes a
+// node failed rather than degraded. nonBlockingConditionTypes only degrade it.
+//
+// Both sides of the contract read these: the agent finalizes every one of them
+// on each tick, and the control plane requires the blocking set to be present
+// before it will call a node converged. They live here so a rename cannot land
+// on one side only — that would leave no node ever classifiable as converged,
+// silently and permanently.
+var (
+	blockingConditionTypes = []string{
+		"ConfigFetched", "ConfigParsed", "NetworkReady", "CapacityReady",
+		"ImagesReady", "VMsReconciled", "Reconciled", "LocalRoutesReady",
+	}
+	nonBlockingConditionTypes = []string{"PeerRoutesReady"}
+)
+
+// BlockingConditionTypes returns the conditions whose failure is fatal.
+func BlockingConditionTypes() []string {
+	return append([]string(nil), blockingConditionTypes...)
+}
+
+// ReconciliationConditionTypes returns every condition an agent reports for a
+// tick, blocking and non-blocking alike.
+func ReconciliationConditionTypes() []string {
+	out := make([]string, 0, len(blockingConditionTypes)+len(nonBlockingConditionTypes))
+	out = append(out, blockingConditionTypes...)
+	return append(out, nonBlockingConditionTypes...)
+}
+
+// IsBlockingCondition reports whether a false condition of this type means the
+// node has failed rather than merely degraded.
+func IsBlockingCondition(conditionType string) bool {
+	for _, known := range blockingConditionTypes {
+		if known == conditionType {
+			return true
+		}
+	}
+	return false
+}
+
+// IsNonBlockingCondition reports whether this type is known and degrading.
+func IsNonBlockingCondition(conditionType string) bool {
+	for _, known := range nonBlockingConditionTypes {
+		if known == conditionType {
+			return true
+		}
+	}
+	return false
+}
+
 type Phase string
 
 const (
