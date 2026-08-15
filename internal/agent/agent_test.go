@@ -557,7 +557,10 @@ func TestTick_StatusReportsRuntimeAssignedNetworkAddress(t *testing.T) {
 func TestTick_StatusReportsVMProcessFailureWithoutExitedPID(t *testing.T) {
 	dir := t.TempDir()
 	binary := filepath.Join(dir, "fake-firecracker")
-	if err := os.WriteFile(binary, []byte("#!/bin/sh\nexit 1\n"), 0o755); err != nil {
+	// The VM must live long enough for its launched identity to be confirmed:
+	// a process that exits before it runs Firecracker is a launch failure, not
+	// a VM that started and then died, which is what this test is about.
+	if err := os.WriteFile(binary, []byte("#!/bin/sh\nsleep 1\nexit 1\n"), 0o755); err != nil {
 		t.Fatal(err)
 	}
 	store := &fakeStore{data: map[string][]byte{"web": []byte("node: web\ndesired_revision: desired-1\nplacement_revision: placement-1\nrendered_revision: rendered-1\nservices:\n- name: service\n  image: /img/service\n  kernel: /kern\n  vcpus: 1\n  memory_mb: 128\n")}, revision: "provider-token"}
