@@ -497,13 +497,15 @@ func (s visibilitySnapshot) nodeSummary(record NodeRecord) NodeSummary {
 		summary.AgentVersion = status.AgentVersion
 		if s.statusMatchesCurrent(status) {
 			summary.ReasonCode = status.ReasonCode
-			for _, service := range status.Services {
-				if service.VMState == "running" {
-					summary.RunningServices++
-				}
-			}
 		} else {
 			summary.ReasonCode = "agent_status_revision_mismatch"
+		}
+		// Counted from any fresh status, applied or not, so the node list agrees
+		// with the per-service summaries projected from the same observation.
+		for _, service := range status.Services {
+			if service.VMState == "running" {
+				summary.RunningServices++
+			}
 		}
 	} else if record.AgentStatus == nil {
 		summary.ReasonCode = "agent_status_missing"

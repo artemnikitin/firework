@@ -403,6 +403,16 @@ func TestVisibilityKeepsFreshServiceStateOnANodeThatCannotConverge(t *testing.T)
 			t.Fatalf("%s lost the revision-mismatch reason: %#v", name, got)
 		}
 	}
+
+	// The node list is projected from the same observation, so it must not
+	// contradict the service list on the same screen.
+	nodes, err := NewVisibilityService(cfg, store).Nodes(ctx, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := nodes.Items[0]; got.RunningServices != 1 || got.ReasonCode != "agent_status_revision_mismatch" {
+		t.Fatalf("node summary disagrees with its services: %#v", got)
+	}
 }
 
 func putCurrentState(t *testing.T, ctx context.Context, store StateStore, desired DesiredRevision, placement PlacementRevision, rendered string) {

@@ -32,8 +32,12 @@ const (
 	// waiting for the exec to complete.
 	launchIdentityInterval = 25 * time.Millisecond
 	// launchExitConfirmTimeout bounds how long an abandoned launch is given to
-	// exit before its state directory is left in place for recovery.
-	launchExitConfirmTimeout = 5 * time.Second
+	// exit before its state directory is left in place for recovery. Both
+	// budgets are spent holding the manager lock on the reconcile path, so they
+	// are kept well inside one 30s reconcile interval and the API server's 10s
+	// write timeout. Overrunning them is benign: the launch is retried on the
+	// next tick.
+	launchExitConfirmTimeout = 2 * time.Second
 )
 
 // State represents the lifecycle state of a microVM.
@@ -338,7 +342,7 @@ func (m *Manager) reclaimUnownedState(service, vmDir string) error {
 // The launched command line is the signal that the exec completed: it carries
 // this instance's unique --id together with its socket and config paths.
 func (m *Manager) recordLaunchedIdentity(manifest *instanceManifest, launched *launchedProcess) error {
-	identity, err := awaitLaunchedIdentity(m.inspector, manifest, launched.PID, m.identityTimeout, launchIdentityInterval)
+	identity, err := awaitLaunchedIdentity(m.inspector, manifest, launched.PID, m.launchIdentityTimeout(), launchIdentityInterval)
 	if err != nil {
 		if _, host := m.inspector.(osProcessInspector); host && !processInspectionSupported {
 			// Development hosts without /proc cannot prove ownership of any
@@ -402,7 +406,7 @@ func (m *Manager) abandonLaunch(service string, manifest *instanceManifest, laun
 		}
 		gone = true
 	} else {
-		gone = awaitProcessExit(m.inspector, launched.PID, m.exitConfirmTimeout, launchIdentityInterval)
+		gone = awaitProcessExit(m.inspector, launched.PID, m.launchExitTimeout(), launchIdentityInterval)
 	}
 	if gone {
 		if err := os.RemoveAll(manifest.VMDir); err != nil {
@@ -416,6 +420,23 @@ func (m *Manager) abandonLaunch(service string, manifest *instanceManifest, laun
 	_ = writeManifest(manifestPath(manifest.VMDir), manifest)
 	m.logger.Error("abandoned microVM launch did not exit; its state is retained for recovery",
 		"service", service, "pid", launched.PID)
+}
+
+// launchIdentityTimeout and launchExitTimeout fall back to the package
+// defaults, so a Manager built without the constructor cannot silently collapse
+// the identity wait to a single pre-exec inspection.
+func (m *Manager) launchIdentityTimeout() time.Duration {
+	if m.identityTimeout <= 0 {
+		return launchIdentityTimeout
+	}
+	return m.identityTimeout
+}
+
+func (m *Manager) launchExitTimeout() time.Duration {
+	if m.exitConfirmTimeout <= 0 {
+		return launchExitConfirmTimeout
+	}
+	return m.exitConfirmTimeout
 }
 
 func awaitProcessExit(inspector processInspector, pid int, timeout, interval time.Duration) bool {

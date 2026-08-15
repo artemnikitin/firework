@@ -138,6 +138,7 @@ func TestRecoverNeverTouchesVMsThisProcessStarted(t *testing.T) {
 	launcher := &specCapturingLauncher{inner: &execRacingLauncher{pid: 3637}}
 	manager.launcher = launcher
 	manager.inspector = &execRacingInspector{launcher: launcher, pid: 3637, binary: binary}
+	stopAdoptedMonitors(t, manager)
 
 	service := config.ServiceConfig{Name: "app", Image: "/image", Kernel: "/kernel", VCPUs: 1, MemoryMB: 128}
 	desired := config.NodeConfig{Services: []config.ServiceConfig{service}}

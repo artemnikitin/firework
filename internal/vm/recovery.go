@@ -114,7 +114,7 @@ func (m *Manager) Recover(_ context.Context, desired config.NodeConfig) ([]strin
 					// recorded once that PID is running the launched command
 					// line. Recording it earlier is what produced manifests
 					// describing systemd itself.
-					if identity, waitErr := awaitLaunchedIdentity(m.inspector, manifest, pid, m.identityTimeout, launchIdentityInterval); waitErr == nil {
+					if identity, waitErr := awaitLaunchedIdentity(m.inspector, manifest, pid, m.launchIdentityTimeout(), launchIdentityInterval); waitErr == nil {
 						manifest.PID = pid
 						applyProcessIdentity(manifest, identity)
 					} else {

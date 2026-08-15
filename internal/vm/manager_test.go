@@ -135,20 +135,34 @@ func (l *execRacingLauncher) Stop(*instanceManifest, syscall.Signal) error {
 // declared complete, which is exactly what a systemd MainPID looks like while
 // the transient unit is still forking into Firecracker.
 type execRacingInspector struct {
-	launcher    *specCapturingLauncher
-	pid         int
-	preExec     int
+	launcher *specCapturingLauncher
+	pid      int
+	preExec  int
+	binary   string
+
+	// The adopted-process monitor inspects on its own goroutine, so the call
+	// counter and the exit flag are shared state.
+	mu          sync.Mutex
 	inspections int
 	exited      bool
-	binary      string
+}
+
+func (i *execRacingInspector) exit() {
+	i.mu.Lock()
+	i.exited = true
+	i.mu.Unlock()
 }
 
 func (i *execRacingInspector) Inspect(pid int) (processIdentity, error) {
-	if i.exited || pid != i.pid {
+	i.mu.Lock()
+	exited := i.exited
+	i.inspections++
+	inspections := i.inspections
+	i.mu.Unlock()
+	if exited || pid != i.pid {
 		return processIdentity{}, errProcessNotFound
 	}
-	i.inspections++
-	if i.inspections <= i.preExec {
+	if inspections <= i.preExec {
 		return processIdentity{
 			PID: pid, HostBootID: "boot", StartTicks: 41143, Executable: "/usr/lib/systemd/systemd",
 			ExecutableDev: 66306, ExecutableIno: 8581641,
@@ -169,6 +183,18 @@ func (i *execRacingInspector) FindByArguments(string, string) ([]processIdentity
 
 func (*execRacingInspector) SocketReady(string) error { return nil }
 
+// stopAdoptedMonitors drops the manager's instances so the per-instance monitor
+// goroutines return instead of polling a removed temporary directory for the
+// rest of the test binary's life.
+func stopAdoptedMonitors(t *testing.T, manager *Manager) {
+	t.Helper()
+	t.Cleanup(func() {
+		manager.mu.Lock()
+		manager.instances = make(map[string]*Instance)
+		manager.mu.Unlock()
+	})
+}
+
 func TestStartRecordsIdentityOnlyAfterTheLaunchedProcessExecs(t *testing.T) {
 	dir := t.TempDir()
 	binary := filepath.Join(dir, "firecracker")
@@ -177,6 +203,7 @@ func TestStartRecordsIdentityOnlyAfterTheLaunchedProcessExecs(t *testing.T) {
 	inspector := &execRacingInspector{launcher: launcher, pid: 3637, preExec: 3, binary: binary}
 	manager.launcher = launcher
 	manager.inspector = inspector
+	stopAdoptedMonitors(t, manager)
 
 	service := config.ServiceConfig{Name: "app", Image: "/image", Kernel: "/kernel", VCPUs: 1, MemoryMB: 128}
 	if err := manager.Start(context.Background(), service); err != nil {
@@ -219,7 +246,7 @@ func TestStartAbandonsALaunchWhoseIdentityIsNeverProvable(t *testing.T) {
 			launcher := &specCapturingLauncher{inner: inner}
 			inspector := &execRacingInspector{launcher: launcher, pid: 3637, preExec: 1 << 30, binary: binary}
 			if testCase.exitsWhenKilled {
-				inner.onStop = func() { inspector.exited = true }
+				inner.onStop = inspector.exit
 			}
 			manager.launcher = launcher
 			manager.inspector = inspector
@@ -273,6 +300,7 @@ func TestStartReclaimsStateLeftByAFailedLaunch(t *testing.T) {
 	launcher := &specCapturingLauncher{inner: &execRacingLauncher{pid: 3637}}
 	manager.launcher = launcher
 	manager.inspector = &execRacingInspector{launcher: launcher, pid: 3637, binary: binary}
+	stopAdoptedMonitors(t, manager)
 	if err := manager.Start(context.Background(), service); err != nil {
 		t.Fatalf("retry after a failed launch was blocked: %v", err)
 	}
