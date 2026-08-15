@@ -42,7 +42,10 @@ of the service's volumes.
 Missing data fails closed:
 
 - expired node leases become `stale`;
-- unplaced desired services are `pending`;
+- unplaced desired services are `pending`, carrying the scheduler's reason code
+  (for example `insufficient_compute_capacity`, `volume_capacity_unavailable`,
+  or `host_port_conflict`, which names the contested port and the service
+  already holding it);
 - placed services with missing, stale, or unsupported agent status are
   `unknown`;
 - VM state and health remain separate, so a service can be `running` and

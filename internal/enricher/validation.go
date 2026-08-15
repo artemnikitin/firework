@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strings"
 
 	"github.com/artemnikitin/firework/internal/config"
@@ -42,6 +43,11 @@ const (
 	// port_forwards host port, so it cannot participate in remote multi-node
 	// routing (remote nodes proxy through the host port).
 	WarnRemoteRoutingNoHostPort = "remote_routing_no_host_port"
+	// WarnRepeatedHostPort: several services of the same node type request the
+	// same host port. This is legitimate only while placement keeps them on
+	// different nodes; the scheduler leaves the extra services pending with
+	// host_port_conflict when it cannot.
+	WarnRepeatedHostPort = "repeated_host_port"
 )
 
 // Warn represents a non-fatal issue found during validation.
@@ -84,6 +90,7 @@ func ValidateInput(input *InputConfig) error {
 		}
 
 		validateRouting(ve, s, input.Defaults, subSeen, hostSeen)
+		validatePortForwards(ve, s)
 		validateVolumes(ve, s)
 	}
 
@@ -91,6 +98,17 @@ func ValidateInput(input *InputConfig) error {
 		return ve
 	}
 	return nil
+}
+
+// validatePortForwards rejects a service that claims the same host port twice.
+// Such a service is never schedulable: its own DNAT rules would conflict on any
+// node. Repeats across services are left to placement, which keeps colocated
+// claims unique, so they cannot be judged statically here.
+func validatePortForwards(ve *ValidationError, s ServiceSpec) {
+	svc := config.ServiceConfig{Name: s.Name, PortForwards: s.PortForwards}
+	for _, dupe := range svc.DuplicatePortClaims() {
+		ve.addf("service %s: duplicate port_forwards host port %d", s.Name, dupe.HostPort)
+	}
 }
 
 var volumeNamePattern = regexp.MustCompile(`^[a-z0-9](?:[-a-z0-9]{0,61}[a-z0-9])?$`)
@@ -260,6 +278,9 @@ func ValidateOutput(nc config.NodeConfig) error {
 				ve.addf("service %s volume %s: size_bytes must be positive", svc.Name, volume.Name)
 			}
 		}
+		for _, dupe := range svc.DuplicatePortClaims() {
+			ve.addf("service %s: duplicate port_forwards host port %d", svc.Name, dupe.HostPort)
+		}
 	}
 
 	if ve.hasErrors() {
@@ -271,6 +292,8 @@ func ValidateOutput(nc config.NodeConfig) error {
 // CheckWarnings finds non-fatal issues in the input.
 func CheckWarnings(input *InputConfig) []Warn {
 	var warns []Warn
+
+	warns = append(warns, repeatedHostPortWarnings(input.Services)...)
 
 	for _, svc := range input.Services {
 		if svc.HealthCheck != nil && !svc.Network {
@@ -292,5 +315,35 @@ func CheckWarnings(input *InputConfig) []Warn {
 		}
 	}
 
+	return warns
+}
+
+// repeatedHostPortWarnings reports host ports requested by several services of
+// the same node type. Only placement can decide whether that is safe, so this
+// stays a warning: it is valid while the scheduler separates the services, and
+// becomes a pending host_port_conflict when it cannot.
+func repeatedHostPortWarnings(specs []ServiceSpec) []Warn {
+	byNodeType := make(map[string][]config.ServiceConfig)
+	for _, spec := range specs {
+		byNodeType[spec.NodeType] = append(byNodeType[spec.NodeType],
+			config.ServiceConfig{Name: spec.Name, PortForwards: spec.PortForwards})
+	}
+
+	nodeTypes := make([]string, 0, len(byNodeType))
+	for nodeType := range byNodeType {
+		nodeTypes = append(nodeTypes, nodeType)
+	}
+	sort.Strings(nodeTypes)
+
+	var warns []Warn
+	for _, nodeType := range nodeTypes {
+		for _, conflict := range config.ConflictingPortClaims(byNodeType[nodeType]) {
+			warns = append(warns, Warn{
+				Code: WarnRepeatedHostPort,
+				Message: fmt.Sprintf("node type %s: %s; placement must keep them on different nodes",
+					nodeType, conflict),
+			})
+		}
+	}
 	return warns
 }

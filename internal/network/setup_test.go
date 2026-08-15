@@ -110,3 +110,25 @@ func TestScopedPortForwardSpec(t *testing.T) {
 		}
 	}
 }
+
+// Removing one service's forward must not remove another service's rule for the
+// same host port: every rule spec used for teardown carries the guest
+// destination, so the match is service-scoped even during a same-port handoff.
+func TestPortForwardSpecsAreScopedToGuestDestination(t *testing.T) {
+	t.Parallel()
+
+	specs := map[string][]string{
+		"scoped":  scopedPortForwardSpec("enp3s0", "10.0.100.91", 9200, "172.16.0.6", 9200),
+		"hairpin": hairpinPortForwardSpec("br0", "10.0.100.91", 9200, "172.16.0.6", 9200),
+		"legacy":  legacyPortForwardSpec(9200, "172.16.0.6", 9200),
+	}
+	for name, spec := range specs {
+		got := strings.Join(spec, " ")
+		if !strings.Contains(got, "--to-destination 172.16.0.6:9200") {
+			t.Errorf("%s spec is not destination-scoped: %s", name, got)
+		}
+		if strings.Contains(got, "--to-destination 172.16.0.7:9200") {
+			t.Errorf("%s spec matches a peer guest: %s", name, got)
+		}
+	}
+}

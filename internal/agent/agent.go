@@ -366,6 +366,18 @@ func (a *Agent) tick(ctx context.Context) {
 		a.setStatusCondition("ConfigFetched", statusmodel.ConditionTrue, "", "")
 	}
 
+	// Reject a node config whose services conflict on a host port before any
+	// networking or service state changes. The control plane keeps colocated
+	// claims unique, so this is defense in depth for a stale, hand-written, or
+	// older-controller config: installing its DNAT rules would silently deliver
+	// host-port traffic to whichever guest matched first.
+	if err := config.ValidateNodePortClaims(*merged); err != nil {
+		a.logger.Error("host-port claim preflight failed; not advancing revision", "error", err)
+		a.failAgentStatus("NetworkReady", "host_port_conflict", err.Error())
+		a.syncRegistry(ctx, nodeCap, capacity.NodeCapacity{})
+		return
+	}
+
 	// Preflight routing metadata before any reconciliation so an invalid
 	// direct node config or a missing ingress_domain fails the revision early
 	// instead of being recorded as applied.

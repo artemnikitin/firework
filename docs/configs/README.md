@@ -178,7 +178,7 @@ Supported fields:
 | `memory_mb` | no | Memory in MiB |
 | `kernel_args` | no | Kernel boot args |
 | `network` | no | When true, networking is configured |
-| `port_forwards` | no | Host-to-guest DNAT mappings; required for remote Traefik routing. Reachable from external traffic and from co-located guests addressing the host IP (hairpin) |
+| `port_forwards` | no | Host-to-guest DNAT mappings; required for remote Traefik routing. Reachable from external traffic and from co-located guests addressing the host IP (hairpin). Each `host_port` is a node-exclusive claim — see [Host-port claims](#host-port-claims) |
 | `health_check` | no | `type` supports `http` or `tcp` |
 | `env` | no | Env vars injected via kernel args; values with whitespace are encoded |
 | `links` | no | Same-node service links (`env` gets resolved URL) |
@@ -193,6 +193,26 @@ DNS-label-like, mount paths must be clean absolute paths, and duplicate or
 overlapping mount paths are rejected. A non-empty tenant `volumes` list
 replaces the inherited list. See [Persistent Volumes](../persistent-volumes.md)
 for lifecycle and safety semantics.
+
+#### Host-port claims
+
+A `host_port` is a node-scoped exclusive resource: the agent installs one DNAT
+rule per claim, and two colocated services claiming the same port would produce
+rules with identical match criteria and different guest destinations, so only
+one of them would ever receive traffic.
+
+- Repeating a `host_port` inside one service is always invalid and is rejected
+  by `configcheck` and by the enricher.
+- Repeating a `host_port` across services is valid only while placement keeps
+  them on different nodes. `configcheck` reports it as a `repeated_host_port`
+  warning because it cannot know the placement.
+- The scheduler treats a service's claims atomically: it places the service
+  only on a node where every claim is free, and otherwise leaves it `pending`
+  with reason `host_port_conflict` (or `duplicate_host_port_claims` for a
+  service that repeats its own port).
+- The agent rejects a rendered node config whose services conflict on a host
+  port before changing any networking or service state, reporting
+  `host_port_conflict` and leaving the revision unapplied.
 
 ### 2.3 `tenants/*` (optional)
 
