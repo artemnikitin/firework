@@ -343,8 +343,11 @@ func TestVisibilityFailsClosedAcrossRevisionTransitions(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := list.Items[0]; got.State != "unknown" || got.Health != "unknown" || got.Node != "node" || got.ReasonCode != "agent_status_revision_mismatch" {
-		t.Fatalf("unapplied agent status did not fail closed: %#v", got)
+	// The node has not applied the current revision, which the reason code keeps
+	// reporting, but its per-service observation is fresh and is projected so a
+	// node that cannot converge does not erase visibility into its workloads.
+	if got := list.Items[0]; got.State != "running" || got.Health != "healthy" || got.Node != "node" || got.ReasonCode != "agent_status_revision_mismatch" {
+		t.Fatalf("unapplied agent status was not projected with its mismatch reason: %#v", got)
 	}
 	detail, found, err := service.Service(ctx, "service")
 	if err != nil || !found {
@@ -352,6 +355,53 @@ func TestVisibilityFailsClosedAcrossRevisionTransitions(t *testing.T) {
 	}
 	if detail.ActualNode != "" || detail.AppliedRevision != "" || detail.PID != 0 {
 		t.Fatalf("unapplied runtime fields leaked into service detail: %#v", detail)
+	}
+}
+
+func TestVisibilityKeepsFreshServiceStateOnANodeThatCannotConverge(t *testing.T) {
+	ctx := context.Background()
+	store := newBlobStateStore(newMemBlob())
+	cfg := validConfigForRole(RoleAPI)
+	cfg.NodeStaleTTL = time.Minute
+	now := time.Now().UTC()
+	services := []config.ServiceConfig{
+		{Name: "quarantined", VCPUs: 1, MemoryMB: 128},
+		{Name: "healthy", VCPUs: 1, MemoryMB: 128},
+	}
+	desired := DesiredRevision{Revision: "desired-1", Services: services}
+	placement := PlacementRevision{Revision: "placement-1", DesiredRevision: "desired-1", NodeConfigs: []config.NodeConfig{{Node: "node", Services: services}}}
+	putCurrentState(t, ctx, store, desired, placement, "rendered-2")
+	// One VM cannot be removed, so the node never advances its applied revision
+	// even though every other observation on it is current.
+	putNode(t, ctx, store, cfg, NodeRecord{NodeID: "node", State: NodeStateReady, LastSeenAt: now, AgentStatus: &statusmodel.AgentStatus{
+		SchemaVersion: 1, ObservedAt: now, DesiredRevision: "desired-1", PlacementRevision: "placement-1",
+		ObservedRevision: "rendered-2", AppliedRevision: "rendered-1", Phase: statusmodel.PhaseFailed, ReasonCode: "reconcile_failed",
+		Services: []statusmodel.ServiceStatus{
+			{Name: "quarantined", VMState: "recovery_pending", Health: "unknown", ReasonCode: "vm_recovery_pending", Message: "cannot prove surviving process ownership"},
+			{Name: "healthy", VMState: "running", Health: "healthy"},
+		},
+	}})
+
+	list, err := NewVisibilityService(cfg, store).Services(ctx, "", "", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	byName := make(map[string]ServiceSummary, len(list.Items))
+	for _, item := range list.Items {
+		byName[item.Name] = item
+	}
+	if got := byName["healthy"]; got.State != "running" || got.Health != "healthy" {
+		t.Fatalf("a stalled node erased a healthy service: %#v", got)
+	}
+	// recovery_pending is outside the published vocabulary, so the service that
+	// actually cannot converge is the one that stays unknown.
+	if got := byName["quarantined"]; got.State != "unknown" {
+		t.Fatalf("quarantined service was not reported as unknown: %#v", got)
+	}
+	for name, got := range byName {
+		if got.ReasonCode != "agent_status_revision_mismatch" {
+			t.Fatalf("%s lost the revision-mismatch reason: %#v", name, got)
+		}
 	}
 }
 

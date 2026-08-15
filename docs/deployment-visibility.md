@@ -61,12 +61,22 @@ desired/placement/rendered/applied revisions, reconciliation phase, typed
 conditions, and fixed-shape service summaries.
 
 Agent reconciliation phases are `unknown`, `reconciling`, `ready`, and
-`failed`. Desired service VM/health state is trusted only when the current
+`failed`. A service summary is reported as fully current only when the current
 desired and placement revisions match and the reporting agent has both observed
 and applied the current rendered revision. During publication or rollout
-transitions, mismatched data fails closed to `pending` or `unknown` instead of
+transitions, mismatched placement fails closed to `pending` instead of
 presenting an older VM as the current desired service. Stale/down nodes remain
 separate lifecycle states and are never inferred to be failed or healthy.
+
+A node that has observed the current rendered revision but not applied it keeps
+`reason_code: agent_status_revision_mismatch` on every service placed on it. Its
+per-service VM state and health are still projected, because they are fresh and
+self-consistent: one service that cannot converge must not erase visibility into
+the rest of the node. A service whose own VM state is outside the published
+vocabulary — `recovery_pending`, for example — is still reported as `unknown`,
+so the service that actually cannot converge remains the one that stands out.
+Service detail keeps the stricter rule: runtime fields such as the actual node,
+applied revision, PID, and network address appear only for an applied revision.
 
 Older heartbeats without `agent_status` continue to register normally. Their
 actual service state is reported as `unknown` until the agent is upgraded.

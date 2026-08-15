@@ -4,11 +4,14 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"io"
 	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
+	"syscall"
 	"testing"
 	"time"
 
@@ -25,8 +28,11 @@ func TestManagerClearsPIDAndRecordsProcessFailure(t *testing.T) {
 	manager := NewManager(binary, dir, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	// This test asserts failure bookkeeping, not launcher selection. Pin the
 	// direct launcher so it never depends on whether the host running the suite
-	// can create systemd transient units.
-	manager.launcher = &directLauncher{binary: binary}
+	// can create systemd transient units, and report the launched identity from
+	// the recorded spec so the start does not depend on host /proc support.
+	launcher := &specCapturingLauncher{inner: &directLauncher{binary: binary}}
+	manager.launcher = launcher
+	manager.inspector = &launchedSpecInspector{launcher: launcher, executable: binary}
 	if err := manager.Start(context.Background(), config.ServiceConfig{Name: "service", Image: "/image", Kernel: "/kernel", VCPUs: 1, MemoryMB: 128}); err != nil {
 		t.Fatal(err)
 	}
@@ -49,6 +55,227 @@ func TestManagerClearsPIDAndRecordsProcessFailure(t *testing.T) {
 		time.Sleep(10 * time.Millisecond)
 	}
 	t.Fatalf("instance did not transition to failed: %#v", manager.List()["service"])
+}
+
+// specCapturingLauncher records the launch spec so a test inspector can report
+// the identity of the process that spec describes.
+type specCapturingLauncher struct {
+	inner processLauncher
+	mu    sync.Mutex
+	spec  launchSpec
+	stops int
+}
+
+func (l *specCapturingLauncher) Launch(ctx context.Context, spec launchSpec) (*launchedProcess, error) {
+	l.mu.Lock()
+	l.spec = spec
+	l.mu.Unlock()
+	return l.inner.Launch(ctx, spec)
+}
+
+func (l *specCapturingLauncher) Stop(manifest *instanceManifest, signal syscall.Signal) error {
+	l.mu.Lock()
+	l.stops++
+	l.mu.Unlock()
+	return l.inner.Stop(manifest, signal)
+}
+
+func (l *specCapturingLauncher) launchedSpec() launchSpec {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.spec
+}
+
+type launchedSpecInspector struct {
+	launcher   *specCapturingLauncher
+	executable string
+}
+
+func (i *launchedSpecInspector) Inspect(pid int) (processIdentity, error) {
+	spec := i.launcher.launchedSpec()
+	if spec.InstanceID == "" {
+		return processIdentity{}, errProcessNotFound
+	}
+	return processIdentity{
+		PID: pid, HostBootID: "boot", StartTicks: 1, Executable: i.executable,
+		ExecutableDev: 1, ExecutableIno: 1,
+		CommandLine: []string{i.executable, "--id", spec.InstanceID, "--api-sock", spec.SocketPath, "--config-file", spec.ConfigPath},
+	}, nil
+}
+
+func (i *launchedSpecInspector) FindByArguments(string, string) ([]processIdentity, error) {
+	return nil, nil
+}
+
+func (*launchedSpecInspector) SocketReady(string) error { return nil }
+
+// execRacingLauncher launches nothing and reports a PID the way systemd reports
+// MainPID at fork: before the child has exec'd its command.
+type execRacingLauncher struct {
+	pid       int
+	launchErr error
+	onStop    func()
+}
+
+func (l *execRacingLauncher) Launch(_ context.Context, _ launchSpec) (*launchedProcess, error) {
+	if l.launchErr != nil {
+		return nil, l.launchErr
+	}
+	return &launchedProcess{PID: l.pid, Launcher: "systemd", Unit: "firework-vm-test.service"}, nil
+}
+
+func (l *execRacingLauncher) Stop(*instanceManifest, syscall.Signal) error {
+	if l.onStop != nil {
+		l.onStop()
+	}
+	return nil
+}
+
+// execRacingInspector reports the launcher's own identity until the exec is
+// declared complete, which is exactly what a systemd MainPID looks like while
+// the transient unit is still forking into Firecracker.
+type execRacingInspector struct {
+	launcher    *specCapturingLauncher
+	pid         int
+	preExec     int
+	inspections int
+	exited      bool
+	binary      string
+}
+
+func (i *execRacingInspector) Inspect(pid int) (processIdentity, error) {
+	if i.exited || pid != i.pid {
+		return processIdentity{}, errProcessNotFound
+	}
+	i.inspections++
+	if i.inspections <= i.preExec {
+		return processIdentity{
+			PID: pid, HostBootID: "boot", StartTicks: 41143, Executable: "/usr/lib/systemd/systemd",
+			ExecutableDev: 66306, ExecutableIno: 8581641,
+			CommandLine: []string{"/usr/lib/systemd/systemd"},
+		}, nil
+	}
+	spec := i.launcher.launchedSpec()
+	return processIdentity{
+		PID: pid, HostBootID: "boot", StartTicks: 41143, Executable: i.binary,
+		ExecutableDev: 66306, ExecutableIno: 473725,
+		CommandLine: []string{i.binary, "--id", spec.InstanceID, "--api-sock", spec.SocketPath, "--config-file", spec.ConfigPath},
+	}, nil
+}
+
+func (i *execRacingInspector) FindByArguments(string, string) ([]processIdentity, error) {
+	return nil, nil
+}
+
+func (*execRacingInspector) SocketReady(string) error { return nil }
+
+func TestStartRecordsIdentityOnlyAfterTheLaunchedProcessExecs(t *testing.T) {
+	dir := t.TempDir()
+	binary := filepath.Join(dir, "firecracker")
+	manager := NewManager(binary, dir, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	launcher := &specCapturingLauncher{inner: &execRacingLauncher{pid: 3637}}
+	inspector := &execRacingInspector{launcher: launcher, pid: 3637, preExec: 3, binary: binary}
+	manager.launcher = launcher
+	manager.inspector = inspector
+
+	service := config.ServiceConfig{Name: "app", Image: "/image", Kernel: "/kernel", VCPUs: 1, MemoryMB: 128}
+	if err := manager.Start(context.Background(), service); err != nil {
+		t.Fatal(err)
+	}
+
+	manifest, err := readManifest(manifestPath(filepath.Join(dir, "vms", "app")))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if manifest.Executable != binary || manifest.ExecutableIno != 473725 {
+		t.Fatalf("manifest recorded the pre-exec identity: %#v", manifest)
+	}
+	if manifest.HostBootID == "" || manifest.ProcessStart == 0 || manifest.ExecutableDev == 0 {
+		t.Fatalf("manifest persisted an incomplete identity: %#v", manifest)
+	}
+	// The recorded identity must validate immediately, which is what a raced
+	// manifest could never do again.
+	if err := validateOwnedProcess(inspector, manifest); err != nil {
+		t.Fatalf("recorded identity does not validate: %v", err)
+	}
+}
+
+func TestStartAbandonsALaunchWhoseIdentityIsNeverProvable(t *testing.T) {
+	service := config.ServiceConfig{Name: "app", Image: "/image", Kernel: "/kernel", VCPUs: 1, MemoryMB: 128}
+	for _, testCase := range []struct {
+		name            string
+		exitsWhenKilled bool
+		wantRetained    bool
+	}{
+		{name: "killed process is cleaned up", exitsWhenKilled: true},
+		{name: "surviving process retains its state", wantRetained: true},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			dir := t.TempDir()
+			binary := filepath.Join(dir, "firecracker")
+			manager := NewManager(binary, dir, slog.New(slog.NewTextHandler(io.Discard, nil)))
+			// preExec is never reached, so the PID keeps reporting the launcher.
+			inner := &execRacingLauncher{pid: 3637}
+			launcher := &specCapturingLauncher{inner: inner}
+			inspector := &execRacingInspector{launcher: launcher, pid: 3637, preExec: 1 << 30, binary: binary}
+			if testCase.exitsWhenKilled {
+				inner.onStop = func() { inspector.exited = true }
+			}
+			manager.launcher = launcher
+			manager.inspector = inspector
+			manager.identityTimeout = 20 * time.Millisecond
+			manager.exitConfirmTimeout = 20 * time.Millisecond
+
+			err := manager.Start(context.Background(), service)
+			if err == nil || !strings.Contains(err.Error(), "confirming launched process identity") {
+				t.Fatalf("start did not fail on an unprovable identity: %v", err)
+			}
+			if instance := manager.List()["app"]; instance != nil {
+				t.Fatalf("abandoned launch registered an instance: %#v", instance)
+			}
+			if launcher.stops == 0 {
+				t.Fatal("abandoned launch was never signalled")
+			}
+
+			manifest, manifestErr := readManifest(manifestPath(filepath.Join(dir, "vms", "app")))
+			if !testCase.wantRetained {
+				if !errors.Is(manifestErr, os.ErrNotExist) {
+					t.Fatalf("state of a killed launch was not removed: %v", manifestErr)
+				}
+				return
+			}
+			// A process that is still reported alive keeps its state: deleting it
+			// would let the next reconcile start a duplicate Firecracker against
+			// the same socket and TAP.
+			if manifestErr != nil {
+				t.Fatal(manifestErr)
+			}
+			if manifest.Lifecycle != lifecycleFailed || manifest.LastError == "" || manifest.PID != 3637 {
+				t.Fatalf("retained state did not describe the surviving process: %#v", manifest)
+			}
+		})
+	}
+}
+
+func TestStartReclaimsStateLeftByAFailedLaunch(t *testing.T) {
+	dir := t.TempDir()
+	binary := filepath.Join(dir, "firecracker")
+	manager := NewManager(binary, dir, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	failing := &execRacingLauncher{launchErr: errors.New("transient unit refused")}
+	manager.launcher = &specCapturingLauncher{inner: failing}
+	service := config.ServiceConfig{Name: "app", Image: "/image", Kernel: "/kernel", VCPUs: 1, MemoryMB: 128}
+	if err := manager.Start(context.Background(), service); err == nil {
+		t.Fatal("expected the launch to fail")
+	}
+
+	// The failed launch owns no process, so it must not block later starts for
+	// the life of the agent process.
+	launcher := &specCapturingLauncher{inner: &execRacingLauncher{pid: 3637}}
+	manager.launcher = launcher
+	manager.inspector = &execRacingInspector{launcher: launcher, pid: 3637, binary: binary}
+	if err := manager.Start(context.Background(), service); err != nil {
+		t.Fatalf("retry after a failed launch was blocked: %v", err)
+	}
 }
 
 func TestWriteVMConfigAddsDeterministicVolumeDrivesAndPayload(t *testing.T) {

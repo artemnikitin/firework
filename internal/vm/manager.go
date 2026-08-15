@@ -23,6 +23,19 @@ import (
 
 const maxKernelCommandLineBytes = 2047
 
+const (
+	// launchIdentityTimeout bounds how long a launch waits for its process to
+	// exec into Firecracker before the start is abandoned. Warm launches are
+	// observed to take ~110ms; a cold systemd-run takes ~1.2s.
+	launchIdentityTimeout = 3 * time.Second
+	// launchIdentityInterval is how often the launched PID is re-inspected while
+	// waiting for the exec to complete.
+	launchIdentityInterval = 25 * time.Millisecond
+	// launchExitConfirmTimeout bounds how long an abandoned launch is given to
+	// exit before its state directory is left in place for recovery.
+	launchExitConfirmTimeout = 5 * time.Second
+)
+
 // State represents the lifecycle state of a microVM.
 type State string
 
@@ -65,6 +78,11 @@ type Manager struct {
 	volumeManager  *volume.Manager
 	launcher       processLauncher
 	inspector      processInspector
+	// identityTimeout bounds waiting for a launched process to exec, and
+	// exitConfirmTimeout bounds waiting for an abandoned launch to go away.
+	// They are fields so tests do not have to sleep out the real budgets.
+	identityTimeout    time.Duration
+	exitConfirmTimeout time.Duration
 
 	mu           sync.Mutex
 	instances    map[string]*Instance
@@ -86,8 +104,12 @@ func NewManagerWithVolumes(firecrackerBin, stateDir string, logger *slog.Logger,
 		volumeManager:  volumeManager,
 		launcher:       chooseLauncher(firecrackerBin),
 		inspector:      osProcessInspector{},
-		instances:      make(map[string]*Instance),
-		volumeErrors:   make(map[string]string),
+
+		identityTimeout:    launchIdentityTimeout,
+		exitConfirmTimeout: launchExitConfirmTimeout,
+
+		instances:    make(map[string]*Instance),
+		volumeErrors: make(map[string]string),
 	}
 }
 
@@ -188,12 +210,8 @@ func (m *Manager) Start(ctx context.Context, svc config.ServiceConfig) error {
 	m.logger.Info("starting microVM", "service", svc.Name, "vcpus", svc.VCPUs, "memory_mb", svc.MemoryMB)
 
 	vmDir := filepath.Join(m.stateDir, "vms", svc.Name)
-	if _, err := os.Stat(manifestPath(vmDir)); err == nil {
-		if _, loaded := m.instances[svc.Name]; !loaded {
-			return fmt.Errorf("service %s has durable VM state that must be recovered before start", svc.Name)
-		}
-	} else if !errors.Is(err, os.ErrNotExist) {
-		return fmt.Errorf("inspect existing VM manifest: %w", err)
+	if err := m.reclaimUnownedState(svc.Name, vmDir); err != nil {
+		return err
 	}
 	if err := os.MkdirAll(vmDir, 0o755); err != nil {
 		return fmt.Errorf("creating vm dir: %w", err)
@@ -255,12 +273,9 @@ func (m *Manager) Start(ctx context.Context, svc config.ServiceConfig) error {
 	manifest.PID = launched.PID
 	manifest.Launcher = launched.Launcher
 	manifest.LauncherUnit = launched.Unit
-	if identity, inspectErr := m.inspector.Inspect(launched.PID); inspectErr == nil {
-		manifest.HostBootID = identity.HostBootID
-		manifest.ProcessStart = identity.StartTicks
-		manifest.Executable = identity.Executable
-		manifest.ExecutableDev = identity.ExecutableDev
-		manifest.ExecutableIno = identity.ExecutableIno
+	if identityErr := m.recordLaunchedIdentity(manifest, launched); identityErr != nil {
+		m.abandonLaunch(svc.Name, manifest, launched, identityErr)
+		return fmt.Errorf("confirming launched process identity: %w", identityErr)
 	}
 	manifest.Lifecycle = lifecycleRunning
 	if err := writeManifest(manifestPath(vmDir), manifest); err != nil {
@@ -289,6 +304,131 @@ func (m *Manager) Start(ctx context.Context, svc config.ServiceConfig) error {
 
 	m.logger.Info("microVM started", "service", svc.Name, "pid", launched.PID, "launcher", launched.Launcher)
 	return nil
+}
+
+// reclaimUnownedState decides whether a leftover state directory blocks a fresh
+// start. Durable state that may still own a process is never reclaimed, but
+// state whose process is recorded as gone is removed: otherwise a single failed
+// launch blocks every later start of that service for the life of the process.
+func (m *Manager) reclaimUnownedState(service, vmDir string) error {
+	if _, loaded := m.instances[service]; loaded {
+		return nil
+	}
+	manifest, err := readManifest(manifestPath(vmDir))
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err == nil && manifest.PID == 0 &&
+		(manifest.Lifecycle == lifecycleStopped || manifest.Lifecycle == lifecycleFailed) {
+		if removeErr := os.RemoveAll(vmDir); removeErr != nil {
+			return fmt.Errorf("removing exited VM state for %s: %w", service, removeErr)
+		}
+		return nil
+	}
+	return fmt.Errorf("service %s has durable VM state that must be recovered before start", service)
+}
+
+// recordLaunchedIdentity waits for the launched process to exec into Firecracker
+// and records the identity of that exact process.
+//
+// systemd reports a transient unit's MainPID at fork, before the child has
+// exec'd, so inspecting it immediately either fails or captures systemd's own
+// identity. Both outcomes persist a running manifest describing a process that
+// does not exist at that identity, which no later validation can ever accept.
+// The launched command line is the signal that the exec completed: it carries
+// this instance's unique --id together with its socket and config paths.
+func (m *Manager) recordLaunchedIdentity(manifest *instanceManifest, launched *launchedProcess) error {
+	identity, err := awaitLaunchedIdentity(m.inspector, manifest, launched.PID, m.identityTimeout, launchIdentityInterval)
+	if err != nil {
+		if _, host := m.inspector.(osProcessInspector); host && !processInspectionSupported {
+			// Development hosts without /proc cannot prove ownership of any
+			// process. Leaving the identity fields empty keeps the manifest
+			// honest; every ownership check then fails closed as it does today.
+			m.logger.Warn("host cannot inspect process identity, so VM ownership is unverifiable",
+				"service", manifest.Service, "pid", launched.PID, "error", err)
+			return nil
+		}
+		return err
+	}
+	applyProcessIdentity(manifest, identity)
+	return nil
+}
+
+// awaitLaunchedIdentity polls a launched PID until it is running the exact
+// command line Firework launched for this instance, and returns the identity
+// read from that same inspection so the manifest it populates validates by
+// construction.
+func awaitLaunchedIdentity(inspector processInspector, manifest *instanceManifest, pid int, timeout, interval time.Duration) (processIdentity, error) {
+	deadline := time.Now().Add(timeout)
+	var lastErr error
+	for {
+		identity, err := inspector.Inspect(pid)
+		switch {
+		case errors.Is(err, errProcessNotFound):
+			return processIdentity{}, fmt.Errorf("process %d exited before it ran Firecracker: %w", pid, err)
+		case err != nil:
+			lastErr = fmt.Errorf("inspect process %d: %w", pid, err)
+		case matchesOwnedArguments(identity, manifest):
+			return identity, nil
+		default:
+			lastErr = fmt.Errorf("process %d is running %q rather than the launched Firecracker command line", pid, identity.Executable)
+		}
+		if !time.Now().Before(deadline) {
+			return processIdentity{}, lastErr
+		}
+		time.Sleep(interval)
+	}
+}
+
+// abandonLaunch stops a launch whose process identity could not be confirmed.
+// The state directory is removed only once the process is proven gone: deleting
+// it while an unidentified process may still be alive would let the next
+// reconcile start a duplicate Firecracker against the same socket and TAP.
+func (m *Manager) abandonLaunch(service string, manifest *instanceManifest, launched *launchedProcess, cause error) {
+	m.logger.Error("abandoning microVM launch with unprovable process identity",
+		"service", service, "pid", launched.PID, "error", cause)
+	// Signalling is unit-scoped for systemd launches and, for direct launches,
+	// targets a child this process has not yet reaped, so neither can reach an
+	// unrelated process that recycled the PID.
+	if err := m.launcher.Stop(manifest, syscall.SIGKILL); err != nil {
+		m.logger.Warn("could not signal abandoned microVM launch",
+			"service", service, "pid", launched.PID, "error", err)
+	}
+	gone := false
+	if launched.Cmd != nil {
+		_ = launched.Cmd.Wait()
+		if launched.LogFile != nil {
+			launched.LogFile.Close()
+		}
+		gone = true
+	} else {
+		gone = awaitProcessExit(m.inspector, launched.PID, m.exitConfirmTimeout, launchIdentityInterval)
+	}
+	if gone {
+		if err := os.RemoveAll(manifest.VMDir); err != nil {
+			m.logger.Error("could not remove abandoned microVM state",
+				"service", service, "error", err)
+		}
+		return
+	}
+	manifest.Lifecycle = lifecycleFailed
+	manifest.LastError = cause.Error()
+	_ = writeManifest(manifestPath(manifest.VMDir), manifest)
+	m.logger.Error("abandoned microVM launch did not exit; its state is retained for recovery",
+		"service", service, "pid", launched.PID)
+}
+
+func awaitProcessExit(inspector processInspector, pid int, timeout, interval time.Duration) bool {
+	deadline := time.Now().Add(timeout)
+	for {
+		if _, err := inspector.Inspect(pid); errors.Is(err, errProcessNotFound) {
+			return true
+		}
+		if !time.Now().Before(deadline) {
+			return false
+		}
+		time.Sleep(interval)
+	}
 }
 
 // Stop gracefully shuts down a running microVM.
