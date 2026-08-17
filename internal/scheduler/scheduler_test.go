@@ -301,11 +301,13 @@ func nodeOf(t *testing.T, assignment map[string][]config.ServiceConfig, service 
 }
 
 func TestScheduleWithStorageSeparatesServicesSharingHostPort(t *testing.T) {
+	// i-001 is large enough that plain bin-packing would colocate both
+	// services there, so only the host-port claim separates them.
 	services := []config.ServiceConfig{
 		withPorts("tenant-1-elasticsearch", 2, 512, 9200),
 		withPorts("tenant-2-elasticsearch", 2, 512, 9200),
 	}
-	nodes := []Node{node("i-001", 8, 4096), node("i-002", 8, 4096)}
+	nodes := []Node{node("i-001", 32, 16384), node("i-002", 4, 2048)}
 
 	result, pending := ScheduleWithStorage(services, nodes, nil, StorageReservations{})
 	if len(pending) != 0 {
