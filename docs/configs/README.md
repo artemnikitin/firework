@@ -189,9 +189,12 @@ Supported fields:
 | `volumes` | no | Persistent-volume declarations (`name`, `type`, `mount_path`, optional `size`) |
 
 Volume `size` accepts positive integer `Mi` and `Gi` values. Names must be
-DNS-label-like, mount paths must be clean absolute paths, and duplicate or
-overlapping mount paths are rejected. A non-empty tenant `volumes` list
-replaces the inherited list. See [Persistent Volumes](../persistent-volumes.md)
+DNS-label-like, mount paths must be clean absolute paths of at most 256 bytes
+(the limit the registry enforces on reported volume status; a longer path is
+rejected here rather than accepted only to later drop the whole node's status
+telemetry), and duplicate or overlapping mount paths are rejected. A
+non-empty tenant `volumes` list replaces the inherited list. See
+[Persistent Volumes](../persistent-volumes.md)
 for lifecycle and safety semantics.
 
 ### 2.3 `tenants/*` (optional)

@@ -63,8 +63,11 @@ conditions, and fixed-shape service summaries.
 
 The wire payload accepts at most 16 unique conditions, 256 service summaries,
 and 25 volumes per service. Messages are sanitized and capped at 256
-characters; revisions, names, condition types, and reason codes are also
-length-bounded. When an agent has more than 256 desired services it sets
+characters; revisions, names, condition types, reason codes, agent version,
+per-service state/health/network fields, and per-volume identifier/path
+fields are all length-bounded too, since 256 services x 25 volumes multiplies
+a single unbounded field into megabytes. When an agent has more than 256
+desired services it sets
 `services_truncated` and reports the full desired count, but that snapshot
 cannot prove convergence. Registry requests are body-size limited and reject
 duplicate or invalid bounded fields. Older heartbeats which omit
@@ -111,7 +114,15 @@ second state machine:
 
 The response includes deterministic node sets for converged, degraded,
 progressing, failed, stale, down, and unknown nodes. A rendered revision with
-zero relevant nodes converges only when the desired service set is also empty.
+zero relevant nodes can converge only when the desired service set is also
+empty, and even then only once every node the control plane has a record for
+confirms it via a fresh heartbeat that has actually observed the empty
+revision. The controller currently deletes a no-longer-relevant node's legacy
+`nodes/<node>.yaml` instead of publishing an explicit empty config, so an
+agent that fetches it sees a missing file, treats that as a fetch failure, and
+keeps every VM and route it already had running; treating every known node as
+relevant here is what stops an empty desired state from reporting converged
+while those workloads are still up.
 
 ## CLI
 

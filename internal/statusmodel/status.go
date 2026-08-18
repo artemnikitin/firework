@@ -8,6 +8,7 @@ import (
 	"strings"
 	"time"
 	"unicode"
+	"unicode/utf8"
 )
 
 const (
@@ -19,6 +20,34 @@ const (
 	MaxConditionTypeLen = 64
 	MaxReasonCodeLen    = 64
 	MaxRevisionLen      = 256
+
+	// The following bound every remaining AgentStatus/ServiceStatus/
+	// VolumeStatus string field that would otherwise serialize unbounded.
+	// registry.go's maxRegistryRequestBytes is only a real cap on a heartbeat
+	// if every field that scales with MaxServices or config.MaxServiceVolumes
+	// (6400 volumes at the product of the two) is bounded here; see
+	// TestMaxRegistryRequestBytesExceedsLargestValidHeartbeat.
+	// AgentVersion is `git describe --tags --always --dirty` at build time
+	// (see the root Makefile's VERSION), not a fixed-format value, and it
+	// appears once per heartbeat rather than scaling with MaxServices or
+	// config.MaxServiceVolumes — so unlike the fields below it contributes
+	// nothing to the 6400x budget this bounding pass exists for. The bound
+	// here is generous headroom against a pathological tag name, not a tight
+	// fit: rejecting it outright drops the agent's entire status (see
+	// handleHeartbeat's validate-or-drop fallback), which is worse than the
+	// field being slightly larger than expected.
+	MaxAgentVersionLen   = 256
+	MaxEnumLen           = 32 // VMState, Health, HealthCheckType, VolumeStatus.Type, VolumeStatus.State
+	MaxNetworkAddressLen = 64
+	MaxVolumeIDLen       = 128 // BoundNode, SharedBackendID: a node/backend identifier, not a composed name.
+	// MaxLogicalIDLen must cover visibility.go's composed
+	// "service.Name + "/" + volume.Name": up to MaxServiceNameLen (128) plus
+	// "/" plus a volume name, which the enricher caps at 63 characters
+	// (validation.go's volumeNamePattern) = 192. A tighter bound would reject
+	// a legitimately-named service/volume pair outright, dropping that node's
+	// entire agent_status (see handleHeartbeat's validate-or-drop fallback).
+	MaxLogicalIDLen = 192
+	MaxMountPathLen = 256
 )
 
 // blockingConditionTypes are the reconciliation stages whose failure makes a
@@ -162,6 +191,44 @@ func BoundedMessage(message string) string {
 		return message
 	}
 	return string(runes[:MaxMessageLen])
+}
+
+// BoundedPath truncates a path-like field to MaxMountPathLen bytes. Unlike
+// BoundedMessage it does not collapse whitespace or sanitize URLs — a path is
+// not free text — and the bound is a byte count, matching
+// validateVolumeStatus's check on the receiving side.
+//
+// This exists so a mount_path is bounded on the sender before it is ever
+// marshaled, not only rejected on arrival: the enricher rejects an overlong
+// mount_path at config-validation time (internal/enricher/validation.go), but
+// a config applied without going through the enricher would otherwise
+// produce a heartbeat that fails validateVolumeStatus outright, dropping the
+// node's entire agent_status rather than just this one field.
+func BoundedPath(path string) string {
+	return truncateUTF8(path, MaxMountPathLen)
+}
+
+// BoundedLogicalID truncates a volume's composed "service/volume" identifier
+// to MaxLogicalIDLen bytes, the same sender-side defense as BoundedPath but
+// for LogicalID: the enricher's service-name (MaxServiceNameLen) and
+// volume-name (63-character regex) limits sum to exactly MaxLogicalIDLen with
+// no margin, so a config applied without going through the enricher could
+// otherwise produce a LogicalID validateVolumeStatus rejects outright.
+func BoundedLogicalID(logicalID string) string {
+	return truncateUTF8(logicalID, MaxLogicalIDLen)
+}
+
+// truncateUTF8 truncates s to at most max bytes, trimming back further if
+// needed so the result is never a truncated multi-byte UTF-8 sequence.
+func truncateUTF8(s string, max int) string {
+	if len(s) <= max {
+		return s
+	}
+	truncated := s[:max]
+	for len(truncated) > 0 && !utf8.ValidString(truncated) {
+		truncated = truncated[:len(truncated)-1]
+	}
+	return truncated
 }
 
 func sanitizeURL(value string) string {

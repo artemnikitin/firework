@@ -208,9 +208,9 @@ func (a *Agent) refreshAgentStatus(phase statusmodel.Phase, code, message string
 			for _, prepared := range instance.Volumes {
 				preparedByID[prepared.LogicalID] = prepared
 			}
-			service.Volumes = buildVolumeStatuses(desired, preparedByID)
+			service.Volumes = BuildVolumeStatuses(desired, preparedByID)
 		} else {
-			service.Volumes = buildVolumeStatuses(desired, nil)
+			service.Volumes = BuildVolumeStatuses(desired, nil)
 		}
 		if volumeError := a.vmManager.VolumeError(desired.Name); volumeError != "" {
 			service.ReasonCode = "volume_failed"
@@ -265,12 +265,20 @@ func (a *Agent) refreshAgentStatus(phase statusmodel.Phase, code, message string
 	a.currentStatus.Services = services
 }
 
-func buildVolumeStatuses(service config.ServiceConfig, prepared map[string]volume.PreparedVolume) []statusmodel.VolumeStatus {
+// BuildVolumeStatuses builds the reported volume statuses for a service from
+// its desired config and (if the VM is running) its prepared volumes.
+// Exported so other packages can construct a status through the same path a
+// real agent uses, rather than hand-building a statusmodel.VolumeStatus and
+// only coincidentally matching what this function actually sends.
+func BuildVolumeStatuses(service config.ServiceConfig, prepared map[string]volume.PreparedVolume) []statusmodel.VolumeStatus {
 	statuses := make([]statusmodel.VolumeStatus, 0, len(service.Volumes))
 	for _, desired := range service.Volumes {
+		// logicalID (untruncated) is the map key shared with volume.Manager's
+		// PreparedVolume.LogicalID, so the prepared lookup below must use it
+		// as-is; only the reported field is bounded for the wire.
 		logicalID := service.Name + "/" + desired.Name
 		status := statusmodel.VolumeStatus{
-			LogicalID: logicalID, Type: string(desired.Type), MountPath: desired.MountPath,
+			LogicalID: statusmodel.BoundedLogicalID(logicalID), Type: string(desired.Type), MountPath: statusmodel.BoundedPath(desired.MountPath),
 			BoundNode: desired.BoundNode, SharedBackendID: desired.SharedBackendID,
 			DesiredSizeBytes: desired.SizeBytes, ResizeGeneration: desired.ResizeGeneration,
 			State: "pending",

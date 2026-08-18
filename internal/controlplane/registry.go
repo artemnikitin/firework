@@ -17,17 +17,25 @@ import (
 	"github.com/artemnikitin/firework/internal/statusmodel"
 )
 
-// maxRegistryRequestBytes must stay above the largest agent_status that
-// validateAgentStatus accepts. A heartbeat over the cap is truncated by
+// maxRegistryRequestBytes must stay above the largest agent_status a
+// well-behaved agent can send. A heartbeat over the cap is truncated by
 // MaxBytesReader and fails JSON decoding, so the handler returns 400 before it
-// can reach validatedHeartbeatAgentStatus and drop just the telemetry — the
-// node's liveness heartbeat is rejected too, LastSeenAt stops advancing, and
-// the node goes stale and then down.
+// can even reach the req.AgentStatus != nil check in handleHeartbeat that
+// would otherwise drop just the telemetry — the node's liveness heartbeat is
+// rejected too, LastSeenAt stops advancing, and the node goes stale and then
+// down. That fallback only helps once the body has actually decoded.
 //
-// The bound is driven by per-volume messages: MaxServices x MaxServiceVolumes
-// is 6400 volumes, each carrying a LastError that BoundedMessage limits to 256
-// runes rather than bytes, so up to 1 KiB apiece. Measured worst case is about
-// 11.8 MiB; see TestMaxRegistryRequestBytesExceedsLargestValidHeartbeat, which
+// The bound is driven by MaxServices x config.MaxServiceVolumes = 6400
+// volumes, each field bounded in validateVolumeStatus. Message-shaped fields
+// (AgentStatus.Message, Condition.Message, ServiceStatus.Message,
+// VolumeStatus.LastError) are deliberately excluded from that per-field
+// enforcement — they are accept-then-truncate via BoundedMessage, not
+// rejected. That holds for any agent built from this codebase: the send path
+// (internal/agent/status.go) runs every one of these through BoundedMessage
+// before marshaling, so statusmodel.MaxMessageLen is an actual limit on what
+// gets sent, not just an assumption; only a non-standard client bypassing
+// BoundedMessage could exceed it. Measured worst case at that limit is about
+// 12.2 MiB; see TestMaxRegistryRequestBytesExceedsLargestValidHeartbeat, which
 // fails if the bounds grow past this cap.
 const maxRegistryRequestBytes = 16 << 20
 
@@ -385,6 +393,26 @@ func validateAgentStatus(status statusmodel.AgentStatus) error {
 	if !validStatusPhase(status.Phase) {
 		return fmt.Errorf("agent_status phase %q is invalid", status.Phase)
 	}
+	if len(status.AgentVersion) > statusmodel.MaxAgentVersionLen {
+		return fmt.Errorf("agent_status.agent_version exceeds %d bytes", statusmodel.MaxAgentVersionLen)
+	}
+	// status.NodeID is deliberately not length-checked: it must already equal
+	// the mTLS-authenticated nodeID (checked above this function, in
+	// applyHeartbeatAgentStatus) or be empty, so it contributes nothing to
+	// the MaxServices/config.MaxServiceVolumes multiplication this bounding
+	// pass exists for — it appears once per heartbeat, not per service or
+	// volume — and node IDs are not independently length-bounded at
+	// enrollment, so adding a cap here risks rejecting (and so silently
+	// dropping the telemetry of) a legitimately longer node ID for no size
+	// benefit.
+	// Message is deliberately not length-checked here: it is optional
+	// free-text telemetry that applyHeartbeatAgentStatus truncates to
+	// statusmodel.MaxMessageLen with BoundedMessage after validation succeeds
+	// (see TestApplyHeartbeatAgentStatusValidatesIdentityAndBoundsMessages),
+	// the same accept-then-truncate contract as Condition.Message,
+	// ServiceStatus.Message, and VolumeStatus.LastError below. What
+	// maxRegistryRequestBytes actually depends on is bounding the fields that
+	// have no truncation fallback — see validateVolumeStatus.
 	for _, revision := range []string{status.DesiredRevision, status.PlacementRevision, status.ObservedRevision, status.AppliedRevision} {
 		if len(revision) > statusmodel.MaxRevisionLen {
 			return fmt.Errorf("agent_status revision exceeds %d bytes", statusmodel.MaxRevisionLen)
@@ -418,13 +446,60 @@ func validateAgentStatus(status statusmodel.AgentStatus) error {
 		if !validReasonCode(service.ReasonCode) {
 			return fmt.Errorf("agent_status service %q has invalid reason code", service.Name)
 		}
+		if len(service.VMState) > statusmodel.MaxEnumLen {
+			return fmt.Errorf("agent_status service %q vm_state exceeds %d bytes", service.Name, statusmodel.MaxEnumLen)
+		}
+		if len(service.Health) > statusmodel.MaxEnumLen {
+			return fmt.Errorf("agent_status service %q health exceeds %d bytes", service.Name, statusmodel.MaxEnumLen)
+		}
+		if len(service.HealthCheckType) > statusmodel.MaxEnumLen {
+			return fmt.Errorf("agent_status service %q health_check_type exceeds %d bytes", service.Name, statusmodel.MaxEnumLen)
+		}
+		if len(service.NetworkAddress) > statusmodel.MaxNetworkAddressLen {
+			return fmt.Errorf("agent_status service %q network_address exceeds %d bytes", service.Name, statusmodel.MaxNetworkAddressLen)
+		}
 		if len(service.Volumes) > config.MaxServiceVolumes {
 			return fmt.Errorf("agent_status service %q has too many volumes", service.Name)
+		}
+		for _, volume := range service.Volumes {
+			if err := validateVolumeStatus(service.Name, volume); err != nil {
+				return err
+			}
 		}
 	}
 	if !validReasonCode(status.ReasonCode) {
 		return fmt.Errorf("agent_status has invalid reason code")
 	}
+	return nil
+}
+
+// validateVolumeStatus bounds every VolumeStatus string field. A service can
+// carry up to config.MaxServiceVolumes of these and there can be up to
+// statusmodel.MaxServices services in one heartbeat, so an unbounded field
+// here is what would actually let a "valid" heartbeat exceed
+// maxRegistryRequestBytes: see TestMaxRegistryRequestBytesExceedsLargestValidHeartbeat.
+func validateVolumeStatus(serviceName string, volume statusmodel.VolumeStatus) error {
+	if len(volume.LogicalID) > statusmodel.MaxLogicalIDLen {
+		return fmt.Errorf("agent_status service %q volume logical_id exceeds %d bytes", serviceName, statusmodel.MaxLogicalIDLen)
+	}
+	if len(volume.Type) > statusmodel.MaxEnumLen {
+		return fmt.Errorf("agent_status service %q volume type exceeds %d bytes", serviceName, statusmodel.MaxEnumLen)
+	}
+	if len(volume.MountPath) > statusmodel.MaxMountPathLen {
+		return fmt.Errorf("agent_status service %q volume mount_path exceeds %d bytes", serviceName, statusmodel.MaxMountPathLen)
+	}
+	if len(volume.BoundNode) > statusmodel.MaxVolumeIDLen {
+		return fmt.Errorf("agent_status service %q volume bound_node exceeds %d bytes", serviceName, statusmodel.MaxVolumeIDLen)
+	}
+	if len(volume.SharedBackendID) > statusmodel.MaxVolumeIDLen {
+		return fmt.Errorf("agent_status service %q volume shared_backend_id exceeds %d bytes", serviceName, statusmodel.MaxVolumeIDLen)
+	}
+	if len(volume.State) > statusmodel.MaxEnumLen {
+		return fmt.Errorf("agent_status service %q volume state exceeds %d bytes", serviceName, statusmodel.MaxEnumLen)
+	}
+	// LastError, like Message elsewhere in AgentStatus, is accept-then-
+	// truncate rather than rejected: applyHeartbeatAgentStatus runs it
+	// through BoundedMessage after validation succeeds.
 	return nil
 }
 

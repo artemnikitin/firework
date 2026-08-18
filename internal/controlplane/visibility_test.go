@@ -473,6 +473,42 @@ func TestRevisionStatusAllowsEmptyDesiredRevisionToConverge(t *testing.T) {
 	}
 }
 
+// TestRevisionStatusDoesNotConvergeEmptyDesiredRevisionUntilKnownNodesConfirm
+// covers the gap TestRevisionStatusAllowsEmptyDesiredRevisionToConverge does
+// not: a node the control plane already knows about, still reporting the
+// previous non-empty revision. publishRendered deletes that node's
+// nodes/<node>.yaml instead of publishing an explicit empty config, so the
+// agent's fetch 404s, it treats that as a fetch failure, and it keeps
+// whatever it last applied running — the node's heartbeat never advances to
+// this revision. Reporting converged here would go green while node-1's old
+// workload is still up.
+func TestRevisionStatusDoesNotConvergeEmptyDesiredRevisionUntilKnownNodesConfirm(t *testing.T) {
+	ctx := context.Background()
+	store := newBlobStateStore(newMemBlob())
+	cfg := validConfigForRole(RoleAPI)
+	cfg.NodeStaleTTL = time.Minute
+	now := time.Now().UTC()
+
+	desired := DesiredRevision{Revision: "desired-empty", Services: []config.ServiceConfig{}}
+	placement := PlacementRevision{Revision: "placement-empty", DesiredRevision: desired.Revision, NodeConfigs: []config.NodeConfig{}}
+	putCurrentState(t, ctx, store, desired, placement, "rendered-empty")
+
+	stale := currentAgentStatus(statusmodel.PhaseReady, "rendered-1")
+	stale.ObservedAt = now
+	putNode(t, ctx, store, cfg, NodeRecord{NodeID: "node-1", State: NodeStateReady, LastSeenAt: now, AgentStatus: stale})
+
+	status, err := NewVisibilityService(cfg, store).Revision(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if status.Phase == "converged" {
+		t.Fatalf("empty desired revision reported converged before node-1 confirmed it: %#v", status)
+	}
+	if status.RelevantNodes != 1 {
+		t.Fatalf("known node-1 was not counted as relevant for the empty revision: %#v", status)
+	}
+}
+
 func TestRevisionStatusReportsRenderedPublicationInProgress(t *testing.T) {
 	ctx := context.Background()
 	store := newBlobStateStore(newMemBlob())

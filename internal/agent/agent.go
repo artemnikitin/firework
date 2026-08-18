@@ -111,7 +111,7 @@ func New(cfg config.AgentConfig, s store.Store, logger *slog.Logger) *Agent {
 		networkMgr = network.NewManager(logger)
 	}
 
-	rec := reconciler.New(vmMgr, logger, healthMon, networkMgr, cfg.UpdateStrategy, cfg.UpdateDelay)
+	rec := reconciler.New(vmMgr, logger, healthMon, networkMgr, cfg.UpdateStrategy, cfg.UpdateDelay).WithStateDir(cfg.StateDir)
 
 	// Initialize shared bridge and masquerade if network setup is enabled.
 	if networkMgr != nil && cfg.VMBridge != "" {

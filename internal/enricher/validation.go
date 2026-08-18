@@ -149,6 +149,16 @@ func validateVolumes(ve *ValidationError, svc ServiceSpec) {
 		} else if forbiddenVolumeMount(cleaned) {
 			ve.addf("%s: mount_path %q is reserved", prefix, cleaned)
 		}
+		// The registry rejects any reported mount_path over this length and
+		// discards the whole agent_status with it (statusmodel.MaxMountPathLen,
+		// enforced in controlplane's validateVolumeStatus). Accepting a longer
+		// path here would produce a service that runs while every heartbeat
+		// carrying it is dropped, leaving the node permanently unknown in fleet
+		// visibility — the same reasoning as the service-name check above.
+		if len(volume.MountPath) > statusmodel.MaxMountPathLen {
+			ve.addf("%s: mount_path is %d bytes, exceeding the %d-byte limit for reported mount paths",
+				prefix, len(volume.MountPath), statusmodel.MaxMountPathLen)
+		}
 		if other, exists := paths[cleaned]; exists {
 			ve.addf("service %s volumes %s and %s: duplicate mount_path %q", svc.Name, other, volume.Name, cleaned)
 		}

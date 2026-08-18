@@ -671,14 +671,34 @@ func (s visibilitySnapshot) revisionStatus() RevisionStatus {
 	}
 
 	if len(relevant) == 0 {
-		if len(s.desired.Services) == 0 {
+		if len(s.desired.Services) != 0 {
+			status.Phase = "failed"
+			status.ReasonCode = "no_relevant_nodes"
+			status.Message = "non-empty desired revision has no rendered node assignments"
+			return status
+		}
+		// An empty desired revision has no placement to converge, but
+		// publishRendered deletes nodes/<node>.yaml for a node no longer
+		// relevant instead of publishing an explicit empty config. An agent
+		// that fetches a missing file treats it as a fetch failure and keeps
+		// every VM and route it already had running, so an empty placement
+		// proves nothing about what is actually running: reporting converged
+		// here on the strength of nothing left to place would go green while
+		// old workloads stay up. Require every node this control plane has a
+		// record for to confirm, via a fresh heartbeat that has actually
+		// observed this revision, that it is not silently still running the
+		// previous desired state — fall through into the per-node loop below
+		// with every known node treated as relevant, so a node stuck on a
+		// stale desired/placement/observed revision is bucketed the same way
+		// it would be for any other unconverged revision.
+		for nodeID := range s.nodeByID {
+			relevant[nodeID] = struct{}{}
+		}
+		status.RelevantNodes = len(relevant)
+		if len(relevant) == 0 {
 			status.Phase = "converged"
 			return status
 		}
-		status.Phase = "failed"
-		status.ReasonCode = "no_relevant_nodes"
-		status.Message = "non-empty desired revision has no rendered node assignments"
-		return status
 	}
 
 	observedCurrent := false
