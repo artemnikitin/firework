@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/artemnikitin/firework/internal/ingress"
+	"github.com/artemnikitin/firework/internal/statusmodel"
 	"gopkg.in/yaml.v3"
 )
 
@@ -110,6 +111,20 @@ func LoadAgentConfig(path string) (AgentConfig, error) {
 		if cfg.NodeID == "" {
 			return cfg, fmt.Errorf("node_id is required when registry_url is set")
 		}
+		// A scheduler-assigned local volume's VolumeStatus.BoundNode is this
+		// node ID verbatim (see internal/scheduler's node.InstanceID
+		// assignment), and the control plane matches it for exact equality
+		// against the node record (internal/controlplane/visibility.go). The
+		// registry also rejects a heartbeat whose BoundNode exceeds
+		// statusmodel.MaxVolumeIDLen outright. Reject an overlong node_id
+		// here, at the boundary where it is first configured, rather than
+		// truncating it later on the send path: a truncated BoundNode would
+		// silently stop matching the real node and break that comparison
+		// instead of just losing telemetry precision.
+		if len(cfg.NodeID) > statusmodel.MaxVolumeIDLen {
+			return cfg, fmt.Errorf("node_id is %d bytes, exceeding the %d-byte limit enforced on reported volume bound_node",
+				len(cfg.NodeID), statusmodel.MaxVolumeIDLen)
+		}
 	}
 
 	if cfg.Storage.Local != nil {
@@ -123,8 +138,19 @@ func LoadAgentConfig(path string) (AgentConfig, error) {
 		cfg.Storage.Local.CapacityBytes = capacity
 	}
 	if cfg.Storage.Shared != nil {
-		if strings.TrimSpace(cfg.Storage.Shared.BackendID) == "" {
+		cfg.Storage.Shared.BackendID = strings.TrimSpace(cfg.Storage.Shared.BackendID)
+		if cfg.Storage.Shared.BackendID == "" {
 			return cfg, fmt.Errorf("storage.shared.backend_id is required")
+		}
+		// Copied verbatim into every shared volume's VolumeStatus.SharedBackendID
+		// (internal/agent/registry_client.go, internal/scheduler) and matched
+		// for exact equality against the node record's backend ID
+		// (internal/controlplane/visibility.go). Same reasoning as node_id
+		// above: reject an overlong value here rather than truncating it on
+		// the send path, where truncation would silently break that match.
+		if len(cfg.Storage.Shared.BackendID) > statusmodel.MaxVolumeIDLen {
+			return cfg, fmt.Errorf("storage.shared.backend_id is %d bytes, exceeding the %d-byte limit enforced on reported volume shared_backend_id",
+				len(cfg.Storage.Shared.BackendID), statusmodel.MaxVolumeIDLen)
 		}
 		if err := validateStoragePath("storage.shared.path", cfg.Storage.Shared.Path); err != nil {
 			return cfg, err

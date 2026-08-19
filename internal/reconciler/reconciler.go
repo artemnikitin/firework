@@ -68,19 +68,66 @@ type Reconciler struct {
 	updateDelay     time.Duration
 	sleepFn         func(context.Context, time.Duration) error
 	pendingRecovery map[string]struct{}
-	// pendingTeardowns holds services whose VM was already removed but whose
-	// host network/port-forward teardown failed, keyed by service name. Once
-	// Remove succeeds the service leaves both desired and actual state, so
-	// Plan produces no further delete action for it — retryPendingTeardowns
-	// is the only thing that will ever finish (or keep retrying) that
-	// cleanup, on this tick and every tick after until it succeeds. Persisted
-	// to stateDir (when set) so a pure-delete's pending cleanup survives an
-	// agent restart; see WithStateDir.
-	pendingTeardowns map[string]config.ServiceConfig
-	// stateDir, when non-empty, is where pendingTeardowns is persisted. Set
-	// via WithStateDir; empty by default, which keeps pendingTeardowns
-	// in-memory only (used throughout the test suite).
+	// pendingPortForwards holds every DNAT rule whose teardown has failed,
+	// keyed by the rule's own (hostPort, guestIP, vmPort) identity — not by
+	// service name. A service can pass through several configs in a row
+	// before an earlier teardown ever succeeds (A -> B -> C); keying by name
+	// would let generation B's delete (success or failure) overwrite or
+	// erase generation A's still-pending entry, silently losing track of
+	// A's obsolete rule. Each rule's identity is independent, so each gets
+	// its own entry and its own retry history. See retryPendingPortForwards.
+	pendingPortForwards map[portForwardKey]pendingPortForward
+	// pendingNetworkTeardowns holds service names whose network device (tap)
+	// teardown failed, keyed by name. Unlike port forwards, the tap device
+	// path is derived purely from the service name — not from any other
+	// config field — so unlike pendingPortForwards a later generation's
+	// entry for the same name is not a distinct resource to track
+	// separately; there is only ever one outstanding tap device per name,
+	// and any generation's config snapshot computes the same path to retry
+	// it with. See retryPendingNetworkTeardowns.
+	pendingNetworkTeardowns map[string]config.ServiceConfig
+	// Once Remove succeeds a service leaves both desired and actual state,
+	// so Plan produces no further delete action for it — retryPendingTeardowns
+	// (which retries both maps above) is the only thing that will ever
+	// finish, or keep retrying, that cleanup, on this tick and every tick
+	// after until it succeeds. Both maps are persisted to stateDir (when
+	// set) so pending cleanup survives an agent restart; see WithStateDir.
+	//
+	// stateDir, when non-empty, is where they are persisted. Set via
+	// WithStateDir; empty by default, which keeps everything in-memory only
+	// (used throughout the test suite).
 	stateDir string
+	// journalCorrupt is set by WithStateDir when the persisted journal
+	// exists but cannot be read or parsed. It permanently fails every
+	// Reconcile call and blocks further journal writes for the life of this
+	// process: silently proceeding with an empty pending set would let the
+	// node report converged while whatever was actually pending before the
+	// corruption — quite possibly a still-live obsolete DNAT rule — goes
+	// forever unrecovered. Recovery is manual: stop the agent, inspect and
+	// remove <stateDir>/pending_teardowns.json, restart.
+	journalCorrupt bool
+}
+
+// pendingPortForward is one DNAT rule whose teardown has failed and must
+// keep being retried until it succeeds, independent of whatever the named
+// service's current (possibly several generations later) config claims.
+type pendingPortForward struct {
+	ServiceName string             `json:"service_name"`
+	GuestIP     string             `json:"guest_ip"`
+	PortForward config.PortForward `json:"port_forward"`
+}
+
+func (p pendingPortForward) key() portForwardKey {
+	return portForwardKey{p.PortForward.HostPort, p.GuestIP, p.PortForward.VMPort}
+}
+
+// persistedPendingTeardowns is the on-disk shape of pendingPortForwards and
+// pendingNetworkTeardowns. Port forwards are a slice, not a map, because
+// their natural key (portForwardKey) is a struct and encoding/json requires
+// string map keys.
+type persistedPendingTeardowns struct {
+	PortForwards []pendingPortForward            `json:"port_forwards,omitempty"`
+	Network      map[string]config.ServiceConfig `json:"network,omitempty"`
 }
 
 // New creates a new Reconciler. The healthMon and networkMgr parameters are
@@ -101,14 +148,15 @@ func New(vmManager VMManager, logger *slog.Logger, healthMon *healthcheck.Monito
 // faked when exercising the agent's tick paths.
 func NewWithNetworkManager(vmManager VMManager, logger *slog.Logger, healthMon *healthcheck.Monitor, networkMgr NetworkManager, updateStrategy string, updateDelay time.Duration) *Reconciler {
 	return &Reconciler{
-		vmManager:        vmManager,
-		healthMon:        healthMon,
-		networkMgr:       networkMgr,
-		logger:           logger,
-		updateStrategy:   updateStrategy,
-		updateDelay:      updateDelay,
-		pendingRecovery:  make(map[string]struct{}),
-		pendingTeardowns: make(map[string]config.ServiceConfig),
+		vmManager:               vmManager,
+		healthMon:               healthMon,
+		networkMgr:              networkMgr,
+		logger:                  logger,
+		updateStrategy:          updateStrategy,
+		updateDelay:             updateDelay,
+		pendingRecovery:         make(map[string]struct{}),
+		pendingPortForwards:     make(map[portForwardKey]pendingPortForward),
+		pendingNetworkTeardowns: make(map[string]config.ServiceConfig),
 		sleepFn: func(ctx context.Context, d time.Duration) error {
 			select {
 			case <-time.After(d):
@@ -121,55 +169,90 @@ func NewWithNetworkManager(vmManager VMManager, logger *slog.Logger, healthMon *
 }
 
 // pendingTeardownsFile is the name, under stateDir, of the file that
-// persists pendingTeardowns across an agent restart.
+// persists pendingPortForwards and pendingNetworkTeardowns across an agent
+// restart.
 const pendingTeardownsFile = "pending_teardowns.json"
 
-// WithStateDir enables persisting pendingTeardowns to
-// <dir>/pending_teardowns.json, so a pure delete's host cleanup survives an
-// agent restart between a failed teardown and its retry — without this, that
-// entry only ever lived in memory and a restart silently forgot it, leaving
-// the obsolete host rule with nothing left to notice it. Loads any existing
-// file immediately; the first Reconcile call retries whatever it finds.
-// Returns r so it can be chained onto New/NewWithNetworkManager; a Reconciler
-// that never calls this behaves exactly as before, tracking pending
-// teardowns in memory only (the default in tests).
+// WithStateDir enables persisting pending teardown state to
+// <dir>/pending_teardowns.json, so cleanup survives an agent restart between
+// a failed teardown and its retry — without this, that entry only ever lived
+// in memory and a restart silently forgot it, leaving the obsolete host rule
+// with nothing left to notice it. Loads any existing file immediately; the
+// first Reconcile call retries whatever it finds. If the file exists but
+// cannot be read or parsed, this sets journalCorrupt instead of silently
+// continuing with an empty set — see its doc comment. Returns r so it can be
+// chained onto New/NewWithNetworkManager; a Reconciler that never calls this
+// behaves exactly as before, tracking pending teardowns in memory only (the
+// default in tests).
 func (r *Reconciler) WithStateDir(dir string) *Reconciler {
 	r.stateDir = dir
 	if dir == "" {
 		return r
 	}
-	data, err := os.ReadFile(filepath.Join(dir, pendingTeardownsFile))
+	path := filepath.Join(dir, pendingTeardownsFile)
+	data, err := os.ReadFile(path)
 	if err != nil {
 		if !os.IsNotExist(err) {
-			r.logger.Warn("failed to load persisted pending teardowns", "error", err)
+			// A read failure other than "file does not exist" (permission
+			// denied, I/O error) cannot be distinguished from "a journal
+			// existed and is now unreadable", so it gets the same fail-closed
+			// treatment as a parse failure below.
+			r.logger.Error("pending teardowns journal unreadable; this node will not report converged until it is resolved manually",
+				"path", path, "error", err)
+			r.journalCorrupt = true
 		}
 		return r
 	}
-	var loaded map[string]config.ServiceConfig
+	var loaded persistedPendingTeardowns
 	if err := json.Unmarshal(data, &loaded); err != nil {
-		r.logger.Warn("failed to parse persisted pending teardowns", "error", err)
+		r.logger.Error("pending teardowns journal is corrupt; this node will not report converged until it is resolved manually",
+			"path", path, "error", err)
+		r.journalCorrupt = true
 		return r
 	}
-	for name, svc := range loaded {
-		r.pendingTeardowns[name] = svc
+	for _, entry := range loaded.PortForwards {
+		r.pendingPortForwards[entry.key()] = entry
+	}
+	for name, svc := range loaded.Network {
+		r.pendingNetworkTeardowns[name] = svc
 	}
 	return r
 }
 
-// persistPendingTeardowns writes the current pendingTeardowns to stateDir, or
-// removes the file once it is empty. A no-op when stateDir is unset.
+// persistPendingTeardowns writes pendingPortForwards and
+// pendingNetworkTeardowns to stateDir as one atomic replacement of the
+// journal file, or removes the file once both are empty. A no-op when
+// stateDir is unset, and a no-op (deliberately, not a best-effort write)
+// once journalCorrupt is set: overwriting an unreadable journal with a fresh
+// but incomplete one would erase the evidence an operator needs to diagnose
+// what was actually pending before the corruption.
 func (r *Reconciler) persistPendingTeardowns() {
-	if r.stateDir == "" {
+	if r.stateDir == "" || r.journalCorrupt {
 		return
 	}
 	path := filepath.Join(r.stateDir, pendingTeardownsFile)
-	if len(r.pendingTeardowns) == 0 {
+	if len(r.pendingPortForwards) == 0 && len(r.pendingNetworkTeardowns) == 0 {
 		if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
 			r.logger.Warn("failed to remove empty pending teardowns file", "error", err)
 		}
 		return
 	}
-	data, err := json.Marshal(r.pendingTeardowns)
+	persisted := persistedPendingTeardowns{Network: r.pendingNetworkTeardowns}
+	for _, entry := range r.pendingPortForwards {
+		persisted.PortForwards = append(persisted.PortForwards, entry)
+	}
+	sort.Slice(persisted.PortForwards, func(i, j int) bool {
+		a, b := persisted.PortForwards[i], persisted.PortForwards[j]
+		if a.PortForward.HostPort != b.PortForward.HostPort {
+			return a.PortForward.HostPort < b.PortForward.HostPort
+		}
+		if a.GuestIP != b.GuestIP {
+			return a.GuestIP < b.GuestIP
+		}
+		return a.PortForward.VMPort < b.PortForward.VMPort
+	})
+
+	data, err := json.Marshal(persisted)
 	if err != nil {
 		r.logger.Warn("failed to marshal pending teardowns", "error", err)
 		return
@@ -178,9 +261,42 @@ func (r *Reconciler) persistPendingTeardowns() {
 		r.logger.Warn("failed to create state dir for pending teardowns", "error", err)
 		return
 	}
-	if err := os.WriteFile(path, data, 0o644); err != nil {
+	if err := atomicWriteFile(path, data, 0o644); err != nil {
 		r.logger.Warn("failed to persist pending teardowns", "error", err)
 	}
+}
+
+// atomicWriteFile replaces path with data as a single atomic operation: the
+// new content is written to a temporary file in the same directory (so the
+// rename below is within one filesystem and therefore atomic on POSIX),
+// fsynced, and only then renamed over path. A crash or power loss at any
+// point before the rename leaves the previous file, if any, completely
+// untouched — never the truncated-then-partially-written file
+// os.WriteFile's truncate-then-write can leave when interrupted mid-write.
+func atomicWriteFile(path string, data []byte, perm os.FileMode) error {
+	dir := filepath.Dir(path)
+	tmp, err := os.CreateTemp(dir, ".pending-teardowns-*.tmp")
+	if err != nil {
+		return err
+	}
+	tmpPath := tmp.Name()
+	defer os.Remove(tmpPath) // no-op once the rename below succeeds
+
+	if _, err := tmp.Write(data); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Sync(); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	if err := os.Chmod(tmpPath, perm); err != nil {
+		return err
+	}
+	return os.Rename(tmpPath, path)
 }
 
 // Plan computes the list of actions needed to reach the desired state.
@@ -362,6 +478,15 @@ func (r *Reconciler) preflight(ctx context.Context, svc config.ServiceConfig) er
 // Reconcile is a convenience method that plans and applies in one step.
 func (r *Reconciler) Reconcile(ctx context.Context, desired config.NodeConfig) error {
 	var errs []error
+	if r.journalCorrupt {
+		// Deliberately does not skip the rest of Reconcile: VMs and port
+		// forwards still converge normally, only the convergence *signal*
+		// is permanently poisoned until an operator resolves the journal by
+		// hand. See journalCorrupt's doc comment on the Reconciler struct.
+		errs = append(errs, stageError(FailureStageNetwork,
+			fmt.Errorf("pending teardowns journal at %s is corrupt or unreadable; manual recovery required before this node can report convergence",
+				filepath.Join(r.stateDir, pendingTeardownsFile))))
+	}
 	if recoverer, ok := r.vmManager.(vmRecoverer); ok {
 		adopted, err := recoverer.Recover(ctx, desired)
 		for _, name := range adopted {
@@ -403,12 +528,13 @@ func (r *Reconciler) Reconcile(ctx context.Context, desired config.NodeConfig) e
 	if err := r.syncPortForwards(desired); err != nil {
 		errs = append(errs, err)
 	}
-	// Retry host cleanup for every service whose VM removal outran its
-	// teardown, on this tick's fresh deletes and any left over from earlier
-	// ticks alike. This must run after Plan/Apply above: Plan only diffs
-	// desired against actual VMs, and a service that finished being removed
-	// on this or an earlier tick is absent from both, so this is the only
-	// remaining path that will ever finish tearing down its host rules.
+	// Retry host cleanup for every port forward and network device whose
+	// teardown outran a VM removal, on this tick's fresh deletes and any
+	// left over from earlier ticks alike. This must run after Plan/Apply
+	// above: Plan only diffs desired against actual VMs, and a service that
+	// finished being removed on this or an earlier tick is absent from
+	// both, so this is the only remaining path that will ever finish
+	// tearing down its host rules.
 	if err := r.retryPendingTeardowns(); err != nil {
 		errs = append(errs, err)
 	}
@@ -557,68 +683,68 @@ func (r *Reconciler) deleteService(svc config.ServiceConfig) error {
 		r.healthMon.Deregister(svc.Name)
 	}
 
-	// A teardown failure here is not returned: the update path skips the
+	// Neither teardown failure here is returned: the update path skips the
 	// recreate when this function errors, and a transient teardown failure
 	// must not leave a service deleted. The VM is already gone, though, so
 	// this is the last tick that will ever see svc as a Plan delete action —
-	// record it so retryPendingTeardowns keeps retrying the host cleanup on
-	// every later tick until it actually succeeds, instead of the failure
-	// being logged once and never revisited. At this exact point nothing is
-	// running under svc.Name yet (Remove just succeeded, and any recreate
-	// under an update happens after this call returns), so the full teardown
-	// — network device included — is safe unconditionally; only
-	// retryPendingTeardowns, which can run after that recreate has happened,
-	// needs to be more careful about what it repeats.
-	if err := r.teardownHostResources(svc); err != nil {
-		r.logger.Warn("failed to tear down host resources; will retry", "service", svc.Name, "error", err)
-		r.pendingTeardowns[svc.Name] = svc
-		r.persistPendingTeardowns()
-		return nil
+	// a failure is recorded so retryPendingTeardowns keeps retrying it on
+	// every later tick until it actually succeeds, instead of being logged
+	// once and never revisited. At this exact point nothing is running
+	// under svc.Name yet (Remove just succeeded, and any recreate under an
+	// update happens after this call returns), so tearing down everything
+	// unconditionally is safe here; only the retry path, which can run
+	// after that recreate has happened, needs to be more careful about what
+	// it repeats.
+	var errs []error
+	if err := r.teardownAndTrackPortForwards(svc, svc.PortForwards); err != nil {
+		errs = append(errs, err)
 	}
-	delete(r.pendingTeardowns, svc.Name)
+	if err := r.teardownAndTrackNetwork(svc); err != nil {
+		errs = append(errs, err)
+	}
 	r.persistPendingTeardowns()
+	if len(errs) > 0 {
+		r.logger.Warn("failed to tear down host resources; will retry", "service", svc.Name, "error", combineErrors(errs))
+	}
 	return nil
 }
 
-// teardownHostResources removes both the port-forward and network resources
-// for a service that is not currently running under that name. Called from
-// deleteService and from retryPendingTeardowns' not-running branch; every
-// step must be safe to repeat, since either caller may be retrying an
-// earlier failure: TeardownPortForward and Teardown both tolerate a rule or
-// device that is already gone.
-//
-// Must not be called for a name that has a live VM again — see
-// retryPendingTeardowns for why that case instead calls teardownPortForwards
-// directly, with only the specific obsolete entries.
-func (r *Reconciler) teardownHostResources(svc config.ServiceConfig) error {
-	var errs []error
-	if err := r.teardownPortForwards(svc, svc.PortForwards); err != nil {
-		errs = append(errs, err)
-	}
-	if r.networkMgr != nil {
-		if err := r.networkMgr.Teardown(svc); err != nil {
-			errs = append(errs, stageError(FailureStageNetwork,
-				fmt.Errorf("teardown network for %s: %w", svc.Name, err)))
-		}
-	}
-	return combineErrors(errs)
-}
-
-// teardownPortForwards removes exactly the given port forwards for svc's
-// guest IP. A no-op if svc has no network (the same guard teardownHostResources
-// used to apply inline).
-func (r *Reconciler) teardownPortForwards(svc config.ServiceConfig, pfs []config.PortForward) error {
+// teardownAndTrackPortForwards tears down each of pfs for svc's guest IP.
+// Each one is tracked independently, by its own (hostPort, guestIP, vmPort)
+// identity: a failure adds (or refreshes) its pendingPortForwards entry, a
+// success clears any entry under that same key, whichever generation of
+// svc.Name originally recorded it. A no-op if svc has no network.
+func (r *Reconciler) teardownAndTrackPortForwards(svc config.ServiceConfig, pfs []config.PortForward) error {
 	if r.networkMgr == nil || svc.Network == nil || len(pfs) == 0 {
 		return nil
 	}
 	var errs []error
 	for _, pf := range pfs {
+		key := portForwardKey{pf.HostPort, svc.Network.GuestIP, pf.VMPort}
 		if err := r.networkMgr.TeardownPortForward(pf.HostPort, svc.Network.GuestIP, pf.VMPort); err != nil {
+			r.pendingPortForwards[key] = pendingPortForward{ServiceName: svc.Name, GuestIP: svc.Network.GuestIP, PortForward: pf}
 			errs = append(errs, stageError(FailureStageNetwork,
 				fmt.Errorf("teardown port forward %d for %s: %w", pf.HostPort, svc.Name, err)))
+			continue
 		}
+		delete(r.pendingPortForwards, key)
 	}
 	return combineErrors(errs)
+}
+
+// teardownAndTrackNetwork tears down svc's network device (tap), tracking
+// the outcome in pendingNetworkTeardowns keyed by svc.Name. A no-op if there
+// is no network manager.
+func (r *Reconciler) teardownAndTrackNetwork(svc config.ServiceConfig) error {
+	if r.networkMgr == nil {
+		return nil
+	}
+	if err := r.networkMgr.Teardown(svc); err != nil {
+		r.pendingNetworkTeardowns[svc.Name] = svc
+		return stageError(FailureStageNetwork, fmt.Errorf("teardown network for %s: %w", svc.Name, err))
+	}
+	delete(r.pendingNetworkTeardowns, svc.Name)
+	return nil
 }
 
 // portForwardKey identifies a single DNAT rule the way TeardownPortForward
@@ -642,54 +768,11 @@ func portForwardKeys(svc config.ServiceConfig) map[portForwardKey]struct{} {
 	return keys
 }
 
-// obsoletePortForwards returns the entries of old.PortForwards whose
-// (hostPort, guestIP, vmPort) key is not also claimed by current — the
-// specific DNAT rules that describe a destination current no longer uses. A
-// rule current still claims is excluded even though old also lists it: that
-// rule now belongs to current, and tearing it down would break the live
-// service, not clean up an obsolete one.
-func obsoletePortForwards(old, current config.ServiceConfig) []config.PortForward {
-	if old.Network == nil || len(old.PortForwards) == 0 {
-		return nil
-	}
-	live := portForwardKeys(current)
-	var obsolete []config.PortForward
-	for _, pf := range old.PortForwards {
-		key := portForwardKey{pf.HostPort, old.Network.GuestIP, pf.VMPort}
-		if _, stillLive := live[key]; !stillLive {
-			obsolete = append(obsolete, pf)
-		}
-	}
-	return obsolete
-}
-
-// retryPendingTeardowns retries host cleanup for every service recorded in
-// pendingTeardowns, on this tick's fresh deletes and any left over from
-// earlier ticks (or, with WithStateDir, an earlier agent process) alike.
-// Anything still pending after this pass is returned as an error, so a tick
-// cannot be reported converged while a service's teardown is still failing
-// outright.
-//
-// A name currently running a VM again — a later create or update reclaimed
-// it — is handled differently from a name that stayed deleted:
-//
-//   - The live VM's own network device (tap) was already (re-)established by
-//     that create's Setup call and must never be torn down here: Teardown is
-//     keyed purely by service name, so calling it now would delete the live
-//     VM's own device, not an obsolete one.
-//   - Port forwards are keyed by the full (hostPort, guestIP, vmPort) tuple,
-//     though, so an old rule the live config no longer claims is a distinct,
-//     genuinely obsolete rule — obsoletePortForwards computes exactly that
-//     set — and is still torn down and still kept pending until it is.
-//
-// pendingTeardowns is persisted via persistPendingTeardowns when WithStateDir
-// was called; otherwise it is in-memory only and a restart between a failed
-// delete's teardown and its retry loses that entry, same as before this
-// method existed at all. A persist write failure degrades the same way: the
-// entry stays correct in memory and keeps retrying this tick and every tick
-// after, it just is not durable against a restart until a later write
-// succeeds — never worse than pre-WithStateDir behavior, only sometimes not
-// better.
+// retryPendingTeardowns retries both pendingPortForwards and
+// pendingNetworkTeardowns. See their respective retry methods for how each
+// is tracked and why they need different reclaimed-name handling. Anything
+// still pending after this pass keeps being returned as an error, so a tick
+// cannot be reported converged while a teardown is still failing outright.
 //
 // This method only runs from Reconcile, not from SyncPortForwards — so a
 // pending entry is only ever retried on a tick that actually reconciles.
@@ -700,12 +783,93 @@ func obsoletePortForwards(old, current config.ServiceConfig) []config.PortForwar
 // Once an entry clears, nothing forces another reconcile-path tick, but
 // nothing needs to either.
 func (r *Reconciler) retryPendingTeardowns() error {
-	if len(r.pendingTeardowns) == 0 {
+	var errs []error
+	if err := r.retryPendingPortForwards(); err != nil {
+		errs = append(errs, err)
+	}
+	if err := r.retryPendingNetworkTeardowns(); err != nil {
+		errs = append(errs, err)
+	}
+	return combineErrors(errs)
+}
+
+// retryPendingPortForwards retries every entry in pendingPortForwards, keyed
+// by the rule's own (hostPort, guestIP, vmPort) identity so that a service
+// passing through several configs before an earlier teardown ever succeeds
+// (A -> B -> C) cannot lose track of an older generation's still-obsolete
+// rule: each generation's failure gets its own entry, independent of
+// whatever entry.ServiceName's current config looks like.
+//
+// If entry.ServiceName is running again — a later create or update reclaimed
+// it — this rule is retried only if the live config no longer claims the
+// exact same (hostPort, guestIP, vmPort): if it does, this "pending" rule is
+// in fact the live service's current rule (most often because an update left
+// the port forward unchanged), and tearing it down would break it rather
+// than clean up anything obsolete.
+func (r *Reconciler) retryPendingPortForwards() error {
+	if r.networkMgr == nil || len(r.pendingPortForwards) == 0 {
 		return nil
 	}
 	running := r.vmManager.List()
-	names := make([]string, 0, len(r.pendingTeardowns))
-	for name := range r.pendingTeardowns {
+	keys := make([]portForwardKey, 0, len(r.pendingPortForwards))
+	for key := range r.pendingPortForwards {
+		keys = append(keys, key)
+	}
+	sort.Slice(keys, func(i, j int) bool {
+		a, b := keys[i], keys[j]
+		if a.hostPort != b.hostPort {
+			return a.hostPort < b.hostPort
+		}
+		if a.guestIP != b.guestIP {
+			return a.guestIP < b.guestIP
+		}
+		return a.vmPort < b.vmPort
+	})
+
+	var errs []error
+	changed := false
+	for _, key := range keys {
+		entry := r.pendingPortForwards[key]
+		if inst := running[entry.ServiceName]; inst != nil {
+			if _, stillLive := portForwardKeys(inst.Config)[key]; stillLive {
+				delete(r.pendingPortForwards, key)
+				changed = true
+				continue
+			}
+		}
+		if err := r.networkMgr.TeardownPortForward(key.hostPort, key.guestIP, key.vmPort); err != nil {
+			r.logger.Warn("port forward teardown still pending, will retry next tick",
+				"service", entry.ServiceName, "host_port", key.hostPort, "error", err)
+			errs = append(errs, stageError(FailureStageNetwork,
+				fmt.Errorf("teardown port forward %d for %s: %w", key.hostPort, entry.ServiceName, err)))
+			continue
+		}
+		delete(r.pendingPortForwards, key)
+		changed = true
+	}
+	if changed {
+		r.persistPendingTeardowns()
+	}
+	return combineErrors(errs)
+}
+
+// retryPendingNetworkTeardowns retries every entry in
+// pendingNetworkTeardowns, keyed by service name. Unlike port forwards, a
+// tap device's path is derived purely from the name, so there is at most one
+// outstanding device per name to track — no per-generation distinction is
+// needed here.
+//
+// If the name is running again — a later create or update reclaimed it —
+// its own Setup call already (re-)established this exact tap device; this
+// entry is dropped without ever calling Teardown, which would otherwise
+// delete the live VM's own device instead of an obsolete one.
+func (r *Reconciler) retryPendingNetworkTeardowns() error {
+	if r.networkMgr == nil || len(r.pendingNetworkTeardowns) == 0 {
+		return nil
+	}
+	running := r.vmManager.List()
+	names := make([]string, 0, len(r.pendingNetworkTeardowns))
+	for name := range r.pendingNetworkTeardowns {
 		names = append(names, name)
 	}
 	sort.Strings(names)
@@ -713,29 +877,18 @@ func (r *Reconciler) retryPendingTeardowns() error {
 	var errs []error
 	changed := false
 	for _, name := range names {
-		old := r.pendingTeardowns[name]
-		if inst := running[name]; inst != nil {
-			obsolete := obsoletePortForwards(old, inst.Config)
-			if len(obsolete) == 0 {
-				delete(r.pendingTeardowns, name)
-				changed = true
-				continue
-			}
-			if err := r.teardownPortForwards(old, obsolete); err != nil {
-				r.logger.Warn("stale port forward from a reclaimed service name still pending, will retry", "service", name, "error", err)
-				errs = append(errs, err)
-				continue
-			}
-			delete(r.pendingTeardowns, name)
+		if running[name] != nil {
+			delete(r.pendingNetworkTeardowns, name)
 			changed = true
 			continue
 		}
-		if err := r.teardownHostResources(old); err != nil {
-			r.logger.Warn("host teardown still pending, will retry next tick", "service", name, "error", err)
-			errs = append(errs, err)
+		svc := r.pendingNetworkTeardowns[name]
+		if err := r.networkMgr.Teardown(svc); err != nil {
+			r.logger.Warn("network teardown still pending, will retry next tick", "service", name, "error", err)
+			errs = append(errs, stageError(FailureStageNetwork, fmt.Errorf("teardown network for %s: %w", name, err)))
 			continue
 		}
-		delete(r.pendingTeardowns, name)
+		delete(r.pendingNetworkTeardowns, name)
 		changed = true
 	}
 	if changed {

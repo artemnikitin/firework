@@ -18,6 +18,10 @@ type fakeNetworkManager struct {
 	teardownForwardCalls []int
 	setupForwardErr      error
 	teardownForwardErr   error
+	// teardownForwardErrByPort overrides teardownForwardErr for a specific
+	// host port, so a test can make one port's teardown persistently fail
+	// while others succeed normally.
+	teardownForwardErrByPort map[int]error
 }
 
 func (f *fakeNetworkManager) Setup(config.ServiceConfig) error    { return nil }
@@ -30,6 +34,9 @@ func (f *fakeNetworkManager) SetupPortForward(hostPort int, _ string, _ int) err
 
 func (f *fakeNetworkManager) TeardownPortForward(hostPort int, _ string, _ int) error {
 	f.teardownForwardCalls = append(f.teardownForwardCalls, hostPort)
+	if err, ok := f.teardownForwardErrByPort[hostPort]; ok {
+		return err
+	}
 	return f.teardownForwardErr
 }
 
@@ -243,6 +250,86 @@ func TestReconcile_UpdateWithChangedPortKeepsRetryingStaleRule(t *testing.T) {
 	}
 }
 
+// The regression: pendingPortForwards used to be a single map keyed by
+// service name, so a service passing through several configs before an
+// earlier teardown ever recovered (A -> B -> C) would have the second
+// generation's delete either overwrite or erase the first generation's still
+// -pending entry. Keying by the rule's own (hostPort, guestIP, vmPort)
+// identity instead means each generation's obsolete rule gets its own entry,
+// independent of what happens to any other generation's.
+func TestReconcile_ConsecutiveUpdatesTrackEachGenerationsStaleRuleIndependently(t *testing.T) {
+	net := &fakeNetworkManager{teardownForwardErrByPort: map[int]error{8080: errors.New("rule missing")}}
+	r, vmMgr := newNetworkTestReconciler(net)
+
+	// A: port 8080.
+	a := forwardedService("web")
+	if err := r.Reconcile(context.Background(), config.NodeConfig{Node: "node-1", Services: []config.ServiceConfig{a}}); err != nil {
+		t.Fatalf("initial create: %v", err)
+	}
+
+	// A -> B: port 9090. Tearing down A's 8080 fails and must be tracked.
+	b := a
+	b.PortForwards = []config.PortForward{{HostPort: 9090, VMPort: 80}}
+	toB := config.NodeConfig{Node: "node-1", Services: []config.ServiceConfig{b}}
+	if err := r.Reconcile(context.Background(), toB); err == nil {
+		t.Fatal("expected A's stale 8080 rule to surface")
+	}
+	if len(r.pendingPortForwards) != 1 {
+		t.Fatalf("expected exactly one pending port forward after A->B, got %d: %#v", len(r.pendingPortForwards), r.pendingPortForwards)
+	}
+
+	// B -> C: port 9191. Tearing down B's 9090 succeeds. The bug: this used
+	// to overwrite or delete the single per-name entry, losing A's still-
+	// pending 8080 rule.
+	c := a
+	c.PortForwards = []config.PortForward{{HostPort: 9191, VMPort: 80}}
+	toC := config.NodeConfig{Node: "node-1", Services: []config.ServiceConfig{c}}
+	err := r.Reconcile(context.Background(), toC)
+	if err == nil {
+		t.Fatal("A's 8080 rule is still pending and must keep surfacing through the B->C update")
+	}
+	if !strings.Contains(err.Error(), "8080") {
+		t.Fatalf("error does not identify A's stale port: %v", err)
+	}
+
+	// A's entry must have survived, and only A's.
+	if len(r.pendingPortForwards) != 1 {
+		t.Fatalf("expected A's entry to be the only one still pending, got %d: %#v", len(r.pendingPortForwards), r.pendingPortForwards)
+	}
+	for _, entry := range r.pendingPortForwards {
+		if entry.PortForward.HostPort != 8080 {
+			t.Fatalf("wrong entry survived: %#v", entry)
+		}
+	}
+
+	// One more tick with nothing changed: 8080 must still be retried, and
+	// neither 9090 nor 9191 (both live-and-valid, or already resolved) may
+	// be touched again by the retry path.
+	callsBefore := len(net.teardownForwardCalls)
+	if err := r.Reconcile(context.Background(), toC); err == nil {
+		t.Fatal("A's stale rule must keep failing the tick")
+	}
+	for _, hp := range net.teardownForwardCalls[callsBefore:] {
+		if hp != 8080 {
+			t.Fatalf("retry touched an unrelated port forward: %d", hp)
+		}
+	}
+
+	// Once A's rule is finally torn down, the tick converges and C keeps
+	// running on its own port.
+	delete(net.teardownForwardErrByPort, 8080)
+	if err := r.Reconcile(context.Background(), toC); err != nil {
+		t.Fatalf("tick should converge once A's stale rule is torn down: %v", err)
+	}
+	if len(r.pendingPortForwards) != 0 {
+		t.Fatalf("expected no pending port forwards left, got %#v", r.pendingPortForwards)
+	}
+	inst, running := vmMgr.instances["web"]
+	if !running || len(inst.Config.PortForwards) != 1 || inst.Config.PortForwards[0].HostPort != 9191 {
+		t.Fatalf("service C not left running on its own port: %#v", vmMgr.instances["web"])
+	}
+}
+
 // The regression: pendingTeardowns previously lived in memory only, so an
 // agent restart between a failed delete's teardown and its retry silently
 // forgot the obsolete host rule with nothing left to notice it. WithStateDir
@@ -281,6 +368,84 @@ func TestWithStateDir_PersistsPendingTeardownAcrossRestart(t *testing.T) {
 	}
 	if _, err := os.Stat(persisted); !os.IsNotExist(err) {
 		t.Fatalf("persisted file should have been removed once cleared, stat err = %v", err)
+	}
+}
+
+// The regression: os.WriteFile truncates the target before writing, so a
+// crash between the truncate and the write (or a partial write) can leave
+// corrupt JSON on disk. atomicWriteFile must instead write to a temp file
+// and rename it into place, so the target is always either the previous
+// complete content or the new complete content, with no in-between state —
+// and it must leave no stray temp file behind once it succeeds.
+func TestAtomicWriteFile_ReplacesContentAndCleansUpTempFile(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "journal.json")
+
+	if err := atomicWriteFile(path, []byte(`{"a":1}`), 0o644); err != nil {
+		t.Fatalf("first write: %v", err)
+	}
+	if err := atomicWriteFile(path, []byte(`{"a":2}`), 0o644); err != nil {
+		t.Fatalf("second write: %v", err)
+	}
+	got, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != `{"a":2}` {
+		t.Fatalf("got %q, want the latest write to have fully replaced the file", got)
+	}
+
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, e := range entries {
+		if e.Name() != "journal.json" {
+			t.Fatalf("stray temp file left behind after a successful write: %s", e.Name())
+		}
+	}
+}
+
+// The regression: a journal that fails to parse (whether from a genuine
+// crash despite the atomic write above, disk corruption, or manual
+// tampering) used to be logged as a warning and silently treated as an empty
+// pending set — losing track of whatever was actually pending, possibly a
+// still-live obsolete DNAT rule, with the node free to report converged
+// regardless. It must instead permanently fail every Reconcile call and
+// refuse to overwrite the file, so the evidence survives for an operator to
+// inspect.
+func TestWithStateDir_CorruptJournalBlocksConvergencePermanently(t *testing.T) {
+	dir := t.TempDir()
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	journalPath := filepath.Join(dir, pendingTeardownsFile)
+	if err := os.WriteFile(journalPath, []byte("{not valid json"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	r := NewWithNetworkManager(newFakeVMManager(), logger, nil, &fakeNetworkManager{}, "", 0).WithStateDir(dir)
+	if !r.journalCorrupt {
+		t.Fatal("expected journalCorrupt to be set after loading a corrupt journal")
+	}
+
+	desired := config.NodeConfig{Node: "node-1"}
+	if err := r.Reconcile(context.Background(), desired); err == nil {
+		t.Fatal("a corrupt journal must fail Reconcile even on an otherwise-trivial tick")
+	}
+	if err := r.Reconcile(context.Background(), desired); err == nil {
+		t.Fatal("a corrupt journal must keep failing every later tick, not just the first")
+	}
+
+	before, err := os.ReadFile(journalPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	r.persistPendingTeardowns()
+	after, err := os.ReadFile(journalPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(before) != string(after) {
+		t.Fatalf("corrupt journal was overwritten instead of left for inspection: before=%q after=%q", before, after)
 	}
 }
 
