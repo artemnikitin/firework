@@ -22,10 +22,26 @@ type fakeNetworkManager struct {
 	// host port, so a test can make one port's teardown persistently fail
 	// while others succeed normally.
 	teardownForwardErrByPort map[int]error
+	teardownCalls            []string
+	teardownErr              error
+	// teardownErrByTap overrides teardownErr for a specific tap device name,
+	// so a test can make one generation's device teardown persistently fail
+	// while others succeed normally.
+	teardownErrByTap map[string]error
 }
 
-func (f *fakeNetworkManager) Setup(config.ServiceConfig) error    { return nil }
-func (f *fakeNetworkManager) Teardown(config.ServiceConfig) error { return nil }
+func (f *fakeNetworkManager) Setup(config.ServiceConfig) error { return nil }
+func (f *fakeNetworkManager) Teardown(svc config.ServiceConfig) error {
+	tap := ""
+	if svc.Network != nil {
+		tap = svc.Network.Interface
+	}
+	f.teardownCalls = append(f.teardownCalls, tap)
+	if err, ok := f.teardownErrByTap[tap]; ok {
+		return err
+	}
+	return f.teardownErr
+}
 
 func (f *fakeNetworkManager) SetupPortForward(hostPort int, _ string, _ int) error {
 	f.setupForwardCalls = append(f.setupForwardCalls, hostPort)
@@ -327,6 +343,87 @@ func TestReconcile_ConsecutiveUpdatesTrackEachGenerationsStaleRuleIndependently(
 	inst, running := vmMgr.instances["web"]
 	if !running || len(inst.Config.PortForwards) != 1 || inst.Config.PortForwards[0].HostPort != 9191 {
 		t.Fatalf("service C not left running on its own port: %#v", vmMgr.instances["web"])
+	}
+}
+
+// The regression: pendingNetworkTeardowns was previously keyed by service
+// name, on the (false) premise that a tap device's path is derived purely
+// from the name. It is not: svc.Network.Interface, when set explicitly,
+// overrides the default tap-<name> path. So a service moving through two
+// consecutive generations before an earlier device's teardown ever succeeds
+// (A -> B -> C, each naming a distinct tap) could lose track of A's still-
+// pending tap the same way finding 1 showed for port forwards: B's delete
+// (success or failure) overwrote or erased the single per-name entry.
+func TestReconcile_ConsecutiveUpdatesTrackEachGenerationsStaleNetworkDeviceIndependently(t *testing.T) {
+	net := &fakeNetworkManager{teardownErrByTap: map[string]error{"tap-a": errors.New("device busy")}}
+	r, vmMgr := newNetworkTestReconciler(net)
+
+	// A: tap-a.
+	a := config.ServiceConfig{Name: "web", Network: &config.NetworkConfig{Interface: "tap-a", GuestIP: "172.16.0.2"}}
+	if err := r.Reconcile(context.Background(), config.NodeConfig{Node: "node-1", Services: []config.ServiceConfig{a}}); err != nil {
+		t.Fatalf("initial create: %v", err)
+	}
+
+	// A -> B: tap-b. Tearing down A's tap-a fails and must be tracked.
+	b := a
+	b.Network = &config.NetworkConfig{Interface: "tap-b", GuestIP: "172.16.0.2"}
+	toB := config.NodeConfig{Node: "node-1", Services: []config.ServiceConfig{b}}
+	if err := r.Reconcile(context.Background(), toB); err == nil {
+		t.Fatal("expected A's stale tap-a device to surface")
+	}
+	if len(r.pendingNetworkTeardowns) != 1 {
+		t.Fatalf("expected exactly one pending network teardown after A->B, got %d: %#v", len(r.pendingNetworkTeardowns), r.pendingNetworkTeardowns)
+	}
+
+	// B -> C: tap-c. Tearing down B's tap-b succeeds. The bug: this used to
+	// overwrite or delete the single per-name entry, losing A's still-
+	// pending tap-a device.
+	c := a
+	c.Network = &config.NetworkConfig{Interface: "tap-c", GuestIP: "172.16.0.2"}
+	toC := config.NodeConfig{Node: "node-1", Services: []config.ServiceConfig{c}}
+	err := r.Reconcile(context.Background(), toC)
+	if err == nil {
+		t.Fatal("A's tap-a device is still pending and must keep surfacing through the B->C update")
+	}
+	if !strings.Contains(err.Error(), "tap-a") {
+		t.Fatalf("error does not identify A's stale device: %v", err)
+	}
+
+	// A's entry must have survived, and only A's.
+	if len(r.pendingNetworkTeardowns) != 1 {
+		t.Fatalf("expected A's entry to be the only one still pending, got %d: %#v", len(r.pendingNetworkTeardowns), r.pendingNetworkTeardowns)
+	}
+	for key := range r.pendingNetworkTeardowns {
+		if key.tapName != "tap-a" {
+			t.Fatalf("wrong entry survived: %#v", key)
+		}
+	}
+
+	// One more tick with nothing changed: tap-a must still be retried, and
+	// neither tap-b nor tap-c (both live-and-valid, or already resolved) may
+	// be touched again by the retry path.
+	callsBefore := len(net.teardownCalls)
+	if err := r.Reconcile(context.Background(), toC); err == nil {
+		t.Fatal("A's stale device must keep failing the tick")
+	}
+	for _, tap := range net.teardownCalls[callsBefore:] {
+		if tap != "tap-a" {
+			t.Fatalf("retry touched an unrelated network device: %q", tap)
+		}
+	}
+
+	// Once A's device is finally torn down, the tick converges and C keeps
+	// running on its own tap.
+	delete(net.teardownErrByTap, "tap-a")
+	if err := r.Reconcile(context.Background(), toC); err != nil {
+		t.Fatalf("tick should converge once A's stale device is torn down: %v", err)
+	}
+	if len(r.pendingNetworkTeardowns) != 0 {
+		t.Fatalf("expected no pending network teardowns left, got %#v", r.pendingNetworkTeardowns)
+	}
+	inst, running := vmMgr.instances["web"]
+	if !running || inst.Config.Network == nil || inst.Config.Network.Interface != "tap-c" {
+		t.Fatalf("service C not left running on its own tap: %#v", vmMgr.instances["web"])
 	}
 }
 

@@ -31,7 +31,7 @@ Examples:
 
 | Field | Required | Default | Notes |
 |---|---|---|---|
-| `node_id` | no | derived from `node_name` | Stable registry identity for mTLS control-plane integration |
+| `node_id` | no | derived from `node_name` | Stable registry identity for mTLS control-plane integration. Max 128 bytes when `registry_url` is set (rejected, not truncated, since it is matched for exact equality against reported volume `bound_node`) |
 | `node_name` | no | host name | Display/identity name for this node |
 | `node_names` | no | derived from `node_name` | Labels to fetch and merge (`nodes/<label>.yaml`) |
 | `store_type` | no | `git` | `git`, `s3`, or `gcs` |
@@ -74,7 +74,7 @@ Examples:
 | `registry_cert_renew_before` | no | `6h` | Proactive cert renewal window |
 | `storage.local.path` | local volumes | - | Operator-mounted local storage pool; must be an actual mount point |
 | `storage.local.capacity` | local volumes | - | Logical admission budget (`Mi`, `Gi`, or `Ti`) |
-| `storage.shared.backend_id` | shared volumes | - | Stable deployment-wide backend identity |
+| `storage.shared.backend_id` | shared volumes | - | Stable deployment-wide backend identity. Max 128 bytes (rejected, not truncated, since it is matched for exact equality against reported volume `shared_backend_id`) |
 | `storage.shared.path` | shared volumes | - | Operator-mounted shared storage root; must be an actual mount point |
 | `storage.shared.capacity` | no | empty | Optional aggregate shared admission budget |
 
