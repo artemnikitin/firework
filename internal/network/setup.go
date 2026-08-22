@@ -149,8 +149,16 @@ func (m *Manager) TeardownPortForward(hostPort int, guestIP string, vmPort int) 
 			}
 		}
 	} else {
+		// A resolution failure must not be reported as a successful
+		// teardown. The legacy cleanup below cannot stand in for the scoped
+		// rule, and removeIPTablesRule treats "no such rule" as success — so
+		// swallowing this returned nil while the scoped DNAT rule was still
+		// installed, which is precisely the "converged while leaking" shape
+		// the caller's pending-teardown retry exists to prevent. Surfacing it
+		// keeps the rule on the retry list until resolution works again.
 		m.logger.Warn("failed to resolve host ingress context for scoped cleanup, trying legacy rule only",
 			"host_port", hostPort, "error", err)
+		errs = append(errs, fmt.Errorf("resolving host ingress context for scoped cleanup: %w", err))
 	}
 
 	// Backward-compatible cleanup for older unscoped rules.
@@ -381,6 +389,20 @@ func (m *Manager) createTAP(name string) error {
 
 	return nil
 }
+
+// DeleteTAP removes a single TAP device by name, without touching any bridge
+// that may have been created alongside it. Teardown deletes both components
+// of a service's networking together, which is only safe when neither is
+// still claimed by a running service; callers reclaiming one obsolete
+// component at a time (see the reconciler's pending network device retries)
+// need to address them separately. Deleting an absent device is not an error.
+func (m *Manager) DeleteTAP(name string) error { return m.deleteTAP(name) }
+
+// DeleteBridge removes a single bridge by name, without touching the TAP
+// device that may have been attached to it. See DeleteTAP for why the
+// components are separately addressable. Deleting an absent bridge is not an
+// error.
+func (m *Manager) DeleteBridge(name string) error { return m.deleteBridge(name) }
 
 // deleteTAP removes a TAP device.
 func (m *Manager) deleteTAP(name string) error {

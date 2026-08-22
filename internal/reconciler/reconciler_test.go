@@ -18,6 +18,7 @@ type fakeVMManager struct {
 	startCalls  []string
 	removeCalls []string
 	removeErr   error
+	startErr    error
 }
 
 func newFakeVMManager() *fakeVMManager {
@@ -34,6 +35,9 @@ func (f *fakeVMManager) List() map[string]*vm.Instance {
 
 func (f *fakeVMManager) Start(_ context.Context, svc config.ServiceConfig) error {
 	f.startCalls = append(f.startCalls, svc.Name)
+	if f.startErr != nil {
+		return f.startErr
+	}
 	f.instances[svc.Name] = &vm.Instance{Name: svc.Name, State: vm.StateRunning, Config: svc}
 	return nil
 }
@@ -51,6 +55,7 @@ type recoveringVMManager struct {
 	*fakeVMManager
 	adopted     []string
 	recoverCall int
+	recoverErr  error
 }
 
 func (f *recoveringVMManager) Recover(_ context.Context, _ config.NodeConfig) ([]string, error) {
@@ -58,7 +63,7 @@ func (f *recoveringVMManager) Recover(_ context.Context, _ config.NodeConfig) ([
 	if f.recoverCall > 1 {
 		return nil, nil
 	}
-	return f.adopted, nil
+	return f.adopted, f.recoverErr
 }
 
 func newTestReconciler(strategy string, delay time.Duration) *Reconciler {
@@ -190,6 +195,25 @@ func TestReconcileAdoptsMatchingVMWithoutRestart(t *testing.T) {
 	}
 }
 
+func TestReconcilePreservesAllFailureStagesThroughAggregateErrors(t *testing.T) {
+	manager := &recoveringVMManager{
+		fakeVMManager: newFakeVMManager(),
+		recoverErr: errors.Join(
+			stageError(FailureStageNetwork, errors.New("tap failed")),
+			stageError(FailureStageVM, errors.New("ownership check failed")),
+		),
+	}
+	r := New(manager, slog.New(slog.NewTextHandler(io.Discard, nil)), nil, nil, "", 0)
+
+	err := r.Reconcile(context.Background(), config.NodeConfig{})
+	if err == nil {
+		t.Fatal("expected recovery error")
+	}
+	if !HasFailureStage(err, FailureStageNetwork) || !HasFailureStage(err, FailureStageVM) {
+		t.Fatalf("aggregate reconciliation error lost stages: %v", err)
+	}
+}
+
 func TestUpdateDoesNotStartReplacementWhenOwnedVMCannotBeRemoved(t *testing.T) {
 	oldService := config.ServiceConfig{Name: "svc-a", Image: "/img/old", Kernel: "/kern", VCPUs: 1, MemoryMB: 256}
 	newService := oldService
@@ -202,6 +226,9 @@ func TestUpdateDoesNotStartReplacementWhenOwnedVMCannotBeRemoved(t *testing.T) {
 	err := reconciler.Reconcile(context.Background(), config.NodeConfig{Services: []config.ServiceConfig{newService}})
 	if err == nil {
 		t.Fatal("expected update to fail closed")
+	}
+	if !HasFailureStage(err, FailureStageVM) {
+		t.Fatalf("unsafe VM removal error lost VM stage: %v", err)
 	}
 	if len(manager.startCalls) != 0 {
 		t.Fatalf("replacement started after unsafe removal failure: %v", manager.startCalls)

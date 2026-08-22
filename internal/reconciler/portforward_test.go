@@ -1,0 +1,896 @@
+package reconciler
+
+import (
+	"context"
+	"errors"
+	"io"
+	"log/slog"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+
+	"github.com/artemnikitin/firework/internal/config"
+)
+
+type fakeNetworkManager struct {
+	setupForwardCalls    []int
+	teardownForwardCalls []int
+	setupForwardErr      error
+	teardownForwardErr   error
+	// teardownForwardErrByPort overrides teardownForwardErr for a specific
+	// host port, so a test can make one port's teardown persistently fail
+	// while others succeed normally.
+	teardownForwardErrByPort map[int]error
+	teardownCalls            []string
+	deleteTAPCalls           []string
+	deleteBridgeCalls        []string
+	teardownErr              error
+	// deleteErrByDevice overrides teardownErr for a specific device name, so
+	// a test can make one component's deletion persistently fail while others
+	// succeed normally. Keyed by device name, which is unique across taps and
+	// bridges (tap-* / br-* by construction).
+	deleteErrByDevice map[string]error
+}
+
+func (f *fakeNetworkManager) Setup(config.ServiceConfig) error { return nil }
+
+// Teardown is the composite path, used only by createService's rollback.
+func (f *fakeNetworkManager) Teardown(svc config.ServiceConfig) error {
+	tap := ""
+	if svc.Network != nil {
+		tap = svc.Network.Interface
+	}
+	f.teardownCalls = append(f.teardownCalls, tap)
+	return f.teardownErr
+}
+
+func (f *fakeNetworkManager) DeleteTAP(name string) error {
+	f.deleteTAPCalls = append(f.deleteTAPCalls, name)
+	if err, ok := f.deleteErrByDevice[name]; ok {
+		return err
+	}
+	return f.teardownErr
+}
+
+func (f *fakeNetworkManager) DeleteBridge(name string) error {
+	f.deleteBridgeCalls = append(f.deleteBridgeCalls, name)
+	if err, ok := f.deleteErrByDevice[name]; ok {
+		return err
+	}
+	return f.teardownErr
+}
+
+func (f *fakeNetworkManager) SetupPortForward(hostPort int, _ string, _ int) error {
+	f.setupForwardCalls = append(f.setupForwardCalls, hostPort)
+	return f.setupForwardErr
+}
+
+func (f *fakeNetworkManager) TeardownPortForward(hostPort int, _ string, _ int) error {
+	f.teardownForwardCalls = append(f.teardownForwardCalls, hostPort)
+	if err, ok := f.teardownForwardErrByPort[hostPort]; ok {
+		return err
+	}
+	return f.teardownForwardErr
+}
+
+func forwardedService(name string) config.ServiceConfig {
+	return config.ServiceConfig{
+		Name:         name,
+		Network:      &config.NetworkConfig{GuestIP: "172.16.0.2"},
+		PortForwards: []config.PortForward{{HostPort: 8080, VMPort: 80}},
+	}
+}
+
+func newNetworkTestReconciler(net NetworkManager) (*Reconciler, *fakeVMManager) {
+	vmMgr := newFakeVMManager()
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	return NewWithNetworkManager(vmMgr, logger, nil, net, "", 0), vmMgr
+}
+
+// The regression: a port forward that failed while creating the service was
+// logged and dropped. An existing VM produces no further plan actions, so
+// nothing retried it and the node kept reporting a converged revision while
+// cross-node routing stayed broken.
+func TestReconcile_RetriesPortForwardAfterCreateFailure(t *testing.T) {
+	net := &fakeNetworkManager{setupForwardErr: errors.New("iptables busy")}
+	r, _ := newNetworkTestReconciler(net)
+	desired := config.NodeConfig{Node: "node-1", Services: []config.ServiceConfig{forwardedService("web")}}
+
+	// First tick creates the VM; the port forward fails.
+	if err := r.Reconcile(context.Background(), desired); err == nil {
+		t.Fatal("expected the failed port forward to surface as a reconcile error")
+	}
+
+	// Second tick has no plan actions at all, and must still retry.
+	before := len(net.setupForwardCalls)
+	err := r.Reconcile(context.Background(), desired)
+	if err == nil {
+		t.Fatal("a persistently failing port forward must keep failing the tick, not converge")
+	}
+	if !strings.Contains(err.Error(), "port forward") {
+		t.Fatalf("error does not identify the port forward: %v", err)
+	}
+	if len(net.setupForwardCalls) <= before {
+		t.Fatal("port forward was not re-asserted on a tick with no plan actions")
+	}
+}
+
+// Recovery must be automatic once the underlying cause clears, without the VM
+// being destroyed and recreated.
+func TestReconcile_ConvergesOncePortForwardRecovers(t *testing.T) {
+	net := &fakeNetworkManager{setupForwardErr: errors.New("iptables busy")}
+	r, vmMgr := newNetworkTestReconciler(net)
+	desired := config.NodeConfig{Node: "node-1", Services: []config.ServiceConfig{forwardedService("web")}}
+
+	if err := r.Reconcile(context.Background(), desired); err == nil {
+		t.Fatal("expected first tick to fail")
+	}
+	startsAfterCreate := len(vmMgr.startCalls)
+
+	net.setupForwardErr = nil
+	if err := r.Reconcile(context.Background(), desired); err != nil {
+		t.Fatalf("tick should converge once the port forward succeeds: %v", err)
+	}
+	if len(vmMgr.startCalls) != startsAfterCreate {
+		t.Fatalf("VM was restarted to recover a port forward: %d starts, want %d",
+			len(vmMgr.startCalls), startsAfterCreate)
+	}
+}
+
+// A failed teardown leaves a DNAT rule pointing at a dead guest. It must be
+// visible, but it must not abort the tick's other work.
+func TestReconcile_SurfacesPortForwardTeardownFailure(t *testing.T) {
+	net := &fakeNetworkManager{teardownForwardErr: errors.New("rule missing")}
+	r, vmMgr := newNetworkTestReconciler(net)
+	desired := config.NodeConfig{Node: "node-1", Services: []config.ServiceConfig{forwardedService("web")}}
+
+	if err := r.Reconcile(context.Background(), desired); err != nil {
+		t.Fatalf("initial create: %v", err)
+	}
+
+	// Drop the service so the next tick deletes it.
+	empty := config.NodeConfig{Node: "node-1"}
+	err := r.Reconcile(context.Background(), empty)
+	if err == nil {
+		t.Fatal("a failed port-forward teardown must surface")
+	}
+	if !strings.Contains(err.Error(), "teardown port forward") {
+		t.Fatalf("error does not identify the teardown: %v", err)
+	}
+	if len(vmMgr.removeCalls) == 0 {
+		t.Fatal("the VM should still have been removed")
+	}
+
+	// The regression: once the VM is gone, Plan has no further delete action
+	// for "web" — nothing about the desired/actual diff changes on the next
+	// tick. Without a retry path the obsolete DNAT rule is simply never
+	// looked at again and the tick starts reporting success.
+	teardownCallsAfterFirstTick := len(net.teardownForwardCalls)
+	tick2Err := r.Reconcile(context.Background(), empty)
+	if tick2Err == nil {
+		t.Fatal("a still-failing teardown must keep failing every later tick, not be forgotten once the VM is gone")
+	}
+	if len(net.teardownForwardCalls) <= teardownCallsAfterFirstTick {
+		t.Fatal("the obsolete port forward was not retried on a tick with no plan actions")
+	}
+	// The stage tag drives the agent's NetworkReady=false condition
+	// (classifyReconcileFailure in internal/agent/agent.go); it must survive
+	// the extra combineErrors/errors.Join nesting retryPendingTeardowns adds.
+	if !HasFailureStage(tick2Err, FailureStageNetwork) {
+		t.Fatalf("retried teardown error lost its network failure stage: %v", tick2Err)
+	}
+
+	// Once the underlying failure clears, the retry must actually finish the
+	// cleanup and let the node converge again.
+	net.teardownForwardErr = nil
+	if err := r.Reconcile(context.Background(), empty); err != nil {
+		t.Fatalf("tick should converge once the retried teardown succeeds: %v", err)
+	}
+	if err := r.Reconcile(context.Background(), empty); err != nil {
+		t.Fatalf("a cleared teardown must not resurface on a later tick: %v", err)
+	}
+}
+
+// The update path skips the recreate when deleteService errors, so a teardown
+// failure must not leave the service deleted. The old and new configs here
+// claim the identical port forward (only VCPUs changed), so once the update
+// recreates the VM there is nothing obsolete left to clean up and the tick
+// must converge — this is the case the previous version of this test
+// discarded the returned error for instead of checking it.
+func TestReconcile_TeardownFailureDoesNotBlockUpdate(t *testing.T) {
+	net := &fakeNetworkManager{teardownForwardErr: errors.New("rule missing")}
+	r, vmMgr := newNetworkTestReconciler(net)
+	svc := forwardedService("web")
+	desired := config.NodeConfig{Node: "node-1", Services: []config.ServiceConfig{svc}}
+
+	if err := r.Reconcile(context.Background(), desired); err != nil {
+		t.Fatalf("initial create: %v", err)
+	}
+
+	updated := svc
+	updated.VCPUs = 4
+	err := r.Reconcile(context.Background(), config.NodeConfig{Node: "node-1", Services: []config.ServiceConfig{updated}})
+	if err != nil {
+		t.Fatalf("update with unchanged port forwards must not fail: %v", err)
+	}
+
+	if _, running := vmMgr.instances["web"]; !running {
+		t.Fatal("service was left deleted after a non-blocking teardown failure")
+	}
+}
+
+// The regression: an update that also changes a service's port forwards used
+// to let the stale rule for the old port disappear silently once the
+// same-named VM was recreated — retryPendingTeardowns saw the name running
+// again and dropped the pending entry unconditionally. It must instead
+// recognize the old rule is distinct from whatever the new config claims,
+// keep failing the tick until the old rule is actually torn down, and never
+// touch the new port's live rule while doing so.
+func TestReconcile_UpdateWithChangedPortKeepsRetryingStaleRule(t *testing.T) {
+	net := &fakeNetworkManager{}
+	r, vmMgr := newNetworkTestReconciler(net)
+	svc := forwardedService("web") // HostPort: 8080
+	desired := config.NodeConfig{Node: "node-1", Services: []config.ServiceConfig{svc}}
+
+	if err := r.Reconcile(context.Background(), desired); err != nil {
+		t.Fatalf("initial create: %v", err)
+	}
+
+	// The update moves the service to a different host port; tearing down
+	// the old one fails.
+	net.teardownForwardErr = errors.New("rule missing")
+	updated := svc
+	updated.PortForwards = []config.PortForward{{HostPort: 9090, VMPort: 80}}
+	moved := config.NodeConfig{Node: "node-1", Services: []config.ServiceConfig{updated}}
+
+	err := r.Reconcile(context.Background(), moved)
+	if err == nil {
+		t.Fatal("a stale rule from a changed port must surface, not be dropped because the name is running again")
+	}
+	if !strings.Contains(err.Error(), "teardown port forward") {
+		t.Fatalf("error does not identify the stale teardown: %v", err)
+	}
+	if !HasFailureStage(err, FailureStageNetwork) {
+		t.Fatalf("stale-rule error lost its network failure stage: %v", err)
+	}
+	if !containsInt(net.setupForwardCalls, 9090) {
+		t.Fatal("the new port forward was not set up for the updated service")
+	}
+
+	// The stale 8080 teardown must keep being retried every tick, without
+	// ever touching 9090's live rule.
+	teardownCallsBefore := len(net.teardownForwardCalls)
+	if err := r.Reconcile(context.Background(), moved); err == nil {
+		t.Fatal("the stale rule must keep failing the tick until it is actually torn down")
+	}
+	retried := net.teardownForwardCalls[teardownCallsBefore:]
+	if containsInt(retried, 9090) {
+		t.Fatal("retry tore down the new port's live rule instead of the stale one")
+	}
+	if !containsInt(retried, 8080) {
+		t.Fatal("the stale 8080 rule was not retried")
+	}
+
+	// Once the old rule's teardown succeeds, the tick converges and the
+	// updated service keeps running on the new port.
+	net.teardownForwardErr = nil
+	if err := r.Reconcile(context.Background(), moved); err != nil {
+		t.Fatalf("tick should converge once the stale rule is torn down: %v", err)
+	}
+	inst, running := vmMgr.instances["web"]
+	if !running || len(inst.Config.PortForwards) != 1 || inst.Config.PortForwards[0].HostPort != 9090 {
+		t.Fatalf("updated service not left running on the new port: %#v", vmMgr.instances["web"])
+	}
+}
+
+// The regression: pendingPortForwards used to be a single map keyed by
+// service name, so a service passing through several configs before an
+// earlier teardown ever recovered (A -> B -> C) would have the second
+// generation's delete either overwrite or erase the first generation's still
+// -pending entry. Keying by the rule's own (hostPort, guestIP, vmPort)
+// identity instead means each generation's obsolete rule gets its own entry,
+// independent of what happens to any other generation's.
+func TestReconcile_ConsecutiveUpdatesTrackEachGenerationsStaleRuleIndependently(t *testing.T) {
+	net := &fakeNetworkManager{teardownForwardErrByPort: map[int]error{8080: errors.New("rule missing")}}
+	r, vmMgr := newNetworkTestReconciler(net)
+
+	// A: port 8080.
+	a := forwardedService("web")
+	if err := r.Reconcile(context.Background(), config.NodeConfig{Node: "node-1", Services: []config.ServiceConfig{a}}); err != nil {
+		t.Fatalf("initial create: %v", err)
+	}
+
+	// A -> B: port 9090. Tearing down A's 8080 fails and must be tracked.
+	b := a
+	b.PortForwards = []config.PortForward{{HostPort: 9090, VMPort: 80}}
+	toB := config.NodeConfig{Node: "node-1", Services: []config.ServiceConfig{b}}
+	if err := r.Reconcile(context.Background(), toB); err == nil {
+		t.Fatal("expected A's stale 8080 rule to surface")
+	}
+	if len(r.pendingPortForwards) != 1 {
+		t.Fatalf("expected exactly one pending port forward after A->B, got %d: %#v", len(r.pendingPortForwards), r.pendingPortForwards)
+	}
+
+	// B -> C: port 9191. Tearing down B's 9090 succeeds. The bug: this used
+	// to overwrite or delete the single per-name entry, losing A's still-
+	// pending 8080 rule.
+	c := a
+	c.PortForwards = []config.PortForward{{HostPort: 9191, VMPort: 80}}
+	toC := config.NodeConfig{Node: "node-1", Services: []config.ServiceConfig{c}}
+	err := r.Reconcile(context.Background(), toC)
+	if err == nil {
+		t.Fatal("A's 8080 rule is still pending and must keep surfacing through the B->C update")
+	}
+	if !strings.Contains(err.Error(), "8080") {
+		t.Fatalf("error does not identify A's stale port: %v", err)
+	}
+
+	// A's entry must have survived, and only A's.
+	if len(r.pendingPortForwards) != 1 {
+		t.Fatalf("expected A's entry to be the only one still pending, got %d: %#v", len(r.pendingPortForwards), r.pendingPortForwards)
+	}
+	for _, entry := range r.pendingPortForwards {
+		if entry.PortForward.HostPort != 8080 {
+			t.Fatalf("wrong entry survived: %#v", entry)
+		}
+	}
+
+	// One more tick with nothing changed: 8080 must still be retried, and
+	// neither 9090 nor 9191 (both live-and-valid, or already resolved) may
+	// be touched again by the retry path.
+	callsBefore := len(net.teardownForwardCalls)
+	if err := r.Reconcile(context.Background(), toC); err == nil {
+		t.Fatal("A's stale rule must keep failing the tick")
+	}
+	for _, hp := range net.teardownForwardCalls[callsBefore:] {
+		if hp != 8080 {
+			t.Fatalf("retry touched an unrelated port forward: %d", hp)
+		}
+	}
+
+	// Once A's rule is finally torn down, the tick converges and C keeps
+	// running on its own port.
+	delete(net.teardownForwardErrByPort, 8080)
+	if err := r.Reconcile(context.Background(), toC); err != nil {
+		t.Fatalf("tick should converge once A's stale rule is torn down: %v", err)
+	}
+	if len(r.pendingPortForwards) != 0 {
+		t.Fatalf("expected no pending port forwards left, got %#v", r.pendingPortForwards)
+	}
+	inst, running := vmMgr.instances["web"]
+	if !running || len(inst.Config.PortForwards) != 1 || inst.Config.PortForwards[0].HostPort != 9191 {
+		t.Fatalf("service C not left running on its own port: %#v", vmMgr.instances["web"])
+	}
+}
+
+// The regression: pendingNetworkDevices was previously keyed by service
+// name, on the (false) premise that a tap device's path is derived purely
+// from the name. It is not: svc.Network.Interface, when set explicitly,
+// overrides the default tap-<name> path. So a service moving through two
+// consecutive generations before an earlier device's teardown ever succeeds
+// (A -> B -> C, each naming a distinct tap) could lose track of A's still-
+// pending tap the same way finding 1 showed for port forwards: B's delete
+// (success or failure) overwrote or erased the single per-name entry.
+func TestReconcile_ConsecutiveUpdatesTrackEachGenerationsStaleNetworkDeviceIndependently(t *testing.T) {
+	net := &fakeNetworkManager{deleteErrByDevice: map[string]error{"tap-a": errors.New("device busy")}}
+	r, vmMgr := newNetworkTestReconciler(net)
+
+	// A: tap-a.
+	a := config.ServiceConfig{Name: "web", Network: &config.NetworkConfig{Interface: "tap-a", GuestIP: "172.16.0.2"}}
+	if err := r.Reconcile(context.Background(), config.NodeConfig{Node: "node-1", Services: []config.ServiceConfig{a}}); err != nil {
+		t.Fatalf("initial create: %v", err)
+	}
+
+	// A -> B: tap-b. Tearing down A's tap-a fails and must be tracked.
+	b := a
+	b.Network = &config.NetworkConfig{Interface: "tap-b", GuestIP: "172.16.0.2"}
+	toB := config.NodeConfig{Node: "node-1", Services: []config.ServiceConfig{b}}
+	if err := r.Reconcile(context.Background(), toB); err == nil {
+		t.Fatal("expected A's stale tap-a device to surface")
+	}
+	if len(r.pendingNetworkDevices) != 1 {
+		t.Fatalf("expected exactly one pending network device after A->B, got %d: %#v", len(r.pendingNetworkDevices), r.pendingNetworkDevices)
+	}
+
+	// B -> C: tap-c. Tearing down B's tap-b succeeds. The bug: this used to
+	// overwrite or delete the single per-name entry, losing A's still-
+	// pending tap-a device.
+	c := a
+	c.Network = &config.NetworkConfig{Interface: "tap-c", GuestIP: "172.16.0.2"}
+	toC := config.NodeConfig{Node: "node-1", Services: []config.ServiceConfig{c}}
+	err := r.Reconcile(context.Background(), toC)
+	if err == nil {
+		t.Fatal("A's tap-a device is still pending and must keep surfacing through the B->C update")
+	}
+	if !strings.Contains(err.Error(), "tap-a") {
+		t.Fatalf("error does not identify A's stale device: %v", err)
+	}
+
+	// A's entry must have survived, and only A's.
+	if len(r.pendingNetworkDevices) != 1 {
+		t.Fatalf("expected A's entry to be the only one still pending, got %d: %#v", len(r.pendingNetworkDevices), r.pendingNetworkDevices)
+	}
+	for key := range r.pendingNetworkDevices {
+		if key.name != "tap-a" {
+			t.Fatalf("wrong entry survived: %#v", key)
+		}
+	}
+
+	// One more tick with nothing changed: tap-a must still be retried, and
+	// neither tap-b nor tap-c (both live-and-valid, or already resolved) may
+	// be touched again by the retry path.
+	callsBefore := len(net.deleteTAPCalls)
+	if err := r.Reconcile(context.Background(), toC); err == nil {
+		t.Fatal("A's stale device must keep failing the tick")
+	}
+	for _, tap := range net.deleteTAPCalls[callsBefore:] {
+		if tap != "tap-a" {
+			t.Fatalf("retry touched an unrelated network device: %q", tap)
+		}
+	}
+
+	// Once A's device is finally torn down, the tick converges and C keeps
+	// running on its own tap.
+	delete(net.deleteErrByDevice, "tap-a")
+	if err := r.Reconcile(context.Background(), toC); err != nil {
+		t.Fatalf("tick should converge once A's stale device is torn down: %v", err)
+	}
+	if len(r.pendingNetworkDevices) != 0 {
+		t.Fatalf("expected no pending network devices left, got %#v", r.pendingNetworkDevices)
+	}
+	inst, running := vmMgr.instances["web"]
+	if !running || inst.Config.Network == nil || inst.Config.Network.Interface != "tap-c" {
+		t.Fatalf("service C not left running on its own tap: %#v", vmMgr.instances["web"])
+	}
+}
+
+// The regression: a service's tap and bridge were tracked as one composite
+// (tapName, bridgeName) identity and retried through NetworkManager.Teardown,
+// which always deletes both components. A config can drop host_dev_name while
+// keeping the same explicit interface, which makes only the bridge obsolete —
+// but because the composite key differed, the retry fired and took the live
+// tap down with it, while reporting a successful reconciliation. Each device
+// must be tracked and released on its own, and any device claimed by a
+// running service must never be deleted.
+func TestReconcile_ObsoleteBridgeRetryDoesNotDeleteTAPStillClaimedByRunningService(t *testing.T) {
+	net := &fakeNetworkManager{deleteErrByDevice: map[string]error{"br-web": errors.New("bridge busy")}}
+	r, vmMgr := newNetworkTestReconciler(net)
+
+	// A: explicit tap-x plus a bridge (host_dev_name set).
+	a := config.ServiceConfig{
+		Name:    "web",
+		Network: &config.NetworkConfig{Interface: "tap-x", HostDevName: "eth0", GuestIP: "172.16.0.2"},
+	}
+	if err := r.Reconcile(context.Background(), config.NodeConfig{Node: "node-1", Services: []config.ServiceConfig{a}}); err != nil {
+		t.Fatalf("initial create: %v", err)
+	}
+
+	// A -> B: same explicit tap-x, host_dev_name dropped. Only the bridge is
+	// obsolete; tap-x stays claimed by the running service. Deleting br-web
+	// fails, so it must be tracked on its own.
+	b := a
+	b.Network = &config.NetworkConfig{Interface: "tap-x", GuestIP: "172.16.0.2"}
+	toB := config.NodeConfig{Node: "node-1", Services: []config.ServiceConfig{b}}
+	if err := r.Reconcile(context.Background(), toB); err == nil {
+		t.Fatal("expected the failed br-web deletion to surface")
+	}
+	if len(r.pendingNetworkDevices) != 1 {
+		t.Fatalf("expected only the bridge to be pending, got %#v", r.pendingNetworkDevices)
+	}
+	for key := range r.pendingNetworkDevices {
+		if key.kind != networkDeviceBridge || key.name != "br-web" {
+			t.Fatalf("expected the pending device to be bridge br-web, got %#v", key)
+		}
+	}
+
+	// From here on there are no further updates, only retry ticks. The A->B
+	// update legitimately deleted and recreated tap-x (an update is a stop +
+	// start), but no retry may ever delete it again: it is claimed by the
+	// running B. Everything after this mark is retry-path activity.
+	retriesStart := len(net.deleteTAPCalls)
+
+	if err := r.Reconcile(context.Background(), toB); err == nil {
+		t.Fatal("the still-failing bridge deletion must keep failing the tick")
+	}
+	if net.teardownCalls != nil {
+		t.Fatalf("retry used the composite Teardown, which always deletes both components: %#v", net.teardownCalls)
+	}
+
+	// Once the bridge finally goes away the tick converges, and B is still
+	// running on the tap that was never touched.
+	delete(net.deleteErrByDevice, "br-web")
+	if err := r.Reconcile(context.Background(), toB); err != nil {
+		t.Fatalf("tick should converge once the obsolete bridge is deleted: %v", err)
+	}
+	if len(r.pendingNetworkDevices) != 0 {
+		t.Fatalf("expected no pending network devices left, got %#v", r.pendingNetworkDevices)
+	}
+	inst, running := vmMgr.instances["web"]
+	if !running || inst.Config.Network == nil || inst.Config.Network.Interface != "tap-x" {
+		t.Fatalf("service B was not left running on tap-x: %#v", vmMgr.instances["web"])
+	}
+	for _, tap := range net.deleteTAPCalls[retriesStart:] {
+		if tap == "tap-x" {
+			t.Fatalf("a retry deleted tap-x, which was claimed by the running service throughout: %#v", net.deleteTAPCalls[retriesStart:])
+		}
+	}
+}
+
+// The regression: the journal was written *after* the VM was removed, so a
+// crash in between left the VM gone, no future delete action to plan (the
+// service is absent from both desired and actual state), and no durable
+// record of the host resources it left behind — the node restarted and
+// reported converged with stale DNAT rules and devices still on the host.
+// The journal must be written before the VM is removed, and a write failure
+// must abort the removal rather than proceed unrecorded.
+func TestDeleteService_AbortsRemovalWhenCleanupCannotBeJournalled(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("running as root ignores the directory permissions this test relies on")
+	}
+	dir := t.TempDir()
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	net := &fakeNetworkManager{}
+	vmMgr := newFakeVMManager()
+	r := NewWithNetworkManager(vmMgr, logger, nil, net, "", 0).WithStateDir(dir)
+
+	desired := config.NodeConfig{Node: "node-1", Services: []config.ServiceConfig{forwardedService("web")}}
+	if err := r.Reconcile(context.Background(), desired); err != nil {
+		t.Fatalf("initial create: %v", err)
+	}
+
+	// Make the journal unwritable only now: the state dir has to be readable
+	// at construction (an unreadable one is the separate journalCorrupt path)
+	// and nothing writes the journal until a delete needs to record cleanup.
+	if err := os.Chmod(dir, 0o500); err != nil {
+		t.Fatalf("making state dir read-only: %v", err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(dir, 0o755) })
+
+	// Now delete the service. The journal write must fail, and that must
+	// stop the VM from being removed at all.
+	err := r.Reconcile(context.Background(), config.NodeConfig{Node: "node-1"})
+	if err == nil {
+		t.Fatal("expected the delete to fail when its cleanup cannot be journalled")
+	}
+	if _, stillRunning := vmMgr.instances["web"]; !stillRunning {
+		t.Fatal("VM was removed even though its pending cleanup could not be durably recorded")
+	}
+	// Nothing may have been torn down either, since the removal never happened.
+	if len(net.teardownForwardCalls) != 0 {
+		t.Fatalf("host resources were torn down despite the aborted removal: %#v", net.teardownForwardCalls)
+	}
+	// The in-memory maps must be rolled back to match the (unchanged) journal
+	// on disk, not left holding entries for a VM that was never removed.
+	if len(r.pendingPortForwards) != 0 || len(r.pendingNetworkDevices) != 0 {
+		t.Fatalf("failed journal write left phantom pending entries: %#v / %#v", r.pendingPortForwards, r.pendingNetworkDevices)
+	}
+}
+
+// The regression: pendingTeardowns previously lived in memory only, so an
+// agent restart between a failed delete's teardown and its retry silently
+// forgot the obsolete host rule with nothing left to notice it. WithStateDir
+// must make that entry survive the restart and get retried by the new
+// process.
+func TestWithStateDir_PersistsPendingTeardownAcrossRestart(t *testing.T) {
+	dir := t.TempDir()
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+
+	net1 := &fakeNetworkManager{teardownForwardErr: errors.New("rule missing")}
+	r1 := NewWithNetworkManager(newFakeVMManager(), logger, nil, net1, "", 0).WithStateDir(dir)
+	desired := config.NodeConfig{Node: "node-1", Services: []config.ServiceConfig{forwardedService("web")}}
+	if err := r1.Reconcile(context.Background(), desired); err != nil {
+		t.Fatalf("initial create: %v", err)
+	}
+	if err := r1.Reconcile(context.Background(), config.NodeConfig{Node: "node-1"}); err == nil {
+		t.Fatal("expected the failed teardown to surface")
+	}
+
+	persisted := filepath.Join(dir, pendingTeardownsFile)
+	if _, err := os.Stat(persisted); err != nil {
+		t.Fatalf("pending teardown was not persisted to %s: %v", persisted, err)
+	}
+
+	// Simulate a restart: a fresh Reconciler, fresh fakeVMManager (the VM was
+	// already gone before the crash — only the host cleanup was pending),
+	// pointed at the same state dir. It must load the persisted entry rather
+	// than starting with nothing to retry.
+	net2 := &fakeNetworkManager{}
+	r2 := NewWithNetworkManager(newFakeVMManager(), logger, nil, net2, "", 0).WithStateDir(dir)
+	if err := r2.Reconcile(context.Background(), config.NodeConfig{Node: "node-1"}); err != nil {
+		t.Fatalf("restarted reconciler should have converged once the persisted teardown succeeded: %v", err)
+	}
+	if !containsInt(net2.teardownForwardCalls, 8080) {
+		t.Fatal("restarted reconciler did not retry the persisted teardown; the entry was lost across restart")
+	}
+	if _, err := os.Stat(persisted); !os.IsNotExist(err) {
+		t.Fatalf("persisted file should have been removed once cleared, stat err = %v", err)
+	}
+}
+
+// The regression: os.WriteFile truncates the target before writing, so a
+// crash between the truncate and the write (or a partial write) can leave
+// corrupt JSON on disk. atomicWriteFile must instead write to a temp file
+// and rename it into place, so the target is always either the previous
+// complete content or the new complete content, with no in-between state —
+// and it must leave no stray temp file behind once it succeeds.
+func TestAtomicWriteFile_ReplacesContentAndCleansUpTempFile(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "journal.json")
+
+	if err := atomicWriteFile(path, []byte(`{"a":1}`), 0o644); err != nil {
+		t.Fatalf("first write: %v", err)
+	}
+	if err := atomicWriteFile(path, []byte(`{"a":2}`), 0o644); err != nil {
+		t.Fatalf("second write: %v", err)
+	}
+	got, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != `{"a":2}` {
+		t.Fatalf("got %q, want the latest write to have fully replaced the file", got)
+	}
+
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, e := range entries {
+		if e.Name() != "journal.json" {
+			t.Fatalf("stray temp file left behind after a successful write: %s", e.Name())
+		}
+	}
+}
+
+// The regression: a journal that fails to parse (whether from a genuine
+// crash despite the atomic write above, disk corruption, or manual
+// tampering) used to be logged as a warning and silently treated as an empty
+// pending set — losing track of whatever was actually pending, possibly a
+// still-live obsolete DNAT rule, with the node free to report converged
+// regardless. It must instead permanently fail every Reconcile call and
+// refuse to overwrite the file, so the evidence survives for an operator to
+// inspect.
+func TestWithStateDir_CorruptJournalBlocksConvergencePermanently(t *testing.T) {
+	dir := t.TempDir()
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	journalPath := filepath.Join(dir, pendingTeardownsFile)
+	if err := os.WriteFile(journalPath, []byte("{not valid json"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	r := NewWithNetworkManager(newFakeVMManager(), logger, nil, &fakeNetworkManager{}, "", 0).WithStateDir(dir)
+	if !r.journalCorrupt {
+		t.Fatal("expected journalCorrupt to be set after loading a corrupt journal")
+	}
+
+	desired := config.NodeConfig{Node: "node-1"}
+	if err := r.Reconcile(context.Background(), desired); err == nil {
+		t.Fatal("a corrupt journal must fail Reconcile even on an otherwise-trivial tick")
+	}
+	if err := r.Reconcile(context.Background(), desired); err == nil {
+		t.Fatal("a corrupt journal must keep failing every later tick, not just the first")
+	}
+
+	before, err := os.ReadFile(journalPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	r.persistPendingTeardowns()
+	after, err := os.ReadFile(journalPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(before) != string(after) {
+		t.Fatalf("corrupt journal was overwritten instead of left for inspection: before=%q after=%q", before, after)
+	}
+}
+
+func containsInt(vals []int, want int) bool {
+	for _, v := range vals {
+		if v == want {
+			return true
+		}
+	}
+	return false
+}
+
+// A nil *network.Manager must not become a non-nil interface, or every guard
+// passes and the first call dereferences nil.
+func TestNew_NilNetworkManagerStaysNil(t *testing.T) {
+	r := New(newFakeVMManager(), slog.New(slog.NewTextHandler(io.Discard, nil)), nil, nil, "", 0)
+	if r.networkMgr != nil {
+		t.Fatal("nil *network.Manager was stored as a non-nil interface")
+	}
+	desired := config.NodeConfig{Node: "node-1", Services: []config.ServiceConfig{forwardedService("web")}}
+	if err := r.Reconcile(context.Background(), desired); err != nil {
+		t.Fatalf("reconcile without a network manager: %v", err)
+	}
+}
+
+// The regression: retryPendingPortForwards guarded only against
+// entry.ServiceName being live, but a DNAT rule is identified by its tuple
+// alone. After a rename or replacement, a different service can legitimately
+// claim the exact (hostPort, guestIP, vmPort) another service left pending —
+// and the retry would then delete that live rule while reporting a successful
+// reconciliation. The guard has to consider every running service, the way
+// retryPendingNetworkDevices already did.
+func TestReconcile_PortForwardRetryDoesNotDeleteRuleClaimedByAnotherService(t *testing.T) {
+	net := &fakeNetworkManager{teardownForwardErr: errors.New("rule missing")}
+	r, vmMgr := newNetworkTestReconciler(net)
+
+	// Tick 1: "web" owns 8080 -> 172.16.0.2:80.
+	if err := r.Reconcile(context.Background(), config.NodeConfig{
+		Node: "node-1", Services: []config.ServiceConfig{forwardedService("web")},
+	}); err != nil {
+		t.Fatalf("initial create: %v", err)
+	}
+
+	// Tick 2: "web" is deleted and its teardown fails, leaving the tuple pending.
+	if err := r.Reconcile(context.Background(), config.NodeConfig{Node: "node-1"}); err == nil {
+		t.Fatal("expected the failed teardown to surface")
+	}
+	if len(r.pendingPortForwards) != 1 {
+		t.Fatalf("expected web's rule to be pending, got %#v", r.pendingPortForwards)
+	}
+
+	// Tick 3: a different service claims the identical tuple. Its rule is
+	// live, so the pending entry must be dropped without any teardown call.
+	replacement := forwardedService("web-v2")
+	callsBefore := len(net.teardownForwardCalls)
+	err := r.Reconcile(context.Background(), config.NodeConfig{
+		Node: "node-1", Services: []config.ServiceConfig{replacement},
+	})
+	if err != nil {
+		t.Fatalf("tick should converge once another service claims the tuple: %v", err)
+	}
+	if got := net.teardownForwardCalls[callsBefore:]; len(got) != 0 {
+		t.Fatalf("retry tore down a rule claimed by the running replacement: %#v", got)
+	}
+	if len(r.pendingPortForwards) != 0 {
+		t.Fatalf("expected the claimed entry to be dropped, got %#v", r.pendingPortForwards)
+	}
+	if _, running := vmMgr.instances["web-v2"]; !running {
+		t.Fatal("replacement service is not running")
+	}
+}
+
+// The regression: createService discarded the rollback error after a failed
+// VM start, and journalled nothing beforehand. A service whose Start never
+// succeeded is absent from vmManager.List(), so once it is dropped from
+// desired state Plan emits no delete action and its host devices are orphaned
+// with nothing tracking them.
+func TestCreateService_FailedStartTracksNetworkDeviceCleanup(t *testing.T) {
+	net := &fakeNetworkManager{deleteErrByDevice: map[string]error{"tap-web": errors.New("device busy")}}
+	r, vmMgr := newNetworkTestReconciler(net)
+	vmMgr.startErr = errors.New("firecracker refused to boot")
+
+	svc := config.ServiceConfig{Name: "web", Network: &config.NetworkConfig{GuestIP: "172.16.0.2"}}
+	desired := config.NodeConfig{Node: "node-1", Services: []config.ServiceConfig{svc}}
+	if err := r.Reconcile(context.Background(), desired); err == nil {
+		t.Fatal("expected the failed start to surface")
+	}
+	if _, running := vmMgr.instances["web"]; running {
+		t.Fatal("VM should not be running after a failed start")
+	}
+	// The tap could not be rolled back, so it must be tracked rather than
+	// discarded -- this is the entry that keeps the device from leaking.
+	if len(r.pendingNetworkDevices) != 1 {
+		t.Fatalf("expected the un-rolled-back tap to be pending, got %#v", r.pendingNetworkDevices)
+	}
+	for key := range r.pendingNetworkDevices {
+		if key.kind != networkDeviceTAP || key.name != "tap-web" {
+			t.Fatalf("unexpected pending device: %#v", key)
+		}
+	}
+
+	// Dropping the service from desired state produces no delete action, so
+	// the pending entry is the only thing that can still clean it up.
+	if err := r.Reconcile(context.Background(), config.NodeConfig{Node: "node-1"}); err == nil {
+		t.Fatal("the still-pending tap must keep failing the tick")
+	}
+	delete(net.deleteErrByDevice, "tap-web")
+	if err := r.Reconcile(context.Background(), config.NodeConfig{Node: "node-1"}); err != nil {
+		t.Fatalf("tick should converge once the orphaned tap is deleted: %v", err)
+	}
+	if len(r.pendingNetworkDevices) != 0 {
+		t.Fatalf("expected the orphaned tap to be cleaned up, got %#v", r.pendingNetworkDevices)
+	}
+}
+
+// A successful create must not leave its write-ahead entries behind: the
+// running VM claims those devices, so the journal returns to empty.
+func TestCreateService_SuccessfulStartClearsJournalledDevices(t *testing.T) {
+	net := &fakeNetworkManager{}
+	r, _ := newNetworkTestReconciler(net)
+	svc := config.ServiceConfig{Name: "web", Network: &config.NetworkConfig{GuestIP: "172.16.0.2"}}
+	if err := r.Reconcile(context.Background(), config.NodeConfig{
+		Node: "node-1", Services: []config.ServiceConfig{svc},
+	}); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	if len(r.pendingNetworkDevices) != 0 {
+		t.Fatalf("a successful create left write-ahead entries behind: %#v", r.pendingNetworkDevices)
+	}
+}
+
+// The regression: the journal was decoded permissively and unvalidated, so a
+// file written by an older schema could decode into zero-valued entries --
+// a device with an empty kind and name deletes nothing, then clears itself,
+// silently discarding the cleanup the journal exists to guarantee. Any file
+// that is not this exact schema must fail closed instead.
+func TestWithStateDir_RejectsForeignJournalShapesAsCorrupt(t *testing.T) {
+	for name, body := range map[string]string{
+		// The previous release's shape: network entries carried a whole
+		// service config, not a (kind, name) device identity.
+		"previous schema":   `{"network":[{"service_name":"web","config":{"name":"web"}}]}`,
+		"missing version":   `{"port_forwards":[{"service_name":"web","guest_ip":"172.16.0.2","port_forward":{"host_port":8080,"vm_port":80}}]}`,
+		"future version":    `{"version":99,"network":[{"service_name":"web","kind":"tap","name":"tap-web"}]}`,
+		"unknown kind":      `{"version":1,"network":[{"service_name":"web","kind":"bond","name":"bond0"}]}`,
+		"empty device":      `{"version":1,"network":[{"service_name":"web","kind":"tap","name":""}]}`,
+		"port out of range": `{"version":1,"port_forwards":[{"service_name":"web","guest_ip":"172.16.0.2","port_forward":{"host_port":0,"vm_port":80}}]}`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			dir := t.TempDir()
+			if err := os.WriteFile(filepath.Join(dir, pendingTeardownsFile), []byte(body), 0o644); err != nil {
+				t.Fatalf("seeding journal: %v", err)
+			}
+			logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+			r := NewWithNetworkManager(newFakeVMManager(), logger, nil, &fakeNetworkManager{}, "", 0).WithStateDir(dir)
+			if !r.journalCorrupt {
+				t.Fatalf("journal was accepted instead of failing closed; loaded %#v / %#v",
+					r.pendingPortForwards, r.pendingNetworkDevices)
+			}
+			if err := r.Reconcile(context.Background(), config.NodeConfig{Node: "node-1"}); err == nil {
+				t.Fatal("a corrupt journal must keep the node from reporting convergence")
+			}
+		})
+	}
+}
+
+// The regression: json.Decoder.Decode reads exactly one JSON value and stops,
+// so a journal with trailing content decoded as whatever the first value said
+// -- {"version":1}{"network":[...]} was accepted as an empty journal, silently
+// dropping every entry after it.
+func TestWithStateDir_RejectsJournalWithTrailingContent(t *testing.T) {
+	dir := t.TempDir()
+	body := `{"version":1}{"version":1,"network":[{"service_name":"web","kind":"tap","name":"tap-web"}]}`
+	if err := os.WriteFile(filepath.Join(dir, pendingTeardownsFile), []byte(body), 0o644); err != nil {
+		t.Fatalf("seeding journal: %v", err)
+	}
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	r := NewWithNetworkManager(newFakeVMManager(), logger, nil, &fakeNetworkManager{}, "", 0).WithStateDir(dir)
+	if !r.journalCorrupt {
+		t.Fatalf("journal with trailing content was accepted; loaded %#v", r.pendingNetworkDevices)
+	}
+}
+
+// The regression: createService journalled unconditionally, so journalCorrupt
+// blocked starting a VM that has no host network resources to journal at all
+// -- despite Reconcile otherwise continuing to converge normally.
+func TestCreateService_CorruptJournalDoesNotBlockServiceWithoutNetwork(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, pendingTeardownsFile), []byte("{not json"), 0o644); err != nil {
+		t.Fatalf("seeding corrupt journal: %v", err)
+	}
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	vmMgr := newFakeVMManager()
+	r := NewWithNetworkManager(vmMgr, logger, nil, &fakeNetworkManager{}, "", 0).WithStateDir(dir)
+	if !r.journalCorrupt {
+		t.Fatal("expected the seeded journal to be treated as corrupt")
+	}
+
+	// A service with no network config creates no host resources, so a
+	// corrupt journal has no bearing on whether it can start.
+	svc := config.ServiceConfig{Name: "batch"}
+	err := r.Reconcile(context.Background(), config.NodeConfig{Node: "node-1", Services: []config.ServiceConfig{svc}})
+	if err == nil {
+		t.Fatal("the corrupt journal must still poison the convergence signal")
+	}
+	if !strings.Contains(err.Error(), "corrupt") {
+		t.Fatalf("expected the corrupt-journal error, got: %v", err)
+	}
+	if _, running := vmMgr.instances["batch"]; !running {
+		t.Fatal("a service with no host network resources was blocked from starting by the corrupt journal")
+	}
+}

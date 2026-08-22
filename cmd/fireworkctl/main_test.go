@@ -14,9 +14,13 @@ func TestRunWithoutCommandPrintsUsage(t *testing.T) {
 	if err := run(nil, &out); err != nil {
 		t.Fatalf("run returned an error: %v", err)
 	}
+	if strings.Contains(out.String(), "\t") {
+		t.Fatalf("usage output contains tab indentation: %q", out.String())
+	}
 
 	for _, want := range []string{
 		"Usage:",
+		"status                Show current revision convergence",
 		"nodes                 List deployment nodes",
 		"node <node-id>        Show node details",
 		"services              List deployment services",
@@ -43,7 +47,7 @@ func TestRunHelpPrintsUsage(t *testing.T) {
 }
 
 func TestRunSubcommandHelpDoesNotRequireConfiguration(t *testing.T) {
-	for _, command := range []string{"nodes", "node", "services", "service"} {
+	for _, command := range []string{"status", "nodes", "node", "services", "service"} {
 		t.Run(command, func(t *testing.T) {
 			var out bytes.Buffer
 			if err := run([]string{"--endpoint", "https://example.com", command, "--help"}, &out); err != nil {

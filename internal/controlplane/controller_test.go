@@ -4,6 +4,7 @@ import (
 	"testing"
 
 	"github.com/artemnikitin/firework/internal/config"
+	"github.com/artemnikitin/firework/internal/scheduler"
 )
 
 func TestApplyHostIPAndCrossNodeLinks(t *testing.T) {
@@ -140,5 +141,44 @@ func TestApplyCrossNodeLinksSharedEnvKey(t *testing.T) {
 				t.Fatalf("injected SEED_HOSTS = %q, want %q", got, tt.want)
 			}
 		})
+	}
+}
+
+// The regression: scheduler.BuildNodeConfigs omits a node that ended up with
+// no services, publishRendered then deleted its nodes/<node>.yaml, and the
+// agent treated the missing file as a fetch failure and kept running every VM
+// it already had. The fleet view derives its relevant node set from the same
+// placement, so the retired node stopped being counted and the revision could
+// report converged on the strength of the node that received the work.
+func TestAppendRetiredNodeConfigs(t *testing.T) {
+	activeNodes := []scheduler.Node{{InstanceID: "node-a"}, {InstanceID: "node-b"}}
+	// node-b took over the only service; node-a was left with nothing.
+	placed := []config.NodeConfig{{Node: "node-b", Services: []config.ServiceConfig{{Name: "web"}}}}
+
+	got := appendRetiredNodeConfigs(placed, activeNodes)
+
+	if len(got) != 2 {
+		t.Fatalf("expected the retired node to be published explicitly, got %#v", got)
+	}
+	if got[0].Node != "node-a" || got[1].Node != "node-b" {
+		t.Fatalf("expected deterministic ordering by node, got %#v", got)
+	}
+	if len(got[0].Services) != 0 {
+		t.Fatalf("retired node must be published with no services, got %#v", got[0].Services)
+	}
+	if len(got[1].Services) != 1 || got[1].Services[0].Name != "web" {
+		t.Fatalf("the placed node's services were altered: %#v", got[1])
+	}
+}
+
+// A node absent from activeNodes entirely (down, stale, decommissioned) is not
+// part of this placement and must not be resurrected into it.
+func TestAppendRetiredNodeConfigsIgnoresInactiveNodes(t *testing.T) {
+	got := appendRetiredNodeConfigs(
+		[]config.NodeConfig{{Node: "node-b", Services: []config.ServiceConfig{{Name: "web"}}}},
+		[]scheduler.Node{{InstanceID: "node-b"}},
+	)
+	if len(got) != 1 || got[0].Node != "node-b" {
+		t.Fatalf("expected only the active placed node, got %#v", got)
 	}
 }
