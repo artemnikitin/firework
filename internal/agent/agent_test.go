@@ -885,6 +885,8 @@ type fakeNetwork struct {
 
 func (f *fakeNetwork) Setup(config.ServiceConfig) error    { return nil }
 func (f *fakeNetwork) Teardown(config.ServiceConfig) error { return nil }
+func (f *fakeNetwork) DeleteTAP(string) error              { return nil }
+func (f *fakeNetwork) DeleteBridge(string) error           { return nil }
 func (f *fakeNetwork) TeardownPortForward(int, string, int) error {
 	return nil
 }

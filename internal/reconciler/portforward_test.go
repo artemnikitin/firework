@@ -23,21 +23,39 @@ type fakeNetworkManager struct {
 	// while others succeed normally.
 	teardownForwardErrByPort map[int]error
 	teardownCalls            []string
+	deleteTAPCalls           []string
+	deleteBridgeCalls        []string
 	teardownErr              error
-	// teardownErrByTap overrides teardownErr for a specific tap device name,
-	// so a test can make one generation's device teardown persistently fail
-	// while others succeed normally.
-	teardownErrByTap map[string]error
+	// deleteErrByDevice overrides teardownErr for a specific device name, so
+	// a test can make one component's deletion persistently fail while others
+	// succeed normally. Keyed by device name, which is unique across taps and
+	// bridges (tap-* / br-* by construction).
+	deleteErrByDevice map[string]error
 }
 
 func (f *fakeNetworkManager) Setup(config.ServiceConfig) error { return nil }
+
+// Teardown is the composite path, used only by createService's rollback.
 func (f *fakeNetworkManager) Teardown(svc config.ServiceConfig) error {
 	tap := ""
 	if svc.Network != nil {
 		tap = svc.Network.Interface
 	}
 	f.teardownCalls = append(f.teardownCalls, tap)
-	if err, ok := f.teardownErrByTap[tap]; ok {
+	return f.teardownErr
+}
+
+func (f *fakeNetworkManager) DeleteTAP(name string) error {
+	f.deleteTAPCalls = append(f.deleteTAPCalls, name)
+	if err, ok := f.deleteErrByDevice[name]; ok {
+		return err
+	}
+	return f.teardownErr
+}
+
+func (f *fakeNetworkManager) DeleteBridge(name string) error {
+	f.deleteBridgeCalls = append(f.deleteBridgeCalls, name)
+	if err, ok := f.deleteErrByDevice[name]; ok {
 		return err
 	}
 	return f.teardownErr
@@ -346,7 +364,7 @@ func TestReconcile_ConsecutiveUpdatesTrackEachGenerationsStaleRuleIndependently(
 	}
 }
 
-// The regression: pendingNetworkTeardowns was previously keyed by service
+// The regression: pendingNetworkDevices was previously keyed by service
 // name, on the (false) premise that a tap device's path is derived purely
 // from the name. It is not: svc.Network.Interface, when set explicitly,
 // overrides the default tap-<name> path. So a service moving through two
@@ -355,7 +373,7 @@ func TestReconcile_ConsecutiveUpdatesTrackEachGenerationsStaleRuleIndependently(
 // pending tap the same way finding 1 showed for port forwards: B's delete
 // (success or failure) overwrote or erased the single per-name entry.
 func TestReconcile_ConsecutiveUpdatesTrackEachGenerationsStaleNetworkDeviceIndependently(t *testing.T) {
-	net := &fakeNetworkManager{teardownErrByTap: map[string]error{"tap-a": errors.New("device busy")}}
+	net := &fakeNetworkManager{deleteErrByDevice: map[string]error{"tap-a": errors.New("device busy")}}
 	r, vmMgr := newNetworkTestReconciler(net)
 
 	// A: tap-a.
@@ -371,8 +389,8 @@ func TestReconcile_ConsecutiveUpdatesTrackEachGenerationsStaleNetworkDeviceIndep
 	if err := r.Reconcile(context.Background(), toB); err == nil {
 		t.Fatal("expected A's stale tap-a device to surface")
 	}
-	if len(r.pendingNetworkTeardowns) != 1 {
-		t.Fatalf("expected exactly one pending network teardown after A->B, got %d: %#v", len(r.pendingNetworkTeardowns), r.pendingNetworkTeardowns)
+	if len(r.pendingNetworkDevices) != 1 {
+		t.Fatalf("expected exactly one pending network device after A->B, got %d: %#v", len(r.pendingNetworkDevices), r.pendingNetworkDevices)
 	}
 
 	// B -> C: tap-c. Tearing down B's tap-b succeeds. The bug: this used to
@@ -390,11 +408,11 @@ func TestReconcile_ConsecutiveUpdatesTrackEachGenerationsStaleNetworkDeviceIndep
 	}
 
 	// A's entry must have survived, and only A's.
-	if len(r.pendingNetworkTeardowns) != 1 {
-		t.Fatalf("expected A's entry to be the only one still pending, got %d: %#v", len(r.pendingNetworkTeardowns), r.pendingNetworkTeardowns)
+	if len(r.pendingNetworkDevices) != 1 {
+		t.Fatalf("expected A's entry to be the only one still pending, got %d: %#v", len(r.pendingNetworkDevices), r.pendingNetworkDevices)
 	}
-	for key := range r.pendingNetworkTeardowns {
-		if key.tapName != "tap-a" {
+	for key := range r.pendingNetworkDevices {
+		if key.name != "tap-a" {
 			t.Fatalf("wrong entry survived: %#v", key)
 		}
 	}
@@ -402,11 +420,11 @@ func TestReconcile_ConsecutiveUpdatesTrackEachGenerationsStaleNetworkDeviceIndep
 	// One more tick with nothing changed: tap-a must still be retried, and
 	// neither tap-b nor tap-c (both live-and-valid, or already resolved) may
 	// be touched again by the retry path.
-	callsBefore := len(net.teardownCalls)
+	callsBefore := len(net.deleteTAPCalls)
 	if err := r.Reconcile(context.Background(), toC); err == nil {
 		t.Fatal("A's stale device must keep failing the tick")
 	}
-	for _, tap := range net.teardownCalls[callsBefore:] {
+	for _, tap := range net.deleteTAPCalls[callsBefore:] {
 		if tap != "tap-a" {
 			t.Fatalf("retry touched an unrelated network device: %q", tap)
 		}
@@ -414,16 +432,138 @@ func TestReconcile_ConsecutiveUpdatesTrackEachGenerationsStaleNetworkDeviceIndep
 
 	// Once A's device is finally torn down, the tick converges and C keeps
 	// running on its own tap.
-	delete(net.teardownErrByTap, "tap-a")
+	delete(net.deleteErrByDevice, "tap-a")
 	if err := r.Reconcile(context.Background(), toC); err != nil {
 		t.Fatalf("tick should converge once A's stale device is torn down: %v", err)
 	}
-	if len(r.pendingNetworkTeardowns) != 0 {
-		t.Fatalf("expected no pending network teardowns left, got %#v", r.pendingNetworkTeardowns)
+	if len(r.pendingNetworkDevices) != 0 {
+		t.Fatalf("expected no pending network devices left, got %#v", r.pendingNetworkDevices)
 	}
 	inst, running := vmMgr.instances["web"]
 	if !running || inst.Config.Network == nil || inst.Config.Network.Interface != "tap-c" {
 		t.Fatalf("service C not left running on its own tap: %#v", vmMgr.instances["web"])
+	}
+}
+
+// The regression: a service's tap and bridge were tracked as one composite
+// (tapName, bridgeName) identity and retried through NetworkManager.Teardown,
+// which always deletes both components. A config can drop host_dev_name while
+// keeping the same explicit interface, which makes only the bridge obsolete —
+// but because the composite key differed, the retry fired and took the live
+// tap down with it, while reporting a successful reconciliation. Each device
+// must be tracked and released on its own, and any device claimed by a
+// running service must never be deleted.
+func TestReconcile_ObsoleteBridgeRetryDoesNotDeleteTAPStillClaimedByRunningService(t *testing.T) {
+	net := &fakeNetworkManager{deleteErrByDevice: map[string]error{"br-web": errors.New("bridge busy")}}
+	r, vmMgr := newNetworkTestReconciler(net)
+
+	// A: explicit tap-x plus a bridge (host_dev_name set).
+	a := config.ServiceConfig{
+		Name:    "web",
+		Network: &config.NetworkConfig{Interface: "tap-x", HostDevName: "eth0", GuestIP: "172.16.0.2"},
+	}
+	if err := r.Reconcile(context.Background(), config.NodeConfig{Node: "node-1", Services: []config.ServiceConfig{a}}); err != nil {
+		t.Fatalf("initial create: %v", err)
+	}
+
+	// A -> B: same explicit tap-x, host_dev_name dropped. Only the bridge is
+	// obsolete; tap-x stays claimed by the running service. Deleting br-web
+	// fails, so it must be tracked on its own.
+	b := a
+	b.Network = &config.NetworkConfig{Interface: "tap-x", GuestIP: "172.16.0.2"}
+	toB := config.NodeConfig{Node: "node-1", Services: []config.ServiceConfig{b}}
+	if err := r.Reconcile(context.Background(), toB); err == nil {
+		t.Fatal("expected the failed br-web deletion to surface")
+	}
+	if len(r.pendingNetworkDevices) != 1 {
+		t.Fatalf("expected only the bridge to be pending, got %#v", r.pendingNetworkDevices)
+	}
+	for key := range r.pendingNetworkDevices {
+		if key.kind != networkDeviceBridge || key.name != "br-web" {
+			t.Fatalf("expected the pending device to be bridge br-web, got %#v", key)
+		}
+	}
+
+	// From here on there are no further updates, only retry ticks. The A->B
+	// update legitimately deleted and recreated tap-x (an update is a stop +
+	// start), but no retry may ever delete it again: it is claimed by the
+	// running B. Everything after this mark is retry-path activity.
+	retriesStart := len(net.deleteTAPCalls)
+
+	if err := r.Reconcile(context.Background(), toB); err == nil {
+		t.Fatal("the still-failing bridge deletion must keep failing the tick")
+	}
+	if net.teardownCalls != nil {
+		t.Fatalf("retry used the composite Teardown, which always deletes both components: %#v", net.teardownCalls)
+	}
+
+	// Once the bridge finally goes away the tick converges, and B is still
+	// running on the tap that was never touched.
+	delete(net.deleteErrByDevice, "br-web")
+	if err := r.Reconcile(context.Background(), toB); err != nil {
+		t.Fatalf("tick should converge once the obsolete bridge is deleted: %v", err)
+	}
+	if len(r.pendingNetworkDevices) != 0 {
+		t.Fatalf("expected no pending network devices left, got %#v", r.pendingNetworkDevices)
+	}
+	inst, running := vmMgr.instances["web"]
+	if !running || inst.Config.Network == nil || inst.Config.Network.Interface != "tap-x" {
+		t.Fatalf("service B was not left running on tap-x: %#v", vmMgr.instances["web"])
+	}
+	for _, tap := range net.deleteTAPCalls[retriesStart:] {
+		if tap == "tap-x" {
+			t.Fatalf("a retry deleted tap-x, which was claimed by the running service throughout: %#v", net.deleteTAPCalls[retriesStart:])
+		}
+	}
+}
+
+// The regression: the journal was written *after* the VM was removed, so a
+// crash in between left the VM gone, no future delete action to plan (the
+// service is absent from both desired and actual state), and no durable
+// record of the host resources it left behind — the node restarted and
+// reported converged with stale DNAT rules and devices still on the host.
+// The journal must be written before the VM is removed, and a write failure
+// must abort the removal rather than proceed unrecorded.
+func TestDeleteService_AbortsRemovalWhenCleanupCannotBeJournalled(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("running as root ignores the directory permissions this test relies on")
+	}
+	dir := t.TempDir()
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	net := &fakeNetworkManager{}
+	vmMgr := newFakeVMManager()
+	r := NewWithNetworkManager(vmMgr, logger, nil, net, "", 0).WithStateDir(dir)
+
+	desired := config.NodeConfig{Node: "node-1", Services: []config.ServiceConfig{forwardedService("web")}}
+	if err := r.Reconcile(context.Background(), desired); err != nil {
+		t.Fatalf("initial create: %v", err)
+	}
+
+	// Make the journal unwritable only now: the state dir has to be readable
+	// at construction (an unreadable one is the separate journalCorrupt path)
+	// and nothing writes the journal until a delete needs to record cleanup.
+	if err := os.Chmod(dir, 0o500); err != nil {
+		t.Fatalf("making state dir read-only: %v", err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(dir, 0o755) })
+
+	// Now delete the service. The journal write must fail, and that must
+	// stop the VM from being removed at all.
+	err := r.Reconcile(context.Background(), config.NodeConfig{Node: "node-1"})
+	if err == nil {
+		t.Fatal("expected the delete to fail when its cleanup cannot be journalled")
+	}
+	if _, stillRunning := vmMgr.instances["web"]; !stillRunning {
+		t.Fatal("VM was removed even though its pending cleanup could not be durably recorded")
+	}
+	// Nothing may have been torn down either, since the removal never happened.
+	if len(net.teardownForwardCalls) != 0 {
+		t.Fatalf("host resources were torn down despite the aborted removal: %#v", net.teardownForwardCalls)
+	}
+	// The in-memory maps must be rolled back to match the (unchanged) journal
+	// on disk, not left holding entries for a VM that was never removed.
+	if len(r.pendingPortForwards) != 0 || len(r.pendingNetworkDevices) != 0 {
+		t.Fatalf("failed journal write left phantom pending entries: %#v / %#v", r.pendingPortForwards, r.pendingNetworkDevices)
 	}
 }
 
