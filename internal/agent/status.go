@@ -1,7 +1,9 @@
 package agent
 
 import (
+	"fmt"
 	"sort"
+	"strings"
 	"time"
 
 	"github.com/artemnikitin/firework/internal/config"
@@ -55,16 +57,67 @@ func (a *Agent) finishTickStatus() {
 //   - CapacityReady and ImagesReady are inferred from the revision being
 //     unchanged: the same revision demands the same capacity and the same
 //     images, both already satisfied when it was first applied.
-//   - VMsReconciled and Reconciled likewise describe work whose inputs have
-//     not changed.
-func (a *Agent) markUnchangedRevisionReady() {
-	for _, conditionType := range []string{"NetworkReady", "CapacityReady", "ImagesReady", "VMsReconciled", "Reconciled"} {
+//   - VMsReconciled and Reconciled describe work whose *inputs* have not
+//     changed, which is not the same as its outputs still holding. A VM can
+//     fail after the revision was applied, and this path skips reconciliation
+//     entirely, so those two are asserted only after checking that no VM has
+//     actually failed. Without that check a crashed workload keeps reporting
+//     converged: the service summary says failed, but the fleet view only
+//     requires the service to be present with true conditions.
+//
+// Returns false when it could not honestly claim readiness, so the caller
+// does not go on to publish PhaseReady over the top of a failed condition.
+func (a *Agent) markUnchangedRevisionReady() bool {
+	return a.markUnchangedRevisionReadyWith(a.failedVMNames())
+}
+
+// markUnchangedRevisionReadyWith is markUnchangedRevisionReady's decision,
+// separated from the VM state it reads so it can be exercised directly.
+func (a *Agent) markUnchangedRevisionReadyWith(failed []string) bool {
+	ready := []string{"NetworkReady", "CapacityReady", "ImagesReady", "VMsReconciled", "Reconciled"}
+	if len(failed) > 0 {
+		message := fmt.Sprintf("VMs in a failed state: %s", strings.Join(failed, ", "))
+		for _, conditionType := range []string{"NetworkReady", "CapacityReady", "ImagesReady"} {
+			if a.statusConditionIs(conditionType, statusmodel.ConditionTrue) {
+				a.markConditionEvaluated(conditionType)
+				continue
+			}
+			a.setStatusCondition(conditionType, statusmodel.ConditionTrue, "unchanged_revision", "")
+		}
+		// Same condition vocabulary the reconciling path uses for a failed VM,
+		// so the two cannot describe the same state differently.
+		a.setStatusCondition("VMsReconciled", statusmodel.ConditionFalse, "vm_reconcile_failed", message)
+		a.failAgentStatus("Reconciled", "vm_reconcile_failed", message)
+		return false
+	}
+	for _, conditionType := range ready {
 		if a.statusConditionIs(conditionType, statusmodel.ConditionTrue) {
 			a.markConditionEvaluated(conditionType)
 			continue
 		}
 		a.setStatusCondition(conditionType, statusmodel.ConditionTrue, "unchanged_revision", "")
 	}
+	return true
+}
+
+// failedVMNames lists the running services whose VM is in a failed state, in
+// deterministic order.
+func (a *Agent) failedVMNames() []string {
+	if a.vmManager == nil {
+		return nil
+	}
+	return failedVMNamesFrom(a.vmManager.List())
+}
+
+func failedVMNamesFrom(instances map[string]*vm.Instance) []string {
+	var failed []string
+	for name, instance := range instances {
+		if instance != nil && instance.State == vm.StateFailed {
+			failed = append(failed, name)
+		}
+	}
+	sort.Strings(failed)
+	return failed
 }
 
 func (a *Agent) setStatusServices(node config.NodeConfig, fallbackRevision string) {

@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"maps"
 	"os"
@@ -331,6 +332,16 @@ func (r *Reconciler) WithStateDir(dir string) *Reconciler {
 	decoder.DisallowUnknownFields()
 	if err := decoder.Decode(&loaded); err != nil {
 		r.logger.Error("pending teardowns journal is corrupt; this node will not report converged until it is resolved manually",
+			"path", path, "error", err)
+		r.journalCorrupt = true
+		return r
+	}
+	// Decode reads exactly one JSON value and stops, so a file like
+	// {"version":1}{"network":[...]} would otherwise be accepted as an empty
+	// journal and silently drop everything after the first value. Anything
+	// beyond the first value means this is not a file this code wrote.
+	if err := decoder.Decode(new(json.RawMessage)); !errors.Is(err, io.EOF) {
+		r.logger.Error("pending teardowns journal has trailing content; this node will not report converged until it is resolved manually",
 			"path", path, "error", err)
 		r.journalCorrupt = true
 		return r
@@ -1009,6 +1020,13 @@ func (r *Reconciler) journalPendingCleanup(mutate func()) error {
 	prevPortForwards := maps.Clone(r.pendingPortForwards)
 	prevNetworkDevices := maps.Clone(r.pendingNetworkDevices)
 	mutate()
+	// Nothing to record means nothing to fail on. A service with no network
+	// config produces no host resources at all, and writing the journal for it
+	// anyway made an unrelated condition — a corrupt journal, a full disk —
+	// block starting a VM that has nothing to clean up in the first place.
+	if maps.Equal(prevPortForwards, r.pendingPortForwards) && maps.Equal(prevNetworkDevices, r.pendingNetworkDevices) {
+		return nil
+	}
 	if err := r.persistPendingTeardowns(); err != nil {
 		r.pendingPortForwards = prevPortForwards
 		r.pendingNetworkDevices = prevNetworkDevices

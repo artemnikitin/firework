@@ -847,3 +847,50 @@ func TestWithStateDir_RejectsForeignJournalShapesAsCorrupt(t *testing.T) {
 		})
 	}
 }
+
+// The regression: json.Decoder.Decode reads exactly one JSON value and stops,
+// so a journal with trailing content decoded as whatever the first value said
+// -- {"version":1}{"network":[...]} was accepted as an empty journal, silently
+// dropping every entry after it.
+func TestWithStateDir_RejectsJournalWithTrailingContent(t *testing.T) {
+	dir := t.TempDir()
+	body := `{"version":1}{"version":1,"network":[{"service_name":"web","kind":"tap","name":"tap-web"}]}`
+	if err := os.WriteFile(filepath.Join(dir, pendingTeardownsFile), []byte(body), 0o644); err != nil {
+		t.Fatalf("seeding journal: %v", err)
+	}
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	r := NewWithNetworkManager(newFakeVMManager(), logger, nil, &fakeNetworkManager{}, "", 0).WithStateDir(dir)
+	if !r.journalCorrupt {
+		t.Fatalf("journal with trailing content was accepted; loaded %#v", r.pendingNetworkDevices)
+	}
+}
+
+// The regression: createService journalled unconditionally, so journalCorrupt
+// blocked starting a VM that has no host network resources to journal at all
+// -- despite Reconcile otherwise continuing to converge normally.
+func TestCreateService_CorruptJournalDoesNotBlockServiceWithoutNetwork(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, pendingTeardownsFile), []byte("{not json"), 0o644); err != nil {
+		t.Fatalf("seeding corrupt journal: %v", err)
+	}
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	vmMgr := newFakeVMManager()
+	r := NewWithNetworkManager(vmMgr, logger, nil, &fakeNetworkManager{}, "", 0).WithStateDir(dir)
+	if !r.journalCorrupt {
+		t.Fatal("expected the seeded journal to be treated as corrupt")
+	}
+
+	// A service with no network config creates no host resources, so a
+	// corrupt journal has no bearing on whether it can start.
+	svc := config.ServiceConfig{Name: "batch"}
+	err := r.Reconcile(context.Background(), config.NodeConfig{Node: "node-1", Services: []config.ServiceConfig{svc}})
+	if err == nil {
+		t.Fatal("the corrupt journal must still poison the convergence signal")
+	}
+	if !strings.Contains(err.Error(), "corrupt") {
+		t.Fatalf("expected the corrupt-journal error, got: %v", err)
+	}
+	if _, running := vmMgr.instances["batch"]; !running {
+		t.Fatal("a service with no host network resources was blocked from starting by the corrupt journal")
+	}
+}

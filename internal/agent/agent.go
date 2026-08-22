@@ -389,9 +389,13 @@ func (a *Agent) tick(ctx context.Context) {
 			case traefikErr != nil:
 				a.failAgentStatus("LocalRoutesReady", "local_route_sync_failed", traefikErr.Error())
 			default:
-				a.markUnchangedRevisionReady()
+				// Routes did sync, so record that first — it holds whether or
+				// not the VMs are healthy, and it makes the snapshot taken
+				// inside a failed markUnchangedRevisionReady consistent.
 				a.setStatusCondition("LocalRoutesReady", statusmodel.ConditionTrue, "", "")
-				a.refreshAgentStatus(statusmodel.PhaseReady, "", "")
+				if a.markUnchangedRevisionReady() {
+					a.refreshAgentStatus(statusmodel.PhaseReady, "", "")
+				}
 			}
 			a.logger.Debug("config unchanged, skipped reconciliation after route refresh", "revision", rev)
 			a.refreshRuntimeMetrics()
