@@ -175,7 +175,9 @@ so a PID inspected any earlier is still systemd, and a manifest written from
 that inspection describes a process that never existed at that identity and can
 never be validated again. A launch whose identity cannot be confirmed within a
 short bound is killed rather than recorded; its state directory is removed once
-the process is proven gone, and retained for recovery if it is not.
+the process is proven gone. If it cannot be proven gone, it is retained as
+`recovery_pending` and keeps ownership of its host networking so reconciliation
+cannot tear resources down around a potentially live microVM.
 
 Recovery is spent once per agent process, including on a fresh node where the
 VM state directory does not exist yet. That directory appears as soon as the

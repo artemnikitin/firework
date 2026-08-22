@@ -278,7 +278,9 @@ func (m *Manager) Start(ctx context.Context, svc config.ServiceConfig) error {
 	manifest.Launcher = launched.Launcher
 	manifest.LauncherUnit = launched.Unit
 	if identityErr := m.recordLaunchedIdentity(manifest, launched); identityErr != nil {
-		m.abandonLaunch(svc.Name, manifest, launched, identityErr)
+		if m.abandonLaunch(svc.Name, manifest, launched, identityErr) {
+			m.instances[svc.Name] = instanceFromManifest(manifest, StateRecoveryPending, manifest.LastError)
+		}
 		return fmt.Errorf("confirming launched process identity: %w", identityErr)
 	}
 	manifest.Lifecycle = lifecycleRunning
@@ -314,6 +316,10 @@ func (m *Manager) Start(ctx context.Context, svc config.ServiceConfig) error {
 // start. Durable state that may still own a process is never reclaimed, but
 // state whose process is recorded as gone is removed: otherwise a single failed
 // launch blocks every later start of that service for the life of the process.
+// A failed direct launch with no PID is also safe to reclaim because exec.Start
+// did not create a child. The same is not true for systemd: systemd-run can
+// create a unit and then fail while Firework is waiting for MainPID, so a
+// missing recorded PID does not prove that no process exists.
 func (m *Manager) reclaimUnownedState(service, vmDir string) error {
 	if _, loaded := m.instances[service]; loaded {
 		return nil
@@ -323,7 +329,8 @@ func (m *Manager) reclaimUnownedState(service, vmDir string) error {
 		return nil
 	}
 	if err == nil && manifest.PID == 0 &&
-		(manifest.Lifecycle == lifecycleStopped || manifest.Lifecycle == lifecycleFailed) {
+		(manifest.Lifecycle == lifecycleStopped ||
+			(manifest.Lifecycle == lifecycleFailed && manifest.Launcher == "direct")) {
 		if removeErr := os.RemoveAll(vmDir); removeErr != nil {
 			return fmt.Errorf("removing exited VM state for %s: %w", service, removeErr)
 		}
@@ -387,8 +394,10 @@ func awaitLaunchedIdentity(inspector processInspector, manifest *instanceManifes
 // abandonLaunch stops a launch whose process identity could not be confirmed.
 // The state directory is removed only once the process is proven gone: deleting
 // it while an unidentified process may still be alive would let the next
-// reconcile start a duplicate Firecracker against the same socket and TAP.
-func (m *Manager) abandonLaunch(service string, manifest *instanceManifest, launched *launchedProcess, cause error) {
+// reconcile start a duplicate Firecracker against the same socket and TAP. It
+// reports whether the ambiguous launch was retained so Start can expose it as
+// recovery_pending while it still holds the manager lock.
+func (m *Manager) abandonLaunch(service string, manifest *instanceManifest, launched *launchedProcess, cause error) bool {
 	m.logger.Error("abandoning microVM launch with unprovable process identity",
 		"service", service, "pid", launched.PID, "error", cause)
 	// Signalling is unit-scoped for systemd launches and, for direct launches,
@@ -413,13 +422,14 @@ func (m *Manager) abandonLaunch(service string, manifest *instanceManifest, laun
 			m.logger.Error("could not remove abandoned microVM state",
 				"service", service, "error", err)
 		}
-		return
+		return false
 	}
 	manifest.Lifecycle = lifecycleFailed
-	manifest.LastError = cause.Error()
+	manifest.LastError = fmt.Sprintf("launch identity is unprovable and the process did not exit: %v", cause)
 	_ = writeManifest(manifestPath(manifest.VMDir), manifest)
 	m.logger.Error("abandoned microVM launch did not exit; its state is retained for recovery",
 		"service", service, "pid", launched.PID)
+	return true
 }
 
 // launchIdentityTimeout and launchExitTimeout fall back to the package

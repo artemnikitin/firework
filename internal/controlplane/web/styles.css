@@ -142,9 +142,9 @@ tbody tr:hover { background: #fafcfd; }
 .service-disk { display: grid; gap: .25rem; }
 
 .badge { display: inline-block; padding: .2rem .52rem; border-radius: 1rem; color: #425362; background: #e4eaf0; font-size: .76rem; line-height: 1.25; text-transform: capitalize; white-space: nowrap; }
-.ready, .running, .healthy, .true { color: #12623c; background: #d8f3e5; }
+.ready, .running, .healthy, .true, .converged { color: #12623c; background: #d8f3e5; }
 .failed, .down, .unhealthy, .false { color: #8b1c1c; background: #ffe0e0; }
-.stale, .unknown, .pending, .reconciling { color: #754f00; background: #fff0c7; }
+.stale, .unknown, .pending, .reconciling, .published, .progressing, .degraded { color: #754f00; background: #fff0c7; }
 .draining, .stopped { color: #325777; background: #dcecf8; }
 
 #error { margin-bottom: 1rem; padding: 1rem; border: 1px solid #efb9b9; border-radius: .5rem; color: #8b1c1c; background: #ffe7e7; }

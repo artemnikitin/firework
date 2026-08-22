@@ -117,7 +117,16 @@ func (m *Manager) Recover(_ context.Context, desired config.NodeConfig) ([]strin
 					if identity, waitErr := awaitLaunchedIdentity(m.inspector, manifest, pid, m.launchIdentityTimeout(), launchIdentityInterval); waitErr == nil {
 						manifest.PID = pid
 						applyProcessIdentity(manifest, identity)
+					} else if errors.Is(waitErr, errProcessNotFound) {
+						if removeErr := os.RemoveAll(vmDir); removeErr != nil {
+							errs = append(errs, fmt.Errorf("clean dead starting VM state for %s: %w", name, removeErr))
+						}
+						continue
 					} else {
+						// MainPID identifies the candidate process even though its
+						// ownership is not proved. Retaining it makes the ambiguity
+						// explicit and prevents PID-free state from hiding a live unit.
+						manifest.PID = pid
 						m.logger.Warn("could not confirm the identity of a starting microVM",
 							"service", name, "pid", pid, "error", waitErr)
 					}

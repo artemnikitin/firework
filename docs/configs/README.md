@@ -31,7 +31,7 @@ Examples:
 
 | Field | Required | Default | Notes |
 |---|---|---|---|
-| `node_id` | no | derived from `node_name` | Stable registry identity for mTLS control-plane integration |
+| `node_id` | no | derived from `node_name` | Stable registry identity for mTLS control-plane integration. Max 128 bytes when `registry_url` is set (rejected, not truncated, since it is matched for exact equality against reported volume `bound_node`) |
 | `node_name` | no | host name | Display/identity name for this node |
 | `node_names` | no | derived from `node_name` | Labels to fetch and merge (`nodes/<label>.yaml`) |
 | `store_type` | no | `git` | `git`, `s3`, or `gcs` |
@@ -74,7 +74,7 @@ Examples:
 | `registry_cert_renew_before` | no | `6h` | Proactive cert renewal window |
 | `storage.local.path` | local volumes | - | Operator-mounted local storage pool; must be an actual mount point |
 | `storage.local.capacity` | local volumes | - | Logical admission budget (`Mi`, `Gi`, or `Ti`) |
-| `storage.shared.backend_id` | shared volumes | - | Stable deployment-wide backend identity |
+| `storage.shared.backend_id` | shared volumes | - | Stable deployment-wide backend identity. Max 128 bytes (rejected, not truncated, since it is matched for exact equality against reported volume `shared_backend_id`) |
 | `storage.shared.path` | shared volumes | - | Operator-mounted shared storage root; must be an actual mount point |
 | `storage.shared.capacity` | no | empty | Optional aggregate shared admission budget |
 
@@ -189,9 +189,12 @@ Supported fields:
 | `volumes` | no | Persistent-volume declarations (`name`, `type`, `mount_path`, optional `size`) |
 
 Volume `size` accepts positive integer `Mi` and `Gi` values. Names must be
-DNS-label-like, mount paths must be clean absolute paths, and duplicate or
-overlapping mount paths are rejected. A non-empty tenant `volumes` list
-replaces the inherited list. See [Persistent Volumes](../persistent-volumes.md)
+DNS-label-like, mount paths must be clean absolute paths of at most 256 bytes
+(the limit the registry enforces on reported volume status; a longer path is
+rejected here rather than accepted only to later drop the whole node's status
+telemetry), and duplicate or overlapping mount paths are rejected. A
+non-empty tenant `volumes` list replaces the inherited list. See
+[Persistent Volumes](../persistent-volumes.md)
 for lifecycle and safety semantics.
 
 ### 2.3 `tenants/*` (optional)

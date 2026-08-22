@@ -178,6 +178,41 @@ func TestRecoverCleansStateAfterAHostReboot(t *testing.T) {
 	}
 }
 
+func TestRecoverCleansStartingSystemdStateWhenMainProcessExited(t *testing.T) {
+	manager, manifest, inspector := recoveryFixture(t)
+	manifest.PID = 0
+	manifest.HostBootID = ""
+	manifest.ProcessStart = 0
+	manifest.Executable = ""
+	manifest.ExecutableDev = 0
+	manifest.ExecutableIno = 0
+	manifest.Lifecycle = lifecycleStarting
+	manifest.Launcher = "systemd"
+	manifest.LauncherUnit = "firework-vm-test.service"
+	if err := writeManifest(manifestPath(manifest.VMDir), manifest); err != nil {
+		t.Fatal(err)
+	}
+	delete(inspector.identities, 3637)
+	manager.inspector = inspector
+
+	binDir := t.TempDir()
+	systemctl := filepath.Join(binDir, "systemctl")
+	if err := os.WriteFile(systemctl, []byte("#!/bin/sh\nprintf '3637\\n'\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	if _, err := manager.Recover(context.Background(), config.NodeConfig{}); err != nil {
+		t.Fatal(err)
+	}
+	if instance := manager.List()[manifest.Service]; instance != nil {
+		t.Fatalf("dead starting process was quarantined: %#v", instance)
+	}
+	if _, err := os.Stat(manifest.VMDir); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("dead starting VM state was not removed: %v", err)
+	}
+}
+
 func TestRecoverDistinguishesUnrecordedIdentityFromAMismatch(t *testing.T) {
 	manager, manifest, inspector := recoveryFixture(t)
 	// An inspection that raced the launcher's exec recorded nothing, and the

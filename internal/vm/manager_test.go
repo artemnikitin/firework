@@ -257,8 +257,9 @@ func TestStartAbandonsALaunchWhoseIdentityIsNeverProvable(t *testing.T) {
 			if err == nil || !strings.Contains(err.Error(), "confirming launched process identity") {
 				t.Fatalf("start did not fail on an unprovable identity: %v", err)
 			}
-			if instance := manager.List()["app"]; instance != nil {
-				t.Fatalf("abandoned launch registered an instance: %#v", instance)
+			instance := manager.List()["app"]
+			if !testCase.wantRetained && instance != nil {
+				t.Fatalf("killed launch registered an instance: %#v", instance)
 			}
 			if launcher.stops == 0 {
 				t.Fatal("abandoned launch was never signalled")
@@ -279,6 +280,9 @@ func TestStartAbandonsALaunchWhoseIdentityIsNeverProvable(t *testing.T) {
 			}
 			if manifest.Lifecycle != lifecycleFailed || manifest.LastError == "" || manifest.PID != 3637 {
 				t.Fatalf("retained state did not describe the surviving process: %#v", manifest)
+			}
+			if instance == nil || instance.State != StateRecoveryPending || instance.PID != 3637 || instance.LastError == "" {
+				t.Fatalf("retained launch was not exposed as recovery_pending: %#v", instance)
 			}
 		})
 	}
@@ -303,6 +307,43 @@ func TestStartReclaimsStateLeftByAFailedLaunch(t *testing.T) {
 	stopAdoptedMonitors(t, manager)
 	if err := manager.Start(context.Background(), service); err != nil {
 		t.Fatalf("retry after a failed launch was blocked: %v", err)
+	}
+}
+
+func TestStartDoesNotReclaimFailedSystemdLaunchWithoutProofItExited(t *testing.T) {
+	dir := t.TempDir()
+	vmDir := filepath.Join(dir, "vms", "app")
+	service := config.ServiceConfig{Name: "app", Image: "/image", Kernel: "/kernel", VCPUs: 1, MemoryMB: 128}
+	hash, err := serviceConfigHash(service)
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifest := &instanceManifest{
+		SchemaVersion: manifestSchemaVersion,
+		Service:       service.Name,
+		InstanceID:    "failed-systemd-launch",
+		Lifecycle:     lifecycleFailed,
+		Config:        service,
+		ConfigHash:    hash,
+		SocketPath:    filepath.Join(vmDir, "firecracker.sock"),
+		ConfigPath:    filepath.Join(vmDir, "vm-config.json"),
+		VMDir:         vmDir,
+		Launcher:      "systemd",
+		LauncherUnit:  "firework-vm-failed-systemd-launch.service",
+		StartedAt:     time.Now().UTC(),
+		LastError:     "transient unit did not report a main PID",
+	}
+	if err := writeManifest(manifestPath(vmDir), manifest); err != nil {
+		t.Fatal(err)
+	}
+
+	manager := NewManager("/usr/bin/firecracker", dir, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	err = manager.Start(context.Background(), service)
+	if err == nil || !strings.Contains(err.Error(), "durable VM state") {
+		t.Fatalf("ambiguous systemd launch state was reclaimed: %v", err)
+	}
+	if _, err := os.Stat(manifestPath(vmDir)); err != nil {
+		t.Fatalf("ambiguous systemd launch state was removed: %v", err)
 	}
 }
 

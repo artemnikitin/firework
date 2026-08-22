@@ -209,6 +209,7 @@ func (c *Controller) runReconcile(ctx context.Context) {
 	assignments, pending := scheduler.ScheduleWithStorage(services, activeNodes, existingAssignment, storageReservations(volumeRecords))
 
 	nodeConfigs := scheduler.BuildNodeConfigs(assignments)
+	nodeConfigs = appendRetiredNodeConfigs(nodeConfigs, activeNodes)
 	if err := c.createAssignedVolumeRecords(ctx, nodeConfigs, volumeRecords); err != nil {
 		c.logger.Warn("creating volume records conflicted; retrying on next tick", "error", err)
 		return
@@ -386,6 +387,42 @@ func (c *Controller) publishRendered(ctx context.Context, renderRev string, node
 	}
 
 	return upsertPointer(ctx, c.store, renderedCurrentKey(c.cfg.State.Prefix), renderRev)
+}
+
+// appendRetiredNodeConfigs adds an explicit empty config for every active node
+// the placement assigned no services to. scheduler.BuildNodeConfigs omits such
+// a node entirely, and publishRendered then deletes its nodes/<node>.yaml —
+// but an agent treats a missing config as a fetch failure, not as "run
+// nothing", so it keeps every VM it already had. Meanwhile the fleet view
+// derives its relevant node set from this same placement, so the retired node
+// stops being counted at all and the revision can report converged on the
+// strength of the nodes that did receive work. During an A -> B migration
+// that means B alone converges the revision while A still runs the old
+// workload.
+//
+// Publishing an explicit empty config instead turns retirement into an
+// ordinary convergence step: the node fetches it, reconciles down to zero
+// services, and reports the new revision like every other node — and stays in
+// the relevant set until it does. This must run before the revision metadata
+// is stamped onto nodeConfigs below, because a config published without those
+// revisions can never satisfy the fleet view's observed check.
+//
+// Nodes missing from activeNodes entirely (down, stale, or decommissioned)
+// are deliberately not included: they are not part of this placement at all,
+// and publishRendered's stale-key cleanup still applies to them.
+func appendRetiredNodeConfigs(nodeConfigs []config.NodeConfig, activeNodes []scheduler.Node) []config.NodeConfig {
+	placed := make(map[string]struct{}, len(nodeConfigs))
+	for _, nc := range nodeConfigs {
+		placed[nc.Node] = struct{}{}
+	}
+	for _, node := range activeNodes {
+		if _, ok := placed[node.InstanceID]; ok {
+			continue
+		}
+		nodeConfigs = append(nodeConfigs, config.NodeConfig{Node: node.InstanceID})
+	}
+	sort.Slice(nodeConfigs, func(i, j int) bool { return nodeConfigs[i].Node < nodeConfigs[j].Node })
+	return nodeConfigs
 }
 
 func applyHostIPAndCrossNodeLinks(nodeConfigs []config.NodeConfig, hostIPByNode map[string]string) {

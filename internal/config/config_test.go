@@ -1,10 +1,14 @@
 package config
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
+
+	"github.com/artemnikitin/firework/internal/statusmodel"
 )
 
 func TestParseNodeConfig(t *testing.T) {
@@ -489,6 +493,63 @@ registry_ca_file: "/tmp/ca.crt"
 	_, err := LoadAgentConfig(cfgPath)
 	if err == nil {
 		t.Fatal("expected validation error for blank node_id")
+	}
+}
+
+// TestLoadAgentConfig_RegistryRejectsOverlongNodeID guards a match the
+// control plane makes for equality, not just a display field: a
+// scheduler-assigned local volume's VolumeStatus.BoundNode is this node_id
+// verbatim, and internal/controlplane/visibility.go compares it byte-for-byte
+// against the node record. A node_id accepted here but longer than the
+// registry's statusmodel.MaxVolumeIDLen bound would make every heartbeat
+// carrying that node's volumes fail validateVolumeStatus outright — dropping
+// the whole agent_status — so it must be rejected here, at the boundary
+// where it is first configured, rather than truncated later on the send
+// path (truncation would silently break the equality match instead).
+func TestLoadAgentConfig_RegistryRejectsOverlongNodeID(t *testing.T) {
+	yaml := fmt.Sprintf(`
+node_id: %q
+node_name: "node-a"
+store_type: "s3"
+s3_bucket: "bucket-a"
+registry_url: "https://registry.internal:9443"
+registry_cert_file: "/tmp/node.crt"
+registry_key_file: "/tmp/node.key"
+registry_ca_file: "/tmp/ca.crt"
+`, strings.Repeat("a", statusmodel.MaxVolumeIDLen+1))
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, "agent.yaml")
+	if err := os.WriteFile(cfgPath, []byte(yaml), 0o644); err != nil {
+		t.Fatalf("writing test config: %v", err)
+	}
+
+	_, err := LoadAgentConfig(cfgPath)
+	if err == nil || !strings.Contains(err.Error(), "node_id") {
+		t.Fatalf("expected validation error for overlong node_id, got %v", err)
+	}
+}
+
+// TestLoadAgentConfigStorageRejectsOverlongSharedBackendID mirrors the
+// node_id case above for storage.shared.backend_id, which is copied verbatim
+// into every shared volume's VolumeStatus.SharedBackendID and matched the
+// same way.
+func TestLoadAgentConfigStorageRejectsOverlongSharedBackendID(t *testing.T) {
+	yaml := fmt.Sprintf(`
+node_name: "node-1"
+store_type: "git"
+store_url: "https://example.invalid/config.git"
+storage:
+  shared:
+    backend_id: %q
+    path: "/mnt/firework-shared"
+`, strings.Repeat("b", statusmodel.MaxVolumeIDLen+1))
+	path := filepath.Join(t.TempDir(), "agent.yaml")
+	if err := os.WriteFile(path, []byte(yaml), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	_, err := LoadAgentConfig(path)
+	if err == nil || !strings.Contains(err.Error(), "backend_id") {
+		t.Fatalf("expected validation error for overlong shared backend_id, got %v", err)
 	}
 }
 

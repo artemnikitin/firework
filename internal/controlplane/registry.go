@@ -11,9 +11,33 @@ import (
 	"os"
 	"strings"
 	"time"
+	"unicode"
 
+	"github.com/artemnikitin/firework/internal/config"
 	"github.com/artemnikitin/firework/internal/statusmodel"
 )
+
+// maxRegistryRequestBytes must stay above the largest agent_status a
+// well-behaved agent can send. A heartbeat over the cap is truncated by
+// MaxBytesReader and fails JSON decoding, so the handler returns 400 before it
+// can even reach the req.AgentStatus != nil check in handleHeartbeat that
+// would otherwise drop just the telemetry — the node's liveness heartbeat is
+// rejected too, LastSeenAt stops advancing, and the node goes stale and then
+// down. That fallback only helps once the body has actually decoded.
+//
+// The bound is driven by MaxServices x config.MaxServiceVolumes = 6400
+// volumes, each field bounded in validateVolumeStatus. Message-shaped fields
+// (AgentStatus.Message, Condition.Message, ServiceStatus.Message,
+// VolumeStatus.LastError) are deliberately excluded from that per-field
+// enforcement — they are accept-then-truncate via BoundedMessage, not
+// rejected. That holds for any agent built from this codebase: the send path
+// (internal/agent/status.go) runs every one of these through BoundedMessage
+// before marshaling, so statusmodel.MaxMessageLen is an actual limit on what
+// gets sent, not just an assumption; only a non-standard client bypassing
+// BoundedMessage could exceed it. Measured worst case at that limit is about
+// 12.2 MiB; see TestMaxRegistryRequestBytesExceedsLargestValidHeartbeat, which
+// fails if the bounds grow past this cap.
+const maxRegistryRequestBytes = 16 << 20
 
 // RegistryServer serves node enrollment and registry APIs.
 type RegistryServer struct {
@@ -64,8 +88,11 @@ func (s *RegistryServer) HTTPServer() (*http.Server, error) {
 	}
 
 	return &http.Server{
-		Addr:              s.cfg.RegistryListenAddr,
-		Handler:           mux,
+		Addr: s.cfg.RegistryListenAddr,
+		// The status bounds allow 256 services with up to 25 volume
+		// observations each. Keep the request cap above that worst-case JSON
+		// while retaining a finite registry request limit.
+		Handler:           http.MaxBytesHandler(mux, maxRegistryRequestBytes),
 		TLSConfig:         tlsCfg,
 		ReadHeaderTimeout: 10 * time.Second,
 		ReadTimeout:       15 * time.Second,
@@ -241,6 +268,19 @@ func (s *RegistryServer) handleHeartbeat(w http.ResponseWriter, r *http.Request)
 		writeJSON(w, http.StatusForbidden, map[string]string{"error": "node_id does not match mTLS identity"})
 		return
 	}
+	if req.AgentStatus != nil {
+		validated, err := validatedHeartbeatAgentStatus(req.NodeID, req.AgentStatus)
+		if err != nil {
+			// Runtime status is optional telemetry. Do not reject the liveness
+			// heartbeat when a newer or malformed status payload is unusable;
+			// clearing it also prevents stale status from being presented as
+			// current.
+			s.logger.Warn("invalid agent status; accepting heartbeat without status", "node", req.NodeID, "error", err)
+			req.AgentStatus = nil
+		} else {
+			req.AgentStatus = validated
+		}
+	}
 
 	rec, err := s.upsertNodeRecord(r.Context(), req.NodeID, func(cur *NodeRecord) error {
 		if cur.Generation > req.Generation {
@@ -266,9 +306,7 @@ func (s *RegistryServer) handleHeartbeat(w http.ResponseWriter, r *http.Request)
 		if req.HostIP != "" {
 			cur.HostIP = req.HostIP
 		}
-		if err := applyHeartbeatAgentStatus(cur, req.NodeID, req.AgentStatus); err != nil {
-			return err
-		}
+		cur.AgentStatus = req.AgentStatus
 		cur.LastSeenAt = now
 		cur.UpdatedAt = now
 		return nil
@@ -290,6 +328,17 @@ func (s *RegistryServer) handleHeartbeat(w http.ResponseWriter, r *http.Request)
 	})
 }
 
+func validatedHeartbeatAgentStatus(nodeID string, incoming *statusmodel.AgentStatus) (*statusmodel.AgentStatus, error) {
+	if incoming == nil {
+		return nil, nil
+	}
+	var validated NodeRecord
+	if err := applyHeartbeatAgentStatus(&validated, nodeID, incoming); err != nil {
+		return nil, err
+	}
+	return validated.AgentStatus, nil
+}
+
 func applyHeartbeatAgentStatus(cur *NodeRecord, nodeID string, incoming *statusmodel.AgentStatus) error {
 	if incoming == nil {
 		// Older agents omit agent_status. Clear any value left by a newer
@@ -305,15 +354,169 @@ func applyHeartbeatAgentStatus(cur *NodeRecord, nodeID string, incoming *statusm
 		return fmt.Errorf("agent_status.node does not match node_id")
 	}
 	status := *incoming
+	if status.Phase == "" {
+		status.Phase = statusmodel.PhaseUnknown
+	}
+	status.Conditions = append([]statusmodel.Condition(nil), incoming.Conditions...)
+	status.Services = append([]statusmodel.ServiceStatus(nil), incoming.Services...)
+	if err := validateAgentStatus(status); err != nil {
+		return err
+	}
 	status.Message = statusmodel.BoundedMessage(status.Message)
 	for i := range status.Conditions {
 		status.Conditions[i].Message = statusmodel.BoundedMessage(status.Conditions[i].Message)
 	}
 	for i := range status.Services {
 		status.Services[i].Message = statusmodel.BoundedMessage(status.Services[i].Message)
+		status.Services[i].Volumes = append([]statusmodel.VolumeStatus(nil), status.Services[i].Volumes...)
+		for j := range status.Services[i].Volumes {
+			status.Services[i].Volumes[j].LastError = statusmodel.BoundedMessage(status.Services[i].Volumes[j].LastError)
+		}
 	}
 	cur.AgentStatus = &status
 	return nil
+}
+
+func validateAgentStatus(status statusmodel.AgentStatus) error {
+	if status.SchemaVersion <= 0 {
+		return fmt.Errorf("agent_status.schema_version is required")
+	}
+	if len(status.Conditions) > statusmodel.MaxConditions {
+		return fmt.Errorf("agent_status has %d conditions; maximum is %d", len(status.Conditions), statusmodel.MaxConditions)
+	}
+	if len(status.Services) > statusmodel.MaxServices {
+		return fmt.Errorf("agent_status has %d services; maximum is %d", len(status.Services), statusmodel.MaxServices)
+	}
+	if status.DesiredServices < 0 || status.ReadyServices < 0 || status.ReadyServices > status.DesiredServices {
+		return fmt.Errorf("agent_status service counts are invalid")
+	}
+	if !validStatusPhase(status.Phase) {
+		return fmt.Errorf("agent_status phase %q is invalid", status.Phase)
+	}
+	if len(status.AgentVersion) > statusmodel.MaxAgentVersionLen {
+		return fmt.Errorf("agent_status.agent_version exceeds %d bytes", statusmodel.MaxAgentVersionLen)
+	}
+	// status.NodeID is deliberately not length-checked: it must already equal
+	// the mTLS-authenticated nodeID (checked above this function, in
+	// applyHeartbeatAgentStatus) or be empty, so it contributes nothing to
+	// the MaxServices/config.MaxServiceVolumes multiplication this bounding
+	// pass exists for — it appears once per heartbeat, not per service or
+	// volume — and node IDs are not independently length-bounded at
+	// enrollment, so adding a cap here risks rejecting (and so silently
+	// dropping the telemetry of) a legitimately longer node ID for no size
+	// benefit.
+	// Message is deliberately not length-checked here: it is optional
+	// free-text telemetry that applyHeartbeatAgentStatus truncates to
+	// statusmodel.MaxMessageLen with BoundedMessage after validation succeeds
+	// (see TestApplyHeartbeatAgentStatusValidatesIdentityAndBoundsMessages),
+	// the same accept-then-truncate contract as Condition.Message,
+	// ServiceStatus.Message, and VolumeStatus.LastError below. What
+	// maxRegistryRequestBytes actually depends on is bounding the fields that
+	// have no truncation fallback — see validateVolumeStatus.
+	for _, revision := range []string{status.DesiredRevision, status.PlacementRevision, status.ObservedRevision, status.AppliedRevision} {
+		if len(revision) > statusmodel.MaxRevisionLen {
+			return fmt.Errorf("agent_status revision exceeds %d bytes", statusmodel.MaxRevisionLen)
+		}
+	}
+	conditionTypes := make(map[string]struct{}, len(status.Conditions))
+	for _, condition := range status.Conditions {
+		if condition.Type == "" || len(condition.Type) > statusmodel.MaxConditionTypeLen {
+			return fmt.Errorf("agent_status condition type is invalid")
+		}
+		if _, duplicate := conditionTypes[condition.Type]; duplicate {
+			return fmt.Errorf("agent_status condition %q is duplicated", condition.Type)
+		}
+		conditionTypes[condition.Type] = struct{}{}
+		if condition.Status != statusmodel.ConditionTrue && condition.Status != statusmodel.ConditionFalse && condition.Status != statusmodel.ConditionUnknown {
+			return fmt.Errorf("agent_status condition %q has invalid status %q", condition.Type, condition.Status)
+		}
+		if !validReasonCode(condition.ReasonCode) {
+			return fmt.Errorf("agent_status condition %q has invalid reason code", condition.Type)
+		}
+	}
+	serviceNames := make(map[string]struct{}, len(status.Services))
+	for _, service := range status.Services {
+		if service.Name == "" || len(service.Name) > statusmodel.MaxServiceNameLen {
+			return fmt.Errorf("agent_status service name is invalid")
+		}
+		if _, duplicate := serviceNames[service.Name]; duplicate {
+			return fmt.Errorf("agent_status service %q is duplicated", service.Name)
+		}
+		serviceNames[service.Name] = struct{}{}
+		if !validReasonCode(service.ReasonCode) {
+			return fmt.Errorf("agent_status service %q has invalid reason code", service.Name)
+		}
+		if len(service.VMState) > statusmodel.MaxEnumLen {
+			return fmt.Errorf("agent_status service %q vm_state exceeds %d bytes", service.Name, statusmodel.MaxEnumLen)
+		}
+		if len(service.Health) > statusmodel.MaxEnumLen {
+			return fmt.Errorf("agent_status service %q health exceeds %d bytes", service.Name, statusmodel.MaxEnumLen)
+		}
+		if len(service.HealthCheckType) > statusmodel.MaxEnumLen {
+			return fmt.Errorf("agent_status service %q health_check_type exceeds %d bytes", service.Name, statusmodel.MaxEnumLen)
+		}
+		if len(service.NetworkAddress) > statusmodel.MaxNetworkAddressLen {
+			return fmt.Errorf("agent_status service %q network_address exceeds %d bytes", service.Name, statusmodel.MaxNetworkAddressLen)
+		}
+		if len(service.Volumes) > config.MaxServiceVolumes {
+			return fmt.Errorf("agent_status service %q has too many volumes", service.Name)
+		}
+		for _, volume := range service.Volumes {
+			if err := validateVolumeStatus(service.Name, volume); err != nil {
+				return err
+			}
+		}
+	}
+	if !validReasonCode(status.ReasonCode) {
+		return fmt.Errorf("agent_status has invalid reason code")
+	}
+	return nil
+}
+
+// validateVolumeStatus bounds every VolumeStatus string field. A service can
+// carry up to config.MaxServiceVolumes of these and there can be up to
+// statusmodel.MaxServices services in one heartbeat, so an unbounded field
+// here is what would actually let a "valid" heartbeat exceed
+// maxRegistryRequestBytes: see TestMaxRegistryRequestBytesExceedsLargestValidHeartbeat.
+func validateVolumeStatus(serviceName string, volume statusmodel.VolumeStatus) error {
+	if len(volume.LogicalID) > statusmodel.MaxLogicalIDLen {
+		return fmt.Errorf("agent_status service %q volume logical_id exceeds %d bytes", serviceName, statusmodel.MaxLogicalIDLen)
+	}
+	if len(volume.Type) > statusmodel.MaxEnumLen {
+		return fmt.Errorf("agent_status service %q volume type exceeds %d bytes", serviceName, statusmodel.MaxEnumLen)
+	}
+	if len(volume.MountPath) > statusmodel.MaxMountPathLen {
+		return fmt.Errorf("agent_status service %q volume mount_path exceeds %d bytes", serviceName, statusmodel.MaxMountPathLen)
+	}
+	if len(volume.BoundNode) > statusmodel.MaxVolumeIDLen {
+		return fmt.Errorf("agent_status service %q volume bound_node exceeds %d bytes", serviceName, statusmodel.MaxVolumeIDLen)
+	}
+	if len(volume.SharedBackendID) > statusmodel.MaxVolumeIDLen {
+		return fmt.Errorf("agent_status service %q volume shared_backend_id exceeds %d bytes", serviceName, statusmodel.MaxVolumeIDLen)
+	}
+	if len(volume.State) > statusmodel.MaxEnumLen {
+		return fmt.Errorf("agent_status service %q volume state exceeds %d bytes", serviceName, statusmodel.MaxEnumLen)
+	}
+	// LastError, like Message elsewhere in AgentStatus, is accept-then-
+	// truncate rather than rejected: applyHeartbeatAgentStatus runs it
+	// through BoundedMessage after validation succeeds.
+	return nil
+}
+
+func validStatusPhase(phase statusmodel.Phase) bool {
+	return phase == statusmodel.PhaseUnknown || phase == statusmodel.PhaseReconciling || phase == statusmodel.PhaseReady || phase == statusmodel.PhaseFailed
+}
+
+func validReasonCode(code string) bool {
+	if len(code) > statusmodel.MaxReasonCodeLen {
+		return false
+	}
+	for _, char := range code {
+		if unicode.IsControl(char) || unicode.IsSpace(char) {
+			return false
+		}
+	}
+	return true
 }
 
 func (s *RegistryServer) handleState(w http.ResponseWriter, r *http.Request) {

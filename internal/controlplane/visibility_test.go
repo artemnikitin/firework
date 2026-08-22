@@ -358,6 +358,200 @@ func TestVisibilityFailsClosedAcrossRevisionTransitions(t *testing.T) {
 	}
 }
 
+func TestRevisionStatusDerivesFleetConvergence(t *testing.T) {
+	tests := []struct {
+		name       string
+		agent      *statusmodel.AgentStatus
+		nodeState  NodeState
+		lastSeen   time.Duration
+		wantPhase  string
+		wantBucket string
+	}{
+		{name: "converged", agent: currentAgentStatus(statusmodel.PhaseReady, "rendered-1"), nodeState: NodeStateReady, wantPhase: "converged", wantBucket: "converged"},
+		{name: "degraded", agent: func() *statusmodel.AgentStatus {
+			status := currentAgentStatus(statusmodel.PhaseReady, "rendered-1")
+			status.Conditions = append(status.Conditions, statusmodel.Condition{Type: "PeerRoutesReady", Status: statusmodel.ConditionFalse, ReasonCode: "peer_route_sync_degraded"})
+			return status
+		}(), nodeState: NodeStateReady, wantPhase: "degraded", wantBucket: "degraded"},
+		{name: "failed", agent: currentAgentStatus(statusmodel.PhaseFailed, ""), nodeState: NodeStateReady, wantPhase: "failed", wantBucket: "failed"},
+		{name: "progressing", agent: currentAgentStatus(statusmodel.PhaseReconciling, ""), nodeState: NodeStateReady, wantPhase: "progressing", wantBucket: "progressing"},
+		{name: "published", agent: &statusmodel.AgentStatus{SchemaVersion: 1, ObservedAt: time.Now().UTC(), Phase: statusmodel.PhaseReady, DesiredRevision: "old", PlacementRevision: "old", ObservedRevision: "old", AppliedRevision: "old"}, nodeState: NodeStateReady, wantPhase: "published", wantBucket: "progressing"},
+		{name: "stale", agent: currentAgentStatus(statusmodel.PhaseReady, "rendered-1"), nodeState: NodeStateReady, lastSeen: -2 * time.Minute, wantPhase: "unknown", wantBucket: "stale"},
+		{name: "down", agent: currentAgentStatus(statusmodel.PhaseReady, "rendered-1"), nodeState: NodeStateDown, wantPhase: "unknown", wantBucket: "down"},
+		{name: "old agent", agent: nil, nodeState: NodeStateReady, wantPhase: "unknown", wantBucket: "unknown"},
+		{name: "truncated", agent: func() *statusmodel.AgentStatus {
+			status := currentAgentStatus(statusmodel.PhaseReady, "rendered-1")
+			status.ServicesTruncated = true
+			return status
+		}(), nodeState: NodeStateReady, wantPhase: "unknown", wantBucket: "unknown"},
+		{name: "no services reported", agent: func() *statusmodel.AgentStatus {
+			status := currentAgentStatus(statusmodel.PhaseReady, "rendered-1")
+			status.Services = nil
+			return status
+		}(), nodeState: NodeStateReady, wantPhase: "unknown", wantBucket: "unknown"},
+		{name: "placed service missing from status", agent: func() *statusmodel.AgentStatus {
+			status := currentAgentStatus(statusmodel.PhaseReady, "rendered-1")
+			status.Services = []statusmodel.ServiceStatus{{Name: "other", VMState: "running", Health: "healthy"}}
+			return status
+		}(), nodeState: NodeStateReady, wantPhase: "unknown", wantBucket: "unknown"},
+		{name: "no conditions reported", agent: func() *statusmodel.AgentStatus {
+			status := currentAgentStatus(statusmodel.PhaseReady, "rendered-1")
+			status.Conditions = nil
+			return status
+		}(), nodeState: NodeStateReady, wantPhase: "unknown", wantBucket: "unknown"},
+		{name: "missing one blocking condition", agent: func() *statusmodel.AgentStatus {
+			status := currentAgentStatus(statusmodel.PhaseReady, "rendered-1")
+			status.Conditions = status.Conditions[:len(status.Conditions)-1]
+			return status
+		}(), nodeState: NodeStateReady, wantPhase: "unknown", wantBucket: "unknown"},
+		{name: "future condition", agent: func() *statusmodel.AgentStatus {
+			status := currentAgentStatus(statusmodel.PhaseReady, "rendered-1")
+			status.Conditions = append(status.Conditions, statusmodel.Condition{Type: "FutureNonBlockingCondition", Status: statusmodel.ConditionFalse})
+			return status
+		}(), nodeState: NodeStateReady, wantPhase: "unknown", wantBucket: "unknown"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			ctx := context.Background()
+			store := newBlobStateStore(newMemBlob())
+			cfg := validConfigForRole(RoleAPI)
+			cfg.NodeStaleTTL = time.Minute
+			now := time.Now().UTC()
+			desired := DesiredRevision{Revision: "desired-1", Services: []config.ServiceConfig{{Name: "service"}}}
+			placement := PlacementRevision{Revision: "placement-1", DesiredRevision: desired.Revision, NodeConfigs: []config.NodeConfig{{Node: "node-1", Services: desired.Services}}}
+			putCurrentState(t, ctx, store, desired, placement, "rendered-1")
+			if test.agent != nil {
+				test.agent.ObservedAt = now.Add(test.lastSeen)
+			}
+			putNode(t, ctx, store, cfg, NodeRecord{NodeID: "node-1", State: test.nodeState, LastSeenAt: now.Add(test.lastSeen), AgentStatus: test.agent})
+
+			got, err := NewVisibilityService(cfg, store).Revision(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got.Phase != test.wantPhase || got.RelevantNodes != 1 {
+				t.Fatalf("status = %#v, want phase %s", got, test.wantPhase)
+			}
+			buckets := map[string][]string{
+				"converged": got.ConvergedNodes, "degraded": got.DegradedNodes,
+				"progressing": got.ProgressingNodes, "failed": got.FailedNodes,
+				"stale": got.StaleNodes, "down": got.DownNodes, "unknown": got.UnknownNodes,
+			}
+			if len(buckets[test.wantBucket]) != 1 || buckets[test.wantBucket][0] != "node-1" {
+				t.Fatalf("node not classified in %s: %#v", test.wantBucket, got)
+			}
+		})
+	}
+}
+
+func TestRevisionStatusCountsRelevantNodesBeforeEarlyReturn(t *testing.T) {
+	snapshot := visibilitySnapshot{
+		now:     time.Now().UTC(),
+		desired: DesiredRevision{Revision: "desired-2"},
+		placement: PlacementRevision{
+			Revision:        "placement-1",
+			DesiredRevision: "desired-1",
+			NodeConfigs:     []config.NodeConfig{{Node: "node-1"}},
+		},
+	}
+	status := snapshot.revisionStatus()
+	if status.Phase != "published" || status.RelevantNodes != 1 {
+		t.Fatalf("early status omitted relevant node count: %#v", status)
+	}
+}
+
+func TestRevisionStatusAllowsEmptyDesiredRevisionToConverge(t *testing.T) {
+	ctx := context.Background()
+	store := newBlobStateStore(newMemBlob())
+	cfg := validConfigForRole(RoleAPI)
+	desired := DesiredRevision{Revision: "desired-empty", Services: []config.ServiceConfig{}}
+	placement := PlacementRevision{Revision: "placement-empty", DesiredRevision: desired.Revision, NodeConfigs: []config.NodeConfig{}}
+	putCurrentState(t, ctx, store, desired, placement, "rendered-empty")
+	status, err := NewVisibilityService(cfg, store).Revision(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if status.Phase != "converged" || status.RelevantNodes != 0 {
+		t.Fatalf("empty desired revision did not converge: %#v", status)
+	}
+}
+
+// TestRevisionStatusDoesNotConvergeEmptyDesiredRevisionUntilKnownNodesConfirm
+// covers the gap TestRevisionStatusAllowsEmptyDesiredRevisionToConverge does
+// not: a node the control plane already knows about, still reporting the
+// previous non-empty revision. publishRendered deletes that node's
+// nodes/<node>.yaml instead of publishing an explicit empty config, so the
+// agent's fetch 404s, it treats that as a fetch failure, and it keeps
+// whatever it last applied running — the node's heartbeat never advances to
+// this revision. Reporting converged here would go green while node-1's old
+// workload is still up.
+func TestRevisionStatusDoesNotConvergeEmptyDesiredRevisionUntilKnownNodesConfirm(t *testing.T) {
+	ctx := context.Background()
+	store := newBlobStateStore(newMemBlob())
+	cfg := validConfigForRole(RoleAPI)
+	cfg.NodeStaleTTL = time.Minute
+	now := time.Now().UTC()
+
+	desired := DesiredRevision{Revision: "desired-empty", Services: []config.ServiceConfig{}}
+	placement := PlacementRevision{Revision: "placement-empty", DesiredRevision: desired.Revision, NodeConfigs: []config.NodeConfig{}}
+	putCurrentState(t, ctx, store, desired, placement, "rendered-empty")
+
+	stale := currentAgentStatus(statusmodel.PhaseReady, "rendered-1")
+	stale.ObservedAt = now
+	putNode(t, ctx, store, cfg, NodeRecord{NodeID: "node-1", State: NodeStateReady, LastSeenAt: now, AgentStatus: stale})
+
+	status, err := NewVisibilityService(cfg, store).Revision(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if status.Phase == "converged" {
+		t.Fatalf("empty desired revision reported converged before node-1 confirmed it: %#v", status)
+	}
+	if status.RelevantNodes != 1 {
+		t.Fatalf("known node-1 was not counted as relevant for the empty revision: %#v", status)
+	}
+}
+
+func TestRevisionStatusReportsRenderedPublicationInProgress(t *testing.T) {
+	ctx := context.Background()
+	store := newBlobStateStore(newMemBlob())
+	cfg := validConfigForRole(RoleAPI)
+	desired := DesiredRevision{Revision: "desired-1", Services: []config.ServiceConfig{{Name: "service"}}}
+	placement := PlacementRevision{Revision: "placement-1", DesiredRevision: desired.Revision, NodeConfigs: []config.NodeConfig{{
+		Node: "node-1", RenderedRevision: "rendered-new", Services: desired.Services,
+	}}}
+	putCurrentState(t, ctx, store, desired, placement, "rendered-old")
+	status, err := NewVisibilityService(cfg, store).Revision(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if status.Phase != "progressing" || status.ReasonCode != "rendered_revision_pending" {
+		t.Fatalf("rendered publication window was not detected: %#v", status)
+	}
+}
+
+// currentAgentStatus builds the telemetry a healthy agent actually sends: every
+// placed service reported, and every blocking condition present. Convergence
+// now requires that completeness, so a helper that omitted it would assert the
+// fail-open shape this package must reject.
+func currentAgentStatus(phase statusmodel.Phase, applied string) *statusmodel.AgentStatus {
+	return &statusmodel.AgentStatus{
+		SchemaVersion: 1, ObservedAt: time.Now().UTC(), Phase: phase,
+		DesiredRevision: "desired-1", PlacementRevision: "placement-1",
+		ObservedRevision: "rendered-1", AppliedRevision: applied,
+		Services:   []statusmodel.ServiceStatus{{Name: "service", VMState: "running", Health: "healthy"}},
+		Conditions: allBlockingConditionsTrue(),
+	}
+}
+
+func allBlockingConditionsTrue() []statusmodel.Condition {
+	conditions := make([]statusmodel.Condition, 0, len(blockingConditionTypes))
+	for _, conditionType := range blockingConditionTypes {
+		conditions = append(conditions, statusmodel.Condition{Type: conditionType, Status: statusmodel.ConditionTrue})
+	}
+	return conditions
+}
+
 func TestVisibilityKeepsFreshServiceStateOnANodeThatCannotConverge(t *testing.T) {
 	ctx := context.Background()
 	store := newBlobStateStore(newMemBlob())
@@ -412,6 +606,39 @@ func TestVisibilityKeepsFreshServiceStateOnANodeThatCannotConverge(t *testing.T)
 	}
 	if got := nodes.Items[0]; got.RunningServices != 1 || got.ReasonCode != "agent_status_revision_mismatch" {
 		t.Fatalf("node summary disagrees with its services: %#v", got)
+	}
+}
+
+func TestVisibilityDoesNotProjectServiceStateBeforeCurrentRevisionIsObserved(t *testing.T) {
+	ctx := context.Background()
+	store := newBlobStateStore(newMemBlob())
+	cfg := validConfigForRole(RoleAPI)
+	cfg.NodeStaleTTL = time.Minute
+	now := time.Now().UTC()
+	services := []config.ServiceConfig{{Name: "service", VCPUs: 1, MemoryMB: 128}}
+	desired := DesiredRevision{Revision: "desired-2", Services: services}
+	placement := PlacementRevision{Revision: "placement-2", DesiredRevision: desired.Revision, NodeConfigs: []config.NodeConfig{{Node: "node", Services: services}}}
+	putCurrentState(t, ctx, store, desired, placement, "rendered-2")
+	putNode(t, ctx, store, cfg, NodeRecord{NodeID: "node", State: NodeStateReady, LastSeenAt: now, AgentStatus: &statusmodel.AgentStatus{
+		SchemaVersion: 1, ObservedAt: now, DesiredRevision: "desired-1", PlacementRevision: "placement-1",
+		ObservedRevision: "rendered-1", AppliedRevision: "rendered-1",
+		Services: []statusmodel.ServiceStatus{{Name: "service", VMState: "running", Health: "healthy"}},
+	}})
+
+	list, err := NewVisibilityService(cfg, store).Services(ctx, "", "", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := list.Items[0]; got.State != "unknown" || got.Health != "unknown" || got.ReasonCode != "agent_status_revision_mismatch" {
+		t.Fatalf("older service observation was projected as current: %#v", got)
+	}
+
+	nodes, err := NewVisibilityService(cfg, store).Nodes(ctx, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := nodes.Items[0]; got.RunningServices != 0 || got.ReasonCode != "agent_status_revision_mismatch" {
+		t.Fatalf("older node observation was counted as current: %#v", got)
 	}
 }
 
