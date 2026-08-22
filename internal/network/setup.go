@@ -149,8 +149,16 @@ func (m *Manager) TeardownPortForward(hostPort int, guestIP string, vmPort int) 
 			}
 		}
 	} else {
+		// A resolution failure must not be reported as a successful
+		// teardown. The legacy cleanup below cannot stand in for the scoped
+		// rule, and removeIPTablesRule treats "no such rule" as success — so
+		// swallowing this returned nil while the scoped DNAT rule was still
+		// installed, which is precisely the "converged while leaking" shape
+		// the caller's pending-teardown retry exists to prevent. Surfacing it
+		// keeps the rule on the retry list until resolution works again.
 		m.logger.Warn("failed to resolve host ingress context for scoped cleanup, trying legacy rule only",
 			"host_port", hostPort, "error", err)
+		errs = append(errs, fmt.Errorf("resolving host ingress context for scoped cleanup: %w", err))
 	}
 
 	// Backward-compatible cleanup for older unscoped rules.

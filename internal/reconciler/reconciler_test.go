@@ -18,6 +18,7 @@ type fakeVMManager struct {
 	startCalls  []string
 	removeCalls []string
 	removeErr   error
+	startErr    error
 }
 
 func newFakeVMManager() *fakeVMManager {
@@ -34,6 +35,9 @@ func (f *fakeVMManager) List() map[string]*vm.Instance {
 
 func (f *fakeVMManager) Start(_ context.Context, svc config.ServiceConfig) error {
 	f.startCalls = append(f.startCalls, svc.Name)
+	if f.startErr != nil {
+		return f.startErr
+	}
 	f.instances[svc.Name] = &vm.Instance{Name: svc.Name, State: vm.StateRunning, Config: svc}
 	return nil
 }

@@ -707,3 +707,143 @@ func TestNew_NilNetworkManagerStaysNil(t *testing.T) {
 		t.Fatalf("reconcile without a network manager: %v", err)
 	}
 }
+
+// The regression: retryPendingPortForwards guarded only against
+// entry.ServiceName being live, but a DNAT rule is identified by its tuple
+// alone. After a rename or replacement, a different service can legitimately
+// claim the exact (hostPort, guestIP, vmPort) another service left pending —
+// and the retry would then delete that live rule while reporting a successful
+// reconciliation. The guard has to consider every running service, the way
+// retryPendingNetworkDevices already did.
+func TestReconcile_PortForwardRetryDoesNotDeleteRuleClaimedByAnotherService(t *testing.T) {
+	net := &fakeNetworkManager{teardownForwardErr: errors.New("rule missing")}
+	r, vmMgr := newNetworkTestReconciler(net)
+
+	// Tick 1: "web" owns 8080 -> 172.16.0.2:80.
+	if err := r.Reconcile(context.Background(), config.NodeConfig{
+		Node: "node-1", Services: []config.ServiceConfig{forwardedService("web")},
+	}); err != nil {
+		t.Fatalf("initial create: %v", err)
+	}
+
+	// Tick 2: "web" is deleted and its teardown fails, leaving the tuple pending.
+	if err := r.Reconcile(context.Background(), config.NodeConfig{Node: "node-1"}); err == nil {
+		t.Fatal("expected the failed teardown to surface")
+	}
+	if len(r.pendingPortForwards) != 1 {
+		t.Fatalf("expected web's rule to be pending, got %#v", r.pendingPortForwards)
+	}
+
+	// Tick 3: a different service claims the identical tuple. Its rule is
+	// live, so the pending entry must be dropped without any teardown call.
+	replacement := forwardedService("web-v2")
+	callsBefore := len(net.teardownForwardCalls)
+	err := r.Reconcile(context.Background(), config.NodeConfig{
+		Node: "node-1", Services: []config.ServiceConfig{replacement},
+	})
+	if err != nil {
+		t.Fatalf("tick should converge once another service claims the tuple: %v", err)
+	}
+	if got := net.teardownForwardCalls[callsBefore:]; len(got) != 0 {
+		t.Fatalf("retry tore down a rule claimed by the running replacement: %#v", got)
+	}
+	if len(r.pendingPortForwards) != 0 {
+		t.Fatalf("expected the claimed entry to be dropped, got %#v", r.pendingPortForwards)
+	}
+	if _, running := vmMgr.instances["web-v2"]; !running {
+		t.Fatal("replacement service is not running")
+	}
+}
+
+// The regression: createService discarded the rollback error after a failed
+// VM start, and journalled nothing beforehand. A service whose Start never
+// succeeded is absent from vmManager.List(), so once it is dropped from
+// desired state Plan emits no delete action and its host devices are orphaned
+// with nothing tracking them.
+func TestCreateService_FailedStartTracksNetworkDeviceCleanup(t *testing.T) {
+	net := &fakeNetworkManager{deleteErrByDevice: map[string]error{"tap-web": errors.New("device busy")}}
+	r, vmMgr := newNetworkTestReconciler(net)
+	vmMgr.startErr = errors.New("firecracker refused to boot")
+
+	svc := config.ServiceConfig{Name: "web", Network: &config.NetworkConfig{GuestIP: "172.16.0.2"}}
+	desired := config.NodeConfig{Node: "node-1", Services: []config.ServiceConfig{svc}}
+	if err := r.Reconcile(context.Background(), desired); err == nil {
+		t.Fatal("expected the failed start to surface")
+	}
+	if _, running := vmMgr.instances["web"]; running {
+		t.Fatal("VM should not be running after a failed start")
+	}
+	// The tap could not be rolled back, so it must be tracked rather than
+	// discarded -- this is the entry that keeps the device from leaking.
+	if len(r.pendingNetworkDevices) != 1 {
+		t.Fatalf("expected the un-rolled-back tap to be pending, got %#v", r.pendingNetworkDevices)
+	}
+	for key := range r.pendingNetworkDevices {
+		if key.kind != networkDeviceTAP || key.name != "tap-web" {
+			t.Fatalf("unexpected pending device: %#v", key)
+		}
+	}
+
+	// Dropping the service from desired state produces no delete action, so
+	// the pending entry is the only thing that can still clean it up.
+	if err := r.Reconcile(context.Background(), config.NodeConfig{Node: "node-1"}); err == nil {
+		t.Fatal("the still-pending tap must keep failing the tick")
+	}
+	delete(net.deleteErrByDevice, "tap-web")
+	if err := r.Reconcile(context.Background(), config.NodeConfig{Node: "node-1"}); err != nil {
+		t.Fatalf("tick should converge once the orphaned tap is deleted: %v", err)
+	}
+	if len(r.pendingNetworkDevices) != 0 {
+		t.Fatalf("expected the orphaned tap to be cleaned up, got %#v", r.pendingNetworkDevices)
+	}
+}
+
+// A successful create must not leave its write-ahead entries behind: the
+// running VM claims those devices, so the journal returns to empty.
+func TestCreateService_SuccessfulStartClearsJournalledDevices(t *testing.T) {
+	net := &fakeNetworkManager{}
+	r, _ := newNetworkTestReconciler(net)
+	svc := config.ServiceConfig{Name: "web", Network: &config.NetworkConfig{GuestIP: "172.16.0.2"}}
+	if err := r.Reconcile(context.Background(), config.NodeConfig{
+		Node: "node-1", Services: []config.ServiceConfig{svc},
+	}); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	if len(r.pendingNetworkDevices) != 0 {
+		t.Fatalf("a successful create left write-ahead entries behind: %#v", r.pendingNetworkDevices)
+	}
+}
+
+// The regression: the journal was decoded permissively and unvalidated, so a
+// file written by an older schema could decode into zero-valued entries --
+// a device with an empty kind and name deletes nothing, then clears itself,
+// silently discarding the cleanup the journal exists to guarantee. Any file
+// that is not this exact schema must fail closed instead.
+func TestWithStateDir_RejectsForeignJournalShapesAsCorrupt(t *testing.T) {
+	for name, body := range map[string]string{
+		// The previous release's shape: network entries carried a whole
+		// service config, not a (kind, name) device identity.
+		"previous schema":   `{"network":[{"service_name":"web","config":{"name":"web"}}]}`,
+		"missing version":   `{"port_forwards":[{"service_name":"web","guest_ip":"172.16.0.2","port_forward":{"host_port":8080,"vm_port":80}}]}`,
+		"future version":    `{"version":99,"network":[{"service_name":"web","kind":"tap","name":"tap-web"}]}`,
+		"unknown kind":      `{"version":1,"network":[{"service_name":"web","kind":"bond","name":"bond0"}]}`,
+		"empty device":      `{"version":1,"network":[{"service_name":"web","kind":"tap","name":""}]}`,
+		"port out of range": `{"version":1,"port_forwards":[{"service_name":"web","guest_ip":"172.16.0.2","port_forward":{"host_port":0,"vm_port":80}}]}`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			dir := t.TempDir()
+			if err := os.WriteFile(filepath.Join(dir, pendingTeardownsFile), []byte(body), 0o644); err != nil {
+				t.Fatalf("seeding journal: %v", err)
+			}
+			logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+			r := NewWithNetworkManager(newFakeVMManager(), logger, nil, &fakeNetworkManager{}, "", 0).WithStateDir(dir)
+			if !r.journalCorrupt {
+				t.Fatalf("journal was accepted instead of failing closed; loaded %#v / %#v",
+					r.pendingPortForwards, r.pendingNetworkDevices)
+			}
+			if err := r.Reconcile(context.Background(), config.NodeConfig{Node: "node-1"}); err == nil {
+				t.Fatal("a corrupt journal must keep the node from reporting convergence")
+			}
+		})
+	}
+}
