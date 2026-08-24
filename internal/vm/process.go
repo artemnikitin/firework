@@ -12,6 +12,12 @@ import (
 
 var errProcessNotFound = errors.New("process not found")
 
+// errIdentityNotRecorded marks a manifest that never captured the identity of
+// the process it describes. It is distinct from a mismatch: an absent field
+// proves nothing about the recorded process, so the VM stays quarantined
+// instead of having its state cleaned while the process may still be alive.
+var errIdentityNotRecorded = errors.New("process ownership identity was never recorded")
+
 type processIdentity struct {
 	PID           int
 	HostBootID    string
@@ -53,27 +59,53 @@ func validateOwnedProcess(inspector processInspector, manifest *instanceManifest
 	if err != nil {
 		return err
 	}
-	if manifest.HostBootID == "" || identity.HostBootID != manifest.HostBootID {
-		return fmt.Errorf("host boot identity does not match")
+	if manifest.HostBootID == "" {
+		return fmt.Errorf("host boot ID: %w", errIdentityNotRecorded)
 	}
-	if manifest.ProcessStart == 0 || identity.StartTicks != manifest.ProcessStart {
+	// The boot ID is host-global and read fresh on every inspection, so a real
+	// mismatch proves the recorded process did not survive: PIDs do not persist
+	// across a reboot. Report it as a gone process rather than as ambiguity.
+	if identity.HostBootID != manifest.HostBootID {
+		return fmt.Errorf("host booted since the manifest was written: %w", errProcessNotFound)
+	}
+	if manifest.ProcessStart == 0 {
+		return fmt.Errorf("process start time: %w", errIdentityNotRecorded)
+	}
+	if identity.StartTicks != manifest.ProcessStart {
 		return fmt.Errorf("process start time does not match")
 	}
-	if manifest.ExecutableDev == 0 || manifest.ExecutableIno == 0 ||
-		identity.ExecutableDev != manifest.ExecutableDev || identity.ExecutableIno != manifest.ExecutableIno {
+	if manifest.ExecutableDev == 0 || manifest.ExecutableIno == 0 {
+		return fmt.Errorf("process executable device and inode: %w", errIdentityNotRecorded)
+	}
+	if identity.ExecutableDev != manifest.ExecutableDev || identity.ExecutableIno != manifest.ExecutableIno {
 		return fmt.Errorf("process executable identity does not match")
 	}
-	if manifest.Executable == "" || identity.Executable != manifest.Executable {
+	if manifest.Executable == "" {
+		return fmt.Errorf("process executable path: %w", errIdentityNotRecorded)
+	}
+	if identity.Executable != manifest.Executable {
 		return fmt.Errorf("process executable path does not match")
 	}
-	if !manifest.Legacy && !hasExactArgument(identity.CommandLine, "--id", manifest.InstanceID) {
-		return fmt.Errorf("process command line does not contain its instance ID")
-	}
-	if !hasExactArgument(identity.CommandLine, "--api-sock", manifest.SocketPath) ||
-		!hasExactArgument(identity.CommandLine, "--config-file", manifest.ConfigPath) {
+	if !matchesOwnedArguments(identity, manifest) {
+		if !manifest.Legacy && !hasExactArgument(identity.CommandLine, "--id", manifest.InstanceID) {
+			return fmt.Errorf("process command line does not contain its instance ID")
+		}
 		return fmt.Errorf("process command line does not match manifest")
 	}
 	return nil
+}
+
+// matchesOwnedArguments reports whether a process is running the exact command
+// line Firework launched for this instance. The instance ID is 128 random bits
+// generated once per launch and passed to Firecracker as --id, so a match on it
+// together with this instance's socket and config paths proves ownership on its
+// own: a recycled PID cannot reproduce arguments it never received.
+func matchesOwnedArguments(identity processIdentity, manifest *instanceManifest) bool {
+	if !manifest.Legacy && !hasExactArgument(identity.CommandLine, "--id", manifest.InstanceID) {
+		return false
+	}
+	return hasExactArgument(identity.CommandLine, "--api-sock", manifest.SocketPath) &&
+		hasExactArgument(identity.CommandLine, "--config-file", manifest.ConfigPath)
 }
 
 func validateOwnedSocket(inspector processInspector, manifest *instanceManifest) error {

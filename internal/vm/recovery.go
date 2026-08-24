@@ -26,15 +26,21 @@ func (m *Manager) Recover(_ context.Context, desired config.NodeConfig) ([]strin
 
 	root := filepath.Join(m.stateDir, "vms")
 	entries, err := os.ReadDir(root)
-	if errors.Is(err, os.ErrNotExist) {
-		return nil, nil
-	}
-	if err != nil {
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		// Leave the guard unarmed so a transient read failure retries instead of
+		// disabling recovery, which would make every later start refuse the
+		// durable state it never got to inspect.
 		return nil, fmt.Errorf("read VM state directory: %w", err)
 	}
+	// Arm the guard even when the directory does not exist yet. On a fresh node
+	// it appears only once this process creates its first VM, and a later pass
+	// would then "recover" VMs this very process owns and started.
 	m.mu.Lock()
 	m.recovered = true
 	m.mu.Unlock()
+	if errors.Is(err, os.ErrNotExist) {
+		return nil, nil
+	}
 	sort.Slice(entries, func(i, j int) bool { return entries[i].Name() < entries[j].Name() })
 	desiredByName := make(map[string]config.ServiceConfig, len(desired.Services))
 	for _, service := range desired.Services {
@@ -48,6 +54,14 @@ func (m *Manager) Recover(_ context.Context, desired config.NodeConfig) ([]strin
 			continue
 		}
 		name := entry.Name()
+		m.mu.Lock()
+		_, owned := m.instances[name]
+		m.mu.Unlock()
+		if owned {
+			// This process already tracks the service, so its VM is not a
+			// survivor of an earlier agent and must not be adopted again.
+			continue
+		}
 		vmDir := filepath.Join(root, name)
 		path := manifestPath(vmDir)
 		manifest, readErr := readManifest(path)
@@ -96,13 +110,25 @@ func (m *Manager) Recover(_ context.Context, desired config.NodeConfig) ([]strin
 		if manifest.PID <= 0 {
 			if manifest.Lifecycle == lifecycleStarting && manifest.Launcher == "systemd" && manifest.LauncherUnit != "" {
 				if pid, lookupErr := systemdMainPID("systemctl", manifest.LauncherUnit); lookupErr == nil {
-					manifest.PID = pid
-					if identity, inspectErr := m.inspector.Inspect(pid); inspectErr == nil {
-						manifest.HostBootID = identity.HostBootID
-						manifest.ProcessStart = identity.StartTicks
-						manifest.Executable = identity.Executable
-						manifest.ExecutableDev = identity.ExecutableDev
-						manifest.ExecutableIno = identity.ExecutableIno
+					// systemd reports MainPID at fork, so the identity is only
+					// recorded once that PID is running the launched command
+					// line. Recording it earlier is what produced manifests
+					// describing systemd itself.
+					if identity, waitErr := awaitLaunchedIdentity(m.inspector, manifest, pid, m.launchIdentityTimeout(), launchIdentityInterval); waitErr == nil {
+						manifest.PID = pid
+						applyProcessIdentity(manifest, identity)
+					} else if errors.Is(waitErr, errProcessNotFound) {
+						if removeErr := os.RemoveAll(vmDir); removeErr != nil {
+							errs = append(errs, fmt.Errorf("clean dead starting VM state for %s: %w", name, removeErr))
+						}
+						continue
+					} else {
+						// MainPID identifies the candidate process even though its
+						// ownership is not proved. Retaining it makes the ambiguity
+						// explicit and prevents PID-free state from hiding a live unit.
+						manifest.PID = pid
+						m.logger.Warn("could not confirm the identity of a starting microVM",
+							"service", name, "pid", pid, "error", waitErr)
 					}
 				}
 			}
@@ -118,8 +144,10 @@ func (m *Manager) Recover(_ context.Context, desired config.NodeConfig) ([]strin
 				}
 				continue
 			}
-			m.addRecoveryPending(name, manifest, fmt.Sprintf("cannot prove surviving process ownership: %v", processErr))
-			continue
+			if !m.repairOwnership(name, manifest, processErr) {
+				m.addRecoveryPending(name, manifest, fmt.Sprintf("cannot prove surviving process ownership: %v", processErr))
+				continue
+			}
 		}
 		if socketErr := validateOwnedSocket(m.inspector, manifest); socketErr != nil {
 			m.addRecoveryPending(name, manifest, fmt.Sprintf("surviving process API socket is not ready: %v", socketErr))
@@ -143,6 +171,46 @@ func (m *Manager) Recover(_ context.Context, desired config.NodeConfig) ([]strin
 		return adopted, fmt.Errorf("VM recovery had %d error(s): %v", len(errs), errs)
 	}
 	return adopted, nil
+}
+
+// repairOwnership re-proves ownership of a VM whose recorded identity cannot be
+// validated, and rewrites the identity from the live process when it succeeds.
+//
+// A manifest can hold an identity that never described its Firecracker process:
+// an inspection that raced the launcher's exec records either nothing or the
+// launcher's own identity, and neither can ever validate again even though the
+// VM is running and healthy. The command line settles that independently. It
+// carries the instance ID, 128 bits generated once for this launch and never
+// reused, so a process presenting it with this instance's socket and config
+// paths is the process this manifest was written for.
+func (m *Manager) repairOwnership(name string, manifest *instanceManifest, cause error) bool {
+	if manifest.Legacy || manifest.InstanceID == "" {
+		return false
+	}
+	identity, err := m.inspector.Inspect(manifest.PID)
+	if err != nil || !matchesOwnedArguments(identity, manifest) {
+		return false
+	}
+	// A recorded start time that disagrees is the PID-reuse signal the manifest
+	// exists to catch, and it means this PID is a different incarnation from the
+	// one described. Only an unrecorded identity, or one belonging to the same
+	// incarnation before it exec'd, is repairable. A boot ID that disagrees is
+	// already classified as a process that did not survive.
+	if manifest.ProcessStart != 0 && identity.StartTicks != manifest.ProcessStart {
+		return false
+	}
+	applyProcessIdentity(manifest, identity)
+	m.logger.Warn("repaired the recorded identity of a surviving microVM",
+		"service", name, "pid", manifest.PID, "error", cause)
+	return true
+}
+
+func applyProcessIdentity(manifest *instanceManifest, identity processIdentity) {
+	manifest.HostBootID = identity.HostBootID
+	manifest.ProcessStart = identity.StartTicks
+	manifest.Executable = identity.Executable
+	manifest.ExecutableDev = identity.ExecutableDev
+	manifest.ExecutableIno = identity.ExecutableIno
 }
 
 func (m *Manager) recoverLegacy(name, vmDir string, desired map[string]config.ServiceConfig) (*instanceManifest, bool, error) {

@@ -528,13 +528,18 @@ func (s visibilitySnapshot) nodeSummary(record NodeRecord) NodeSummary {
 		summary.AgentVersion = status.AgentVersion
 		if s.statusMatchesCurrent(status) {
 			summary.ReasonCode = status.ReasonCode
+		} else {
+			summary.ReasonCode = "agent_status_revision_mismatch"
+		}
+		// Once the node has observed the current revision, count its fresh
+		// service state whether or not every change applied. Older observations
+		// stay fail-closed, matching the per-service projection.
+		if s.statusObservedCurrent(status) {
 			for _, service := range status.Services {
 				if service.VMState == "running" {
 					summary.RunningServices++
 				}
 			}
-		} else {
-			summary.ReasonCode = "agent_status_revision_mismatch"
 		}
 	} else if record.AgentStatus == nil {
 		summary.ReasonCode = "agent_status_missing"
@@ -601,13 +606,16 @@ func (s visibilitySnapshot) currentStatus(record NodeRecord) (statusmodel.AgentS
 }
 
 func (s visibilitySnapshot) statusMatchesCurrent(status statusmodel.AgentStatus) bool {
+	return s.statusObservedCurrent(status) && status.AppliedRevision == s.renderedRevision
+}
+
+func (s visibilitySnapshot) statusObservedCurrent(status statusmodel.AgentStatus) bool {
 	if !s.placementCurrent || s.renderedRevision == "" {
 		return false
 	}
 	return status.DesiredRevision == s.desired.Revision &&
 		status.PlacementRevision == s.placement.Revision &&
-		status.ObservedRevision == s.renderedRevision &&
-		status.AppliedRevision == s.renderedRevision
+		status.ObservedRevision == s.renderedRevision
 }
 
 func (s visibilitySnapshot) revisionStatus() RevisionStatus {
@@ -879,8 +887,24 @@ func (s visibilitySnapshot) serviceSummary(desired config.ServiceConfig) Service
 	if !current {
 		if record.LastSeenAt.IsZero() || s.now.Sub(record.LastSeenAt) > s.staleTTL {
 			summary.ReasonCode = "node_stale"
-		} else if _, fresh := s.freshStatus(record); fresh {
-			summary.ReasonCode = "agent_status_revision_mismatch"
+			return summary
+		}
+		stale, fresh := s.freshStatus(record)
+		if !fresh {
+			return summary
+		}
+		// The node has not applied the current revision, which the reason code
+		// keeps saying. Its per-service observations are still fresh and
+		// self-consistent, so project them rather than erasing visibility into
+		// every service on the node because one of them cannot converge.
+		summary.ReasonCode = "agent_status_revision_mismatch"
+		if !s.statusObservedCurrent(stale) {
+			return summary
+		}
+		if actual, exists := findAgentService(stale, desired.Name); exists {
+			summary.ObservedAt = stale.ObservedAt
+			applyAgentServiceState(&summary, actual)
+			summary.Message = actual.Message
 		}
 		return summary
 	}
@@ -890,6 +914,15 @@ func (s visibilitySnapshot) serviceSummary(desired config.ServiceConfig) Service
 		summary.ReasonCode = "service_status_missing"
 		return summary
 	}
+	applyAgentServiceState(&summary, actual)
+	summary.ReasonCode = actual.ReasonCode
+	summary.Message = actual.Message
+	return summary
+}
+
+// applyAgentServiceState copies an agent's per-service observation into a
+// summary, mapping any value outside the published vocabulary to unknown.
+func applyAgentServiceState(summary *ServiceSummary, actual statusmodel.ServiceStatus) {
 	switch actual.VMState {
 	case "running", "stopped", "failed":
 		summary.State = actual.VMState
@@ -903,9 +936,6 @@ func (s visibilitySnapshot) serviceSummary(desired config.ServiceConfig) Service
 		summary.Health = "unknown"
 	}
 	summary.LastTransitionAt = actual.LastTransitionAt
-	summary.ReasonCode = actual.ReasonCode
-	summary.Message = actual.Message
-	return summary
 }
 
 func findAgentService(status statusmodel.AgentStatus, name string) (statusmodel.ServiceStatus, bool) {

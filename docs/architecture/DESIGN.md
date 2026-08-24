@@ -169,16 +169,52 @@ of those fields plus the API socket before adopting a survivor. It then
 re-establishes idempotent TAP, forwarding, and health-monitor state without
 restarting a VM whose resolved configuration is unchanged.
 
+The identity is recorded only once the launched PID is running the command line
+Firework launched for it. systemd reports a transient unit's `MainPID` at fork,
+so a PID inspected any earlier is still systemd, and a manifest written from
+that inspection describes a process that never existed at that identity and can
+never be validated again. A launch whose identity cannot be confirmed within a
+short bound is killed rather than recorded; its state directory is removed once
+the process is proven gone. If it cannot be proven gone, it is retained as
+`recovery_pending` and keeps ownership of its host networking so reconciliation
+cannot tear resources down around a potentially live microVM.
+
+Recovery is spent once per agent process, including on a fresh node where the
+VM state directory does not exist yet. That directory appears as soon as the
+process creates its first VM, and a later pass would otherwise "recover" VMs the
+running process owns. Services already tracked in memory are skipped for the
+same reason.
+
+A manifest whose recorded identity does not validate is re-proved from the live
+command line before it is quarantined. The instance ID is 128 bits generated
+once per launch and passed to Firecracker as `--id`, so a process presenting it
+together with that instance's socket and config paths is the process the
+manifest was written for, whatever the recorded identity says. The identity is
+then repaired from the live process and persisted. A recorded process start time
+that disagrees is never repaired: that is the PID-reuse signal the manifest
+exists to catch.
+
 During the first upgrade from the pre-manifest runtime, the agent can migrate
 one legacy process when the configured Firecracker executable, resolved desired
 service, config path, socket path, and responsive Unix socket all match exactly.
 Any ambiguous legacy inventory is quarantined instead of guessed.
 
-Dead processes have their stale runtime directory cleaned. Ambiguous cases —
-including PID reuse, mismatched command lines, corrupt manifests, and a live
-process with a missing or invalid socket — enter `recovery_pending`. Firework
-does not signal the process, delete its files, or launch a duplicate in that
-state. The condition is exposed in agent status for operator investigation.
+Dead processes have their stale runtime directory cleaned. A host boot ID that
+disagrees with the manifest is one of them rather than an ambiguity: the boot ID
+is host-global and read fresh on every inspection, so a mismatch proves the
+recorded PID cannot be the recorded process. An identity that was never recorded
+is reported distinctly from one that disagrees, because an absent field proves
+nothing about the process and must not license cleaning up under a VM that may
+still be alive.
+
+Ambiguous cases — including PID reuse, mismatched command lines, corrupt
+manifests, and a live process with a missing or invalid socket — enter
+`recovery_pending`. Firework does not signal the process, delete its files, or
+launch a duplicate in that state. The condition is exposed in agent status for
+operator investigation. There is no supported interface for clearing it while
+the agent runs: the manual procedure is to stop the agent, remove
+`<state_dir>/vms/<service>/`, and start it again. Persistent volumes live
+outside that directory and are unaffected.
 
 A process observed mid-exit is classified as exited, not ambiguous. Linux
 releases a process's address space, and with it its `exe` link and command line,

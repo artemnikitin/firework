@@ -14,11 +14,12 @@ import (
 
 // fakeVMManager implements VMManager for testing.
 type fakeVMManager struct {
-	instances   map[string]*vm.Instance
-	startCalls  []string
-	removeCalls []string
-	removeErr   error
-	startErr    error
+	instances          map[string]*vm.Instance
+	startCalls         []string
+	removeCalls        []string
+	removeErr          error
+	startErr           error
+	retainOnStartError bool
 }
 
 func newFakeVMManager() *fakeVMManager {
@@ -36,6 +37,9 @@ func (f *fakeVMManager) List() map[string]*vm.Instance {
 func (f *fakeVMManager) Start(_ context.Context, svc config.ServiceConfig) error {
 	f.startCalls = append(f.startCalls, svc.Name)
 	if f.startErr != nil {
+		if f.retainOnStartError {
+			f.instances[svc.Name] = &vm.Instance{Name: svc.Name, State: vm.StateRecoveryPending, Config: svc, LastError: f.startErr.Error()}
+		}
 		return f.startErr
 	}
 	f.instances[svc.Name] = &vm.Instance{Name: svc.Name, State: vm.StateRunning, Config: svc}

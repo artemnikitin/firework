@@ -848,9 +848,13 @@ func (r *Reconciler) createService(ctx context.Context, svc config.ServiceConfig
 	if err := r.vmManager.Start(ctx, svc); err != nil {
 		// Roll back networking through the component-level teardown so a
 		// failure to remove either device is recorded and retried rather
-		// than discarded. Nothing claims these devices — the VM did not
-		// start — so the retry path will keep at them until they are gone.
-		if r.networkMgr != nil {
+		// than discarded. A failed start normally leaves no claimant, but an
+		// identity failure can retain an unprovable process as recovery_pending.
+		// In that case its host resources must stay in place until ownership is
+		// resolved; Manager.List is the authoritative claimant set used by the
+		// retry paths as well.
+		_, retained := r.vmManager.List()[svc.Name]
+		if r.networkMgr != nil && !retained {
 			if tdErr := r.teardownAndTrackNetwork(svc); tdErr != nil {
 				r.logger.Warn("failed to roll back networking after VM start failure; will retry",
 					"service", svc.Name, "error", tdErr)

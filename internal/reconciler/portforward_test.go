@@ -11,6 +11,7 @@ import (
 	"testing"
 
 	"github.com/artemnikitin/firework/internal/config"
+	"github.com/artemnikitin/firework/internal/vm"
 )
 
 type fakeNetworkManager struct {
@@ -795,6 +796,30 @@ func TestCreateService_FailedStartTracksNetworkDeviceCleanup(t *testing.T) {
 	}
 	if len(r.pendingNetworkDevices) != 0 {
 		t.Fatalf("expected the orphaned tap to be cleaned up, got %#v", r.pendingNetworkDevices)
+	}
+}
+
+func TestCreateService_RetainedFailedStartKeepsClaimedNetworkDevices(t *testing.T) {
+	net := &fakeNetworkManager{}
+	r, vmMgr := newNetworkTestReconciler(net)
+	vmMgr.startErr = errors.New("could not prove launched process identity")
+	vmMgr.retainOnStartError = true
+
+	svc := config.ServiceConfig{Name: "web", Network: &config.NetworkConfig{
+		Interface: "tap-web", HostDevName: "eth0", GuestIP: "172.16.0.2",
+	}}
+	err := r.Reconcile(context.Background(), config.NodeConfig{Node: "node-1", Services: []config.ServiceConfig{svc}})
+	if err == nil {
+		t.Fatal("expected the ambiguous start to fail reconciliation")
+	}
+	if instance := vmMgr.instances[svc.Name]; instance == nil || instance.State != vm.StateRecoveryPending {
+		t.Fatalf("ambiguous launch was not retained: %#v", instance)
+	}
+	if len(net.deleteTAPCalls) != 0 || len(net.deleteBridgeCalls) != 0 {
+		t.Fatalf("networking was removed from a retained process: taps=%v bridges=%v", net.deleteTAPCalls, net.deleteBridgeCalls)
+	}
+	if len(r.pendingNetworkDevices) != 0 {
+		t.Fatalf("claimed devices remained pending for deletion: %#v", r.pendingNetworkDevices)
 	}
 }
 

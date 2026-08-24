@@ -4,6 +4,11 @@ package vm
 
 import "fmt"
 
+// processInspectionSupported reports whether the host exposes the process
+// identity Firework needs to prove VM ownership. Without it a launch cannot be
+// verified, so this platform is development-only.
+const processInspectionSupported = false
+
 func (osProcessInspector) Inspect(_ int) (processIdentity, error) {
 	return processIdentity{}, errProcessNotFound
 }

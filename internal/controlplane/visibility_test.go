@@ -343,8 +343,11 @@ func TestVisibilityFailsClosedAcrossRevisionTransitions(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := list.Items[0]; got.State != "unknown" || got.Health != "unknown" || got.Node != "node" || got.ReasonCode != "agent_status_revision_mismatch" {
-		t.Fatalf("unapplied agent status did not fail closed: %#v", got)
+	// The node has not applied the current revision, which the reason code keeps
+	// reporting, but its per-service observation is fresh and is projected so a
+	// node that cannot converge does not erase visibility into its workloads.
+	if got := list.Items[0]; got.State != "running" || got.Health != "healthy" || got.Node != "node" || got.ReasonCode != "agent_status_revision_mismatch" {
+		t.Fatalf("unapplied agent status was not projected with its mismatch reason: %#v", got)
 	}
 	detail, found, err := service.Service(ctx, "service")
 	if err != nil || !found {
@@ -547,6 +550,96 @@ func allBlockingConditionsTrue() []statusmodel.Condition {
 		conditions = append(conditions, statusmodel.Condition{Type: conditionType, Status: statusmodel.ConditionTrue})
 	}
 	return conditions
+}
+
+func TestVisibilityKeepsFreshServiceStateOnANodeThatCannotConverge(t *testing.T) {
+	ctx := context.Background()
+	store := newBlobStateStore(newMemBlob())
+	cfg := validConfigForRole(RoleAPI)
+	cfg.NodeStaleTTL = time.Minute
+	now := time.Now().UTC()
+	services := []config.ServiceConfig{
+		{Name: "quarantined", VCPUs: 1, MemoryMB: 128},
+		{Name: "healthy", VCPUs: 1, MemoryMB: 128},
+	}
+	desired := DesiredRevision{Revision: "desired-1", Services: services}
+	placement := PlacementRevision{Revision: "placement-1", DesiredRevision: "desired-1", NodeConfigs: []config.NodeConfig{{Node: "node", Services: services}}}
+	putCurrentState(t, ctx, store, desired, placement, "rendered-2")
+	// One VM cannot be removed, so the node never advances its applied revision
+	// even though every other observation on it is current.
+	putNode(t, ctx, store, cfg, NodeRecord{NodeID: "node", State: NodeStateReady, LastSeenAt: now, AgentStatus: &statusmodel.AgentStatus{
+		SchemaVersion: 1, ObservedAt: now, DesiredRevision: "desired-1", PlacementRevision: "placement-1",
+		ObservedRevision: "rendered-2", AppliedRevision: "rendered-1", Phase: statusmodel.PhaseFailed, ReasonCode: "reconcile_failed",
+		Services: []statusmodel.ServiceStatus{
+			{Name: "quarantined", VMState: "recovery_pending", Health: "unknown", ReasonCode: "vm_recovery_pending", Message: "cannot prove surviving process ownership"},
+			{Name: "healthy", VMState: "running", Health: "healthy"},
+		},
+	}})
+
+	list, err := NewVisibilityService(cfg, store).Services(ctx, "", "", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	byName := make(map[string]ServiceSummary, len(list.Items))
+	for _, item := range list.Items {
+		byName[item.Name] = item
+	}
+	if got := byName["healthy"]; got.State != "running" || got.Health != "healthy" {
+		t.Fatalf("a stalled node erased a healthy service: %#v", got)
+	}
+	// recovery_pending is outside the published vocabulary, so the service that
+	// actually cannot converge is the one that stays unknown.
+	if got := byName["quarantined"]; got.State != "unknown" {
+		t.Fatalf("quarantined service was not reported as unknown: %#v", got)
+	}
+	for name, got := range byName {
+		if got.ReasonCode != "agent_status_revision_mismatch" {
+			t.Fatalf("%s lost the revision-mismatch reason: %#v", name, got)
+		}
+	}
+
+	// The node list is projected from the same observation, so it must not
+	// contradict the service list on the same screen.
+	nodes, err := NewVisibilityService(cfg, store).Nodes(ctx, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := nodes.Items[0]; got.RunningServices != 1 || got.ReasonCode != "agent_status_revision_mismatch" {
+		t.Fatalf("node summary disagrees with its services: %#v", got)
+	}
+}
+
+func TestVisibilityDoesNotProjectServiceStateBeforeCurrentRevisionIsObserved(t *testing.T) {
+	ctx := context.Background()
+	store := newBlobStateStore(newMemBlob())
+	cfg := validConfigForRole(RoleAPI)
+	cfg.NodeStaleTTL = time.Minute
+	now := time.Now().UTC()
+	services := []config.ServiceConfig{{Name: "service", VCPUs: 1, MemoryMB: 128}}
+	desired := DesiredRevision{Revision: "desired-2", Services: services}
+	placement := PlacementRevision{Revision: "placement-2", DesiredRevision: desired.Revision, NodeConfigs: []config.NodeConfig{{Node: "node", Services: services}}}
+	putCurrentState(t, ctx, store, desired, placement, "rendered-2")
+	putNode(t, ctx, store, cfg, NodeRecord{NodeID: "node", State: NodeStateReady, LastSeenAt: now, AgentStatus: &statusmodel.AgentStatus{
+		SchemaVersion: 1, ObservedAt: now, DesiredRevision: "desired-1", PlacementRevision: "placement-1",
+		ObservedRevision: "rendered-1", AppliedRevision: "rendered-1",
+		Services: []statusmodel.ServiceStatus{{Name: "service", VMState: "running", Health: "healthy"}},
+	}})
+
+	list, err := NewVisibilityService(cfg, store).Services(ctx, "", "", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := list.Items[0]; got.State != "unknown" || got.Health != "unknown" || got.ReasonCode != "agent_status_revision_mismatch" {
+		t.Fatalf("older service observation was projected as current: %#v", got)
+	}
+
+	nodes, err := NewVisibilityService(cfg, store).Nodes(ctx, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := nodes.Items[0]; got.RunningServices != 0 || got.ReasonCode != "agent_status_revision_mismatch" {
+		t.Fatalf("older node observation was counted as current: %#v", got)
+	}
 }
 
 func putCurrentState(t *testing.T, ctx context.Context, store StateStore, desired DesiredRevision, placement PlacementRevision, rendered string) {
