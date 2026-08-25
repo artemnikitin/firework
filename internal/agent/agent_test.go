@@ -878,6 +878,45 @@ func TestReadNodeCapacity_UsesLastKnownOnError(t *testing.T) {
 	}
 }
 
+func TestTick_HostPortConflict_RejectsConfigBeforeReconcile(t *testing.T) {
+	nodeYAML := []byte("node: web\nservices:\n" +
+		"- name: tenant-1-elasticsearch\n  image: /img/es\n  kernel: /kern\n  vcpus: 1\n  memory_mb: 256\n  network: {}\n  port_forwards:\n  - host_port: 9200\n    vm_port: 9200\n" +
+		"- name: tenant-2-elasticsearch\n  image: /img/es\n  kernel: /kern\n  vcpus: 1\n  memory_mb: 256\n  network: {}\n  port_forwards:\n  - host_port: 9200\n    vm_port: 9200\n")
+	s := &fakeStore{data: map[string][]byte{"web": nodeYAML}, revision: "rev-1"}
+
+	a := New(testAgentConfig(t), s, testLogger())
+	a.tick(context.Background())
+
+	if instances := a.vmManager.List(); len(instances) != 0 {
+		t.Errorf("expected no VMs to be started for a conflicting config, got %d", len(instances))
+	}
+	status := a.agentStatusSnapshot()
+	if status.Phase != "failed" || status.ReasonCode != "host_port_conflict" {
+		t.Fatalf("unexpected status: %#v", status)
+	}
+	if !strings.Contains(status.Message, "9200") {
+		t.Errorf("status message %q does not identify the conflicting port", status.Message)
+	}
+	// The revision must not be recorded as applied, so the next poll retries.
+	if a.lastRevision != "" {
+		t.Errorf("expected revision not to advance, got %q", a.lastRevision)
+	}
+}
+
+func TestTick_DistinctHostPortsReconcileNormally(t *testing.T) {
+	nodeYAML := []byte("node: web\nservices:\n" +
+		"- name: tenant-1-elasticsearch\n  image: /img/es\n  kernel: /kern\n  vcpus: 1\n  memory_mb: 256\n  network: {}\n  port_forwards:\n  - host_port: 9200\n    vm_port: 9200\n" +
+		"- name: tenant-2-elasticsearch\n  image: /img/es\n  kernel: /kern\n  vcpus: 1\n  memory_mb: 256\n  network: {}\n  port_forwards:\n  - host_port: 9201\n    vm_port: 9200\n")
+	s := &fakeStore{data: map[string][]byte{"web": nodeYAML}, revision: "rev-1"}
+
+	a := New(testAgentConfig(t), s, testLogger())
+	a.tick(context.Background())
+
+	if status := a.agentStatusSnapshot(); status.ReasonCode == "host_port_conflict" {
+		t.Fatalf("distinct host ports must not be rejected: %#v", status)
+	}
+}
+
 // runningVMManager reports a service as already running, which is what steady
 // state looks like: port forwards are only asserted for services that have a
 // guest to forward to.
