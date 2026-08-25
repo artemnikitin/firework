@@ -52,6 +52,24 @@ type acceptingMounts struct{}
 
 func (acceptingMounts) Verify(string) error { return nil }
 
+// fakeRunner reports a fixed filesystem minimum, so a small shrink target is
+// refused and a large one is accepted.
+type fakeRunner struct{}
+
+func (fakeRunner) Run(_ context.Context, name string, args ...string) ([]byte, error) {
+	if name == "resize2fs" && len(args) > 0 && args[0] == "-P" {
+		return []byte("Estimated minimum size of the filesystem: 1024\n"), nil
+	}
+	if name == "tune2fs" {
+		return []byte("Block size: 4096\n"), nil
+	}
+	return nil, nil
+}
+
+func (r fakeRunner) RunDestructive(ctx context.Context, name string, args ...string) ([]byte, error) {
+	return r.Run(ctx, name, args...)
+}
+
 // countingLauncher fails the test's purpose loudly: phase 3 must not launch
 // anything after an abort, so any launch at all is the defect.
 type countingLauncher struct {
@@ -333,4 +351,58 @@ type fakeVolumeRunner struct{}
 func (fakeVolumeRunner) Run(context.Context, string, ...string) ([]byte, error) { return nil, nil }
 func (fakeVolumeRunner) RunDestructive(context.Context, string, ...string) ([]byte, error) {
 	return nil, nil
+}
+
+// The acknowledged form of a refused shrink must converge.
+//
+// After the control plane acknowledges a rejection it renders the *effective*
+// size with the *refused* generation — it keeps that generation so the
+// acknowledgement can match its own record. The running instance, meanwhile,
+// carries the applied generation. needsUpdate compares whole VolumeConfig
+// structs, so unless normalization reconciles the two the reconciler plans an
+// update, stops the VM, and restarts it — every tick that reaches Plan.
+func TestAcknowledgedRejectionConvergesWithTheRunningConfig(t *testing.T) {
+	manager, _ := barrierManager(t, &fakeRunner{})
+	svc := barrierService()
+
+	if _, err := manager.volumeManager.Prepare(context.Background(), svc); err != nil {
+		t.Fatal(err)
+	}
+	// A shrink the fake measurement refuses, at generation 2.
+	refused := svc
+	refused.Volumes = append([]config.VolumeConfig(nil), svc.Volumes...)
+	refused.Volumes[0].SizeBytes = 2 * config.MiB
+	refused.Volumes[0].ResizeGeneration = 2
+	prepared, err := manager.volumeManager.Prepare(context.Background(), refused)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !prepared[0].Rejected {
+		t.Fatalf("precondition: expected the shrink to be refused, got %#v", prepared[0])
+	}
+
+	// What Start stores on the instance: the effective configuration.
+	running := clampToPrepared(refused, prepared)
+
+	// What the control plane renders once it has acknowledged the rejection.
+	acknowledged := svc
+	acknowledged.Volumes = append([]config.VolumeConfig(nil), svc.Volumes...)
+	acknowledged.Volumes[0].SizeBytes = 16 * config.MiB
+	acknowledged.Volumes[0].ResizeGeneration = 2
+
+	services := []config.ServiceConfig{acknowledged}
+	manager.NormalizeVolumes(services)
+
+	// volumesEqual compares whole VolumeConfig structs, so this equality is
+	// exactly the condition under which no ActionUpdate is planned.
+	if services[0].Volumes[0] != running.Volumes[0] {
+		t.Fatalf("the rendered config does not match the running one, so an update would be re-planned:\nrendered %#v\nrunning  %#v",
+			services[0].Volumes[0], running.Volumes[0])
+	}
+
+	// And the refusal is still reported, so this converges without becoming
+	// invisible.
+	if got := manager.VolumeRejections()["app/data"]; got.RequestedSizeBytes != 2*config.MiB {
+		t.Fatalf("the rejection stopped being reported: %#v", got)
+	}
 }

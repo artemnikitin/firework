@@ -207,9 +207,22 @@ func (c *Controller) runReconcile(ctx context.Context) {
 	}
 
 	existingPlacement, err := c.readExistingPlacement(ctx)
+	placementUnavailable := err != nil
 	if err != nil {
 		c.logger.Warn("reading existing placement failed; will re-place all", "error", err)
 		existingPlacement = nil
+	}
+	// A held service is one already running that must keep running, and the
+	// prior placement is the only source for where. Without it the service
+	// would be classified as never-placed and left pending, which drops it
+	// from the rendered node configs — and the agent turns an absent service
+	// into a delete. Publishing anything here would evict a healthy workload
+	// over a transient read failure, so nothing is published and the next tick
+	// retries. Omission is eviction; there is no partial answer to give.
+	if heldPlacementUnrecoverable(placementUnavailable, admission.Held) {
+		c.logger.Error("holding services but the previous placement is unreadable; not publishing",
+			"held", len(admission.Held))
+		return
 	}
 	existingAssignment := make(map[string]string, len(existingPlacement))
 	for name, placed := range existingPlacement {
@@ -419,6 +432,23 @@ func splitHeldServices(services []config.ServiceConfig, admission volumeAdmissio
 		held[placed.Node] = append(held[placed.Node], rendered)
 	}
 	return schedulable, held, pending
+}
+
+// heldPlacementUnrecoverable reports whether publishing this cycle could evict
+// a running service.
+//
+// A held service is one already running that must keep running, and the prior
+// placement is the only source for where it runs. When that read fails, a held
+// service would be classified as never-placed and left pending, which drops it
+// from the rendered node configs — and the agent turns an absent service into a
+// delete. Omission is eviction, and there is no partial answer to give, so the
+// cycle publishes nothing and the next tick retries.
+//
+// With nothing held, a failed placement read is harmless: the scheduler simply
+// re-places everything from the desired revision, which is the pre-existing
+// behavior.
+func heldPlacementUnrecoverable(placementUnavailable bool, held map[string]string) bool {
+	return placementUnavailable && len(held) > 0
 }
 
 // heldPortClaims collects the node-exclusive host-port claims a held service is

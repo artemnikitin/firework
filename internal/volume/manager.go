@@ -147,16 +147,33 @@ func (m manifest) rejectionFor(generation int64) Rejection {
 	}
 }
 
-// matchesRejection reports whether a desired volume config is the request this
-// manifest already refused. Both the generation and the requested size must
-// match: direct-Git node configs are hand-authored and carry their own
+// matchesRejection reports whether a desired volume config is a request this
+// manifest already refused.
+//
+// The generation must always match. A generation-only match is not enough:
+// direct-Git node configs are hand-authored and carry their own
 // resize_generation, so an operator correcting a refused shrink by editing
-// size_bytes alone presents a different request under the same generation. A
-// generation-only match would clamp that forever.
+// size_bytes alone presents a different request under the same generation, and
+// a generation-only match would clamp that forever.
+//
+// Two sizes carry the same refused request, and both must be recognized:
+//
+//   - the refused size itself, which is what a direct-Git config renders and
+//     what the control plane renders until it has acknowledged the refusal;
+//   - the applied size, which is what the control plane renders *after*
+//     acknowledging it — the clamp there substitutes the effective size but
+//     keeps the refused generation, because the acknowledgement has to be able
+//     to match that generation to its record.
+//
+// Recognizing only the first leaves the second carrying the refused generation
+// while the running instance carries the applied one. needsUpdate compares
+// whole volume configs, so the service is stopped and restarted on every
+// reconcile that reaches Plan — the loop this whole mechanism exists to end.
 func (m manifest) matchesRejection(volume config.VolumeConfig) bool {
-	return m.RejectedGeneration != 0 &&
-		m.RejectedGeneration == volume.ResizeGeneration &&
-		m.RejectedSizeBytes == volume.SizeBytes
+	if m.RejectedGeneration == 0 || m.RejectedGeneration != volume.ResizeGeneration {
+		return false
+	}
+	return volume.SizeBytes == m.RejectedSizeBytes || volume.SizeBytes == m.AppliedSizeBytes
 }
 
 func (m *manifest) clearRejection() {
@@ -873,7 +890,43 @@ func (m *Manager) checkCapacity(pool *config.LocalStorageConfig, desired map[str
 	return nil
 }
 
-// refreshRejections rebuilds the refusal snapshot for one service from the
+// rebuildRejections replaces the whole refusal snapshot from the durable
+// manifests of the currently desired services. It is the complete
+// reconciliation; refreshRejections keeps one service fresh within a tick.
+func (m *Manager) rebuildRejections(services []config.ServiceConfig) {
+	if m == nil || m.storage.Local == nil {
+		return
+	}
+	rebuilt := make(map[string]Rejection)
+	for _, svc := range services {
+		for _, declared := range svc.Volumes {
+			if declared.Type != config.VolumeTypeLocal {
+				continue
+			}
+			if rejection, ok := m.storedRejection(svc.Name, declared.Name); ok {
+				rebuilt[svc.Name+"/"+declared.Name] = rejection
+			}
+		}
+	}
+	m.rejectionMu.Lock()
+	defer m.rejectionMu.Unlock()
+	m.rejections = rebuilt
+}
+
+// storedRejection reads one volume's durable refusal, if it has one.
+func (m *Manager) storedRejection(service, volumeName string) (Rejection, bool) {
+	dir, err := volumeDir(m.storage.Local.Path, service, volumeName)
+	if err != nil {
+		return Rejection{}, false
+	}
+	var current manifest
+	if err := readJSON(filepath.Join(dir, manifestFilename), &current); err != nil || current.RejectedGeneration == 0 {
+		return Rejection{}, false
+	}
+	return current.rejectionFor(current.RejectedGeneration), true
+}
+
+// refreshRejections updates the refusal snapshot for one service from the
 // durable manifests.
 //
 // It reads the manifests rather than only the outcomes of this pass because
@@ -887,25 +940,24 @@ func (m *Manager) refreshRejections(svc config.ServiceConfig) {
 	if m == nil || m.storage.Local == nil {
 		return
 	}
+	current := make(map[string]Rejection, len(svc.Volumes))
+	for _, declared := range svc.Volumes {
+		if declared.Type != config.VolumeTypeLocal {
+			continue
+		}
+		if rejection, ok := m.storedRejection(svc.Name, declared.Name); ok {
+			current[svc.Name+"/"+declared.Name] = rejection
+		}
+	}
 	m.rejectionMu.Lock()
 	defer m.rejectionMu.Unlock()
 	for _, declared := range svc.Volumes {
 		logicalID := svc.Name + "/" + declared.Name
-		if declared.Type != config.VolumeTypeLocal {
-			delete(m.rejections, logicalID)
+		if rejection, ok := current[logicalID]; ok {
+			m.rejections[logicalID] = rejection
 			continue
 		}
-		dir, err := volumeDir(m.storage.Local.Path, svc.Name, declared.Name)
-		if err != nil {
-			delete(m.rejections, logicalID)
-			continue
-		}
-		var current manifest
-		if err := readJSON(filepath.Join(dir, manifestFilename), &current); err != nil || current.RejectedGeneration == 0 {
-			delete(m.rejections, logicalID)
-			continue
-		}
-		m.rejections[logicalID] = current.rejectionFor(current.RejectedGeneration)
+		delete(m.rejections, logicalID)
 	}
 }
 
@@ -957,6 +1009,17 @@ func (m *Manager) NormalizeVolumes(services []config.ServiceConfig) {
 	if m == nil || m.storage.Local == nil {
 		return
 	}
+	// Reconcile the refusal snapshot against the durable manifests for the
+	// whole desired set, not just the volumes some later Prepare happens to
+	// touch. Two things depend on it being complete:
+	//
+	//   - after an agent restart the snapshot is empty, and if normalization
+	//     clamps the config so that no action is planned, nothing else would
+	//     ever repopulate it — the node would report every size applied while
+	//     running an effective one;
+	//   - a volume that is no longer declared has to drop out, or its stale
+	//     entry keeps VolumeSizesApplied false forever.
+	m.rebuildRejections(services)
 	for si := range services {
 		for vi := range services[si].Volumes {
 			volume := &services[si].Volumes[vi]

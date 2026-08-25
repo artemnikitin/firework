@@ -119,6 +119,18 @@ func (c *Controller) admitVolumeSize(
 	record := stored.Record
 	requested := volume.SizeBytes
 
+	// A state this controller does not recognize belongs to a newer resize
+	// protocol that is presumably mid-flight. Tolerating it in the parse
+	// (so it does not brick scheduling) is only half the rule: advancing the
+	// generation and resetting the state to pending here would destroy the
+	// very state the tolerance exists to preserve. Render what the record
+	// says and write nothing.
+	if !knownVolumeResizeState(record.ResizeState) {
+		volume.SizeBytes = record.DesiredSizeBytes
+		volume.ResizeGeneration = record.ResizeGeneration
+		return stored, false, nil
+	}
+
 	// A standing rejection for exactly this request. The match key is
 	// RequestedSizeBytes, not DesiredSizeBytes: after a rejection
 	// DesiredSizeBytes holds the *effective* size, so comparing against it
@@ -200,6 +212,18 @@ func (c *Controller) admitVolumeSize(
 // ever handed to a running workload.
 func (c *Controller) admitLocalRaise(record VolumeRecord, requested int64, nodeByID map[string]scheduler.Node, localByNode map[string]int64) (string, int64) {
 	if record.Type != config.VolumeTypeLocal || record.BoundNode == "" {
+		return "", 0
+	}
+	// A request that does not increase the record's contribution cannot
+	// over-commit the pool, so it is not subject to admission at all. This is
+	// not just an optimization: because the contribution is
+	// max(size, applied), a shrink leaves it unchanged until the shrink
+	// actually applies — so checking it against a pool that is *already* over
+	// capacity refuses the one operation that would restore the pool. The same
+	// reasoning covers a node that is not currently observable: there is
+	// nothing to verify when nothing new is being claimed.
+	if recordContribution(requested, record.AppliedSizeBytes) <=
+		recordContribution(record.DesiredSizeBytes, record.AppliedSizeBytes) {
 		return "", 0
 	}
 	node, active := nodeByID[record.BoundNode]
