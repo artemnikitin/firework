@@ -1,6 +1,7 @@
 package scheduler
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/artemnikitin/firework/internal/config"
@@ -254,7 +255,7 @@ func TestScheduleWithStorageBindsLocalVolumeAndHonorsRetainedBinding(t *testing.
 		{InstanceID: "small", CapacityVCPUs: 4, CapacityMemMB: 1024, LocalCapacityBytes: 5 * config.GiB},
 		{InstanceID: "large", CapacityVCPUs: 4, CapacityMemMB: 1024, LocalCapacityBytes: 20 * config.GiB},
 	}
-	result, pending := ScheduleWithStorage([]config.ServiceConfig{service}, nodes, nil, StorageReservations{})
+	result, pending := ScheduleWithStorage([]config.ServiceConfig{service}, nodes, nil, StorageReservations{}, nil)
 	if len(pending) != 0 || len(result["large"]) != 1 {
 		t.Fatalf("unexpected placement result=%#v pending=%#v", result, pending)
 	}
@@ -263,7 +264,7 @@ func TestScheduleWithStorageBindsLocalVolumeAndHonorsRetainedBinding(t *testing.
 	}
 
 	service.Volumes[0].BoundNode = "lost"
-	_, pending = ScheduleWithStorage([]config.ServiceConfig{service}, nodes, nil, StorageReservations{})
+	_, pending = ScheduleWithStorage([]config.ServiceConfig{service}, nodes, nil, StorageReservations{}, nil)
 	if len(pending) != 1 || pending[0].ReasonCode != "local_volume_node_unavailable" {
 		t.Fatalf("unexpected retained binding result: %#v", pending)
 	}
@@ -273,8 +274,145 @@ func TestScheduleWithStorageKeepsSharedPendingUntilSafetyGate(t *testing.T) {
 	service := svc("db", 1, 256)
 	service.Volumes = []config.VolumeConfig{{Name: "data", Type: config.VolumeTypeShared, MountPath: "/data", SizeBytes: config.GiB}}
 	nodes := []Node{{InstanceID: "node", CapacityVCPUs: 4, CapacityMemMB: 1024, SharedBackendID: "primary"}}
-	_, pending := ScheduleWithStorage([]config.ServiceConfig{service}, nodes, nil, StorageReservations{})
+	_, pending := ScheduleWithStorage([]config.ServiceConfig{service}, nodes, nil, StorageReservations{}, nil)
 	if len(pending) != 1 || pending[0].ReasonCode != "shared_volume_runtime_unavailable" {
 		t.Fatalf("unexpected pending result: %#v", pending)
+	}
+}
+
+func withPorts(name string, vcpus, memMB int, hostPorts ...int) config.ServiceConfig {
+	service := svc(name, vcpus, memMB)
+	for _, hostPort := range hostPorts {
+		service.PortForwards = append(service.PortForwards, config.PortForward{HostPort: hostPort, VMPort: hostPort})
+	}
+	return service
+}
+
+func nodeOf(t *testing.T, assignment map[string][]config.ServiceConfig, service string) string {
+	t.Helper()
+	for instanceID, services := range assignment {
+		for _, placed := range services {
+			if placed.Name == service {
+				return instanceID
+			}
+		}
+	}
+	return ""
+}
+
+func TestScheduleWithStorageSeparatesServicesSharingHostPort(t *testing.T) {
+	// i-001 is large enough that plain bin-packing would colocate both
+	// services there, so only the host-port claim separates them.
+	services := []config.ServiceConfig{
+		withPorts("tenant-1-elasticsearch", 2, 512, 9200),
+		withPorts("tenant-2-elasticsearch", 2, 512, 9200),
+	}
+	nodes := []Node{node("i-001", 32, 16384), node("i-002", 4, 2048)}
+
+	result, pending := ScheduleWithStorage(services, nodes, nil, StorageReservations{}, nil)
+	if len(pending) != 0 {
+		t.Fatalf("unexpected pending services: %#v", pending)
+	}
+	if len(result["i-001"]) != 1 || len(result["i-002"]) != 1 {
+		t.Fatalf("expected the two claims of host port 9200 to be split across nodes, got %#v", result)
+	}
+}
+
+func TestScheduleWithStorageKeepsRepeatedHostPortsOnDifferentNodes(t *testing.T) {
+	// The same host port on separate nodes is legitimate and must stay placed.
+	services := []config.ServiceConfig{
+		withPorts("a", 2, 512, 9200),
+		withPorts("b", 2, 512, 9200),
+	}
+	nodes := []Node{node("i-001", 8, 4096), node("i-002", 8, 4096)}
+	existing := map[string]string{"a": "i-001", "b": "i-002"}
+
+	result, pending := ScheduleWithStorage(services, nodes, existing, StorageReservations{}, nil)
+	if len(pending) != 0 {
+		t.Fatalf("unexpected pending services: %#v", pending)
+	}
+	if nodeOf(t, result, "a") != "i-001" || nodeOf(t, result, "b") != "i-002" {
+		t.Fatalf("expected conflict-free existing placement to be preserved, got %#v", result)
+	}
+}
+
+func TestScheduleWithStorageLeavesConflictingServicePending(t *testing.T) {
+	services := []config.ServiceConfig{
+		withPorts("tenant-1-elasticsearch", 2, 512, 9200),
+		withPorts("tenant-2-elasticsearch", 2, 512, 9200),
+	}
+	nodes := []Node{node("i-001", 8, 4096)}
+
+	result, pending := ScheduleWithStorage(services, nodes, nil, StorageReservations{}, nil)
+	if len(result["i-001"]) != 1 {
+		t.Fatalf("expected exactly one service placed, got %#v", result)
+	}
+	if len(pending) != 1 || pending[0].ReasonCode != "host_port_conflict" {
+		t.Fatalf("unexpected pending result: %#v", pending)
+	}
+	placed := result["i-001"][0].Name
+	if !strings.Contains(pending[0].Message, "9200") || !strings.Contains(pending[0].Message, placed) {
+		t.Errorf("pending message %q does not identify the port and the holding service", pending[0].Message)
+	}
+}
+
+func TestScheduleWithStorageRelocatesExistingPlacementOnNewConflict(t *testing.T) {
+	// Both services were colocated while they claimed different ports; the
+	// desired state now gives them the same one, so the existing placement is
+	// no longer conflict-free and must be re-evaluated.
+	services := []config.ServiceConfig{
+		withPorts("a", 2, 512, 9200),
+		withPorts("b", 2, 512, 9200),
+	}
+	nodes := []Node{node("i-001", 8, 4096), node("i-002", 8, 4096)}
+	existing := map[string]string{"a": "i-001", "b": "i-001"}
+
+	result, pending := ScheduleWithStorage(services, nodes, existing, StorageReservations{}, nil)
+	if len(pending) != 0 {
+		t.Fatalf("unexpected pending services: %#v", pending)
+	}
+	if nodeOf(t, result, "a") == nodeOf(t, result, "b") {
+		t.Fatalf("expected the conflicting service to be relocated, got %#v", result)
+	}
+}
+
+func TestScheduleWithStorageTreatsMultipleClaimsAtomically(t *testing.T) {
+	// i-001 is the preferred candidate for every service (most free vCPU), and
+	// "keeper" holds 9300 there. "mover" needs both 9200 and 9300, so it must
+	// take neither on i-001 and move as a unit; "later" then proves the
+	// rejected node kept no partial 9200 claim.
+	services := []config.ServiceConfig{
+		withPorts("keeper", 4, 1024, 9300),
+		withPorts("mover", 2, 512, 9200, 9300),
+		withPorts("later", 1, 256, 9200),
+	}
+	nodes := []Node{node("i-001", 16, 8192), node("i-002", 8, 4096)}
+	existing := map[string]string{"keeper": "i-001"}
+
+	result, pending := ScheduleWithStorage(services, nodes, existing, StorageReservations{}, nil)
+	if len(pending) != 0 {
+		t.Fatalf("unexpected pending services: %#v", pending)
+	}
+	if nodeOf(t, result, "keeper") != "i-001" {
+		t.Fatalf("expected keeper to stay on i-001, got %#v", result)
+	}
+	if got := nodeOf(t, result, "mover"); got != "i-002" {
+		t.Fatalf("expected mover to move as a unit to i-002, got %q (%#v)", got, result)
+	}
+	if got := nodeOf(t, result, "later"); got != "i-001" {
+		t.Fatalf("expected 9200 to remain free on i-001, got %q (%#v)", got, result)
+	}
+}
+
+func TestScheduleWithStorageRejectsSelfConflictingService(t *testing.T) {
+	service := withPorts("broken", 2, 512, 8080, 8080)
+	nodes := []Node{node("i-001", 8, 4096), node("i-002", 8, 4096)}
+
+	result, pending := ScheduleWithStorage([]config.ServiceConfig{service}, nodes, nil, StorageReservations{}, nil)
+	if len(pending) != 1 || pending[0].ReasonCode != "duplicate_host_port_claims" {
+		t.Fatalf("unexpected pending result: %#v", pending)
+	}
+	if len(result["i-001"]) != 0 || len(result["i-002"]) != 0 {
+		t.Fatalf("expected no placement for a self-conflicting service, got %#v", result)
 	}
 }

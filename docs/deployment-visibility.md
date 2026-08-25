@@ -43,7 +43,12 @@ of the service's volumes.
 Missing data fails closed:
 
 - expired node leases become `stale`;
-- unplaced desired services are `pending`;
+- unplaced desired services are `pending`, carrying the scheduler's reason code
+  (for example `insufficient_compute_capacity`, `volume_capacity_unavailable`,
+  `node_storage_exhausted`, `storage_capacity_unknown`, `volume_record_invalid`,
+  or `host_port_conflict`, which names the contested port and the service
+  already holding it). See [fireworkctl](fireworkctl.md) for what each storage
+  reason means and how to resolve it;
 - placed services with missing, stale, or unsupported agent status are
   `unknown`;
 - VM state and health remain separate, so a service can be `running` and
@@ -198,7 +203,8 @@ capacity bars. Shared storage is a backend-level resource, so it is not
 duplicated on every node. Service lists show a prominent disk summary, and
 details show local/shared reservation and applied size plus the per-volume
 table, which carries requested, effective, and applied sizes so a refused
-request is visible rather than left to a revision diff. Service details also include a clickable HTTPS public URL when routing
+request is visible rather than left to a revision diff. Service details also
+include a clickable HTTPS public URL when routing
 metadata resolves through the API role's `ingress_domain` (or uses an exact
 `metadata.host`). All views refresh automatically.
 

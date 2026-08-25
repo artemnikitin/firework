@@ -69,6 +69,12 @@ const (
 	// ReasonVolumeRecordInvalid means the service's own retained record could
 	// not be parsed, so it is not placed for the first time.
 	ReasonVolumeRecordInvalid = "volume_record_invalid"
+	// ReasonHostPortConflict means every candidate node already holds one of
+	// the service's (tcp, host_port) claims. It outranks the storage reasons
+	// below because the port check runs first: a node rejected on ports is
+	// never evaluated for storage, so a storage reason recorded elsewhere
+	// describes a different node than the one the operator has to fix.
+	ReasonHostPortConflict = "host_port_conflict"
 )
 
 // storageRank orders storage rejection causes from least to most actionable so
@@ -107,6 +113,9 @@ type Pending struct {
 //
 // existingAssignment maps service name → instance ID from the previous run.
 // The scheduler preserves existing assignments when possible.
+//
+// It does not enforce host-port claims; use ScheduleWithStorage for placement
+// that keeps colocated services from conflicting on a host port.
 //
 // Returns a map of instance ID → services assigned to that node.
 func Schedule(
@@ -251,19 +260,40 @@ func BuildNodeConfigs(assignment map[string][]config.ServiceConfig) []config.Nod
 }
 
 // ScheduleWithStorage preserves the legacy CPU/memory behavior while adding
-// retained-volume constraints and per-service pending results. It is kept
-// separate from Schedule so existing direct callers retain error semantics.
-func ScheduleWithStorage(services []config.ServiceConfig, nodes []Node, existing map[string]string, reservations StorageReservations) (map[string][]config.ServiceConfig, []Pending) {
+// retained-volume constraints, host-port claims, and per-service pending
+// results. It is kept separate from Schedule so existing direct callers retain
+// error semantics.
+//
+// Host ports are node-scoped resources: two colocated services claiming the
+// same port produce DNAT rules with identical match criteria and different
+// guest destinations, so traffic silently reaches only one of them. A service
+// is therefore placed only on a node where all of its claims are free, and its
+// claims are taken atomically.
+// pinned describes services the caller will render itself, outside this
+// scheduler, on a node it has already chosen. They still occupy node-exclusive
+// resources, so the scheduler has to be told about them or it will hand the
+// same host port to something else — the exact collision node-exclusive claims
+// exist to prevent. Compute is reserved by the caller adjusting node capacity;
+// ports cannot be expressed that way, so they are passed here.
+//
+// ScheduleWithStorage takes pinnedClaims as node -> claim -> holding service.
+// A nil map means nothing is pinned, which is the ordinary case.
+func ScheduleWithStorage(services []config.ServiceConfig, nodes []Node, existing map[string]string, reservations StorageReservations, pinnedClaims map[string]map[config.PortClaim]string) (map[string][]config.ServiceConfig, []Pending) {
 	result := make(map[string][]config.ServiceConfig, len(nodes))
 	usedVCPU := make(map[string]int, len(nodes))
 	usedMem := make(map[string]int, len(nodes))
 	usedLocal := make(map[string]int64, len(nodes))
 	usedShared := make(map[string]int64)
 	groups := make(map[string]map[string]bool, len(nodes))
+	claimedPorts := make(map[string]map[config.PortClaim]string, len(nodes))
 	nodeByID := make(map[string]Node, len(nodes))
 	for _, node := range nodes {
 		result[node.InstanceID] = nil
 		groups[node.InstanceID] = make(map[string]bool)
+		claimedPorts[node.InstanceID] = make(map[config.PortClaim]string)
+		for claim, holder := range pinnedClaims[node.InstanceID] {
+			claimedPorts[node.InstanceID][claim] = holder
+		}
 		nodeByID[node.InstanceID] = node
 	}
 
@@ -277,6 +307,14 @@ func ScheduleWithStorage(services []config.ServiceConfig, nodes []Node, existing
 
 	var pending []Pending
 	for _, service := range ordered {
+		if dupes := service.DuplicatePortClaims(); len(dupes) > 0 {
+			pending = append(pending, Pending{
+				Service:    service.Name,
+				ReasonCode: "duplicate_host_port_claims",
+				Message:    fmt.Sprintf("service claims host port %d more than once", dupes[0].HostPort),
+			})
+			continue
+		}
 		boundNode, split := localBinding(service)
 		if split {
 			pending = append(pending, Pending{Service: service.Name, ReasonCode: "local_volume_binding_conflict", Message: "local volumes are retained on different nodes"})
@@ -316,14 +354,24 @@ func ScheduleWithStorage(services []config.ServiceConfig, nodes []Node, existing
 			return candidates[i].InstanceID < candidates[j].InstanceID
 		})
 
+		claims := service.PortClaims()
 		chosen := ""
 		chosenService := service
 		dominantStorageReason := ""
+		portConflict := ""
 		for _, node := range candidates {
 			if boundNode != "" && node.InstanceID != boundNode {
 				continue
 			}
 			if usedVCPU[node.InstanceID]+service.VCPUs > node.CapacityVCPUs || usedMem[node.InstanceID]+service.MemoryMB > node.CapacityMemMB {
+				continue
+			}
+			// All claims must fit on the same node, and the check runs before
+			// fitStorage so a port-rejected node commits no storage usage.
+			if conflict, blocked := firstPortConflict(node.InstanceID, claimedPorts[node.InstanceID], claims); blocked {
+				if portConflict == "" {
+					portConflict = conflict
+				}
 				continue
 			}
 			candidateService, localDelta, sharedDelta, storageReason := fitStorage(service, node, reservations, usedLocal, usedShared)
@@ -351,18 +399,39 @@ func ScheduleWithStorage(services []config.ServiceConfig, nodes []Node, existing
 				reason = dominantStorageReason
 				message = storageReasonMessage(dominantStorageReason)
 			}
+			if portConflict != "" {
+				reason = ReasonHostPortConflict
+				message = portConflict
+			}
 			pending = append(pending, Pending{Service: service.Name, ReasonCode: reason, Message: message})
 			continue
 		}
 		result[chosen] = append(result[chosen], chosenService)
 		usedVCPU[chosen] += service.VCPUs
 		usedMem[chosen] += service.MemoryMB
+		for _, claim := range claims {
+			claimedPorts[chosen][claim] = service.Name
+		}
 		if service.AntiAffinityGroup != "" {
 			groups[chosen][service.AntiAffinityGroup] = true
 		}
 	}
 	sort.Slice(pending, func(i, j int) bool { return pending[i].Service < pending[j].Service })
 	return result, pending
+}
+
+// firstPortConflict reports the first claim already held on a node, together
+// with a message naming the port, the holding service, and the node. Only the
+// conflicting claim is named so the reason stays actionable without exposing
+// unrelated configuration.
+func firstPortConflict(node string, held map[config.PortClaim]string, claims []config.PortClaim) (string, bool) {
+	for _, claim := range claims {
+		if holder, taken := held[claim]; taken {
+			return fmt.Sprintf("host port %d (%s) is already claimed by service %s on node %s",
+				claim.HostPort, claim.Protocol, holder, node), true
+		}
+	}
+	return "", false
 }
 
 func localBinding(service config.ServiceConfig) (string, bool) {

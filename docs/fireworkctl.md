@@ -119,6 +119,10 @@ Storage-related pending and refusal reasons:
 - `shrink_below_minimum`: the requested shrink is smaller than the filesystem's
   current contents allow.
 
+Host-port claims have their own reasons — `host_port_conflict` and
+`duplicate_host_port_claims` — described in
+[docs/configs](configs/README.md#host-port-claims).
+
 `unknown` is intentional: it means the control plane cannot safely confirm the
 current state. For example, a stale node or an agent that has not converged to
 the current revision is not reported as healthy by inference.

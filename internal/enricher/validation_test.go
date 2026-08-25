@@ -305,3 +305,92 @@ func TestCheckWarnings_NoWarnings(t *testing.T) {
 		t.Errorf("expected no warnings, got: %v", warns)
 	}
 }
+
+func hasWarn(warns []Warn, code string) bool {
+	for _, w := range warns {
+		if w.Code == code {
+			return true
+		}
+	}
+	return false
+}
+
+func TestValidateInput_RejectsDuplicateHostPortWithinService(t *testing.T) {
+	input := &InputConfig{Services: []ServiceSpec{{
+		Name:     "web",
+		Image:    "/img/web.ext4",
+		NodeType: "compute",
+		PortForwards: []config.PortForward{
+			{HostPort: 8080, VMPort: 80},
+			{HostPort: 8080, VMPort: 81},
+		},
+	}}}
+
+	err := ValidateInput(input)
+	if err == nil {
+		t.Fatal("expected a service claiming one host port twice to be rejected")
+	}
+	if !strings.Contains(err.Error(), "8080") {
+		t.Errorf("error %q does not identify the port", err)
+	}
+}
+
+// Repeated host ports across services are decided by placement, not statically:
+// they are valid whenever the scheduler puts the services on different nodes.
+func TestValidateInput_AllowsRepeatedHostPortAcrossServicesWithWarning(t *testing.T) {
+	input := &InputConfig{Services: []ServiceSpec{
+		{Name: "tenant-1-es", Image: "/img/es.ext4", NodeType: "compute",
+			PortForwards: []config.PortForward{{HostPort: 9200, VMPort: 9200}}},
+		{Name: "tenant-2-es", Image: "/img/es.ext4", NodeType: "compute",
+			PortForwards: []config.PortForward{{HostPort: 9200, VMPort: 9200}}},
+	}}
+
+	if err := ValidateInput(input); err != nil {
+		t.Fatalf("expected valid, got: %v", err)
+	}
+	warns := CheckWarnings(input)
+	if !hasWarn(warns, WarnRepeatedHostPort) {
+		t.Fatalf("expected a repeated-host-port warning, got: %v", warns)
+	}
+	for _, w := range warns {
+		if w.Code != WarnRepeatedHostPort {
+			continue
+		}
+		for _, want := range []string{"compute", "9200", "tenant-1-es", "tenant-2-es"} {
+			if !strings.Contains(w.Message, want) {
+				t.Errorf("warning %q does not mention %q", w.Message, want)
+			}
+		}
+	}
+}
+
+func TestCheckWarnings_NoRepeatedHostPortAcrossNodeTypes(t *testing.T) {
+	input := &InputConfig{Services: []ServiceSpec{
+		{Name: "a", Image: "/img/a.ext4", NodeType: "compute",
+			PortForwards: []config.PortForward{{HostPort: 9200, VMPort: 9200}}},
+		{Name: "b", Image: "/img/b.ext4", NodeType: "storage",
+			PortForwards: []config.PortForward{{HostPort: 9200, VMPort: 9200}}},
+	}}
+
+	if warns := CheckWarnings(input); hasWarn(warns, WarnRepeatedHostPort) {
+		t.Fatalf("services of different node types never share a node: %v", warns)
+	}
+}
+
+func TestValidateOutput_RejectsDuplicateHostPortWithinService(t *testing.T) {
+	nc := config.NodeConfig{Node: "compute", Services: []config.ServiceConfig{{
+		Name:     "web",
+		Image:    "/images/web.ext4",
+		Kernel:   "/kernels/vmlinux",
+		VCPUs:    2,
+		MemoryMB: 1024,
+		PortForwards: []config.PortForward{
+			{HostPort: 8080, VMPort: 80},
+			{HostPort: 8080, VMPort: 81},
+		},
+	}}}
+
+	if err := ValidateOutput(nc); err == nil {
+		t.Fatal("expected duplicate host port in rendered output to be rejected")
+	}
+}

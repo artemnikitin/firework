@@ -62,7 +62,7 @@ func TestOverReservedNodeStillAcceptsServicesThatAddNoReservation(t *testing.T) 
 	}
 	existing := map[string]string{"stateless": "i-1", "kept": "i-1"}
 
-	assignments, pending := ScheduleWithStorage(services, nodes, existing, reservations)
+	assignments, pending := ScheduleWithStorage(services, nodes, existing, reservations, nil)
 
 	if len(pending) != 0 {
 		t.Fatalf("expected no pending services, got %#v", pending)
@@ -108,7 +108,7 @@ func TestStorageRejectionReasonsAreDistinct(t *testing.T) {
 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			_, pending := ScheduleWithStorage([]config.ServiceConfig{test.service}, nodes, nil, reservations)
+			_, pending := ScheduleWithStorage([]config.ServiceConfig{test.service}, nodes, nil, reservations, nil)
 			if got := pendingReason(pending, test.service.Name); got != test.want {
 				t.Fatalf("expected reason %q, got %q (%#v)", test.want, got, pending)
 			}
@@ -130,7 +130,7 @@ func TestUnknownCapacityBlocksOnlyNewVolumeBearingPlacement(t *testing.T) {
 		localVolumeService("kept", 16*config.MiB),
 		localVolumeService("fresh", 16*config.MiB),
 	}
-	assignments, pending := ScheduleWithStorage(services, nodes, map[string]string{"kept": "i-1"}, reservations)
+	assignments, pending := ScheduleWithStorage(services, nodes, map[string]string{"kept": "i-1"}, reservations, nil)
 
 	if placedOn(assignments, "stateless") == "" || placedOn(assignments, "kept") == "" {
 		t.Fatalf("existing and stateless workloads must keep running: %#v (%#v)", assignments, pending)
@@ -163,7 +163,7 @@ func TestOversizedReservationDoesNotEmptyTheRenderedNodeConfig(t *testing.T) {
 	}
 	existing := map[string]string{"web": "i-1", "api": "i-1", "db": "i-1"}
 
-	assignments, pending := ScheduleWithStorage(services, nodes, existing, reservations)
+	assignments, pending := ScheduleWithStorage(services, nodes, existing, reservations, nil)
 	if len(pending) != 0 {
 		t.Fatalf("expected no service to be evicted, got %#v", pending)
 	}

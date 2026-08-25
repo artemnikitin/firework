@@ -222,7 +222,8 @@ func (c *Controller) runReconcile(ctx context.Context) {
 	schedulable, held, heldPending := splitHeldServices(services, admission, existingPlacement)
 	schedulingNodes := reserveHeldCapacity(activeNodes, held)
 
-	assignments, pending := scheduler.ScheduleWithStorage(schedulable, schedulingNodes, existingAssignment, storageReservations(volumeRecords))
+	assignments, pending := scheduler.ScheduleWithStorage(
+		schedulable, schedulingNodes, existingAssignment, storageReservations(volumeRecords), heldPortClaims(held))
 	for node, services := range held {
 		assignments[node] = append(assignments[node], services...)
 	}
@@ -418,6 +419,32 @@ func splitHeldServices(services []config.ServiceConfig, admission volumeAdmissio
 		held[placed.Node] = append(held[placed.Node], rendered)
 	}
 	return schedulable, held, pending
+}
+
+// heldPortClaims collects the node-exclusive host-port claims a held service is
+// still holding.
+//
+// A held service is re-rendered outside the scheduler, so the scheduler cannot
+// see its claims and would otherwise place a new service claiming the same
+// (tcp, host_port) on the same node. The agent rejects a node config with a
+// duplicate claim outright, so that would take down every service on the node —
+// a strictly worse outcome than the unreadable record that caused the hold.
+func heldPortClaims(held map[string][]config.ServiceConfig) map[string]map[config.PortClaim]string {
+	if len(held) == 0 {
+		return nil
+	}
+	claims := make(map[string]map[config.PortClaim]string, len(held))
+	for node, services := range held {
+		for _, service := range services {
+			for _, claim := range service.PortClaims() {
+				if claims[node] == nil {
+					claims[node] = make(map[config.PortClaim]string)
+				}
+				claims[node][claim] = service.Name
+			}
+		}
+	}
+	return claims
 }
 
 // reserveHeldCapacity removes the compute a held service is still using from

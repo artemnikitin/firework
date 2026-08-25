@@ -301,3 +301,39 @@ func TestDegradedFleetReasonNamesTheCause(t *testing.T) {
 		})
 	}
 }
+
+// A held service is re-rendered outside the scheduler, so its node-exclusive
+// host-port claims have to be handed to the scheduler explicitly. Without this
+// the scheduler places a new service on the same (tcp, host_port), and the
+// agent then rejects the whole node config — taking down every service on the
+// node over an unreadable record for one of them.
+func TestHeldServicesKeepTheirHostPortClaims(t *testing.T) {
+	held := map[string][]config.ServiceConfig{"node-1": {{
+		Name: "running", VCPUs: 1, MemoryMB: 512,
+		PortForwards: []config.PortForward{{HostPort: 8080, VMPort: 80}},
+	}}}
+
+	claims := heldPortClaims(held)
+	if holder := claims["node-1"][config.PortClaim{Protocol: "tcp", HostPort: 8080}]; holder != "running" {
+		t.Fatalf("expected the held service to hold its claim, got %#v", claims)
+	}
+	if heldPortClaims(nil) != nil {
+		t.Fatal("no held services means nothing is pinned")
+	}
+
+	// End to end: the scheduler must not hand the same port to a new service.
+	nodes := []scheduler.Node{{InstanceID: "node-1", CapacityVCPUs: 8, CapacityMemMB: 8192}}
+	newcomer := config.ServiceConfig{
+		Name: "newcomer", VCPUs: 1, MemoryMB: 512,
+		PortForwards: []config.PortForward{{HostPort: 8080, VMPort: 80}},
+	}
+	assignments, pending := scheduler.ScheduleWithStorage(
+		[]config.ServiceConfig{newcomer}, nodes, nil, scheduler.StorageReservations{}, claims)
+
+	if len(assignments["node-1"]) != 0 {
+		t.Fatalf("the newcomer took a port a held service still holds: %#v", assignments)
+	}
+	if len(pending) != 1 || pending[0].ReasonCode != scheduler.ReasonHostPortConflict {
+		t.Fatalf("expected a host-port conflict, got %#v", pending)
+	}
+}
