@@ -21,108 +21,271 @@ type storedVolumeRecord struct {
 	Token  objectstorage.WriteToken
 }
 
-func (c *Controller) loadVolumeRecords(ctx context.Context) (map[string]storedVolumeRecord, error) {
-	keys, err := c.store.ListKeys(ctx, volumeRecordsPrefix(c.cfg.State.Prefix))
-	if err != nil {
-		return nil, err
-	}
-	records := make(map[string]storedVolumeRecord, len(keys))
-	for _, key := range keys {
-		if !strings.HasSuffix(key, ".json") {
-			continue
-		}
-		var record VolumeRecord
-		token, exists, err := c.store.GetJSON(ctx, key, &record)
-		if err != nil {
-			return nil, fmt.Errorf("read volume record %s: %w", key, err)
-		}
-		if !exists || record.LogicalID == "" {
-			continue
-		}
-		parts := strings.Split(record.LogicalID, "/")
-		expectedKey := ""
-		if len(parts) == 2 {
-			expectedKey, _ = volumeRecordKey(c.cfg.State.Prefix, parts[0], parts[1])
-		}
-		if expectedKey == "" || key != expectedKey {
-			return nil, fmt.Errorf("volume record %s logical_id does not match its key", key)
-		}
-		if record.DesiredSizeBytes <= 0 || record.ResizeGeneration <= 0 {
-			return nil, fmt.Errorf("volume record %s has invalid size or generation", key)
-		}
-		if record.AppliedSizeBytes < 0 {
-			return nil, fmt.Errorf("volume record %s has negative applied size", key)
-		}
-		if record.ResizeState != VolumeResizePending && record.ResizeState != VolumeResizeApplied && record.ResizeState != VolumeResizeFailed {
-			return nil, fmt.Errorf("volume record %s has invalid resize state %q", key, record.ResizeState)
-		}
-		if record.ResizeState == VolumeResizeApplied && record.AppliedSizeBytes != record.DesiredSizeBytes {
-			return nil, fmt.Errorf("volume record %s has applied state with mismatched size", key)
-		}
-		if record.Type == config.VolumeTypeLocal && record.BoundNode == "" {
-			return nil, fmt.Errorf("volume record %s is missing bound_node", key)
-		} else if record.Type == config.VolumeTypeShared && record.SharedBackendID == "" {
-			return nil, fmt.Errorf("volume record %s is missing shared_backend_id", key)
-		} else if record.Type != config.VolumeTypeLocal && record.Type != config.VolumeTypeShared {
-			return nil, fmt.Errorf("volume record %s has invalid type %q", key, record.Type)
-		}
-		records[record.LogicalID] = storedVolumeRecord{Record: record, Token: token}
-	}
-	return records, nil
+// volumeAdmission is the outcome of reconciling one desired revision against
+// the retained records: which services cannot be scheduled from their desired
+// configuration, and why.
+type volumeAdmission struct {
+	// Held names the services whose own volume records could not be used. They
+	// are never simply dropped — omission from the rendered node configs is
+	// what the agent turns into a delete — so the caller either re-renders the
+	// last placement or leaves the service pending.
+	Held map[string]string
 }
 
-func (c *Controller) applyExistingVolumeRecords(ctx context.Context, services []config.ServiceConfig, records map[string]storedVolumeRecord) error {
-	for si := range services {
-		for vi := range services[si].Volumes {
-			volume := &services[si].Volumes[vi]
-			logicalID := services[si].Name + "/" + volume.Name
-			stored, exists := records[logicalID]
+// applyExistingVolumeRecords folds retained records into the desired revision
+// and decides which size requests the cluster can accept.
+//
+// The key property is that a rejection clamps the *rendered* configuration
+// rather than merely declining to write a record. Skipping the write alone
+// changes nothing the agent sees: the scheduling copy still carries the
+// requested SizeBytes, the logical ID is already recorded so the placement
+// check computes a zero delta, and BuildNodeConfigs renders the infeasible
+// size regardless of what the record says.
+//
+// Rejections never mark a service pending. Pending drops the service from
+// BuildNodeConfigs, the agent turns the absent service into a delete, and a
+// refused resize would stop a healthy workload.
+func (c *Controller) applyExistingVolumeRecords(ctx context.Context, services []config.ServiceConfig, set volumeRecordSet, nodes []scheduler.Node) (volumeAdmission, error) {
+	admission := volumeAdmission{Held: make(map[string]string)}
+	nodeByID := make(map[string]scheduler.Node, len(nodes))
+	for _, node := range nodes {
+		nodeByID[node.InstanceID] = node
+	}
+	// The evolving reservation total. Checking each raise against a total
+	// computed once before the loop is wrong: two individually feasible raises
+	// can both be admitted while their combined reservation exceeds the pool.
+	localByNode := make(map[string]int64)
+	for node, size := range storageReservations(set).LocalByNode {
+		localByNode[node] = size
+	}
+
+	// Deterministic evaluation order — services then volumes, by name — so the
+	// same desired revision admits the same subset on every controller and
+	// after every leader change.
+	for _, si := range orderedServiceIndexes(services) {
+		service := &services[si]
+		for _, vi := range orderedVolumeIndexes(service.Volumes) {
+			volume := &service.Volumes[vi]
+			logicalID := service.Name + "/" + volume.Name
+			if quarantine, blocked := set.quarantineFor(logicalID); blocked {
+				admission.Held[service.Name] = scheduler.ReasonVolumeRecordInvalid
+				c.logger.Warn("holding service with an unreadable volume record",
+					"service", service.Name, "volume", volume.Name,
+					"tier", quarantine.Tier, "reason", quarantine.Reason)
+				continue
+			}
+			stored, exists := set.Records[logicalID]
 			if !exists {
 				volume.ResizeGeneration = 1
 				continue
 			}
 			if stored.Record.Type != volume.Type {
-				return fmt.Errorf("volume %s: type is immutable (stored %s, desired %s)", logicalID, stored.Record.Type, volume.Type)
-			}
-			if stored.Record.Type == config.VolumeTypeLocal && stored.Record.BoundNode == "" {
-				return fmt.Errorf("volume %s: retained local record is missing bound_node", logicalID)
-			}
-			if stored.Record.Type == config.VolumeTypeShared && stored.Record.SharedBackendID == "" {
-				return fmt.Errorf("volume %s: retained shared record is missing shared_backend_id", logicalID)
+				// A desired-configuration conflict, not a record fault. It is
+				// held rather than returned as an error, because failing the
+				// whole reconcile would stop scheduling for the cluster.
+				admission.Held[service.Name] = "volume_type_immutable"
+				c.logger.Warn("holding service whose volume type changed",
+					"service", service.Name, "volume", volume.Name,
+					"stored", stored.Record.Type, "desired", volume.Type)
+				continue
 			}
 			volume.BoundNode = stored.Record.BoundNode
 			volume.SharedBackendID = stored.Record.SharedBackendID
 			volume.ResizeGeneration = stored.Record.ResizeGeneration
-			if stored.Record.DesiredSizeBytes == volume.SizeBytes {
-				continue
-			}
-			updated := stored.Record
-			updated.DesiredSizeBytes = volume.SizeBytes
-			updated.ResizeGeneration++
-			updated.ResizeState = VolumeResizePending
-			updated.LastError = ""
-			updated.UpdatedAt = time.Now().UTC()
-			ok, token, err := c.store.PutJSONIfMatch(ctx, mustVolumeRecordKey(c.cfg.State.Prefix, services[si].Name, volume.Name), stored.Token, updated)
+
+			updated, changed, err := c.admitVolumeSize(ctx, service.Name, volume, stored, nodeByID, localByNode)
 			if err != nil {
-				return err
+				return admission, err
 			}
-			if !ok {
-				return fmt.Errorf("volume %s changed concurrently; retry reconciliation", logicalID)
+			if changed {
+				set.Records[logicalID] = updated
 			}
-			volume.ResizeGeneration = updated.ResizeGeneration
-			records[logicalID] = storedVolumeRecord{Record: updated, Token: token}
 		}
 	}
-	return nil
+	return admission, nil
 }
 
-func (c *Controller) createAssignedVolumeRecords(ctx context.Context, nodeConfigs []config.NodeConfig, records map[string]storedVolumeRecord) error {
+// admitVolumeSize decides what the agent is told to run for one volume, and
+// records the decision durably. It returns the record as it now stands and
+// whether it was rewritten.
+func (c *Controller) admitVolumeSize(
+	ctx context.Context,
+	serviceName string,
+	volume *config.VolumeConfig,
+	stored storedVolumeRecord,
+	nodeByID map[string]scheduler.Node,
+	localByNode map[string]int64,
+) (storedVolumeRecord, bool, error) {
+	record := stored.Record
+	requested := volume.SizeBytes
+
+	// A standing rejection for exactly this request. The match key is
+	// RequestedSizeBytes, not DesiredSizeBytes: after a rejection
+	// DesiredSizeBytes holds the *effective* size, so comparing against it
+	// makes the unchanged request look new on every tick and mints a
+	// generation forever.
+	if record.rejectionStands() && requested == record.RequestedSizeBytes {
+		volume.SizeBytes = record.DesiredSizeBytes
+		volume.ResizeGeneration = record.ResizeGeneration
+		available := c.availableLocalBytes(record, nodeByID, localByNode)
+		if record.RejectedAvailableBytes == available {
+			// Nothing about the rejection changed, so nothing is written and
+			// the records digest stays stable.
+			return stored, false, nil
+		}
+		record.RejectedAvailableBytes = available
+		return c.putVolumeRecord(ctx, serviceName, volume.Name, stored.Token, record)
+	}
+
+	if record.DesiredSizeBytes == requested {
+		// The request matches the effective size. Any standing rejection was
+		// for a different size and is cleared — without minting a generation,
+		// because there is no resize to perform.
+		if !record.clearRejection() {
+			return stored, false, nil
+		}
+		return c.putVolumeRecord(ctx, serviceName, volume.Name, stored.Token, record)
+	}
+
+	reason, available := c.admitLocalRaise(record, requested, nodeByID, localByNode)
+	if reason != "" {
+		// Clamp the rendered configuration to the last accepted size so the
+		// service keeps running at a size the cluster is actually able to
+		// serve, and record the refusal for status.
+		volume.SizeBytes = record.DesiredSizeBytes
+		volume.ResizeGeneration = record.ResizeGeneration
+		if record.RequestedSizeBytes == requested && record.RejectedReason == reason && record.RejectedAvailableBytes == available {
+			return stored, false, nil
+		}
+		if !record.rejectionStands() || record.RequestedSizeBytes != requested {
+			// First refusal of this request: stamp the time once. It is
+			// preserved on later ticks so a standing rejection produces no
+			// further writes.
+			record.RejectedAt = time.Now().UTC()
+		}
+		record.RequestedSizeBytes = requested
+		record.RejectedReason = reason
+		record.RejectedAvailableBytes = available
+		c.logger.Warn("refused a volume size request",
+			"service", serviceName, "volume", volume.Name,
+			"requested_bytes", requested, "effective_bytes", record.DesiredSizeBytes, "reason", reason)
+		return c.putVolumeRecord(ctx, serviceName, volume.Name, stored.Token, record)
+	}
+
+	// Accepted. Fold the new contribution into the evolving total before the
+	// next raise is evaluated.
+	if record.Type == config.VolumeTypeLocal && record.BoundNode != "" {
+		localByNode[record.BoundNode] += recordContribution(requested, record.AppliedSizeBytes) -
+			recordContribution(record.DesiredSizeBytes, record.AppliedSizeBytes)
+	}
+	record.clearRejection()
+	record.DesiredSizeBytes = requested
+	record.ResizeGeneration++
+	record.ResizeState = VolumeResizePending
+	record.LastError = ""
+	updated, _, err := c.putVolumeRecord(ctx, serviceName, volume.Name, stored.Token, record)
+	if err != nil {
+		return stored, false, err
+	}
+	volume.ResizeGeneration = updated.Record.ResizeGeneration
+	return updated, true, nil
+}
+
+// admitLocalRaise applies the replacement arithmetic that keeps a batch of
+// raises inside one pool. It returns an empty reason when the raise is
+// accepted.
+//
+// Shared volumes are admitted here because shared execution is gated off
+// upstream (`shared_volume_runtime_unavailable`), so no shared reservation is
+// ever handed to a running workload.
+func (c *Controller) admitLocalRaise(record VolumeRecord, requested int64, nodeByID map[string]scheduler.Node, localByNode map[string]int64) (string, int64) {
+	if record.Type != config.VolumeTypeLocal || record.BoundNode == "" {
+		return "", 0
+	}
+	node, active := nodeByID[record.BoundNode]
+	if !active {
+		// The node's capacity is not observable, and a node being absent is
+		// correlated with the node being in trouble — exactly when adopting an
+		// unverifiable larger reservation is worst. Only the raise waits; the
+		// existing effective size keeps rendering.
+		return scheduler.ReasonStorageCapacityUnknown, 0
+	}
+	total := localByNode[record.BoundNode]
+	old := recordContribution(record.DesiredSizeBytes, record.AppliedSizeBytes)
+	fresh := recordContribution(requested, record.AppliedSizeBytes)
+	// Subtract before adding so a large existing contribution cannot make the
+	// running total transiently overflow.
+	candidate := total - old
+	if fresh > 0 && candidate > (1<<63-1)-fresh {
+		return scheduler.ReasonNodeStorageExhausted, node.LocalCapacityBytes
+	}
+	candidate += fresh
+	if candidate > node.LocalCapacityBytes {
+		return scheduler.ReasonNodeStorageExhausted, node.LocalCapacityBytes - (total - old)
+	}
+	return "", 0
+}
+
+// availableLocalBytes recomputes the capacity figure a standing rejection was
+// measured against, so a changed pool is reflected without restamping the time.
+func (c *Controller) availableLocalBytes(record VolumeRecord, nodeByID map[string]scheduler.Node, localByNode map[string]int64) int64 {
+	if record.Type != config.VolumeTypeLocal || record.BoundNode == "" {
+		return 0
+	}
+	node, active := nodeByID[record.BoundNode]
+	if !active {
+		return 0
+	}
+	return node.LocalCapacityBytes - (localByNode[record.BoundNode] - recordContribution(record.DesiredSizeBytes, record.AppliedSizeBytes))
+}
+
+// recordContribution is what storageReservations charges for one record.
+func recordContribution(desired, applied int64) int64 {
+	return max64(max64(desired, 0), max64(applied, 0))
+}
+
+func (c *Controller) putVolumeRecord(ctx context.Context, service, volume string, token objectstorage.WriteToken, record VolumeRecord) (storedVolumeRecord, bool, error) {
+	record.UpdatedAt = time.Now().UTC()
+	ok, newToken, err := c.store.PutJSONIfMatch(ctx, mustVolumeRecordKey(c.cfg.State.Prefix, service, volume), token, record)
+	if err != nil {
+		return storedVolumeRecord{}, false, err
+	}
+	if !ok {
+		return storedVolumeRecord{}, false, fmt.Errorf("volume %s/%s changed concurrently; retry reconciliation", service, volume)
+	}
+	return storedVolumeRecord{Record: record, Token: newToken}, true, nil
+}
+
+func orderedServiceIndexes(services []config.ServiceConfig) []int {
+	indexes := make([]int, len(services))
+	for i := range services {
+		indexes[i] = i
+	}
+	sort.Slice(indexes, func(i, j int) bool { return services[indexes[i]].Name < services[indexes[j]].Name })
+	return indexes
+}
+
+func orderedVolumeIndexes(volumes []config.VolumeConfig) []int {
+	indexes := make([]int, len(volumes))
+	for i := range volumes {
+		indexes[i] = i
+	}
+	sort.Slice(indexes, func(i, j int) bool { return volumes[indexes[i]].Name < volumes[indexes[j]].Name })
+	return indexes
+}
+
+func (c *Controller) createAssignedVolumeRecords(ctx context.Context, nodeConfigs []config.NodeConfig, set volumeRecordSet) error {
 	now := time.Now().UTC()
 	for _, node := range nodeConfigs {
 		for _, service := range node.Services {
 			for _, volume := range service.Volumes {
 				logicalID := service.Name + "/" + volume.Name
-				if _, exists := records[logicalID]; exists {
+				if _, exists := set.Records[logicalID]; exists {
+					continue
+				}
+				// A quarantined key already has an object. Creating a fresh
+				// record over it would overwrite state that has not been read.
+				if _, quarantined := set.Quarantined[logicalID]; quarantined {
 					continue
 				}
 				record := VolumeRecord{
@@ -139,24 +302,24 @@ func (c *Controller) createAssignedVolumeRecords(ctx context.Context, nodeConfig
 				if !ok {
 					return fmt.Errorf("volume %s was created concurrently; retry reconciliation", logicalID)
 				}
-				records[logicalID] = storedVolumeRecord{Record: record, Token: token}
+				set.Records[logicalID] = storedVolumeRecord{Record: record, Token: token}
 			}
 		}
 	}
 	return nil
 }
 
-func storageReservations(records map[string]storedVolumeRecord) scheduler.StorageReservations {
+func storageReservations(set volumeRecordSet) scheduler.StorageReservations {
 	reservations := scheduler.StorageReservations{
 		LocalByNode: make(map[string]int64), SharedByBackend: make(map[string]int64),
-		RecordedLogicalIDs: make(map[string]bool, len(records)), SharedEnabled: false,
+		RecordedLogicalIDs:     make(map[string]bool, len(set.Records)+len(set.Quarantined)),
+		LocalUnknownByNode:     make(map[string]bool),
+		SharedUnknownByBackend: make(map[string]bool),
+		SharedEnabled:          false,
 	}
-	for id, stored := range records {
+	for id, stored := range set.Records {
 		record := stored.Record
-		size := record.DesiredSizeBytes
-		if record.AppliedSizeBytes > size {
-			size = record.AppliedSizeBytes
-		}
+		size := recordContribution(record.DesiredSizeBytes, record.AppliedSizeBytes)
 		reservations.RecordedLogicalIDs[id] = true
 		if record.Type == config.VolumeTypeLocal {
 			reservations.LocalByNode[record.BoundNode] += size
@@ -164,15 +327,80 @@ func storageReservations(records map[string]storedVolumeRecord) scheduler.Storag
 			reservations.SharedByBackend[record.SharedBackendID] += size
 		}
 	}
+	// A quarantined record still holds capacity. Dropping it would silently
+	// release the reservation and turn a hard failure into over-commit, which
+	// is the failure mode the admission check exists to prevent. So each tier
+	// charges what it can prove and flags the scope it cannot.
+	for id, quarantine := range set.Quarantined {
+		// Marked recorded so the owner's volume never contributes a *second*
+		// delta on top of the reservation charged here.
+		reservations.RecordedLogicalIDs[id] = true
+		switch quarantine.Tier {
+		case quarantineTierExact, quarantineTierPartial:
+			switch quarantine.Class {
+			case config.VolumeTypeLocal:
+				reservations.LocalByNode[quarantine.BoundNode] += quarantine.ReservedBytes
+				if quarantine.Tier == quarantineTierPartial {
+					reservations.LocalUnknownByNode[quarantine.BoundNode] = true
+				}
+			case config.VolumeTypeShared:
+				reservations.SharedByBackend[quarantine.SharedBackendID] += quarantine.ReservedBytes
+				if quarantine.Tier == quarantineTierPartial {
+					reservations.SharedUnknownByBackend[quarantine.SharedBackendID] = true
+				}
+			}
+		default:
+			// No binding, so there is no account to charge. The block widens to
+			// the class if the type parsed, and to both classes if it did not —
+			// the key encodes only service and volume names, never the class.
+			switch quarantine.Class {
+			case config.VolumeTypeLocal:
+				reservations.LocalClassUnknown = true
+			case config.VolumeTypeShared:
+				reservations.SharedClassUnknown = true
+			default:
+				reservations.LocalClassUnknown = true
+				reservations.SharedClassUnknown = true
+			}
+		}
+	}
 	return reservations
 }
 
-func volumeRecordsDigest(records map[string]storedVolumeRecord) string {
-	ordered := make([]VolumeRecord, 0, len(records))
-	for _, stored := range records {
-		ordered = append(ordered, stored.Record)
+// digestEntry is the normalized scheduling-visible outcome for one record key.
+//
+// Quarantined objects have no valid VolumeRecord, so hashing only the valid
+// ones would leave the scheduling signature unchanged across transitions that
+// must trigger re-placement — a partial repair that narrows a block, a changed
+// binding that moves which node is blocked, or the full repair an operator is
+// actively waiting on.
+//
+// Reason is deliberately excluded: it is display text, and hashing it would
+// make a reworded error message invalidate the signature cache.
+type digestEntry struct {
+	Key             string            `json:"key"`
+	Record          *VolumeRecord     `json:"record,omitempty"`
+	Tier            int               `json:"tier,omitempty"`
+	BoundNode       string            `json:"bound_node,omitempty"`
+	SharedBackendID string            `json:"shared_backend_id,omitempty"`
+	Class           config.VolumeType `json:"class,omitempty"`
+	ReservedBytes   int64             `json:"reserved_bytes,omitempty"`
+}
+
+func volumeRecordsDigest(set volumeRecordSet) string {
+	ordered := make([]digestEntry, 0, len(set.Records)+len(set.Quarantined))
+	for id, stored := range set.Records {
+		record := stored.Record
+		ordered = append(ordered, digestEntry{Key: id, Record: &record})
 	}
-	sort.Slice(ordered, func(i, j int) bool { return ordered[i].LogicalID < ordered[j].LogicalID })
+	for id, quarantine := range set.Quarantined {
+		ordered = append(ordered, digestEntry{
+			Key: id, Tier: quarantine.Tier, BoundNode: quarantine.BoundNode,
+			SharedBackendID: quarantine.SharedBackendID, Class: quarantine.Class,
+			ReservedBytes: quarantine.ReservedBytes,
+		})
+	}
+	sort.Slice(ordered, func(i, j int) bool { return ordered[i].Key < ordered[j].Key })
 	data, _ := json.Marshal(ordered)
 	sum := sha256.Sum256(data)
 	return hex.EncodeToString(sum[:])
@@ -202,6 +430,12 @@ func (c *Controller) acknowledgeVolumeRecords(ctx context.Context) error {
 				var record VolumeRecord
 				token, exists, err := c.store.GetJSON(ctx, key, &record)
 				if err != nil || !exists || observed.ResizeGeneration != record.ResizeGeneration {
+					continue
+				}
+				// A state written by a newer control plane is carried through
+				// untouched: an older controller must not advance a state
+				// machine it does not understand.
+				if !knownVolumeResizeState(record.ResizeState) {
 					continue
 				}
 				if observed.Type != string(record.Type) {

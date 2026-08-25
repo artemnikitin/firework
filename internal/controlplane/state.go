@@ -106,7 +106,25 @@ const (
 	VolumeResizePending VolumeResizeState = "pending"
 	VolumeResizeApplied VolumeResizeState = "applied"
 	VolumeResizeFailed  VolumeResizeState = "failed"
+	// VolumeResizeRejected is a terminal sibling of VolumeResizeFailed. Failed
+	// means an operation that failed and may succeed on retry; rejected means
+	// the requested size is impossible for the current contents and will not
+	// be retried without a new generation.
+	VolumeResizeRejected VolumeResizeState = "rejected"
 )
+
+// knownVolumeResizeState reports whether a state is one this controller
+// understands. An unrecognized value is carried through untouched rather than
+// treated as invalid, so a record written by a newer control plane does not
+// brick scheduling on an older one during a rollback.
+func knownVolumeResizeState(state VolumeResizeState) bool {
+	switch state {
+	case VolumeResizePending, VolumeResizeApplied, VolumeResizeFailed, VolumeResizeRejected:
+		return true
+	default:
+		return false
+	}
+}
 
 // VolumeRecord retains volume identity and placement after workload removal.
 type VolumeRecord struct {
@@ -119,8 +137,46 @@ type VolumeRecord struct {
 	ResizeGeneration int64             `json:"resize_generation"`
 	ResizeState      VolumeResizeState `json:"resize_state"`
 	LastError        string            `json:"last_error,omitempty"`
-	CreatedAt        time.Time         `json:"created_at"`
-	UpdatedAt        time.Time         `json:"updated_at"`
+	// RequestedSizeBytes preserves a size the cluster refused, so status can
+	// show the operator's request next to the effective size actually running.
+	//
+	// The invariant that makes one field enough is that DesiredSizeBytes never
+	// renders a size the cluster is not running: a capacity rejection is
+	// refused before it is written, and a shrink rejection is acknowledged by
+	// resetting DesiredSizeBytes to AppliedSizeBytes in the same write that
+	// records RequestedSizeBytes.
+	RequestedSizeBytes int64 `json:"requested_size_bytes,omitempty"`
+	// RejectedReason is non-empty exactly while a rejection stands. It is the
+	// signal the idempotence guard keys on, alongside RequestedSizeBytes.
+	RejectedReason string `json:"rejected_reason,omitempty"`
+	// RejectedAvailableBytes is the capacity figure the refusal was measured
+	// against, for the operator who has to decide what to free.
+	RejectedAvailableBytes int64 `json:"rejected_available_bytes,omitempty"`
+	// RejectedAt records when the request was *first* refused. It is preserved
+	// across ticks rather than restamped: restamping makes every comparison
+	// unequal and turns a standing rejection into a write loop.
+	RejectedAt time.Time `json:"rejected_at,omitempty"`
+	CreatedAt  time.Time `json:"created_at"`
+	UpdatedAt  time.Time `json:"updated_at"`
+}
+
+// rejectionStands reports whether the record currently carries a refused
+// request. ResizeState deliberately does not carry a capacity rejection: it
+// describes the last resize the agent actually attempted, and a request
+// refused before it became a resize never entered that state machine.
+func (r VolumeRecord) rejectionStands() bool { return r.RejectedReason != "" }
+
+// clearRejection drops the rejection fields and reports whether anything
+// changed, so a caller can avoid a no-op write.
+func (r *VolumeRecord) clearRejection() bool {
+	if r.RequestedSizeBytes == 0 && r.RejectedReason == "" && r.RejectedAvailableBytes == 0 && r.RejectedAt.IsZero() {
+		return false
+	}
+	r.RequestedSizeBytes = 0
+	r.RejectedReason = ""
+	r.RejectedAvailableBytes = 0
+	r.RejectedAt = time.Time{}
+	return true
 }
 
 // RevisionPointer points to the current immutable revision.

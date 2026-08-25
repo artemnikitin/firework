@@ -335,12 +335,26 @@ func runService(cfg cliConfig, args []string, out io.Writer) error {
 			}
 		}
 		if len(response.Volumes) > 0 {
-			fmt.Fprintln(w, "\nVOLUME\tTYPE\tMOUNT PATH\tBOUND NODE\tBACKEND\tDESIRED BYTES\tAPPLIED BYTES\tGENERATION\tSTATE\tLAST ERROR")
+			// REQUESTED is what the GitOps repo asked for, EFFECTIVE what the
+			// control plane accepted and rendered, APPLIED what exists on
+			// disk. They differ only when a request was refused — which is
+			// exactly the case where an operator edits size:, sees nothing
+			// change, and needs to be told why rather than left to diff two
+			// revisions.
+			fmt.Fprintln(w, "\nVOLUME\tTYPE\tMOUNT PATH\tBOUND NODE\tBACKEND\tREQUESTED BYTES\tEFFECTIVE BYTES\tAPPLIED BYTES\tGENERATION\tSTATE\tLAST ERROR")
 			for _, volume := range response.Volumes {
-				fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%d\t%d\t%d\t%s\t%s\n",
+				requested := volume.RequestedSizeBytes
+				if requested == 0 {
+					requested = volume.DesiredSizeBytes
+				}
+				state := volume.State
+				if volume.Rejected {
+					state = fmt.Sprintf("%s (rejected: %s)", state, valueOrDash(volume.RejectedReason))
+				}
+				fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%d\t%d\t%d\t%d\t%s\t%s\n",
 					volume.LogicalID, volume.Type, volume.MountPath, valueOrDash(volume.BoundNode),
-					valueOrDash(volume.SharedBackendID), volume.DesiredSizeBytes, volume.AppliedSizeBytes,
-					volume.ResizeGeneration, volume.State, valueOrDash(volume.LastError))
+					valueOrDash(volume.SharedBackendID), requested, volume.DesiredSizeBytes, volume.AppliedSizeBytes,
+					volume.ResizeGeneration, state, valueOrDash(volume.LastError))
 			}
 		}
 		return w.Flush()

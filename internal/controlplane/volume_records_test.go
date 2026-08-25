@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/artemnikitin/firework/internal/config"
+	"github.com/artemnikitin/firework/internal/scheduler"
 	"github.com/artemnikitin/firework/internal/statusmodel"
 )
 
@@ -31,14 +32,15 @@ func TestVolumeRecordsRetainBindingAndAdvanceResizeGeneration(t *testing.T) {
 	services := []config.ServiceConfig{{Name: "db", Volumes: []config.VolumeConfig{{
 		Name: "data", Type: config.VolumeTypeLocal, MountPath: "/data", SizeBytes: 20 * config.GiB,
 	}}}}
-	if err := controller.applyExistingVolumeRecords(ctx, services, records); err != nil {
+	nodes := []scheduler.Node{{InstanceID: "node-1", CapacityVCPUs: 8, CapacityMemMB: 8192, LocalCapacityBytes: 100 * config.GiB}}
+	if _, err := controller.applyExistingVolumeRecords(ctx, services, records, nodes); err != nil {
 		t.Fatal(err)
 	}
 	volume := services[0].Volumes[0]
 	if volume.BoundNode != "node-1" || volume.ResizeGeneration != 2 {
 		t.Fatalf("resolved volume = %#v", volume)
 	}
-	stored := records["db/data"].Record
+	stored := records.Records["db/data"].Record
 	if stored.DesiredSizeBytes != 20*config.GiB || stored.AppliedSizeBytes != 10*config.GiB || stored.ResizeState != VolumeResizePending {
 		t.Fatalf("stored volume = %#v", stored)
 	}
@@ -52,14 +54,14 @@ func TestCreateAssignedVolumeRecordUsesSchedulerBinding(t *testing.T) {
 	ctx := context.Background()
 	store := newBlobStateStore(newMemBlob())
 	controller := NewController(Config{State: StateConfig{Prefix: "cp/v1/"}}, store, slog.New(slog.NewTextHandler(io.Discard, nil)))
-	records := make(map[string]storedVolumeRecord)
+	records := volumeRecordSet{Records: make(map[string]storedVolumeRecord), Quarantined: map[string]volumeQuarantine{}}
 	nodes := []config.NodeConfig{{Node: "node-1", Services: []config.ServiceConfig{{Name: "db", Volumes: []config.VolumeConfig{{
 		Name: "data", Type: config.VolumeTypeLocal, MountPath: "/data", SizeBytes: config.GiB, BoundNode: "node-1", ResizeGeneration: 1,
 	}}}}}}
 	if err := controller.createAssignedVolumeRecords(ctx, nodes, records); err != nil {
 		t.Fatal(err)
 	}
-	if got := records["db/data"].Record; got.BoundNode != "node-1" || got.ResizeState != VolumeResizePending {
+	if got := records.Records["db/data"].Record; got.BoundNode != "node-1" || got.ResizeState != VolumeResizePending {
 		t.Fatalf("created record = %#v", got)
 	}
 }

@@ -341,11 +341,20 @@ func desiredVolumeStatuses(service config.ServiceConfig, records map[string]Volu
 		if record, ok := records[status.LogicalID]; ok {
 			status.BoundNode = record.BoundNode
 			status.SharedBackendID = record.SharedBackendID
+			// DesiredSizeBytes is the *effective* size: what the control plane
+			// accepted and rendered. When a request was refused, the operator
+			// edited size: and would otherwise see nothing change with no
+			// explanation, so the refused request is surfaced beside it.
 			status.DesiredSizeBytes = record.DesiredSizeBytes
 			status.AppliedSizeBytes = record.AppliedSizeBytes
 			status.ResizeGeneration = record.ResizeGeneration
 			status.State = string(record.ResizeState)
 			status.LastError = record.LastError
+			if record.rejectionStands() {
+				status.RequestedSizeBytes = record.RequestedSizeBytes
+				status.Rejected = true
+				status.RejectedReason = record.RejectedReason
+			}
 		}
 		volumes = append(volumes, status)
 	}
