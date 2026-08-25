@@ -205,6 +205,15 @@ func (a *Agent) failAgentStatus(condition, code, message string) {
 	a.metrics.setAgentStatusSnapshot(a.agentStatusSnapshot())
 }
 
+// incompleteAgentStatus records a stage that neither succeeded nor failed. The
+// node stays in the reconciling phase and retries, rather than being published
+// as failed for what is a benign race.
+func (a *Agent) incompleteAgentStatus(condition, code, message string) {
+	a.setStatusCondition(condition, statusmodel.ConditionUnknown, code, message)
+	a.refreshAgentStatus(statusmodel.PhaseReconciling, code, message)
+	a.metrics.setAgentStatusSnapshot(a.agentStatusSnapshot())
+}
+
 func (a *Agent) markAgentStatusApplied(revision string) {
 	a.statusMu.Lock()
 	if observed := a.currentStatus.ObservedRevision; observed != "" {

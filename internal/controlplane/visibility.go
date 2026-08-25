@@ -377,8 +377,34 @@ func mergeVolumeStatuses(base, observed []statusmodel.VolumeStatus) []statusmode
 			if status.DesiredSizeBytes <= 0 {
 				status.DesiredSizeBytes = fallback.DesiredSizeBytes
 			}
+			// An image that exists on disk has a durable applied size even
+			// when its VM is not running and the agent reports zero. Without
+			// this guard the whole-struct replacement below displays applied
+			// 0 for every stopped service. (The merge still cannot tell
+			// "reported zero" from "did not report"; that distinction is the
+			// volume-status freshness work in #38, which supersedes this
+			// guard rather than fighting it.)
+			if status.AppliedSizeBytes <= 0 {
+				status.AppliedSizeBytes = fallback.AppliedSizeBytes
+			}
 			if status.ResizeGeneration <= 0 {
 				status.ResizeGeneration = fallback.ResizeGeneration
+			}
+			// The capacity rejection in applyExistingVolumeRecords is entirely
+			// control-plane-sourced: the agent is handed the clamped config
+			// and does not know a rejection happened, so its observation
+			// carries none of these. Whole-struct replacement would clear them
+			// on every cycle and make the rejection invisible. A shrink
+			// rejection is the other way round — the agent reports it, so the
+			// observed values are non-empty and authoritative.
+			if status.RequestedSizeBytes <= 0 {
+				status.RequestedSizeBytes = fallback.RequestedSizeBytes
+			}
+			if !status.Rejected {
+				status.Rejected = fallback.Rejected
+			}
+			if status.RejectedReason == "" {
+				status.RejectedReason = fallback.RejectedReason
 			}
 			if status.State == "" {
 				status.State = fallback.State

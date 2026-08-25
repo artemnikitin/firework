@@ -37,6 +37,64 @@ type StorageReservations struct {
 	SharedByBackend    map[string]int64
 	RecordedLogicalIDs map[string]bool
 	SharedEnabled      bool
+	// LocalUnknownByNode and SharedUnknownByBackend mark a scope whose
+	// remaining capacity cannot be proved because a retained record was only
+	// partially readable. Its lower bound is still charged above; the flag is
+	// what stops the unaccounted remainder from being handed out again.
+	LocalUnknownByNode     map[string]bool
+	SharedUnknownByBackend map[string]bool
+	// LocalClassUnknown and SharedClassUnknown widen that block to a whole
+	// storage class, for a record so unreadable that no binding — and
+	// therefore no narrower scope — could be determined.
+	LocalClassUnknown  bool
+	SharedClassUnknown bool
+}
+
+// Pending reason codes. They are a bounded vocabulary because the status API,
+// fireworkctl, and the web UI all render them.
+const (
+	// ReasonInsufficientCompute means vCPU or memory, and nothing else.
+	ReasonInsufficientCompute = "insufficient_compute_capacity"
+	// ReasonVolumeCapacityUnavailable means the volume cannot bind to any
+	// candidate at all: no pool is configured there, or its retained binding
+	// names somewhere else. A configuration or placement fact.
+	ReasonVolumeCapacityUnavailable = "volume_capacity_unavailable"
+	// ReasonNodeStorageExhausted means the volume could bind, but the pool has
+	// no room for the new reservation. A capacity fact, resolved by freeing
+	// retained volumes or growing the pool.
+	ReasonNodeStorageExhausted = "node_storage_exhausted"
+	// ReasonStorageCapacityUnknown means remaining capacity cannot be proved,
+	// so new volume-bearing placement is withheld rather than guessed.
+	ReasonStorageCapacityUnknown = "storage_capacity_unknown"
+	// ReasonVolumeRecordInvalid means the service's own retained record could
+	// not be parsed, so it is not placed for the first time.
+	ReasonVolumeRecordInvalid = "volume_record_invalid"
+)
+
+// storageRank orders storage rejection causes from least to most actionable so
+// the dominant one survives across candidate nodes.
+func storageRank(reason string) int {
+	switch reason {
+	case ReasonVolumeCapacityUnavailable:
+		return 1
+	case ReasonStorageCapacityUnknown:
+		return 2
+	case ReasonNodeStorageExhausted:
+		return 3
+	default:
+		return 0
+	}
+}
+
+func storageReasonMessage(reason string) string {
+	switch reason {
+	case ReasonNodeStorageExhausted:
+		return "no active node has room for the requested volume reservation"
+	case ReasonStorageCapacityUnknown:
+		return "remaining volume capacity cannot be verified; repair the quarantined volume record"
+	default:
+		return "no active node satisfies volume binding and capacity"
+	}
 }
 
 type Pending struct {
@@ -260,6 +318,7 @@ func ScheduleWithStorage(services []config.ServiceConfig, nodes []Node, existing
 
 		chosen := ""
 		chosenService := service
+		dominantStorageReason := ""
 		for _, node := range candidates {
 			if boundNode != "" && node.InstanceID != boundNode {
 				continue
@@ -267,8 +326,14 @@ func ScheduleWithStorage(services []config.ServiceConfig, nodes []Node, existing
 			if usedVCPU[node.InstanceID]+service.VCPUs > node.CapacityVCPUs || usedMem[node.InstanceID]+service.MemoryMB > node.CapacityMemMB {
 				continue
 			}
-			candidateService, localDelta, sharedDelta, ok := fitStorage(service, node, reservations, usedLocal, usedShared)
-			if !ok {
+			candidateService, localDelta, sharedDelta, storageReason := fitStorage(service, node, reservations, usedLocal, usedShared)
+			if storageReason != "" {
+				// Keep the most actionable cause seen across candidates. The
+				// dominant reason tells the operator whether the placement is
+				// wrong or the chosen node is simply full.
+				if storageRank(storageReason) > storageRank(dominantStorageReason) {
+					dominantStorageReason = storageReason
+				}
 				continue
 			}
 			chosen = node.InstanceID
@@ -280,11 +345,11 @@ func ScheduleWithStorage(services []config.ServiceConfig, nodes []Node, existing
 			break
 		}
 		if chosen == "" {
-			reason := "insufficient_compute_capacity"
+			reason := ReasonInsufficientCompute
 			message := "no active node satisfies compute capacity"
-			if len(service.Volumes) > 0 {
-				reason = "volume_capacity_unavailable"
-				message = "no active node satisfies volume binding and capacity"
+			if dominantStorageReason != "" {
+				reason = dominantStorageReason
+				message = storageReasonMessage(dominantStorageReason)
 			}
 			pending = append(pending, Pending{Service: service.Name, ReasonCode: reason, Message: message})
 			continue
@@ -323,7 +388,11 @@ func hasSharedVolume(service config.ServiceConfig) bool {
 	return false
 }
 
-func fitStorage(service config.ServiceConfig, node Node, reservations StorageReservations, usedLocal, usedShared map[string]int64) (config.ServiceConfig, int64, int64, bool) {
+// fitStorage reports whether a service's volumes can bind to a node, and why
+// not when they cannot. The reason separates a placement fact (the volume
+// cannot bind here at all) from a capacity fact (it could bind, but the pool
+// has no room), because the two have opposite operator remedies.
+func fitStorage(service config.ServiceConfig, node Node, reservations StorageReservations, usedLocal, usedShared map[string]int64) (config.ServiceConfig, int64, int64, string) {
 	candidate := service
 	candidate.Volumes = append([]config.VolumeConfig(nil), service.Volumes...)
 	var localDelta, sharedDelta int64
@@ -333,7 +402,7 @@ func fitStorage(service config.ServiceConfig, node Node, reservations StorageRes
 		switch volume.Type {
 		case config.VolumeTypeLocal:
 			if node.LocalCapacityBytes <= 0 || (volume.BoundNode != "" && volume.BoundNode != node.InstanceID) {
-				return service, 0, 0, false
+				return service, 0, 0, ReasonVolumeCapacityUnavailable
 			}
 			volume.BoundNode = node.InstanceID
 			if !reservations.RecordedLogicalIDs[logicalID] {
@@ -341,7 +410,7 @@ func fitStorage(service config.ServiceConfig, node Node, reservations StorageRes
 			}
 		case config.VolumeTypeShared:
 			if node.SharedBackendID == "" || (volume.SharedBackendID != "" && volume.SharedBackendID != node.SharedBackendID) {
-				return service, 0, 0, false
+				return service, 0, 0, ReasonVolumeCapacityUnavailable
 			}
 			volume.SharedBackendID = node.SharedBackendID
 			if !reservations.RecordedLogicalIDs[logicalID] {
@@ -349,11 +418,33 @@ func fitStorage(service config.ServiceConfig, node Node, reservations StorageRes
 			}
 		}
 	}
-	if reservations.LocalByNode[node.InstanceID]+usedLocal[node.InstanceID]+localDelta > node.LocalCapacityBytes {
-		return service, 0, 0, false
+	// A service that adds no new local reservation cannot recover capacity by
+	// being rejected, it can only be evicted. Volumes already counted in
+	// LocalByNode contribute a zero delta, and a service with no volumes at
+	// all contributes nothing — so retained reservations above the pool must
+	// not make the node reject either of them. Only a genuinely new
+	// allocation is checked against the pool.
+	if localDelta > 0 && reservations.LocalByNode[node.InstanceID]+usedLocal[node.InstanceID]+localDelta > node.LocalCapacityBytes {
+		return service, 0, 0, ReasonNodeStorageExhausted
 	}
 	if sharedDelta > 0 && node.SharedCapacityBytes > 0 && reservations.SharedByBackend[node.SharedBackendID]+usedShared[node.SharedBackendID]+sharedDelta > node.SharedCapacityBytes {
-		return service, 0, 0, false
+		return service, 0, 0, ReasonNodeStorageExhausted
 	}
-	return candidate, localDelta, sharedDelta, true
+	// A quarantined record whose reservation could not be read makes the
+	// node's remaining pool unknowable. New volume-bearing placement is
+	// withheld there rather than allocated against capacity that may already
+	// be occupied; an already-placed service is re-rendered untouched.
+	if localDelta > 0 && reservations.LocalUnknownByNode[node.InstanceID] {
+		return service, 0, 0, ReasonStorageCapacityUnknown
+	}
+	if sharedDelta > 0 && reservations.SharedUnknownByBackend[node.SharedBackendID] {
+		return service, 0, 0, ReasonStorageCapacityUnknown
+	}
+	if localDelta > 0 && reservations.LocalClassUnknown {
+		return service, 0, 0, ReasonStorageCapacityUnknown
+	}
+	if sharedDelta > 0 && reservations.SharedClassUnknown {
+		return service, 0, 0, ReasonStorageCapacityUnknown
+	}
+	return candidate, localDelta, sharedDelta, ""
 }

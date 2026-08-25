@@ -46,6 +46,7 @@ type Agent struct {
 	cfg            config.AgentConfig
 	store          store.Store
 	vmManager      *vm.Manager
+	volumeManager  *volume.Manager
 	reconciler     *reconciler.Reconciler
 	healthMon      *healthcheck.Monitor
 	networkMgr     *network.Manager
@@ -165,6 +166,7 @@ func New(cfg config.AgentConfig, s store.Store, logger *slog.Logger) *Agent {
 		cfg:            cfg,
 		store:          s,
 		vmManager:      vmMgr,
+		volumeManager:  volumeMgr,
 		reconciler:     rec,
 		healthMon:      healthMon,
 		networkMgr:     networkMgr,
@@ -473,6 +475,22 @@ func (a *Agent) tick(ctx context.Context) {
 	reconcileStart := time.Now()
 	err := a.reconciler.Reconcile(ctx, *merged)
 	a.metrics.observeReconcile(time.Since(reconcileStart), err != nil)
+	if err != nil && reconciler.IsIncomplete(err) {
+		// Every collected error was a benign start race: a stop or remove
+		// arrived while a start was preparing volumes, or two starts
+		// collided. Nothing failed, but nothing converged either, so the
+		// revision must not advance and the node must not be reported as
+		// having reconciled. Returning here leaves lastRevision unchanged, so
+		// the next tick re-plans from real state instead of taking the
+		// unchanged-revision shortcut.
+		a.logger.Info("reconciliation incomplete; retrying on the next tick", "error", err)
+		a.setStatusCondition("NetworkReady", statusmodel.ConditionTrue, "", "")
+		a.setStatusCondition("VMsReconciled", statusmodel.ConditionUnknown, "start_aborted", err.Error())
+		a.incompleteAgentStatus("Reconciled", "reconcile_incomplete", err.Error())
+		a.refreshRuntimeMetrics()
+		a.syncRegistryAfterTick(ctx, nodeCap, used)
+		return
+	}
 	if err != nil {
 		a.logger.Error("reconciliation failed", "error", err)
 		networkFailed, vmFailed, code := classifyReconcileFailure(err)
@@ -992,6 +1010,10 @@ func (a *Agent) MetricsText() string {
 
 func (a *Agent) refreshRuntimeMetrics() {
 	a.finishTickStatus()
+	// Pool gauges are published from retained state on every tick, not from
+	// the admission path, so a node holding retained-but-unplaced volumes
+	// keeps reporting them.
+	a.volumeManager.ObservePool()
 	results := make(map[string]healthcheck.Result)
 	if a.healthMon != nil {
 		results = a.healthMon.Results()

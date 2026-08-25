@@ -380,7 +380,7 @@ func ensureWritablePaths(paths, volumePaths []string, uid, gid int) error {
 		if overlapsVolumePath(path, volumePaths) {
 			continue
 		}
-		if err := chownPathRecursive(path, uid, gid); err != nil {
+		if err := chownPathRecursive(path, volumePaths, uid, gid); err != nil {
 			if os.IsNotExist(err) {
 				continue
 			}
@@ -393,16 +393,23 @@ func ensureWritablePaths(paths, volumePaths []string, uid, gid int) error {
 	return nil
 }
 
+// overlapsVolumePath reports whether a declared writable path is at or below a
+// volume root. A path *above* a volume root does not overlap: the volume is a
+// separate filesystem mounted inside it, and skipping the parent would leave a
+// non-root guest process unable to write to its own directory.
 func overlapsVolumePath(path string, volumePaths []string) bool {
 	for _, volumePath := range volumePaths {
-		if path == volumePath || strings.HasPrefix(path, volumePath+"/") || strings.HasPrefix(volumePath, path+"/") {
+		if path == volumePath || strings.HasPrefix(path, volumePath+"/") {
 			return true
 		}
 	}
 	return false
 }
 
-func chownPathRecursive(path string, uid, gid int) error {
+// chownPathRecursive walks a writable path, pruning any volume mount point it
+// reaches. A mounted volume carries its own ownership on its own ext4
+// filesystem; descending into it is both wrong and potentially expensive.
+func chownPathRecursive(path string, volumePaths []string, uid, gid int) error {
 	info, err := os.Lstat(path)
 	if err != nil {
 		return err
@@ -411,9 +418,19 @@ func chownPathRecursive(path string, uid, gid int) error {
 		return os.Lchown(path, uid, gid)
 	}
 
+	pruned := make(map[string]struct{}, len(volumePaths))
+	for _, volumePath := range volumePaths {
+		pruned[volumePath] = struct{}{}
+	}
 	return filepath.WalkDir(path, func(p string, d fs.DirEntry, walkErr error) error {
 		if walkErr != nil {
 			return walkErr
+		}
+		if _, isVolume := pruned[p]; isVolume {
+			if d != nil && d.IsDir() {
+				return fs.SkipDir
+			}
+			return nil
 		}
 		return os.Lchown(p, uid, gid)
 	})

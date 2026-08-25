@@ -152,6 +152,13 @@ type VolumeStatus struct {
 	ResizeGeneration int64  `json:"resize_generation,omitempty"`
 	State            string `json:"state"`
 	LastError        string `json:"last_error,omitempty"`
+	// RequestedSizeBytes is what the desired revision asked for, when that
+	// differs from the effective DesiredSizeBytes the cluster accepted and
+	// rendered. Equal sizes are reported only through DesiredSizeBytes, so an
+	// unrejected volume's surface is unchanged.
+	RequestedSizeBytes int64  `json:"requested_size_bytes,omitempty"`
+	Rejected           bool   `json:"rejected,omitempty"`
+	RejectedReason     string `json:"rejected_reason,omitempty"`
 }
 
 type AgentStatus struct {

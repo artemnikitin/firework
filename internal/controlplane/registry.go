@@ -497,6 +497,9 @@ func validateVolumeStatus(serviceName string, volume statusmodel.VolumeStatus) e
 	if len(volume.State) > statusmodel.MaxEnumLen {
 		return fmt.Errorf("agent_status service %q volume state exceeds %d bytes", serviceName, statusmodel.MaxEnumLen)
 	}
+	if len(volume.RejectedReason) > statusmodel.MaxReasonCodeLen {
+		return fmt.Errorf("agent_status service %q volume rejected_reason exceeds %d bytes", serviceName, statusmodel.MaxReasonCodeLen)
+	}
 	// LastError, like Message elsewhere in AgentStatus, is accept-then-
 	// truncate rather than rejected: applyHeartbeatAgentStatus runs it
 	// through BoundedMessage after validation succeeds.

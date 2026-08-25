@@ -25,6 +25,10 @@ const (
 	manifestFilename    = "manifest.json"
 	transactionFilename = "resize-transaction.json"
 	imageFilename       = "volume.ext4"
+	// creationMarkerFilename records that a first creation is in flight. It is
+	// what separates "we crashed while making an empty image" from "an image
+	// Firework did not create", which the manifest's absence alone cannot.
+	creationMarkerFilename = "creating.json"
 )
 
 var (
@@ -67,6 +71,20 @@ type manifest struct {
 	UpdatedAt        time.Time         `json:"updated_at"`
 }
 
+// creationMarker is written before the backing image and removed after the
+// manifest. Its presence authorizes deleting an image that has no manifest, so
+// its lifetime is deliberately bounded by the condition it describes: every
+// path that reads a valid manifest removes a matching marker (see
+// clearStaleCreationMarker). A marker that outlived a successful creation would
+// otherwise authorize destroying populated data if the manifest were later lost.
+type creationMarker struct {
+	LogicalID        string    `json:"logical_id"`
+	NodeID           string    `json:"node_id"`
+	TargetSizeBytes  int64     `json:"target_size_bytes"`
+	ResizeGeneration int64     `json:"resize_generation"`
+	CreatedAt        time.Time `json:"created_at"`
+}
+
 type resizeTransaction struct {
 	OldSizeBytes     int64     `json:"old_size_bytes"`
 	DesiredSizeBytes int64     `json:"desired_size_bytes"`
@@ -76,15 +94,54 @@ type resizeTransaction struct {
 	UpdatedAt        time.Time `json:"updated_at"`
 }
 
+// destructiveCommandTimeout bounds a filesystem-mutating command that has been
+// detached from the caller's context. It has to accommodate mkfs, e2fsck, and
+// resize2fs on a pool-sized image, so it is generous: the point is that the
+// operation is not killed by an agent restart, not that it is killed promptly.
+const destructiveCommandTimeout = 30 * time.Minute
+
+// destructiveCommandGrace is how long a timed-out destructive command is given
+// to handle SIGTERM before the process group is killed.
+const destructiveCommandGrace = 10 * time.Second
+
 // CommandRunner isolates filesystem utilities for unit tests.
+//
+// The split between Run and RunDestructive is the interface's whole point, and
+// it lives here rather than in a name match inside the runner so a new
+// filesystem-mutating command cannot inherit the cancellable path by omission.
 type CommandRunner interface {
+	// Run executes a read-only measurement command. It keeps the caller's
+	// context and stays promptly cancellable.
 	Run(context.Context, string, ...string) ([]byte, error)
+	// RunDestructive executes a command that mutates a filesystem. It must not
+	// be killed when the caller's context is cancelled: the agent's context is
+	// cancelled on SIGINT/SIGTERM, and exec.CommandContext cancellation is
+	// SIGKILL, so a systemd restart or node drain during a shrink would
+	// SIGKILL resize2fs mid-operation.
+	RunDestructive(context.Context, string, ...string) ([]byte, error)
 }
 
 type execRunner struct{}
 
 func (execRunner) Run(ctx context.Context, name string, args ...string) ([]byte, error) {
-	output, err := exec.CommandContext(ctx, name, args...).CombinedOutput()
+	return runCommand(exec.CommandContext(ctx, name, args...), name, args)
+}
+
+func (execRunner) RunDestructive(ctx context.Context, name string, args ...string) ([]byte, error) {
+	// WithoutCancel keeps the values (and therefore any tracing) from the
+	// caller's context while detaching it from the SIGTERM cancellation chain.
+	// The command then gets its own absolute deadline, and that deadline is a
+	// SIGTERM with a grace period rather than an unconditional SIGKILL.
+	detached, cancel := context.WithTimeout(context.WithoutCancel(ctx), destructiveCommandTimeout)
+	defer cancel()
+	cmd := exec.CommandContext(detached, name, args...)
+	cmd.Cancel = func() error { return cmd.Process.Signal(syscall.SIGTERM) }
+	cmd.WaitDelay = destructiveCommandGrace
+	return runCommand(cmd, name, args)
+}
+
+func runCommand(cmd *exec.Cmd, name string, args []string) ([]byte, error) {
+	output, err := cmd.CombinedOutput()
 	if err != nil {
 		return output, fmt.Errorf("%s %s: %w: %s", name, strings.Join(args, " "), err, strings.TrimSpace(string(output)))
 	}
@@ -288,6 +345,16 @@ func (m *Manager) validateExisting(service string, volume config.VolumeConfig, r
 	if err := readJSON(manifestPath, &found); err != nil {
 		if os.IsNotExist(err) {
 			if _, statErr := os.Stat(imagePath); statErr == nil {
+				// An image with no manifest is either a creation this node
+				// crashed partway through — recoverable, because the image is
+				// empty and nothing is protected by failing closed — or an
+				// image Firework did not create, which is exactly what
+				// fail-closed exists for. Only a matching marker tells them
+				// apart, so an absent, unreadable, or mismatched marker still
+				// quarantines.
+				if matchingCreationMarker(dir, service, volume, m.nodeID) {
+					return nil
+				}
 				return fmt.Errorf("volume %s/%s: image exists without manifest; quarantined", service, volume.Name)
 			}
 			return nil
@@ -346,14 +413,23 @@ func (m *Manager) prepareOne(ctx context.Context, service string, volume config.
 	err = readJSON(manifestPath, &current)
 	if os.IsNotExist(err) {
 		operation = "create"
+		if err := m.clearInterruptedCreation(dir, imagePath, service, volume); err != nil {
+			return PreparedVolume{}, err
+		}
+		if err := writeCreationMarker(dir, service, volume, m.nodeID); err != nil {
+			return PreparedVolume{}, err
+		}
 		if err := createSparseImage(imagePath, volume.SizeBytes); err != nil {
 			return PreparedVolume{}, err
 		}
-		if _, err := m.runner.Run(ctx, "mkfs.ext4", "-F", "-m", "0", imagePath); err != nil {
+		if _, err := m.runner.RunDestructive(ctx, "mkfs.ext4", "-F", "-m", "0", imagePath); err != nil {
 			return PreparedVolume{}, err
 		}
 		current = manifestFor(service, volume, m.nodeID)
 		if err := writeJSONAtomic(manifestPath, current); err != nil {
+			return PreparedVolume{}, err
+		}
+		if err := removeCreationMarker(dir); err != nil {
 			return PreparedVolume{}, err
 		}
 	} else if err != nil {
@@ -361,6 +437,13 @@ func (m *Manager) prepareOne(ctx context.Context, service string, volume config.
 	} else {
 		operation = "reuse"
 		if err := verifyManifest(current, service, volume, m.nodeID); err != nil {
+			return PreparedVolume{}, err
+		}
+		// The manifest is valid, so any surviving marker describes a condition
+		// that has already ended — a crash between the manifest write and the
+		// marker removal. Clearing it here is what stops it from authorizing a
+		// delete later, if the manifest is ever lost.
+		if err := removeCreationMarker(dir); err != nil {
 			return PreparedVolume{}, err
 		}
 		transactionPath := filepath.Join(dir, transactionFilename)
@@ -420,7 +503,7 @@ func (m *Manager) resize(ctx context.Context, dir, imagePath string, current *ma
 	if err := writeJSONAtomic(transactionPath, tx); err != nil {
 		return fmt.Errorf("write resize transaction: %w", err)
 	}
-	if _, err := m.runner.Run(ctx, "e2fsck", "-f", "-y", imagePath); err != nil {
+	if _, err := m.runner.RunDestructive(ctx, "e2fsck", "-f", "-y", imagePath); err != nil {
 		return err
 	}
 	if direction == "shrink" {
@@ -439,7 +522,7 @@ func (m *Manager) resize(ctx context.Context, dir, imagePath string, current *ma
 		if err := os.Truncate(imagePath, desired.SizeBytes); err != nil {
 			return fmt.Errorf("extend backing image: %w", err)
 		}
-		if _, err := m.runner.Run(ctx, "resize2fs", imagePath); err != nil {
+		if _, err := m.runner.RunDestructive(ctx, "resize2fs", imagePath); err != nil {
 			return err
 		}
 	} else {
@@ -447,7 +530,7 @@ func (m *Manager) resize(ctx context.Context, dir, imagePath string, current *ma
 		if err := writeJSONAtomic(transactionPath, tx); err != nil {
 			return err
 		}
-		if _, err := m.runner.Run(ctx, "resize2fs", imagePath, strconv.FormatInt(desired.SizeBytes/1024, 10)+"K"); err != nil {
+		if _, err := m.runner.RunDestructive(ctx, "resize2fs", imagePath, strconv.FormatInt(desired.SizeBytes/1024, 10)+"K"); err != nil {
 			return err
 		}
 		tx.Phase = "filesystem_shrunk"
@@ -459,7 +542,7 @@ func (m *Manager) resize(ctx context.Context, dir, imagePath string, current *ma
 		}
 	}
 
-	if _, err := m.runner.Run(ctx, "e2fsck", "-f", "-y", imagePath); err != nil {
+	if _, err := m.runner.RunDestructive(ctx, "e2fsck", "-f", "-y", imagePath); err != nil {
 		return err
 	}
 	current.AppliedSizeBytes = desired.SizeBytes
@@ -497,9 +580,11 @@ func (m *Manager) checkCapacity(pool *config.LocalStorageConfig, desired map[str
 		return fmt.Errorf("read local storage free space: %w", err)
 	}
 	available := int64(stat.Bavail) * int64(stat.Bsize)
-	if m.observer != nil {
-		m.observer.ObserveVolumePool(string(config.VolumeTypeLocal), reserved, pool.CapacityBytes, available)
-	}
+	// Pool observation deliberately does not happen here. checkCapacity runs
+	// only when a service declares local volumes, so reporting from it made
+	// the gauges vanish on a node holding retained-but-unplaced volumes —
+	// exactly the state an operator needs them for. ObservePool now publishes
+	// them once per tick from the agent loop, independent of desired state.
 	if reserved > pool.CapacityBytes {
 		return fmt.Errorf("local volume capacity exceeded: reserved %d bytes, configured %d bytes", reserved, pool.CapacityBytes)
 	}
@@ -517,6 +602,37 @@ func (m *Manager) checkCapacity(pool *config.LocalStorageConfig, desired map[str
 		return fmt.Errorf("local storage free space is insufficient: growth needs %d bytes, %d available", growth, available)
 	}
 	return nil
+}
+
+// ObservePool publishes the local pool gauges from retained state alone. It is
+// called once per agent tick, independent of any desired configuration, so a
+// node with retained but unplaced volumes — or with no desired local volumes at
+// all — keeps reporting reserved, capacity, and available bytes.
+//
+// It never fails a tick: a pool that is not configured or not readable is
+// simply not reported, because a metrics side effect must not be able to block
+// reconciliation.
+func (m *Manager) ObservePool() {
+	if m == nil || m.observer == nil || m.storage.Local == nil {
+		return
+	}
+	pool := m.storage.Local
+	retained, err := readRetained(pool.Path)
+	if err != nil {
+		return
+	}
+	var reserved int64
+	for _, size := range retained {
+		if size > 0 && reserved > (1<<63-1)-size {
+			return
+		}
+		reserved += size
+	}
+	var stat syscall.Statfs_t
+	if err := syscall.Statfs(pool.Path, &stat); err != nil {
+		return
+	}
+	m.observer.ObserveVolumePool(string(config.VolumeTypeLocal), reserved, pool.CapacityBytes, int64(stat.Bavail)*int64(stat.Bsize))
 }
 
 func readRetained(root string) (map[string]int64, error) {
@@ -614,6 +730,61 @@ func manifestFor(service string, volume config.VolumeConfig, nodeID string) mani
 		m.SharedBackendID = volume.SharedBackendID
 	}
 	return m
+}
+
+// clearInterruptedCreation removes an image left behind by a crashed first
+// creation. It refuses — leaving the volume quarantined — for any image whose
+// creation this node cannot prove it started.
+func (m *Manager) clearInterruptedCreation(dir, imagePath, service string, volume config.VolumeConfig) error {
+	if _, err := os.Stat(imagePath); err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return fmt.Errorf("volume %s/%s: stat image: %w", service, volume.Name, err)
+	}
+	if !matchingCreationMarker(dir, service, volume, m.nodeID) {
+		return fmt.Errorf("volume %s/%s: image exists without manifest; quarantined", service, volume.Name)
+	}
+	if err := os.Remove(imagePath); err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("volume %s/%s: remove interrupted image: %w", service, volume.Name, err)
+	}
+	if err := syncDir(dir); err != nil {
+		return err
+	}
+	return nil
+}
+
+func matchingCreationMarker(dir, service string, volume config.VolumeConfig, nodeID string) bool {
+	var marker creationMarker
+	if err := readJSON(filepath.Join(dir, creationMarkerFilename), &marker); err != nil {
+		return false
+	}
+	return marker.LogicalID == service+"/"+volume.Name && marker.NodeID == nodeID
+}
+
+func writeCreationMarker(dir, service string, volume config.VolumeConfig, nodeID string) error {
+	marker := creationMarker{
+		LogicalID: service + "/" + volume.Name, NodeID: nodeID,
+		TargetSizeBytes: volume.SizeBytes, ResizeGeneration: volume.ResizeGeneration,
+		CreatedAt: time.Now().UTC(),
+	}
+	if err := writeJSONAtomic(filepath.Join(dir, creationMarkerFilename), marker); err != nil {
+		return fmt.Errorf("write creation marker: %w", err)
+	}
+	return nil
+}
+
+// removeCreationMarker is idempotent: the common case is that there is no
+// marker to remove, and it must stay cheap enough to call on every reuse.
+func removeCreationMarker(dir string) error {
+	err := os.Remove(filepath.Join(dir, creationMarkerFilename))
+	if os.IsNotExist(err) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("remove creation marker: %w", err)
+	}
+	return syncDir(dir)
 }
 
 func createSparseImage(path string, size int64) error {

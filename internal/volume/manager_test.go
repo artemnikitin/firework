@@ -11,7 +11,13 @@ import (
 	"github.com/artemnikitin/firework/internal/config"
 )
 
-type fakeRunner struct{ calls []string }
+type fakeRunner struct {
+	calls []string
+	// destructive records the commands that were routed through
+	// RunDestructive, so a test can assert a filesystem-mutating command did
+	// not take the promptly-cancellable path.
+	destructive []string
+}
 
 func (r *fakeRunner) Run(_ context.Context, name string, args ...string) ([]byte, error) {
 	r.calls = append(r.calls, name+" "+strings.Join(args, " "))
@@ -22,6 +28,11 @@ func (r *fakeRunner) Run(_ context.Context, name string, args ...string) ([]byte
 		return []byte("Block size: 4096\n"), nil
 	}
 	return nil, nil
+}
+
+func (r *fakeRunner) RunDestructive(ctx context.Context, name string, args ...string) ([]byte, error) {
+	r.destructive = append(r.destructive, name+" "+strings.Join(args, " "))
+	return r.Run(ctx, name, args...)
 }
 
 type acceptingMounts struct{}
