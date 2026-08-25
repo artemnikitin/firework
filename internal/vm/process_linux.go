@@ -13,6 +13,10 @@ import (
 	"time"
 )
 
+// processInspectionSupported reports whether the host exposes the process
+// identity Firework needs to prove VM ownership.
+const processInspectionSupported = true
+
 func (osProcessInspector) Inspect(pid int) (processIdentity, error) {
 	procDir := filepath.Join("/proc", strconv.Itoa(pid))
 	statData, err := os.ReadFile(filepath.Join(procDir, "stat"))

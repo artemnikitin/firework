@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	"github.com/artemnikitin/firework/internal/config"
+	"github.com/artemnikitin/firework/internal/statusmodel"
 )
 
 func TestValidateInput_Valid(t *testing.T) {
@@ -30,6 +31,29 @@ func TestValidateInput_DuplicateServiceNames(t *testing.T) {
 	err := ValidateInput(input)
 	if err == nil {
 		t.Fatal("expected error for duplicate service names")
+	}
+}
+
+// A name the registry will reject makes every heartbeat carrying it be
+// discarded, so accepting it here produces a running service that is invisible
+// to fleet status. Reject it at input instead.
+func TestValidateInput_ServiceNameExceedingReportedLimit(t *testing.T) {
+	tooLong := strings.Repeat("a", statusmodel.MaxServiceNameLen+1)
+	input := &InputConfig{
+		Services: []ServiceSpec{{Name: tooLong, Image: "/img/a.ext4", NodeType: "compute"}},
+	}
+
+	if err := ValidateInput(input); err == nil {
+		t.Fatal("expected error for a service name over the reported-name limit")
+	}
+
+	atLimit := strings.Repeat("a", statusmodel.MaxServiceNameLen)
+	input = &InputConfig{
+		Services: []ServiceSpec{{Name: atLimit, Image: "/img/a.ext4", NodeType: "compute"}},
+	}
+
+	if err := ValidateInput(input); err != nil {
+		t.Fatalf("a name exactly at the limit must be accepted: %v", err)
 	}
 }
 

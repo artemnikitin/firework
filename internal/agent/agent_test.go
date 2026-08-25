@@ -2,6 +2,7 @@ package agent
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -13,6 +14,9 @@ import (
 
 	"github.com/artemnikitin/firework/internal/capacity"
 	"github.com/artemnikitin/firework/internal/config"
+	"github.com/artemnikitin/firework/internal/reconciler"
+	"github.com/artemnikitin/firework/internal/statusmodel"
+	"github.com/artemnikitin/firework/internal/vm"
 )
 
 type fakeStore struct {
@@ -198,6 +202,14 @@ func TestTick_TraefikSyncFailureDoesNotAdvanceRevisionAndRetries(t *testing.T) {
 	if rs.calls != 2 {
 		t.Fatalf("expected the next tick to retry the sync, got %d sync calls", rs.calls)
 	}
+
+	rs.err = nil
+	a.tick(context.Background())
+	status := a.agentStatusSnapshot()
+	condition, ok := agentCondition(status, "LocalRoutesReady")
+	if a.lastRevision != "rev-1" || status.Phase != statusmodel.PhaseReady || !ok || condition.Status != statusmodel.ConditionTrue || condition.ReasonCode != "" {
+		t.Fatalf("recovered route apply did not clear current failure: revision=%q status=%#v", a.lastRevision, status)
+	}
 }
 
 func TestTick_UnchangedRevisionRefreshesTraefikRoutes(t *testing.T) {
@@ -276,6 +288,11 @@ func TestTick_PeerListFailurePreservesRoutesAndAdvancesRevision(t *testing.T) {
 	if a.lastRevision != "rev-1" {
 		t.Fatalf("expected revision to advance despite peer-list failure, got %q", a.lastRevision)
 	}
+	status := a.agentStatusSnapshot()
+	condition, ok := agentCondition(status, "PeerRoutesReady")
+	if status.Phase != statusmodel.PhaseReady || !ok || condition.Status != statusmodel.ConditionFalse || condition.ReasonCode != "peer_route_sync_degraded" {
+		t.Fatalf("peer route degradation missing from applied status: %#v", status)
+	}
 }
 
 // The degraded path applies local routes via SyncLocal instead of a full Sync,
@@ -305,6 +322,71 @@ func TestTick_PeerListFailureStillSyncsLocalRoutes(t *testing.T) {
 	a.tick(context.Background())
 	if a.lastRevision != "rev-1" {
 		t.Fatalf("expected revision unchanged on local sync failure, got %q", a.lastRevision)
+	}
+}
+
+func TestTick_IncompleteMultiLabelConfigPreservesLastKnownGoodRoutes(t *testing.T) {
+	s := &fakeStore{
+		data:     map[string][]byte{"web": []byte("node: web\nservices: []\n")},
+		revision: "rev-1",
+	}
+	cfg := testAgentConfig(t)
+	cfg.NodeNames = []string{"web", "missing"}
+	a := New(cfg, s, testLogger())
+	rs := &fakeRouteSyncer{}
+	a.traefikMgr = rs
+
+	a.tick(context.Background())
+
+	if rs.calls != 0 || rs.localCalls != 0 {
+		t.Fatalf("incomplete config mutated routes: full syncs=%d local syncs=%d", rs.calls, rs.localCalls)
+	}
+}
+
+func TestTick_UnchangedRevisionRefreshesAllSkippedConditions(t *testing.T) {
+	s := &fakeStore{
+		data:     map[string][]byte{"web": []byte("node: web\nservices: []\n")},
+		revision: "rev-1",
+	}
+	a := New(testAgentConfig(t), s, testLogger())
+	a.lastRevision = "rev-1"
+	a.setStatusCondition("ImagesReady", statusmodel.ConditionFalse, "image_sync_failed", "old failure")
+	a.setStatusCondition("VMsReconciled", statusmodel.ConditionFalse, "vm_reconcile_failed", "old failure")
+	a.refreshAgentStatus(statusmodel.PhaseFailed, "vm_reconcile_failed", "old failure")
+
+	a.tick(context.Background())
+
+	status := a.agentStatusSnapshot()
+	for _, kind := range []string{"ImagesReady", "VMsReconciled", "NetworkReady", "CapacityReady", "Reconciled"} {
+		condition, ok := agentCondition(status, kind)
+		if !ok || condition.Status != statusmodel.ConditionTrue {
+			t.Fatalf("unchanged revision left %s inconsistent with ready phase: %#v", kind, status)
+		}
+	}
+	if status.Phase != statusmodel.PhaseReady {
+		t.Fatalf("unchanged revision did not report ready: %#v", status)
+	}
+}
+
+func TestTick_PreservesConditionTransitionTimeAcrossNoChange(t *testing.T) {
+	s := &fakeStore{
+		data:     map[string][]byte{"web": []byte("node: web\nservices: []\n")},
+		revision: "rev-1",
+	}
+	a := New(testAgentConfig(t), s, testLogger())
+
+	a.tick(context.Background())
+	first := a.agentStatusSnapshot()
+	time.Sleep(time.Millisecond)
+	a.tick(context.Background())
+	second := a.agentStatusSnapshot()
+
+	for _, kind := range []string{"ConfigFetched", "ImagesReady"} {
+		before, beforeOK := agentCondition(first, kind)
+		after, afterOK := agentCondition(second, kind)
+		if !beforeOK || !afterOK || !before.LastTransitionAt.Equal(after.LastTransitionAt) {
+			t.Fatalf("%s transition changed across no-op ticks: before=%#v after=%#v", kind, before, after)
+		}
 	}
 }
 
@@ -557,7 +639,12 @@ func TestTick_StatusReportsRuntimeAssignedNetworkAddress(t *testing.T) {
 func TestTick_StatusReportsVMProcessFailureWithoutExitedPID(t *testing.T) {
 	dir := t.TempDir()
 	binary := filepath.Join(dir, "fake-firecracker")
-	if err := os.WriteFile(binary, []byte("#!/bin/sh\nexit 1\n"), 0o755); err != nil {
+	exitMarker := filepath.Join(dir, "exit")
+	t.Setenv("FIREWORK_TEST_EXIT_MARKER", exitMarker)
+	// Keep the fake VM alive until Start has confirmed and recorded its launched
+	// identity. A wall-clock sleep is flaky under Linux race+coverage scheduling
+	// and can turn this into a launch-failure test before Start registers the VM.
+	if err := os.WriteFile(binary, []byte("#!/bin/sh\nwhile [ ! -f \"$FIREWORK_TEST_EXIT_MARKER\" ]; do sleep 0.01; done\nexit 1\n"), 0o755); err != nil {
 		t.Fatal(err)
 	}
 	store := &fakeStore{data: map[string][]byte{"web": []byte("node: web\ndesired_revision: desired-1\nplacement_revision: placement-1\nrendered_revision: rendered-1\nservices:\n- name: service\n  image: /img/service\n  kernel: /kern\n  vcpus: 1\n  memory_mb: 128\n")}, revision: "provider-token"}
@@ -565,22 +652,131 @@ func TestTick_StatusReportsVMProcessFailureWithoutExitedPID(t *testing.T) {
 	cfg.FirecrackerBin = binary
 	a := New(cfg, store, testLogger())
 	a.tick(context.Background())
+	if err := os.WriteFile(exitMarker, []byte("exit\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
 
 	// The race build can take several seconds to schedule the monitor goroutine
 	// while the full package suite is running concurrently.
 	deadline := time.Now().Add(10 * time.Second)
 	for time.Now().Before(deadline) {
-		status := a.agentStatusSnapshot()
-		if len(status.Services) == 1 && status.Services[0].VMState == "failed" {
-			service := status.Services[0]
-			if service.ReasonCode != "vm_failed" || service.Message == "" || service.PID != 0 {
-				t.Fatalf("unexpected VM failure status: %#v", service)
-			}
-			return
+		if instance := a.vmManager.List()["service"]; instance != nil && instance.State == vm.StateFailed {
+			break
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
-	t.Fatalf("service did not report VM failure: %#v", a.agentStatusSnapshot().Services)
+	if instance := a.vmManager.List()["service"]; instance == nil || instance.State != vm.StateFailed {
+		t.Fatalf("fake VM did not exit as failed: %#v", instance)
+	}
+
+	// The unchanged-revision tick must publish the asynchronous process failure
+	// without reporting the exited PID as live.
+	a.tick(context.Background())
+	status := a.agentStatusSnapshot()
+	if len(status.Services) != 1 || status.Services[0].VMState != "failed" {
+		t.Fatalf("service did not report VM failure: %#v", status.Services)
+	}
+	service := status.Services[0]
+	if service.ReasonCode != "vm_failed" || service.Message == "" || service.PID != 0 {
+		t.Fatalf("unexpected VM failure status: %#v", service)
+	}
+}
+
+func TestTick_StatusDistinguishesConfigParseFailure(t *testing.T) {
+	store := &fakeStore{data: map[string][]byte{"web": []byte("node: [invalid\n")}, revision: "rev"}
+	a := New(testAgentConfig(t), store, testLogger())
+	a.tick(context.Background())
+	status := a.agentStatusSnapshot()
+	parsed, ok := agentCondition(status, "ConfigParsed")
+	if status.Phase != statusmodel.PhaseFailed || status.ReasonCode != "config_parse_failed" || !ok || parsed.Status != statusmodel.ConditionFalse {
+		t.Fatalf("parse failure was not typed: %#v", status)
+	}
+	fetched, ok := agentCondition(status, "ConfigFetched")
+	if !ok || fetched.Status != statusmodel.ConditionTrue {
+		t.Fatalf("successful fetch was not retained before parse failure: %#v", status.Conditions)
+	}
+}
+
+func TestTick_MultiLabelPartialFetchFailsClosed(t *testing.T) {
+	store := &fakeStore{data: map[string][]byte{"web": []byte("node: web\nservices: []\n")}, revision: "rev"}
+	cfg := testAgentConfig(t)
+	cfg.NodeNames = []string{"web", "missing"}
+	a := New(cfg, store, testLogger())
+	a.tick(context.Background())
+	status := a.agentStatusSnapshot()
+	condition, ok := agentCondition(status, "ConfigFetched")
+	if status.Phase != statusmodel.PhaseFailed || status.ReasonCode != "config_fetch_failed" || !ok || condition.Status != statusmodel.ConditionFalse {
+		t.Fatalf("partial multi-label fetch was not rejected: %#v", status)
+	}
+}
+
+func TestTick_StatusDistinguishesVMReconcileFailure(t *testing.T) {
+	store := &fakeStore{data: map[string][]byte{"web": []byte("node: web\nservices:\n- name: service\n  image: /image\n  kernel: /kernel\n  vcpus: 1\n  memory_mb: 128\n")}, revision: "rev"}
+	cfg := testAgentConfig(t)
+	cfg.FirecrackerBin = filepath.Join(t.TempDir(), "missing-firecracker")
+	a := New(cfg, store, testLogger())
+	a.tick(context.Background())
+	status := a.agentStatusSnapshot()
+	condition, ok := agentCondition(status, "VMsReconciled")
+	if status.Phase != statusmodel.PhaseFailed || status.ReasonCode != "vm_reconcile_failed" || !ok || condition.Status != statusmodel.ConditionFalse {
+		t.Fatalf("VM reconcile failure was not typed: %#v", status)
+	}
+	metrics := a.metrics.render()
+	if !strings.Contains(metrics, `firework_agent_status_phase{node="web",phase="failed"} 1`) ||
+		!strings.Contains(metrics, `firework_agent_status_condition{node="web",condition="VMsReconciled",status="false"} 1`) {
+		t.Fatalf("status model was not reflected in metrics:\n%s", metrics)
+	}
+}
+
+func TestClassifyReconcileFailureDistinguishesNetworkAndVMStages(t *testing.T) {
+	failure := fmt.Errorf("reconcile: %w", errors.Join(
+		&reconciler.StageError{Stage: reconciler.FailureStageNetwork, Err: errors.New("tap failed")},
+		&reconciler.StageError{Stage: reconciler.FailureStageVM, Err: errors.New("launch failed")},
+	))
+	network, vmFailed, code := classifyReconcileFailure(failure)
+	if !network || !vmFailed || code != "vm_reconcile_failed" {
+		t.Fatalf("aggregate failure classification = network:%v vm:%v code:%q", network, vmFailed, code)
+	}
+
+	network, vmFailed, code = classifyReconcileFailure(&reconciler.StageError{Stage: reconciler.FailureStageNetwork, Err: errors.New("tap failed")})
+	if !network || vmFailed || code != "network_setup_failed" {
+		t.Fatalf("network failure classification = network:%v vm:%v code:%q", network, vmFailed, code)
+	}
+	network, vmFailed, code = classifyReconcileFailure(&reconciler.StageError{Stage: reconciler.FailureStageVM, Err: errors.New("launch failed")})
+	if network || !vmFailed || code != "vm_reconcile_failed" {
+		t.Fatalf("VM failure classification = network:%v vm:%v code:%q", network, vmFailed, code)
+	}
+}
+
+func TestConfigLoadErrorErrorIsSafeWithNoUnderlyingErrors(t *testing.T) {
+	var err *configLoadError
+	if got := err.Error(); got != "" {
+		t.Fatalf("nil config load error string = %q", got)
+	}
+	if got := (&configLoadError{}).Error(); got == "" {
+		t.Fatal("empty config load error did not describe the failure")
+	}
+}
+
+func TestAgentStatusTruncatesServiceSummaries(t *testing.T) {
+	a := New(testAgentConfig(t), &fakeStore{}, testLogger())
+	a.statusServices = make([]config.ServiceConfig, statusmodel.MaxServices+1)
+	for index := range a.statusServices {
+		a.statusServices[index].Name = fmt.Sprintf("service-%03d", index)
+	}
+	status := a.agentStatusSnapshot()
+	if !status.ServicesTruncated || status.DesiredServices != statusmodel.MaxServices+1 || len(status.Services) != statusmodel.MaxServices {
+		t.Fatalf("service status was not bounded: desired=%d summaries=%d truncated=%v", status.DesiredServices, len(status.Services), status.ServicesTruncated)
+	}
+}
+
+func agentCondition(status statusmodel.AgentStatus, kind string) (statusmodel.Condition, bool) {
+	for _, condition := range status.Conditions {
+		if condition.Type == kind {
+			return condition, true
+		}
+	}
+	return statusmodel.Condition{}, false
 }
 
 func TestTick_StatusReportsAmbiguousVMRecovery(t *testing.T) {
@@ -718,5 +914,113 @@ func TestTick_DistinctHostPortsReconcileNormally(t *testing.T) {
 
 	if status := a.agentStatusSnapshot(); status.ReasonCode == "host_port_conflict" {
 		t.Fatalf("distinct host ports must not be rejected: %#v", status)
+	}
+}
+
+// runningVMManager reports a service as already running, which is what steady
+// state looks like: port forwards are only asserted for services that have a
+// guest to forward to.
+type runningVMManager struct{ names []string }
+
+func (r *runningVMManager) List() map[string]*vm.Instance {
+	out := make(map[string]*vm.Instance, len(r.names))
+	for _, name := range r.names {
+		out[name] = &vm.Instance{Name: name, State: vm.StateRunning}
+	}
+	return out
+}
+func (r *runningVMManager) Start(context.Context, config.ServiceConfig) error { return nil }
+func (r *runningVMManager) Remove(string) error                               { return nil }
+
+// fakeNetwork lets the agent's tick paths exercise host networking without
+// touching real iptables rules.
+type fakeNetwork struct {
+	setupForwardCalls []int
+	setupForwardErr   error
+}
+
+func (f *fakeNetwork) Setup(config.ServiceConfig) error    { return nil }
+func (f *fakeNetwork) Teardown(config.ServiceConfig) error { return nil }
+func (f *fakeNetwork) DeleteTAP(string) error              { return nil }
+func (f *fakeNetwork) DeleteBridge(string) error           { return nil }
+func (f *fakeNetwork) TeardownPortForward(int, string, int) error {
+	return nil
+}
+
+func (f *fakeNetwork) SetupPortForward(hostPort int, _ string, _ int) error {
+	f.setupForwardCalls = append(f.setupForwardCalls, hostPort)
+	return f.setupForwardErr
+}
+
+// The regression: port-forward convergence lived only inside Reconcile, and the
+// unchanged-revision fast path returns before Reconcile. On a single-label node
+// in steady state the rules were therefore re-asserted only on ticks that
+// changed the revision — while the same path reported NetworkReady=true, so the
+// control plane called the node converged with host DNAT possibly flushed.
+func TestTick_UnchangedRevisionReassertsPortForwards(t *testing.T) {
+	s := &fakeStore{
+		data: map[string][]byte{"web": []byte(`node: web
+services:
+  - name: local
+    network: {}
+    port_forwards:
+      - host_port: 8080
+        vm_port: 8080
+`)},
+		revision: "rev-1",
+	}
+	cfg := testAgentConfig(t)
+	cfg.VMSubnet = "172.16.0.0/24"
+	cfg.VMGateway = "172.16.0.1"
+	a := New(cfg, s, testLogger())
+	net := &fakeNetwork{}
+	a.reconciler = reconciler.NewWithNetworkManager(&runningVMManager{names: []string{"local"}}, testLogger(), nil, net, "", 0)
+	a.traefikMgr = &fakeRouteSyncer{}
+	a.lastRevision = "rev-1"
+
+	a.tick(context.Background())
+	if len(net.setupForwardCalls) == 0 {
+		t.Fatal("unchanged-revision tick did not re-assert port forwards")
+	}
+
+	before := len(net.setupForwardCalls)
+	a.tick(context.Background())
+	if len(net.setupForwardCalls) <= before {
+		t.Fatal("port forwards were not re-asserted on a second unchanged-revision tick")
+	}
+}
+
+// A port-forward failure on the fast path must not be reported as ready.
+func TestTick_UnchangedRevisionPortForwardFailureIsNotReady(t *testing.T) {
+	s := &fakeStore{
+		data: map[string][]byte{"web": []byte(`node: web
+services:
+  - name: local
+    network: {}
+    port_forwards:
+      - host_port: 8080
+        vm_port: 8080
+`)},
+		revision: "rev-1",
+	}
+	cfg := testAgentConfig(t)
+	cfg.VMSubnet = "172.16.0.0/24"
+	cfg.VMGateway = "172.16.0.1"
+	a := New(cfg, s, testLogger())
+	a.reconciler = reconciler.NewWithNetworkManager(&runningVMManager{names: []string{"local"}}, testLogger(),
+		nil, &fakeNetwork{setupForwardErr: errors.New("nat table flushed")}, "", 0)
+	a.traefikMgr = &fakeRouteSyncer{}
+	a.lastRevision = "rev-1"
+
+	a.tick(context.Background())
+
+	status := a.agentStatusSnapshot()
+	if status.Phase == statusmodel.PhaseReady {
+		t.Fatal("node reported ready while its port forwards could not be applied")
+	}
+	for _, condition := range status.Conditions {
+		if condition.Type == "NetworkReady" && condition.Status == statusmodel.ConditionTrue {
+			t.Fatal("NetworkReady reported true while port forwards could not be applied")
+		}
 	}
 }

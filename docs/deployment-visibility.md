@@ -18,6 +18,7 @@ Endpoints:
 
 ```text
 GET /healthz
+GET /v1/status
 GET /v1/nodes
 GET /v1/nodes/{node_id}
 GET /v1/services
@@ -63,16 +64,78 @@ agent-local `/status` endpoint. It reports agent version, observation time,
 desired/placement/rendered/applied revisions, reconciliation phase, typed
 conditions, and fixed-shape service summaries.
 
+The wire payload accepts at most 16 unique conditions, 256 service summaries,
+and 25 volumes per service. Messages are sanitized and capped at 256
+characters; revisions, names, condition types, reason codes, agent version,
+per-service state/health/network fields, and per-volume identifier/path
+fields are all length-bounded too, since 256 services x 25 volumes multiplies
+a single unbounded field into megabytes. When an agent has more than 256
+desired services it sets
+`services_truncated` and reports the full desired count, but that snapshot
+cannot prove convergence. Registry requests are body-size limited and reject
+duplicate or invalid bounded fields. Older heartbeats which omit
+`agent_status` remain valid and are represented as unknown.
+
+Blocking stages are reported separately: config fetch/parse, capacity, image
+sync, host networking, VM reconciliation, and local route publication. Peer
+route refresh is non-blocking; failure preserves last-known-good remote routes,
+allows the revision to apply, and sets `PeerRoutesReady=false` with a bounded
+reason/message.
+
+The local `/status` response, heartbeat payload, and
+`firework_agent_status_phase`/`firework_agent_status_condition` gauges are
+derived from the same status snapshot. Metric labels contain only the bounded
+phase, condition type, and condition status; free-form messages never become
+labels.
+
 Agent reconciliation phases are `unknown`, `reconciling`, `ready`, and
-`failed`. Desired service VM/health state is trusted only when the current
+`failed`. A service summary is reported as fully current only when the current
 desired and placement revisions match and the reporting agent has both observed
 and applied the current rendered revision. During publication or rollout
-transitions, mismatched data fails closed to `pending` or `unknown` instead of
+transitions, mismatched placement fails closed to `pending` instead of
 presenting an older VM as the current desired service. Stale/down nodes remain
 separate lifecycle states and are never inferred to be failed or healthy.
 
+A node that has observed the current rendered revision but not applied it keeps
+`reason_code: agent_status_revision_mismatch` on every service placed on it. Its
+per-service VM state and health are still projected, because they are fresh and
+self-consistent: one service that cannot converge must not erase visibility into
+the rest of the node. A service whose own VM state is outside the published
+vocabulary — `recovery_pending`, for example — is still reported as `unknown`,
+so the service that actually cannot converge remains the one that stands out.
+Service detail keeps the stricter rule: runtime fields such as the actual node,
+applied revision, PID, and network address appear only for an applied revision.
+
 Older heartbeats without `agent_status` continue to register normally. Their
 actual service state is reported as `unknown` until the agent is upgraded.
+
+`GET /v1/status` derives the current fleet revision state from desired,
+placement, rendered, and fresh registry snapshots. It does not persist a
+second state machine:
+
+- `published`: desired/rendered state exists, but no relevant fresh agent has
+  observed the current rendered revision yet;
+- `progressing`: at least one relevant agent is applying the current revision;
+- `converged`: every relevant node is fresh and has applied it with no false or
+  unknown blocking condition;
+- `degraded`: convergence criteria are met, but at least one node reports the
+  non-blocking peer-route condition false;
+- `failed`: scheduling left a service pending, or a relevant agent reports a
+  blocking failure for the current revision;
+- `unknown`: required node status is missing, unsupported, truncated, stale,
+  or down.
+
+The response includes deterministic node sets for converged, degraded,
+progressing, failed, stale, down, and unknown nodes. A rendered revision with
+zero relevant nodes can converge only when the desired service set is also
+empty, and even then only once every node the control plane has a record for
+confirms it via a fresh heartbeat that has actually observed the empty
+revision. The controller currently deletes a no-longer-relevant node's legacy
+`nodes/<node>.yaml` instead of publishing an explicit empty config, so an
+agent that fetches it sees a missing file, treats that as a fetch failure, and
+keeps every VM and route it already had running; treating every known node as
+relevant here is what stops an empty desired state from reporting converged
+while those workloads are still up.
 
 ## CLI
 
@@ -83,6 +146,7 @@ commands and global options.
 
 ```text
 fireworkctl nodes
+fireworkctl status
 fireworkctl node <node-id>
 fireworkctl services --health unhealthy
 fireworkctl service <service-name> --output json

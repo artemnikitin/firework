@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	"github.com/artemnikitin/firework/internal/config"
+	"github.com/artemnikitin/firework/internal/statusmodel"
 )
 
 func TestEnrichServiceResolvesAndSortsVolumes(t *testing.T) {
@@ -36,6 +37,25 @@ func TestValidateInputRejectsUnsafeVolumes(t *testing.T) {
 		if !strings.Contains(err.Error(), want) {
 			t.Fatalf("validation error %q does not contain %q", err, want)
 		}
+	}
+}
+
+// TestValidateInputRejectsOverlongMountPath guards the boundary between
+// config admission and reported status: statusmodel.MaxMountPathLen is what
+// controlplane's validateVolumeStatus enforces on the heartbeat, and a
+// mount_path accepted here but longer than that bound would pass this check
+// only to have the agent's entire agent_status dropped later, at heartbeat
+// time — silently, and long after the config was accepted.
+func TestValidateInputRejectsOverlongMountPath(t *testing.T) {
+	overlong := "/data/" + strings.Repeat("x", statusmodel.MaxMountPathLen)
+	input := &InputConfig{Services: []ServiceSpec{{
+		Name: "app", Image: "/image", NodeType: "node", Volumes: []VolumeSpec{
+			{Name: "data", Type: config.VolumeTypeLocal, MountPath: overlong, Size: "1Gi"},
+		},
+	}}}
+	err := ValidateInput(input)
+	if err == nil || !strings.Contains(err.Error(), "exceeding the") {
+		t.Fatalf("expected mount_path length validation error, got %v", err)
 	}
 }
 
