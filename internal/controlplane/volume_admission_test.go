@@ -261,3 +261,103 @@ func TestCapacityRejectionSurvivesTheMergeAgainstAnUnawareAgent(t *testing.T) {
 		t.Fatalf("the agent observation must still be authoritative for state: %#v", got)
 	}
 }
+
+// A rejection cannot ride on the "prepared" branch: after a refusal Prepare
+// succeeds at the old size, but the prepared arm requires the observed applied
+// size to equal the record's desired size — which is exactly what a rejection
+// makes false. It needs its own state and its own acknowledgement arm.
+func TestRejectedObservationConvergesTheRecordOnTheEffectiveSize(t *testing.T) {
+	ctx := context.Background()
+	controller, store := admissionController(t)
+	recordKey := mustVolumeRecordKey("cp/v1/", "db", "data")
+	// The raise to 2 GiB was accepted by the control plane; the agent then
+	// refused it as below the safe minimum.
+	putRecord(t, store, "db", "data", VolumeRecord{
+		LogicalID: "db/data", Type: config.VolumeTypeLocal, BoundNode: "node-1",
+		DesiredSizeBytes: 2 * config.GiB, AppliedSizeBytes: 10 * config.GiB,
+		ResizeGeneration: 2, ResizeState: VolumeResizePending,
+	})
+
+	nodeKey, err := nodeRecordKey("cp/v1/", "node-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	node := NodeRecord{NodeID: "node-1", AgentStatus: &statusmodel.AgentStatus{Services: []statusmodel.ServiceStatus{{
+		Name: "db", Volumes: []statusmodel.VolumeStatus{{
+			LogicalID: "db/data", Type: "local", BoundNode: "node-1",
+			AppliedSizeBytes: 10 * config.GiB, RequestedSizeBytes: 2 * config.GiB,
+			ResizeGeneration: 2, State: "rejected", Rejected: true,
+			RejectedReason: "shrink_below_minimum", LastError: "below the safe minimum",
+		}},
+	}}}}
+	if _, err := store.PutJSON(ctx, nodeKey, node); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := controller.acknowledgeVolumeRecords(ctx); err != nil {
+		t.Fatal(err)
+	}
+	readRecord := func() VolumeRecord {
+		t.Helper()
+		var got VolumeRecord
+		if _, exists, err := store.GetJSON(ctx, recordKey, &got); err != nil || !exists {
+			t.Fatalf("read record: exists=%v err=%v", exists, err)
+		}
+		return got
+	}
+	got := readRecord()
+	if got.ResizeState != VolumeResizeRejected {
+		t.Fatalf("expected the rejected state, got %#v", got)
+	}
+	// One write establishes the invariant that the record never renders a size
+	// the cluster is not running.
+	if got.DesiredSizeBytes != 10*config.GiB || got.RequestedSizeBytes != 2*config.GiB {
+		t.Fatalf("the record did not converge on the effective size: %#v", got)
+	}
+	if got.ResizeGeneration != 2 {
+		t.Fatalf("the requested generation must be retained, got %d", got.ResizeGeneration)
+	}
+	first := got.RejectedAt
+
+	// Re-running against an unchanged observation must perform no second write.
+	if err := controller.acknowledgeVolumeRecords(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if again := readRecord(); !again.RejectedAt.Equal(first) || again.UpdatedAt != got.UpdatedAt {
+		t.Fatalf("an unchanged rejected observation was written again: %#v vs %#v", again, got)
+	}
+}
+
+// After the acknowledgement, the effective size is what renders — so no
+// further update is planned, and the requested size is still visible.
+func TestAcknowledgedRejectionRendersTheEffectiveSize(t *testing.T) {
+	ctx := context.Background()
+	controller, store := admissionController(t)
+	putRecord(t, store, "db", "data", VolumeRecord{
+		LogicalID: "db/data", Type: config.VolumeTypeLocal, BoundNode: "node-1",
+		DesiredSizeBytes: 10 * config.GiB, AppliedSizeBytes: 10 * config.GiB,
+		RequestedSizeBytes: 2 * config.GiB, ResizeGeneration: 2,
+		ResizeState: VolumeResizeRejected, RejectedReason: "shrink_below_minimum",
+		RejectedAt: time.Now().UTC(),
+	})
+
+	set, err := controller.loadVolumeRecords(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	services := []config.ServiceConfig{serviceWithVolume("db", 2*config.GiB)}
+	if _, err := controller.applyExistingVolumeRecords(ctx, services, set, poolNodes(100*config.GiB)); err != nil {
+		t.Fatal(err)
+	}
+	volume := services[0].Volumes[0]
+	if volume.SizeBytes != 10*config.GiB || volume.ResizeGeneration != 2 {
+		t.Fatalf("expected the effective configuration to render, got %#v", volume)
+	}
+	stored := set.Records["db/data"].Record
+	if stored.ResizeGeneration != 2 {
+		t.Fatalf("a standing rejection must not mint a generation, got %d", stored.ResizeGeneration)
+	}
+	if stored.RequestedSizeBytes != 2*config.GiB {
+		t.Fatalf("the refused size must stay visible, got %d", stored.RequestedSizeBytes)
+	}
+}

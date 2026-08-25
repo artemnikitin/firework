@@ -89,16 +89,16 @@ func TestManagerCreatesReusesGrowsAndShrinksLocalVolume(t *testing.T) {
 func TestManagerRejectsBindingCapacityAndSharedRuntime(t *testing.T) {
 	root := t.TempDir()
 	manager := NewManagerWithDependencies("node-1", config.StorageConfig{Local: &config.LocalStorageConfig{Path: root, CapacityBytes: 8 * config.MiB}}, &fakeRunner{}, acceptingMounts{})
-	if err := manager.Preflight(context.Background(), localService(16*config.MiB, 1)); err == nil || !strings.Contains(err.Error(), "capacity exceeded") {
+	if _, err := manager.Preflight(context.Background(), localService(16*config.MiB, 1)); err == nil || !strings.Contains(err.Error(), "capacity exceeded") {
 		t.Fatalf("expected capacity error, got %v", err)
 	}
 	wrong := localService(config.MiB, 1)
 	wrong.Volumes[0].BoundNode = "node-2"
-	if err := manager.Preflight(context.Background(), wrong); err == nil || !strings.Contains(err.Error(), "does not match") {
+	if _, err := manager.Preflight(context.Background(), wrong); err == nil || !strings.Contains(err.Error(), "does not match") {
 		t.Fatalf("expected binding error, got %v", err)
 	}
 	shared := config.ServiceConfig{Name: "app", Volumes: []config.VolumeConfig{{Name: "data", Type: config.VolumeTypeShared, MountPath: "/data", SizeBytes: config.GiB}}}
-	if err := manager.Preflight(context.Background(), shared); !errors.Is(err, ErrSharedUnsupported) && (err == nil || !strings.Contains(err.Error(), ErrSharedUnsupported.Error())) {
+	if _, err := manager.Preflight(context.Background(), shared); !errors.Is(err, ErrSharedUnsupported) && (err == nil || !strings.Contains(err.Error(), ErrSharedUnsupported.Error())) {
 		t.Fatalf("expected shared safety gate, got %v", err)
 	}
 }
@@ -180,7 +180,7 @@ func TestManagerQuarantinesAmbiguousRetainedState(t *testing.T) {
 			t.Fatal(err)
 		}
 		manager := NewManagerWithDependencies("node-1", config.StorageConfig{Local: &config.LocalStorageConfig{Path: root, CapacityBytes: 100 * config.MiB}}, &fakeRunner{}, acceptingMounts{})
-		if err := manager.Preflight(context.Background(), localService(16*config.MiB, 1)); err == nil || !strings.Contains(err.Error(), "quarantined") {
+		if _, err := manager.Preflight(context.Background(), localService(16*config.MiB, 1)); err == nil || !strings.Contains(err.Error(), "quarantined") {
 			t.Fatalf("expected quarantine error, got %v", err)
 		}
 	})
@@ -195,7 +195,7 @@ func TestManagerQuarantinesAmbiguousRetainedState(t *testing.T) {
 		if err := os.Truncate(prepared[0].PathOnHost, 16*config.MiB); err != nil {
 			t.Fatal(err)
 		}
-		if err := manager.Preflight(context.Background(), localService(16*config.MiB, 2)); err == nil || !strings.Contains(err.Error(), "quarantined") {
+		if _, err := manager.Preflight(context.Background(), localService(16*config.MiB, 2)); err == nil || !strings.Contains(err.Error(), "quarantined") {
 			t.Fatalf("expected quarantine error, got %v", err)
 		}
 	})
@@ -209,7 +209,15 @@ func TestManagerRejectsShrinkBelowSafeMinimum(t *testing.T) {
 	if _, err := manager.Prepare(context.Background(), localService(16*config.MiB, 1)); err != nil {
 		t.Fatal(err)
 	}
-	if err := manager.Preflight(context.Background(), localService(4*config.MiB, 2)); err == nil || !strings.Contains(err.Error(), "below safe minimum") {
-		t.Fatalf("expected safe-minimum error, got %v", err)
+	// A shrink below the safe minimum is refused, and the refusal is a
+	// decision rather than a fault: it is reported as a rejection so the
+	// caller can keep the workload running at its effective size.
+	rejections, err := manager.Preflight(context.Background(), localService(4*config.MiB, 2))
+	if err != nil {
+		t.Fatalf("a refused shrink must not be an error: %v", err)
+	}
+	if len(rejections) != 1 || rejections[0].RequestedSizeBytes != 4*config.MiB ||
+		rejections[0].AppliedSizeBytes != 16*config.MiB || rejections[0].MinimumSizeBytes == 0 {
+		t.Fatalf("unexpected rejection: %#v", rejections)
 	}
 }

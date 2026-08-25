@@ -66,6 +66,52 @@ identity, binding, capacity, filesystem health, and shrink feasibility. It then
 records a durable resize transaction, grows the file before ext4, or shrinks
 ext4 before truncating the file. Ambiguous states fail closed.
 
+### Guest data is not flushed before a microVM is stopped
+
+Stopping a microVM — including every service update and every volume resize,
+which are implemented as stop-then-start — terminates the Firecracker process
+without a guest-side shutdown. The ext4 journal keeps the filesystem
+consistent, but application data still in the guest page cache is lost.
+Workloads with persistent volumes should be configured to fsync data they
+cannot afford to lose. A guest quiesce channel is tracked in
+[#49](https://github.com/artemnikitin/firework/issues/49).
+
+### Refused size requests
+
+A size request the cluster cannot serve is refused rather than applied, and the
+service keeps running at the size it already has. Two cases produce this:
+
+- the bound node's pool has no room for the larger reservation, or its capacity
+  cannot be verified because the node is not currently active;
+- the requested shrink is below the safe minimum for the filesystem's current
+  contents.
+
+A refusal is terminal for that request: it is recorded durably, no further
+resize is attempted, and the service is neither stopped nor restarted. Status
+therefore carries three sizes rather than two — **requested** (what the repo
+asked for), **effective** (what the control plane accepted and rendered), and
+**applied** (what exists on disk) — and the API, `fireworkctl service <name>`,
+and the UI show requested next to effective. When they differ, the volume is
+also flagged with the reason it was refused.
+
+To recover, change the requested size to something feasible. That is a new
+request, so it is measured and admitted from scratch. Reverting the request to
+the effective size simply clears the refusal without performing any resize.
+
+### Direct-Git node configs must bump `resize_generation`
+
+In control-plane-managed mode the controller mints a new `resize_generation`
+whenever a volume's requested size changes, so a corrected request is always
+distinguishable from a repeat of a refused one.
+
+Hand-authored node configs (see [docs/configs](configs/README.md)) carry
+`resize_generation` themselves, and Firework cannot mint one for them.
+**Bump `resize_generation` whenever you change a volume's `size_bytes`.** A
+corrected size at an unchanged generation is still re-measured rather than
+clamped, but leaving the generation at `0` or omitting it means no resize is
+ever recognized at all. `configcheck --node-config <file>` warns when a config
+declares a volume size with an absent or zero generation.
+
 Deleting application YAML never deletes a volume. Permanent deletion is a
 manual operator action: first stop/remove the service placement, back up the
 volume if required, then remove both its host directory and
@@ -73,5 +119,5 @@ volume if required, then remove both its host directory and
 automatic adoption.
 
 Service detail in the UI, API, and `fireworkctl service <name>` includes the
-logical ID, binding/backend, desired and applied quota, resize generation, and
-preparation state.
+logical ID, binding/backend, requested/effective/applied quota, resize
+generation, and preparation state.

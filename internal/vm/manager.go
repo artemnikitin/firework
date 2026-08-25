@@ -149,23 +149,44 @@ func NewManagerWithVolumes(firecrackerBin, stateDir string, logger *slog.Logger,
 
 // Preflight validates persistent volumes without changing them. Reconciliation
 // calls this before stopping an existing VM so a failed resize leaves it live.
-func (m *Manager) Preflight(ctx context.Context, svc config.ServiceConfig) error {
+// It also returns any size requests it refused. A rejection never goes through
+// setVolumeError: it is a decision rather than a fault, and recording it there
+// would set a volume_failed reason code and trigger the blanket overwrite that
+// relabels every one of the service's volumes as errored.
+func (m *Manager) Preflight(ctx context.Context, svc config.ServiceConfig) ([]volume.Rejection, error) {
 	if len(svc.Volumes) == 0 {
 		m.setVolumeError(svc.Name, nil)
-		return nil
+		return nil, nil
 	}
 	if err := validateVolumeKernelArgs(svc); err != nil {
 		m.setVolumeError(svc.Name, err)
-		return err
+		return nil, err
 	}
 	if m.volumeManager == nil {
 		err := fmt.Errorf("service %s declares volumes but agent storage is not configured", svc.Name)
 		m.setVolumeError(svc.Name, err)
-		return err
+		return nil, err
 	}
-	err := m.volumeManager.Preflight(ctx, svc)
+	rejections, err := m.volumeManager.Preflight(ctx, svc)
 	m.setVolumeError(svc.Name, err)
-	return err
+	return rejections, err
+}
+
+// VolumeRejections returns the agent's current per-volume refusal snapshot.
+func (m *Manager) VolumeRejections() map[string]volume.Rejection {
+	if m.volumeManager == nil {
+		return nil
+	}
+	return m.volumeManager.Rejections()
+}
+
+// NormalizeVolumes clamps a desired node configuration to the sizes the node
+// is actually able to serve, before anything else in the tick reads it.
+func (m *Manager) NormalizeVolumes(services []config.ServiceConfig) {
+	if m.volumeManager == nil {
+		return
+	}
+	m.volumeManager.NormalizeVolumes(services)
 }
 
 // VolumeError returns the latest persistent-volume preparation failure for a
@@ -174,6 +195,32 @@ func (m *Manager) VolumeError(service string) string {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	return m.volumeErrors[service]
+}
+
+// clampToPrepared substitutes the effective configuration — size and
+// generation — for every volume whose request was refused, so the instance the
+// next tick compares against describes what is actually running. The refused
+// request is reported from the volume manager's rejection snapshot instead,
+// which is what the control-plane acknowledgement matches on.
+func clampToPrepared(svc config.ServiceConfig, prepared []volume.PreparedVolume) config.ServiceConfig {
+	effective := make(map[string]volume.PreparedVolume, len(prepared))
+	for _, preparedVolume := range prepared {
+		if preparedVolume.Rejected {
+			effective[preparedVolume.LogicalID] = preparedVolume
+		}
+	}
+	if len(effective) == 0 {
+		return svc
+	}
+	clamped := svc
+	clamped.Volumes = append([]config.VolumeConfig(nil), svc.Volumes...)
+	for i := range clamped.Volumes {
+		if preparedVolume, ok := effective[svc.Name+"/"+clamped.Volumes[i].Name]; ok {
+			clamped.Volumes[i].SizeBytes = preparedVolume.SizeBytes
+			clamped.Volumes[i].ResizeGeneration = preparedVolume.ResizeGeneration
+		}
+	}
+	return clamped
 }
 
 func (m *Manager) setVolumeError(service string, err error) {
@@ -385,6 +432,15 @@ func (m *Manager) finishStart(ctx context.Context, svc config.ServiceConfig, sta
 		m.logger.Info("start aborted before launch", "service", svc.Name)
 		return fmt.Errorf("service %s: %w", svc.Name, ErrStartAborted)
 	}
+
+	// Clamp the service configuration to what was actually prepared. A refused
+	// shrink prepares successfully at the applied size, and everything
+	// downstream — the config hash, the Firecracker config, the ownership
+	// manifest, and the instance the next tick compares against — must describe
+	// that effective configuration. Storing it here is what makes needsUpdate
+	// compare equal on the following tick rather than one convergence cycle
+	// later.
+	svc = clampToPrepared(svc, prepared)
 
 	configPath, err := m.writeVMConfig(vmDir, svc, prepared)
 	if err != nil {

@@ -241,6 +241,13 @@ func (a *Agent) refreshAgentStatus(phase statusmodel.Phase, code, message string
 		previous[service.Name] = service
 	}
 
+	// The refusal snapshot is read from the volume manager directly rather
+	// than inferred from a running instance's prepared volumes. A preflight
+	// rejection produces no fresh preparation to read — it refuses the update
+	// before anything is stopped, so the instance still describes the previous
+	// one — and that coupling is what used to break the preflight path.
+	rejections := a.vmManager.VolumeRejections()
+
 	services := make([]statusmodel.ServiceStatus, 0, len(a.statusServices))
 	ready := 0
 	for _, desired := range a.statusServices {
@@ -270,9 +277,9 @@ func (a *Agent) refreshAgentStatus(phase statusmodel.Phase, code, message string
 			for _, prepared := range instance.Volumes {
 				preparedByID[prepared.LogicalID] = prepared
 			}
-			service.Volumes = BuildVolumeStatuses(desired, preparedByID)
+			service.Volumes = BuildVolumeStatusesWithRejections(desired, preparedByID, rejections)
 		} else {
-			service.Volumes = BuildVolumeStatuses(desired, nil)
+			service.Volumes = BuildVolumeStatusesWithRejections(desired, nil, rejections)
 		}
 		if volumeError := a.vmManager.VolumeError(desired.Name); volumeError != "" {
 			service.ReasonCode = "volume_failed"
@@ -282,6 +289,11 @@ func (a *Agent) refreshAgentStatus(phase statusmodel.Phase, code, message string
 				desiredGeneration[desired.Name+"/"+desiredVolume.Name] = desiredVolume.ResizeGeneration
 			}
 			for i := range service.Volumes {
+				// A refused size is not a failure, and a genuine failure on
+				// one volume must not relabel a rejection on another.
+				if service.Volumes[i].State == "rejected" {
+					continue
+				}
 				service.Volumes[i].State = "error"
 				service.Volumes[i].LastError = statusmodel.BoundedMessage(volumeError)
 				service.Volumes[i].ResizeGeneration = desiredGeneration[service.Volumes[i].LogicalID]
@@ -333,6 +345,19 @@ func (a *Agent) refreshAgentStatus(phase statusmodel.Phase, code, message string
 // real agent uses, rather than hand-building a statusmodel.VolumeStatus and
 // only coincidentally matching what this function actually sends.
 func BuildVolumeStatuses(service config.ServiceConfig, prepared map[string]volume.PreparedVolume) []statusmodel.VolumeStatus {
+	return BuildVolumeStatusesWithRejections(service, prepared, nil)
+}
+
+// BuildVolumeStatusesWithRejections additionally reports a refused size
+// request as its own state.
+//
+// A rejection cannot ride on the "prepared" branch: after a refusal Prepare
+// succeeds at the old size, so the volume looks prepared, but the control
+// plane's acknowledgement requires the observed applied size to equal the
+// record's desired size — which is exactly what a rejection makes false. It
+// therefore gets a third state alongside pending and prepared, carrying the
+// *requested* generation so it matches the record it has to converge.
+func BuildVolumeStatusesWithRejections(service config.ServiceConfig, prepared map[string]volume.PreparedVolume, rejections map[string]volume.Rejection) []statusmodel.VolumeStatus {
 	statuses := make([]statusmodel.VolumeStatus, 0, len(service.Volumes))
 	for _, desired := range service.Volumes {
 		// logicalID (untruncated) is the map key shared with volume.Manager's
@@ -349,6 +374,24 @@ func BuildVolumeStatuses(service config.ServiceConfig, prepared map[string]volum
 			status.AppliedSizeBytes = applied.SizeBytes
 			status.ResizeGeneration = applied.ResizeGeneration
 			status.State = "prepared"
+		}
+		// Matched by logical ID alone. The desired config reaching status has
+		// already been normalized to the effective generation, so comparing
+		// generations here would never match — and the snapshot is the durable
+		// truth either way: it is rebuilt from the manifests, and a resize that
+		// actually applies clears it.
+		if rejection, ok := rejections[logicalID]; ok {
+			status.State = "rejected"
+			status.AppliedSizeBytes = rejection.AppliedSizeBytes
+			status.RequestedSizeBytes = rejection.RequestedSizeBytes
+			status.Rejected = true
+			status.RejectedReason = "shrink_below_minimum"
+			// The requested generation, not the manifest's applied one: the
+			// usual override would report a generation the record cannot match.
+			status.ResizeGeneration = rejection.ResizeGeneration
+			status.LastError = statusmodel.BoundedMessage(fmt.Sprintf(
+				"requested %d bytes is below the safe minimum %d for the current contents",
+				rejection.RequestedSizeBytes, rejection.MinimumSizeBytes))
 		}
 		statuses = append(statuses, status)
 	}

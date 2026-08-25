@@ -347,6 +347,13 @@ func (a *Agent) tick(ctx context.Context) {
 	a.setStatusCondition("ConfigFetched", statusmodel.ConditionTrue, "", "")
 	a.setStatusCondition("ConfigParsed", statusmodel.ConditionTrue, "", "")
 
+	// Clamp any volume size this node has already refused, before anything
+	// else in the tick reads the merged configuration. Normalizing later — say,
+	// just before Plan — would leave the status snapshot describing the raw
+	// requested size while Plan, the instance, and the Firecracker config all
+	// use the effective one, and the two surfaces would disagree permanently.
+	a.vmManager.NormalizeVolumes(merged.Services)
+
 	// Check revision only after fetch, so stores that update revision state
 	// during Fetch (Git pull, object write token) are evaluated against fresh data.
 	// For multi-label nodes we skip this optimization because revision is

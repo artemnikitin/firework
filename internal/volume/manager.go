@@ -15,6 +15,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -38,14 +39,68 @@ var (
 	ErrSharedUnsupported = errors.New("shared volumes require the durable per-VM supervisor and fencing validation")
 )
 
+// ErrShrinkRejected reports that a requested shrink is below the safe minimum
+// for the filesystem's current contents. It is a *decision*, not a fault: the
+// distinction is what lets the caller keep the workload running instead of
+// treating a refusal like a failed operation.
+//
+// LogicalID is carried because two volumes sharing a size and generation are
+// otherwise indistinguishable, and the clamp cannot tell which one it applies
+// to.
+type ErrShrinkRejected struct {
+	LogicalID  string
+	Requested  int64
+	Minimum    int64
+	Generation int64
+}
+
+func (e *ErrShrinkRejected) Error() string {
+	return fmt.Sprintf("volume %s: shrink target %d is below safe minimum %d", e.LogicalID, e.Requested, e.Minimum)
+}
+
+// Rejection is a durable refusal of one volume's size request, as reported to
+// status and consumed by the agent-side clamp.
+type Rejection struct {
+	LogicalID string
+	// ResizeGeneration is the *requested* generation — the one that was
+	// refused. It is what a reported rejection must carry so the control
+	// plane's acknowledgement can match it to the record it has to converge.
+	ResizeGeneration int64
+	// AppliedGeneration is the generation actually applied to the filesystem.
+	// Together with AppliedSizeBytes it is the *effective* configuration: what
+	// the node is running, what Plan compares against, and what the clamp
+	// substitutes. Keeping the two apart is what lets one rejection be both
+	// terminal locally and matchable remotely.
+	AppliedGeneration  int64
+	RequestedSizeBytes int64
+	AppliedSizeBytes   int64
+	MinimumSizeBytes   int64
+	At                 time.Time
+}
+
 // PreparedVolume is safe to attach to a stopped/new Firecracker process.
 type PreparedVolume struct {
-	LogicalID        string
-	PathOnHost       string
-	MountPath        string
-	Type             config.VolumeType
-	SizeBytes        int64
+	LogicalID  string
+	PathOnHost string
+	MountPath  string
+	Type       config.VolumeType
+	// SizeBytes is the *effective* size: what the image actually is. For a
+	// rejected shrink this is the applied size, not the refused request.
+	SizeBytes int64
+	// ResizeGeneration is always the generation actually applied to the
+	// filesystem. Together with SizeBytes it is the effective configuration
+	// the caller stores on the instance, which is what makes the next tick
+	// compare equal instead of re-planning the same update.
 	ResizeGeneration int64
+	// Rejected marks a preparation that succeeded at a size other than the one
+	// requested. It is not an error, so Prepare continues to the next volume
+	// and one pass collects every rejection.
+	Rejected bool
+	// RequestedGeneration and RequestedSizeBytes describe the refused request.
+	// They are reported rather than run.
+	RequestedGeneration int64
+	RequestedSizeBytes  int64
+	MinimumSizeBytes    int64
 }
 
 // Status is the agent-observed state of one logical volume.
@@ -68,7 +123,47 @@ type manifest struct {
 	Filesystem       string            `json:"filesystem"`
 	AppliedSizeBytes int64             `json:"applied_size_bytes"`
 	ResizeGeneration int64             `json:"resize_generation"`
-	UpdatedAt        time.Time         `json:"updated_at"`
+	// The rejection is keyed to one (generation, size) request. Recording it
+	// durably is what makes the refusal terminal without depending on the
+	// control plane: the agent-side clamp reads it locally, so the stop/restart
+	// loop is broken even if the acknowledgement never lands.
+	//
+	// ResizeGeneration deliberately continues to describe the last generation
+	// actually applied to the filesystem. Advancing it here would erase the
+	// evidence that this generation was refused.
+	RejectedGeneration   int64     `json:"rejected_generation,omitempty"`
+	RejectedSizeBytes    int64     `json:"rejected_size_bytes,omitempty"`
+	RejectedMinimumBytes int64     `json:"rejected_minimum_bytes,omitempty"`
+	RejectedAt           time.Time `json:"rejected_at,omitempty"`
+	UpdatedAt            time.Time `json:"updated_at"`
+}
+
+// rejectionFor builds the reported rejection for a manifest that carries one.
+func (m manifest) rejectionFor(generation int64) Rejection {
+	return Rejection{
+		LogicalID: m.LogicalID, ResizeGeneration: generation, AppliedGeneration: m.ResizeGeneration,
+		RequestedSizeBytes: m.RejectedSizeBytes, AppliedSizeBytes: m.AppliedSizeBytes,
+		MinimumSizeBytes: m.RejectedMinimumBytes, At: m.RejectedAt,
+	}
+}
+
+// matchesRejection reports whether a desired volume config is the request this
+// manifest already refused. Both the generation and the requested size must
+// match: direct-Git node configs are hand-authored and carry their own
+// resize_generation, so an operator correcting a refused shrink by editing
+// size_bytes alone presents a different request under the same generation. A
+// generation-only match would clamp that forever.
+func (m manifest) matchesRejection(volume config.VolumeConfig) bool {
+	return m.RejectedGeneration != 0 &&
+		m.RejectedGeneration == volume.ResizeGeneration &&
+		m.RejectedSizeBytes == volume.SizeBytes
+}
+
+func (m *manifest) clearRejection() {
+	m.RejectedGeneration = 0
+	m.RejectedSizeBytes = 0
+	m.RejectedMinimumBytes = 0
+	m.RejectedAt = time.Time{}
 }
 
 // creationMarker is written before the backing image and removed after the
@@ -196,10 +291,19 @@ type Manager struct {
 	runner   CommandRunner
 	mounts   MountVerifier
 	observer Observer
+
+	// rejections is the synchronized per-volume refusal snapshot, updated
+	// wherever a rejection is recorded — preflight or post-stop. Status reads
+	// it directly rather than inferring state from a running instance's
+	// prepared volumes, because a preflight rejection produces no fresh
+	// preparation to read: it fails the update before anything is stopped, so
+	// the instance still describes the *previous* preparation.
+	rejectionMu sync.RWMutex
+	rejections  map[string]Rejection
 }
 
 func NewManager(nodeID string, storage config.StorageConfig) *Manager {
-	return &Manager{nodeID: nodeID, storage: storage, runner: execRunner{}, mounts: procMountVerifier{}}
+	return &Manager{nodeID: nodeID, storage: storage, runner: execRunner{}, mounts: procMountVerifier{}, rejections: make(map[string]Rejection)}
 }
 
 func NewManagerWithObserver(nodeID string, storage config.StorageConfig, observer Observer) *Manager {
@@ -209,73 +313,142 @@ func NewManagerWithObserver(nodeID string, storage config.StorageConfig, observe
 }
 
 func NewManagerWithDependencies(nodeID string, storage config.StorageConfig, runner CommandRunner, mounts MountVerifier) *Manager {
-	return &Manager{nodeID: nodeID, storage: storage, runner: runner, mounts: mounts}
+	return &Manager{nodeID: nodeID, storage: storage, runner: runner, mounts: mounts, rejections: make(map[string]Rejection)}
 }
 
-// Preflight validates every declaration and retained image without mutating it.
-func (m *Manager) Preflight(ctx context.Context, svc config.ServiceConfig) error {
-	_ = ctx
+// Preflight validates every declaration and retained image without mutating it,
+// apart from recording a refusal.
+//
+// It returns the rejections it found alongside its error rather than returning
+// on the first one. A rejection is a decision and a failure is a fault: only
+// the latter aborts the batch, so one pass collects every refusal and the
+// caller never has to retry per volume.
+func (m *Manager) Preflight(ctx context.Context, svc config.ServiceConfig) ([]Rejection, error) {
 	if len(svc.Volumes) == 0 {
-		return nil
+		return nil, nil
 	}
 	if err := validateServiceVolumes(svc.Volumes); err != nil {
-		return fmt.Errorf("service %s: %w", svc.Name, err)
+		return nil, fmt.Errorf("service %s: %w", svc.Name, err)
 	}
 
+	var rejections []Rejection
 	desiredLocal := make(map[string]int64)
 	for _, volume := range svc.Volumes {
 		logicalID := svc.Name + "/" + volume.Name
 		switch volume.Type {
 		case config.VolumeTypeLocal:
 			if m.storage.Local == nil {
-				return fmt.Errorf("volume %s: storage.local is not configured", logicalID)
+				return rejections, fmt.Errorf("volume %s: storage.local is not configured", logicalID)
 			}
 			if volume.BoundNode == "" || volume.BoundNode != m.nodeID {
-				return fmt.Errorf("volume %s: bound_node %q does not match node %q", logicalID, volume.BoundNode, m.nodeID)
+				return rejections, fmt.Errorf("volume %s: bound_node %q does not match node %q", logicalID, volume.BoundNode, m.nodeID)
 			}
 			if m.mounts != nil {
 				if err := m.mounts.Verify(m.storage.Local.Path); err != nil {
-					return fmt.Errorf("volume %s: verify local storage: %w", logicalID, err)
+					return rejections, fmt.Errorf("volume %s: verify local storage: %w", logicalID, err)
 				}
 			}
 			desiredLocal[logicalID] = volume.SizeBytes
 			if err := m.validateExisting(svc.Name, volume, m.storage.Local.Path); err != nil {
-				return err
+				return rejections, err
 			}
-			if err := m.preflightResize(ctx, svc.Name, volume, m.storage.Local.Path); err != nil {
-				return err
+			rejection, err := m.preflightResize(ctx, svc.Name, volume, m.storage.Local.Path)
+			if err != nil {
+				return rejections, err
+			}
+			if rejection != nil {
+				// The effective size is what capacity should be checked
+				// against; charging the refused request would reject a
+				// configuration the node is already running.
+				desiredLocal[logicalID] = rejection.AppliedSizeBytes
+				rejections = append(rejections, *rejection)
 			}
 		case config.VolumeTypeShared:
-			return fmt.Errorf("volume %s: %w", logicalID, ErrSharedUnsupported)
+			return rejections, fmt.Errorf("volume %s: %w", logicalID, ErrSharedUnsupported)
 		default:
-			return fmt.Errorf("volume %s: unsupported type %q", logicalID, volume.Type)
+			return rejections, fmt.Errorf("volume %s: unsupported type %q", logicalID, volume.Type)
 		}
 	}
 	if len(desiredLocal) > 0 {
 		if err := m.checkCapacity(m.storage.Local, desiredLocal); err != nil {
-			return err
+			return rejections, err
 		}
 	}
-	return nil
+	m.refreshRejections(svc)
+	return rejections, nil
 }
 
-func (m *Manager) preflightResize(ctx context.Context, service string, volume config.VolumeConfig, root string) error {
+// preflightResize measures a requested shrink before anything is stopped, and
+// records a refusal durably so the refusal is terminal rather than re-measured
+// on every tick forever.
+//
+// The measurement is advisory: a live resize2fs -P errs in both directions,
+// because guest deletions whose bitmap updates are still in the page cache read
+// too large and guest writes not yet flushed read too small. Terminality is
+// still the right call, because the costs are asymmetric — a false refusal
+// costs the operator one re-request, which mints a new generation and
+// re-measures from scratch, while a non-terminal preflight costs an unbounded
+// measurement loop on every tick.
+//
+// The whole read → measure → write sequence runs under the volume's lifecycle
+// lock, the same lock prepareOne takes. Preflight used to be a pure reader; now
+// that it writes the manifest it can interleave with a concurrent Prepare, and
+// a measurement taken under one lock and written under another is the same lost
+// update with extra steps.
+func (m *Manager) preflightResize(ctx context.Context, service string, volume config.VolumeConfig, root string) (*Rejection, error) {
 	dir, err := volumeDir(root, service, volume.Name)
 	if err != nil {
-		return err
+		return nil, err
 	}
-	var current manifest
-	if err := readJSON(filepath.Join(dir, manifestFilename), &current); err != nil {
-		if os.IsNotExist(err) {
-			return nil
+	manifestPath := filepath.Join(dir, manifestFilename)
+	if _, statErr := os.Stat(manifestPath); statErr != nil {
+		if os.IsNotExist(statErr) {
+			return nil, nil
 		}
-		return err
+		return nil, statErr
+	}
+	lock, err := lockFile(filepath.Join(dir, "lifecycle.lock"))
+	if err != nil {
+		return nil, err
+	}
+	defer unlockFile(lock)
+
+	var current manifest
+	if err := readJSON(manifestPath, &current); err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	if current.matchesRejection(volume) {
+		// Already refused, for exactly this request. Re-measuring would be the
+		// unbounded loop this record exists to stop.
+		rejection := current.rejectionFor(volume.ResizeGeneration)
+		return &rejection, nil
 	}
 	if volume.SizeBytes >= current.AppliedSizeBytes {
-		return nil
+		return nil, nil
 	}
-	imagePath := filepath.Join(dir, imageFilename)
-	return m.inspectShrinkMinimum(ctx, service, volume, imagePath)
+	err = m.inspectShrinkMinimum(ctx, service, volume, filepath.Join(dir, imageFilename))
+	var rejected *ErrShrinkRejected
+	if errors.As(err, &rejected) {
+		// Nothing has been stopped and no resize has begun, so there is no
+		// transaction to clean up here — only the manifest write applies.
+		current.RejectedGeneration = volume.ResizeGeneration
+		current.RejectedSizeBytes = volume.SizeBytes
+		current.RejectedMinimumBytes = rejected.Minimum
+		current.RejectedAt = time.Now().UTC()
+		current.UpdatedAt = current.RejectedAt
+		if writeErr := writeJSONAtomic(manifestPath, current); writeErr != nil {
+			return nil, writeErr
+		}
+		if syncErr := syncDir(dir); syncErr != nil {
+			return nil, syncErr
+		}
+		rejection := current.rejectionFor(volume.ResizeGeneration)
+		return &rejection, nil
+	}
+	return nil, err
 }
 
 func (m *Manager) inspectShrinkMinimum(ctx context.Context, service string, volume config.VolumeConfig, imagePath string) error {
@@ -300,7 +473,10 @@ func (m *Manager) inspectShrinkMinimum(ctx context.Context, service string, volu
 	// guarantee and can change after a final fsck.
 	minimumWithHeadroom := minimumBytes + minimumBytes/20
 	if volume.SizeBytes < minimumWithHeadroom {
-		return fmt.Errorf("volume %s/%s: shrink target %d is below safe minimum %d", service, volume.Name, volume.SizeBytes, minimumWithHeadroom)
+		return &ErrShrinkRejected{
+			LogicalID: service + "/" + volume.Name, Requested: volume.SizeBytes,
+			Minimum: minimumWithHeadroom, Generation: volume.ResizeGeneration,
+		}
 	}
 	return nil
 }
@@ -308,7 +484,7 @@ func (m *Manager) inspectShrinkMinimum(ctx context.Context, service string, volu
 // Prepare creates/reuses/resizes all service images in deterministic order.
 // Callers must invoke Preflight before stopping a running VM.
 func (m *Manager) Prepare(ctx context.Context, svc config.ServiceConfig) ([]PreparedVolume, error) {
-	if err := m.Preflight(ctx, svc); err != nil {
+	if _, err := m.Preflight(ctx, svc); err != nil {
 		if m.observer != nil {
 			outcome := "failure"
 			if strings.Contains(err.Error(), "quarantined") {
@@ -327,10 +503,14 @@ func (m *Manager) Prepare(ctx context.Context, svc config.ServiceConfig) ([]Prep
 		root := m.storage.Local.Path
 		p, err := m.prepareOne(ctx, svc.Name, volume, root)
 		if err != nil {
+			// A genuine failure still aborts the batch: a rejection is a
+			// decision, a failure is a fault, and only the latter means the
+			// remaining volumes cannot be trusted.
 			return nil, err
 		}
 		prepared = append(prepared, p)
 	}
+	m.refreshRejections(svc)
 	return prepared, nil
 }
 
@@ -394,6 +574,7 @@ func (m *Manager) prepareOne(ctx context.Context, service string, volume config.
 		}
 		m.observer.ObserveVolumeOperation(string(volume.Type), operation, outcome, time.Since(started))
 	}()
+	var rejection *Rejection
 	dir, err := volumeDir(root, service, volume.Name)
 	if err != nil {
 		return PreparedVolume{}, err
@@ -463,7 +644,27 @@ func (m *Manager) prepareOne(ctx context.Context, service string, volume config.
 				return PreparedVolume{}, err
 			}
 		}
-		if current.AppliedSizeBytes != volume.SizeBytes || current.ResizeGeneration != volume.ResizeGeneration {
+		// The clamped configuration needs its own branch, evaluated before the
+		// resize condition. The clamp substitutes the applied size but keeps
+		// the *requested* generation — which is what the acknowledgement has
+		// to match — so it still satisfies the generation arm below and would
+		// re-enter resize forever. A short-circuit keyed on the requested
+		// (generation, size) pair cannot help either: the manifest records the
+		// rejection at the refused size while the clamped input presents the
+		// applied one, so the two never match by construction.
+		//
+		// The applied-size equality is what keeps a genuinely new request from
+		// being clamped: a raw config arriving at a matching generation but a
+		// non-applied size falls through to resize and re-measures.
+		if current.RejectedGeneration != 0 && current.RejectedGeneration == volume.ResizeGeneration &&
+			volume.SizeBytes == current.AppliedSizeBytes {
+			operation = "rejected"
+			rejection = &Rejection{
+				LogicalID: current.LogicalID, ResizeGeneration: volume.ResizeGeneration,
+				RequestedSizeBytes: current.RejectedSizeBytes, AppliedSizeBytes: current.AppliedSizeBytes,
+				MinimumSizeBytes: current.RejectedMinimumBytes, At: current.RejectedAt,
+			}
+		} else if current.AppliedSizeBytes != volume.SizeBytes || current.ResizeGeneration != volume.ResizeGeneration {
 			operation = "grow"
 			if volume.SizeBytes < current.AppliedSizeBytes {
 				operation = "shrink"
@@ -477,20 +678,39 @@ func (m *Manager) prepareOne(ctx context.Context, service string, volume config.
 					return PreparedVolume{}, fmt.Errorf("volume %s/%s: resize transaction does not match desired generation; quarantined", service, volume.Name)
 				}
 			}
-			if err := m.resize(ctx, dir, imagePath, &current, volume); err != nil {
+			resized, err := m.resize(ctx, dir, imagePath, &current, volume)
+			if err != nil {
 				return PreparedVolume{}, err
 			}
+			rejection = resized
 		}
 	}
 
-	return PreparedVolume{
+	prepared = PreparedVolume{
 		LogicalID: service + "/" + volume.Name, PathOnHost: imagePath,
 		MountPath: volume.MountPath, Type: volume.Type, SizeBytes: current.AppliedSizeBytes,
 		ResizeGeneration: current.ResizeGeneration,
-	}, nil
+	}
+	if rejection != nil {
+		// A rejection is a non-fatal outcome of a *successful* preparation, so
+		// no error is returned and Prepare continues to the next volume. One
+		// pass therefore collects every rejection, without a retry budget that
+		// a second rejected volume would exhaust.
+		prepared.Rejected = true
+		prepared.RequestedSizeBytes = rejection.RequestedSizeBytes
+		prepared.RequestedGeneration = rejection.ResizeGeneration
+		prepared.MinimumSizeBytes = rejection.MinimumSizeBytes
+	}
+	return prepared, nil
 }
 
-func (m *Manager) resize(ctx context.Context, dir, imagePath string, current *manifest, desired config.VolumeConfig) error {
+// resize applies a size change, or refuses one.
+//
+// A refusal returns a Rejection and no error, because by this point
+// deleteService has already stopped the VM: treating the refusal as a failure
+// would leave the workload down, which is precisely what the caller must be
+// able to avoid.
+func (m *Manager) resize(ctx context.Context, dir, imagePath string, current *manifest, desired config.VolumeConfig) (*Rejection, error) {
 	transactionPath := filepath.Join(dir, transactionFilename)
 	direction := "grow"
 	if desired.SizeBytes < current.AppliedSizeBytes {
@@ -501,63 +721,112 @@ func (m *Manager) resize(ctx context.Context, dir, imagePath string, current *ma
 		Generation: desired.ResizeGeneration, Direction: direction, Phase: "checking", UpdatedAt: time.Now().UTC(),
 	}
 	if err := writeJSONAtomic(transactionPath, tx); err != nil {
-		return fmt.Errorf("write resize transaction: %w", err)
+		return nil, fmt.Errorf("write resize transaction: %w", err)
 	}
 	if _, err := m.runner.RunDestructive(ctx, "e2fsck", "-f", "-y", imagePath); err != nil {
-		return err
+		return nil, err
 	}
 	if direction == "shrink" {
 		parts := strings.SplitN(current.LogicalID, "/", 2)
 		service := parts[0]
-		if err := m.inspectShrinkMinimum(ctx, service, desired, imagePath); err != nil {
-			return err
+		err := m.inspectShrinkMinimum(ctx, service, desired, imagePath)
+		var rejected *ErrShrinkRejected
+		if errors.As(err, &rejected) {
+			rejection, cleanupErr := m.recordShrinkRejection(dir, current, desired, rejected)
+			if cleanupErr != nil {
+				return nil, cleanupErr
+			}
+			return rejection, nil
+		}
+		if err != nil {
+			return nil, err
 		}
 	}
 
 	if direction == "grow" {
 		tx.Phase = "file_extended"
 		if err := writeJSONAtomic(transactionPath, tx); err != nil {
-			return err
+			return nil, err
 		}
 		if err := os.Truncate(imagePath, desired.SizeBytes); err != nil {
-			return fmt.Errorf("extend backing image: %w", err)
+			return nil, fmt.Errorf("extend backing image: %w", err)
 		}
 		if _, err := m.runner.RunDestructive(ctx, "resize2fs", imagePath); err != nil {
-			return err
+			return nil, err
 		}
 	} else {
 		tx.Phase = "filesystem_shrinking"
 		if err := writeJSONAtomic(transactionPath, tx); err != nil {
-			return err
+			return nil, err
 		}
 		if _, err := m.runner.RunDestructive(ctx, "resize2fs", imagePath, strconv.FormatInt(desired.SizeBytes/1024, 10)+"K"); err != nil {
-			return err
+			return nil, err
 		}
 		tx.Phase = "filesystem_shrunk"
 		if err := writeJSONAtomic(transactionPath, tx); err != nil {
-			return err
+			return nil, err
 		}
 		if err := os.Truncate(imagePath, desired.SizeBytes); err != nil {
-			return fmt.Errorf("truncate backing image after filesystem shrink: %w", err)
+			return nil, fmt.Errorf("truncate backing image after filesystem shrink: %w", err)
 		}
 	}
 
 	if _, err := m.runner.RunDestructive(ctx, "e2fsck", "-f", "-y", imagePath); err != nil {
-		return err
+		return nil, err
 	}
 	current.AppliedSizeBytes = desired.SizeBytes
 	current.ResizeGeneration = desired.ResizeGeneration
+	// A size actually applied supersedes any earlier refusal.
+	current.clearRejection()
 	current.UpdatedAt = time.Now().UTC()
 	if err := writeJSONAtomic(filepath.Join(dir, manifestFilename), current); err != nil {
-		return err
+		return nil, err
 	}
 	if err := os.Remove(transactionPath); err != nil && !os.IsNotExist(err) {
-		return fmt.Errorf("remove resize transaction: %w", err)
+		return nil, fmt.Errorf("remove resize transaction: %w", err)
 	}
 	if err := syncDir(dir); err != nil {
-		return fmt.Errorf("sync volume directory: %w", err)
+		return nil, fmt.Errorf("sync volume directory: %w", err)
 	}
-	return nil
+	return nil, nil
+}
+
+// recordShrinkRejection cleans up the checking transaction and records the
+// refusal, in that order.
+//
+// The order is fixed and crash-consistent. Writing the rejection first risks
+// "rejection recorded plus stale checking transaction", which is exactly the
+// state that quarantines the corrected retry: prepareOne compares the stale
+// transaction's generation against the new one and refuses to proceed. Crashing
+// after the removal instead loses only the rejection record — the request is
+// re-measured, refused again, and recorded on the next pass, which is
+// idempotent and self-healing.
+//
+// Removing the transaction is safe here not because nothing has touched the
+// image (e2fsck ran, and may have replayed a journal) but because the checking
+// phase completes without changing the filesystem's *geometry*. No
+// partially-applied resize exists for the transaction to describe. Every later
+// phase has moved geometry, and its transaction must survive for recovery.
+func (m *Manager) recordShrinkRejection(dir string, current *manifest, desired config.VolumeConfig, rejected *ErrShrinkRejected) (*Rejection, error) {
+	if err := os.Remove(filepath.Join(dir, transactionFilename)); err != nil && !os.IsNotExist(err) {
+		return nil, fmt.Errorf("remove checking transaction after rejection: %w", err)
+	}
+	if err := syncDir(dir); err != nil {
+		return nil, err
+	}
+	current.RejectedGeneration = desired.ResizeGeneration
+	current.RejectedSizeBytes = desired.SizeBytes
+	current.RejectedMinimumBytes = rejected.Minimum
+	current.RejectedAt = time.Now().UTC()
+	current.UpdatedAt = current.RejectedAt
+	if err := writeJSONAtomic(filepath.Join(dir, manifestFilename), current); err != nil {
+		return nil, err
+	}
+	if err := syncDir(dir); err != nil {
+		return nil, err
+	}
+	rejection := current.rejectionFor(desired.ResizeGeneration)
+	return &rejection, nil
 }
 
 func (m *Manager) checkCapacity(pool *config.LocalStorageConfig, desired map[string]int64) error {
@@ -602,6 +871,106 @@ func (m *Manager) checkCapacity(pool *config.LocalStorageConfig, desired map[str
 		return fmt.Errorf("local storage free space is insufficient: growth needs %d bytes, %d available", growth, available)
 	}
 	return nil
+}
+
+// refreshRejections rebuilds the refusal snapshot for one service from the
+// durable manifests.
+//
+// It reads the manifests rather than only the outcomes of this pass because
+// the clamp erases the evidence from the desired configuration: once the
+// effective size and generation are substituted, neither the preflight nor
+// prepareOne has anything left to refuse, and a snapshot built from outcomes
+// alone would clear itself on the very tick that proves the rejection is
+// working. The manifest is where the rejection actually lives, and a resize
+// that succeeds clears it there.
+func (m *Manager) refreshRejections(svc config.ServiceConfig) {
+	if m == nil || m.storage.Local == nil {
+		return
+	}
+	m.rejectionMu.Lock()
+	defer m.rejectionMu.Unlock()
+	for _, declared := range svc.Volumes {
+		logicalID := svc.Name + "/" + declared.Name
+		if declared.Type != config.VolumeTypeLocal {
+			delete(m.rejections, logicalID)
+			continue
+		}
+		dir, err := volumeDir(m.storage.Local.Path, svc.Name, declared.Name)
+		if err != nil {
+			delete(m.rejections, logicalID)
+			continue
+		}
+		var current manifest
+		if err := readJSON(filepath.Join(dir, manifestFilename), &current); err != nil || current.RejectedGeneration == 0 {
+			delete(m.rejections, logicalID)
+			continue
+		}
+		m.rejections[logicalID] = current.rejectionFor(current.RejectedGeneration)
+	}
+}
+
+// Rejections returns the current refusal snapshot, keyed by logical ID.
+func (m *Manager) Rejections() map[string]Rejection {
+	if m == nil {
+		return nil
+	}
+	m.rejectionMu.RLock()
+	defer m.rejectionMu.RUnlock()
+	out := make(map[string]Rejection, len(m.rejections))
+	for id, rejection := range m.rejections {
+		out[id] = rejection
+	}
+	return out
+}
+
+// NormalizeVolumes rewrites a desired node configuration so every volume whose
+// exact request has already been refused renders its effective size instead.
+//
+// This closes the window before the control plane's own clamp catches up:
+// acknowledging a rejection and re-rendering takes at least one control-plane
+// cycle, and during that window the node config still carries the refused size.
+// Running the clamp here means needsUpdate, Prepare, and writeVMConfig all see
+// one configuration, and the instance stores that same configuration — so it
+// compares equal on the very next tick rather than one convergence cycle later.
+//
+// It reads the manifests rather than the in-memory snapshot so it is correct on
+// the first tick after an agent restart, when nothing has been measured yet.
+//
+// The match is on both generation and requested size (see manifest.matchesRejection),
+// which is what lets a hand-authored direct-Git config correct a refused shrink
+// by editing size_bytes alone.
+func (m *Manager) NormalizeVolumes(services []config.ServiceConfig) {
+	if m == nil || m.storage.Local == nil {
+		return
+	}
+	for si := range services {
+		for vi := range services[si].Volumes {
+			volume := &services[si].Volumes[vi]
+			if volume.Type != config.VolumeTypeLocal {
+				continue
+			}
+			dir, err := volumeDir(m.storage.Local.Path, services[si].Name, volume.Name)
+			if err != nil {
+				continue
+			}
+			var current manifest
+			if err := readJSON(filepath.Join(dir, manifestFilename), &current); err != nil {
+				continue
+			}
+			if !current.matchesRejection(*volume) {
+				continue
+			}
+			// Substitute the whole effective configuration — size *and*
+			// generation. Clamping only the size leaves the generation
+			// differing forever, and needsUpdate compares whole volume
+			// configs: the service would be re-planned on every tick, which is
+			// exactly the loop this is here to end. The refused request is not
+			// lost: it is reported from the rejection snapshot, which is where
+			// the acknowledgement reads it.
+			volume.SizeBytes = current.AppliedSizeBytes
+			volume.ResizeGeneration = current.ResizeGeneration
+		}
+	}
 }
 
 // ObservePool publishes the local pool gauges from retained state alone. It is

@@ -3,7 +3,10 @@ package main
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
+
+	"github.com/artemnikitin/firework/internal/config"
 )
 
 func writeTenant(t *testing.T, root, tenant, body string) {
@@ -77,5 +80,51 @@ metadata:
 	}
 	if err := run(dir, true); err == nil {
 		t.Fatal("expected failure with --require-remote-routing")
+	}
+}
+
+func TestRunNodeConfig_WarnsOnVolumeSizeWithoutGeneration(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "node.yaml")
+	if err := os.WriteFile(path, []byte(`node: node-1
+services:
+  - name: db
+    image: /images/db.ext4
+    kernel: /images/vmlinux
+    vcpus: 1
+    memory_mb: 512
+    volumes:
+      - name: data
+        type: local
+        mount_path: /var/lib/db
+        size_bytes: 10737418240
+        bound_node: node-1
+`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := runNodeConfig(path); err != nil {
+		t.Fatalf("an absent generation is advisory, not a failure: %v", err)
+	}
+
+	nc, err := config.ParseNodeConfig([]byte(`node: node-1
+services:
+  - name: db
+    volumes:
+      - name: data
+        type: local
+        mount_path: /var/lib/db
+        size_bytes: 10737418240
+`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	warnings := config.NodeConfigWarnings(nc)
+	if len(warnings) != 1 || !strings.Contains(warnings[0], "resize_generation") {
+		t.Fatalf("expected a resize_generation warning, got %#v", warnings)
+	}
+
+	nc.Services[0].Volumes[0].ResizeGeneration = 1
+	if got := config.NodeConfigWarnings(nc); len(got) != 0 {
+		t.Fatalf("a declared generation must not warn, got %#v", got)
 	}
 }

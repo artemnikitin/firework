@@ -419,7 +419,7 @@ func (c *Controller) acknowledgeVolumeRecords(ctx context.Context) error {
 		}
 		for _, service := range node.AgentStatus.Services {
 			for _, observed := range service.Volumes {
-				if observed.State != "prepared" && observed.State != "error" {
+				if observed.State != "prepared" && observed.State != "error" && observed.State != "rejected" {
 					continue
 				}
 				parts := strings.Split(observed.LogicalID, "/")
@@ -464,6 +464,35 @@ func (c *Controller) acknowledgeVolumeRecords(ctx context.Context) error {
 					record.AppliedSizeBytes = observed.AppliedSizeBytes
 					record.ResizeState = VolumeResizeApplied
 					record.LastError = ""
+				case "rejected":
+					// The agent refused this size. Converge the record on the
+					// effective size in one write: RequestedSizeBytes keeps the
+					// refused size for display, DesiredSizeBytes becomes what
+					// is actually running, and the generation is left alone so
+					// the rejection stays keyed to this one request.
+					//
+					// After this write DesiredSizeBytes means "effective" for
+					// both rejection kinds, which is what lets one clamp serve
+					// both. The invariant is that the record never renders a
+					// size the cluster is not running.
+					if observed.AppliedSizeBytes <= 0 || observed.RequestedSizeBytes <= 0 {
+						continue
+					}
+					if record.ResizeState == VolumeResizeRejected &&
+						record.DesiredSizeBytes == observed.AppliedSizeBytes &&
+						record.AppliedSizeBytes == observed.AppliedSizeBytes &&
+						record.RequestedSizeBytes == observed.RequestedSizeBytes {
+						continue
+					}
+					if record.RejectedAt.IsZero() || record.RequestedSizeBytes != observed.RequestedSizeBytes {
+						record.RejectedAt = time.Now().UTC()
+					}
+					record.RequestedSizeBytes = observed.RequestedSizeBytes
+					record.DesiredSizeBytes = observed.AppliedSizeBytes
+					record.AppliedSizeBytes = observed.AppliedSizeBytes
+					record.ResizeState = VolumeResizeRejected
+					record.RejectedReason = observed.RejectedReason
+					record.LastError = statusmodel.BoundedMessage(observed.LastError)
 				case "error":
 					if record.ResizeState == VolumeResizeFailed && record.LastError == statusmodel.BoundedMessage(observed.LastError) {
 						continue
