@@ -109,3 +109,33 @@ func TestWithdrawnRequestStopsBeingReported(t *testing.T) {
 		t.Fatalf("a withdrawn request is not a standing refusal: %#v", manager.Rejections())
 	}
 }
+
+// The clamp/report split is only unambiguous because a refused size is always
+// strictly below the applied size — both refusal sites reach the measurement
+// only on a shrink. If that ever stopped holding, matchesRejection's two arms
+// could match the same value and a withdrawn request would be indistinguishable
+// from a standing one, silently degrading the node forever.
+func TestARefusedSizeIsAlwaysBelowTheAppliedSize(t *testing.T) {
+	manager, root := hardeningManager(t, &fakeRunner{})
+	if _, err := manager.Prepare(context.Background(), localService(16*config.MiB, 1)); err != nil {
+		t.Fatal(err)
+	}
+
+	// A grow is never measured for a minimum, so it can never be refused.
+	if rejections, err := manager.Preflight(context.Background(), localService(32*config.MiB, 2)); err != nil || len(rejections) != 0 {
+		t.Fatalf("a grow must not be refusable: %#v, %v", rejections, err)
+	}
+	// Nor is a request for the size already applied.
+	if rejections, err := manager.Preflight(context.Background(), localService(16*config.MiB, 2)); err != nil || len(rejections) != 0 {
+		t.Fatalf("an unchanged size must not be refusable: %#v, %v", rejections, err)
+	}
+
+	if _, err := manager.Prepare(context.Background(), localService(2*config.MiB, 3)); err != nil {
+		t.Fatal(err)
+	}
+	found := readManifest(t, root, "app", "data")
+	if found.RejectedSizeBytes >= found.AppliedSizeBytes {
+		t.Fatalf("a refused size must be strictly below the applied size: refused %d, applied %d",
+			found.RejectedSizeBytes, found.AppliedSizeBytes)
+	}
+}
