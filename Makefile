@@ -26,7 +26,7 @@ LDFLAGS   := -s -w \
 	-X '$(MODULE)/internal/version.Commit=$(COMMIT)' \
 	-X '$(MODULE)/internal/version.BuildTime=$(BUILD_TIME)'
 
-.PHONY: all build-all build-agent build-controlplane build-configcheck build-fireworkctl build-fireworkctl-release build-fc-init build-linux-amd64 build-linux-arm64 clean test test-verbose test-race lint vet fmt tidy run smoke-local docker-build-controlplane-image docker-push-controlplane-image push-controlplane-image install help
+.PHONY: all build-all build-agent build-controlplane build-configcheck build-fireworkctl build-fireworkctl-release build-fc-init build-linux-amd64 build-linux-arm64 clean test test-verbose test-race lint vet fmt tidy run smoke-local validate-e2e-local validate-e2e-local-clean docker-build-controlplane-image docker-push-controlplane-image push-controlplane-image install help
 
 all: build-all ## Alias for build-all
 
@@ -117,6 +117,12 @@ run: build-agent ## Build and run with example config
 
 smoke-local: ## Run local smoke test with fake firecracker
 	./scripts/smoke-local.sh
+
+validate-e2e-local: ## Run the local two-node E2E lab with real Firecracker and S3
+	./validation/e2e-local/scripts/validate.sh
+
+validate-e2e-local-clean: ## Destroy a retained local E2E lab (set FIREWORK_E2E_MANIFEST)
+	./validation/e2e-local/scripts/destroy-lab.sh "$(FIREWORK_E2E_MANIFEST)"
 
 docker-build-controlplane-image: ## Build control-plane image locally (linux/amd64)
 	docker buildx build --platform linux/amd64 --file Dockerfile.controlplane \
