@@ -406,6 +406,10 @@ func overlapsVolumePath(path string, volumePaths []string) bool {
 	return false
 }
 
+// chownFn is a seam so the walk can be observed in tests without running as
+// root. Production always uses os.Lchown.
+var chownFn = os.Lchown
+
 // chownPathRecursive walks a writable path, pruning any volume mount point it
 // reaches. A mounted volume carries its own ownership on its own ext4
 // filesystem; descending into it is both wrong and potentially expensive.
@@ -415,7 +419,7 @@ func chownPathRecursive(path string, volumePaths []string, uid, gid int) error {
 		return err
 	}
 	if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
-		return os.Lchown(path, uid, gid)
+		return chownFn(path, uid, gid)
 	}
 
 	pruned := make(map[string]struct{}, len(volumePaths))
@@ -432,7 +436,7 @@ func chownPathRecursive(path string, volumePaths []string, uid, gid int) error {
 			}
 			return nil
 		}
-		return os.Lchown(p, uid, gid)
+		return chownFn(p, uid, gid)
 	})
 }
 
