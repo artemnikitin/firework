@@ -923,6 +923,20 @@ func (m *Manager) Rejections() map[string]Rejection {
 	return out
 }
 
+// SeedRejectionsForTest installs a refusal snapshot directly. Production only
+// ever populates it from the durable manifests, through refreshRejections.
+func (m *Manager) SeedRejectionsForTest(rejections map[string]Rejection) {
+	if m == nil {
+		return
+	}
+	m.rejectionMu.Lock()
+	defer m.rejectionMu.Unlock()
+	m.rejections = make(map[string]Rejection, len(rejections))
+	for id, rejection := range rejections {
+		m.rejections[id] = rejection
+	}
+}
+
 // NormalizeVolumes rewrites a desired node configuration so every volume whose
 // exact request has already been refused renders its effective size instead.
 //

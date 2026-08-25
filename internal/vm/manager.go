@@ -180,6 +180,16 @@ func (m *Manager) VolumeRejections() map[string]volume.Rejection {
 	return m.volumeManager.Rejections()
 }
 
+// SeedVolumeRejectionsForTest installs a refusal snapshot without running a
+// real filesystem operation, so the status and convergence paths can be
+// exercised without a live pool.
+func (m *Manager) SeedVolumeRejectionsForTest(rejections map[string]volume.Rejection) {
+	if m.volumeManager == nil {
+		return
+	}
+	m.volumeManager.SeedRejectionsForTest(rejections)
+}
+
 // NormalizeVolumes clamps a desired node configuration to the sizes the node
 // is actually able to serve, before anything else in the tick reads it.
 func (m *Manager) NormalizeVolumes(services []config.ServiceConfig) {

@@ -353,6 +353,7 @@ func (a *Agent) tick(ctx context.Context) {
 	// requested size while Plan, the instance, and the Firecracker config all
 	// use the effective one, and the two surfaces would disagree permanently.
 	a.vmManager.NormalizeVolumes(merged.Services)
+	a.reportVolumeSizeConvergence()
 
 	// Check revision only after fetch, so stores that update revision state
 	// during Fetch (Git pull, object write token) are evaluated against fresh data.

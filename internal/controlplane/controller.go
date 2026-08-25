@@ -256,6 +256,17 @@ func (c *Controller) runReconcile(ctx context.Context) {
 			Service: item.Service, ReasonCode: item.ReasonCode, Message: item.Message,
 		})
 	}
+	for _, services := range held {
+		for _, service := range services {
+			placementRev.HeldServices = append(placementRev.HeldServices, PendingPlacement{
+				Service: service.Name, ReasonCode: admission.Held[service.Name],
+				Message: "running the last applied configuration; the desired one could not be resolved",
+			})
+		}
+	}
+	sort.Slice(placementRev.HeldServices, func(i, j int) bool {
+		return placementRev.HeldServices[i].Service < placementRev.HeldServices[j].Service
+	})
 	if err := c.publishPlacement(ctx, placementRev); err != nil {
 		c.logger.Error("publishing placement failed", "error", err)
 		return

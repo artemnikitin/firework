@@ -251,3 +251,53 @@ func TestHeldServicesKeepTheirComputeReserved(t *testing.T) {
 		t.Fatal("reserveHeldCapacity must not mutate its input")
 	}
 }
+
+// A held service is running, so it is not a failure — but the desired revision
+// was never applied to it, so it must not read as convergence either.
+func TestHeldServicesDegradeTheDeploymentStatus(t *testing.T) {
+	snapshot := visibilitySnapshot{
+		desired:          DesiredRevision{Revision: "rev-1"},
+		placementCurrent: true,
+		placement: PlacementRevision{
+			Revision: "placement-1",
+			HeldServices: []PendingPlacement{{
+				Service: "db", ReasonCode: scheduler.ReasonVolumeRecordInvalid,
+				Message: "running the last applied configuration; the desired one could not be resolved",
+			}},
+		},
+	}
+	status := snapshot.revisionStatus()
+	if status.Phase != "degraded" {
+		t.Fatalf("expected a degraded deployment, got %q", status.Phase)
+	}
+	if status.ReasonCode != scheduler.ReasonVolumeRecordInvalid {
+		t.Fatalf("expected the hold reason to surface, got %q", status.ReasonCode)
+	}
+}
+
+// The degraded fleet reason must name the actual cause. A volume running at
+// the wrong size outranks peer-route telemetry, because it describes the
+// workload rather than the observability of it.
+func TestDegradedFleetReasonNamesTheCause(t *testing.T) {
+	tests := []struct {
+		name  string
+		types map[string]struct{}
+		want  string
+	}{
+		{name: "volume rejection", types: map[string]struct{}{"VolumeSizesApplied": {}}, want: "volume_size_rejected"},
+		{name: "peer routes", types: map[string]struct{}{"PeerRoutesReady": {}}, want: "peer_routes_degraded"},
+		{
+			name:  "both",
+			types: map[string]struct{}{"PeerRoutesReady": {}, "VolumeSizesApplied": {}},
+			want:  "volume_size_rejected",
+		},
+		{name: "none recognized", types: map[string]struct{}{}, want: "peer_routes_degraded"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := degradedFleetReason(test.types); got != test.want {
+				t.Fatalf("degradedFleetReason = %q, want %q", got, test.want)
+			}
+		})
+	}
+}

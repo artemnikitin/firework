@@ -92,6 +92,13 @@ type PlacementRevision struct {
 	CreatedAt       time.Time           `json:"created_at"`
 	NodeConfigs     []config.NodeConfig `json:"node_configs"`
 	PendingServices []PendingPlacement  `json:"pending_services,omitempty"`
+	// HeldServices are running services whose desired configuration could not
+	// be applied — their own volume record could not be read, so the last
+	// rendered configuration was re-used instead. They are deliberately not
+	// pending: pending drops a service from the rendered node configs and the
+	// agent turns that into a delete. But they are not converged either, so
+	// they are reported here rather than being invisible.
+	HeldServices []PendingPlacement `json:"held_services,omitempty"`
 }
 
 type PendingPlacement struct {

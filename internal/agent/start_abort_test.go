@@ -5,12 +5,14 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"strings"
 	"testing"
 
 	"github.com/artemnikitin/firework/internal/config"
 	"github.com/artemnikitin/firework/internal/reconciler"
 	"github.com/artemnikitin/firework/internal/statusmodel"
 	"github.com/artemnikitin/firework/internal/vm"
+	"github.com/artemnikitin/firework/internal/volume"
 )
 
 // abortingVMManager fails every start the way a start aborted by a concurrent
@@ -120,5 +122,47 @@ func TestTick_GenuineStartFailureIsStillReportedAsFailed(t *testing.T) {
 	}
 	if a.lastRevision != "" {
 		t.Fatalf("a failed tick must not advance lastRevision, got %q", a.lastRevision)
+	}
+}
+
+// A standing rejection must not read as ordinary convergence. The tick runs
+// clean to the end — nothing failed — so without a distinct signal the node
+// reports ready while running a size nobody asked for.
+func TestTick_StandingVolumeRejectionDegradesRatherThanConverges(t *testing.T) {
+	a := agentWithVMManager(t, abortStore(), &abortingVMManager{}, "")
+
+	// No rejection: the condition is true and the node converges.
+	a.tick(context.Background())
+	clean := a.agentStatusSnapshot()
+	if condition, ok := agentCondition(clean, "VolumeSizesApplied"); !ok || condition.Status != statusmodel.ConditionTrue {
+		t.Fatalf("expected a satisfied volume-size condition, got %#v", condition)
+	}
+	if clean.Phase != statusmodel.PhaseReady {
+		t.Fatalf("expected a clean tick to be ready, got %v", clean.Phase)
+	}
+
+	// A standing rejection degrades the node without failing it.
+	a.vmManager.SeedVolumeRejectionsForTest(map[string]volume.Rejection{"app/data": {
+		LogicalID: "app/data", ResizeGeneration: 2, AppliedGeneration: 1,
+		RequestedSizeBytes: 2 << 20, AppliedSizeBytes: 16 << 20, MinimumSizeBytes: 4 << 20,
+	}})
+	a.lastRevision = ""
+	a.tick(context.Background())
+
+	status := a.agentStatusSnapshot()
+	condition, ok := agentCondition(status, "VolumeSizesApplied")
+	if !ok || condition.Status != statusmodel.ConditionFalse || condition.ReasonCode != "volume_size_rejected" {
+		t.Fatalf("expected a degrading volume-size condition, got %#v", condition)
+	}
+	if !strings.Contains(condition.Message, "app/data") {
+		t.Fatalf("expected the refused volume to be named, got %q", condition.Message)
+	}
+	// The workload is healthy, so this must degrade rather than fail: failing
+	// the node over a wrong quota would be the worse outcome.
+	if statusmodel.IsBlockingCondition("VolumeSizesApplied") {
+		t.Fatal("a standing rejection must not be a blocking failure")
+	}
+	if status.Phase == statusmodel.PhaseFailed {
+		t.Fatal("a standing rejection must not publish the node as failed")
 	}
 }

@@ -687,6 +687,15 @@ func (s visibilitySnapshot) revisionStatus() RevisionStatus {
 		status.Message = statusmodel.BoundedMessage(s.placement.PendingServices[0].Message)
 		return status
 	}
+	if len(s.placement.HeldServices) > 0 {
+		// The workloads are running, so this is not a failure — but the
+		// desired revision was not applied to them, so it is not convergence
+		// either.
+		status.Phase = "degraded"
+		status.ReasonCode = s.placement.HeldServices[0].ReasonCode
+		status.Message = statusmodel.BoundedMessage(s.placement.HeldServices[0].Message)
+		return status
+	}
 	expectedRendered := ""
 	for _, node := range s.placement.NodeConfigs {
 		if node.RenderedRevision == "" {
@@ -745,6 +754,7 @@ func (s visibilitySnapshot) revisionStatus() RevisionStatus {
 	}
 
 	observedCurrent := false
+	degradedTypes := make(map[string]struct{})
 	for nodeID := range relevant {
 		record, exists := s.nodeByID[nodeID]
 		if !exists {
@@ -799,6 +809,11 @@ func (s visibilitySnapshot) revisionStatus() RevisionStatus {
 			status.UnknownNodes = append(status.UnknownNodes, nodeID)
 		case degraded:
 			status.DegradedNodes = append(status.DegradedNodes, nodeID)
+			for _, condition := range agentStatus.Conditions {
+				if statusmodel.IsNonBlockingCondition(condition.Type) && condition.Status == statusmodel.ConditionFalse {
+					degradedTypes[condition.Type] = struct{}{}
+				}
+			}
 		default:
 			status.ConvergedNodes = append(status.ConvergedNodes, nodeID)
 		}
@@ -821,7 +836,7 @@ func (s visibilitySnapshot) revisionStatus() RevisionStatus {
 		}
 	case len(status.DegradedNodes) > 0:
 		status.Phase = "degraded"
-		status.ReasonCode = "peer_routes_degraded"
+		status.ReasonCode = degradedFleetReason(degradedTypes)
 	default:
 		status.Phase = "converged"
 	}
@@ -865,6 +880,23 @@ func reportsAllServices(status statusmodel.AgentStatus, expected []string) bool 
 		}
 	}
 	return true
+}
+
+// degradedFleetReason names the fleet-level cause of a degraded phase. The
+// precedence is fixed rather than derived from map order so the reported reason
+// is stable, and a volume running at the wrong size outranks peer-route
+// telemetry because it describes the workload rather than the observability of
+// it.
+func degradedFleetReason(types map[string]struct{}) string {
+	for _, candidate := range []struct{ conditionType, reason string }{
+		{"VolumeSizesApplied", "volume_size_rejected"},
+		{"PeerRoutesReady", "peer_routes_degraded"},
+	} {
+		if _, ok := types[candidate.conditionType]; ok {
+			return candidate.reason
+		}
+	}
+	return "peer_routes_degraded"
 }
 
 func assessConditions(conditions []statusmodel.Condition) (blockingFailure, unknown, degraded bool) {

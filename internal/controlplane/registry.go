@@ -35,7 +35,7 @@ import (
 // before marshaling, so statusmodel.MaxMessageLen is an actual limit on what
 // gets sent, not just an assumption; only a non-standard client bypassing
 // BoundedMessage could exceed it. Measured worst case at that limit is about
-// 12.2 MiB; see TestMaxRegistryRequestBytesExceedsLargestValidHeartbeat, which
+// 13.6 MiB; see TestMaxRegistryRequestBytesExceedsLargestValidHeartbeat, which
 // fails if the bounds grow past this cap.
 const maxRegistryRequestBytes = 16 << 20
 

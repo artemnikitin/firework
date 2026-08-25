@@ -63,7 +63,13 @@ var (
 		"ConfigFetched", "ConfigParsed", "NetworkReady", "CapacityReady",
 		"ImagesReady", "VMsReconciled", "Reconciled", "LocalRoutesReady",
 	}
-	nonBlockingConditionTypes = []string{"PeerRoutesReady"}
+	// VolumeSizesApplied is false while this node is running a volume at a
+	// size other than the one the desired revision asked for. It is
+	// non-blocking because the workload is healthy — it is running, just not
+	// at the requested quota — but it must not read as ordinary convergence,
+	// or the operator sees a service quietly running at the wrong size with no
+	// explanation.
+	nonBlockingConditionTypes = []string{"PeerRoutesReady", "VolumeSizesApplied"}
 )
 
 // BlockingConditionTypes returns the conditions whose failure is fatal.

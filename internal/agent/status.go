@@ -205,6 +205,30 @@ func (a *Agent) failAgentStatus(condition, code, message string) {
 	a.metrics.setAgentStatusSnapshot(a.agentStatusSnapshot())
 }
 
+// reportVolumeSizeConvergence publishes whether this node is running every
+// volume at the size the desired revision asked for.
+//
+// A standing rejection is deliberately not a failure: the service is running
+// and healthy, and failing the node would be a worse outcome than the wrong
+// quota. But the tick that follows one runs clean to the end — advancing the
+// revision and marking it applied — so without this the node reports ordinary
+// convergence while running a size nobody requested. The non-blocking
+// condition degrades it instead.
+func (a *Agent) reportVolumeSizeConvergence() {
+	rejections := a.vmManager.VolumeRejections()
+	if len(rejections) == 0 {
+		a.setStatusCondition("VolumeSizesApplied", statusmodel.ConditionTrue, "", "")
+		return
+	}
+	names := make([]string, 0, len(rejections))
+	for logicalID := range rejections {
+		names = append(names, logicalID)
+	}
+	sort.Strings(names)
+	a.setStatusCondition("VolumeSizesApplied", statusmodel.ConditionFalse, "volume_size_rejected",
+		fmt.Sprintf("running at an effective size for: %s", strings.Join(names, ", ")))
+}
+
 // incompleteAgentStatus records a stage that neither succeeded nor failed. The
 // node stays in the reconciling phase and retries, rather than being published
 // as failed for what is a benign race.
