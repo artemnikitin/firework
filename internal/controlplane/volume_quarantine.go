@@ -103,10 +103,19 @@ func classifyVolumeRecord(prefix, key string, record VolumeRecord, readErr error
 	if record.ResizeState == VolumeResizeApplied && record.AppliedSizeBytes != record.DesiredSizeBytes {
 		return VolumeRecord{}, quarantine("applied state with mismatched size")
 	}
-	// An unrecognized resize_state is deliberately *not* a quarantine. A
-	// record written by a newer control plane must not brick scheduling on an
-	// older one during a rollback, so unknown states are carried through
-	// unchanged and never acknowledged or advanced here.
+	if record.ResizeState == "" {
+		// An *absent* state is malformed, not a state owned by a newer
+		// protocol. Forward compatibility exists to protect a value a newer
+		// controller deliberately wrote; the empty string is what a truncated
+		// or hand-edited object produces, and treating it as untouchable would
+		// freeze the record forever — every later size request ignored, with
+		// nothing to name as the owner.
+		return VolumeRecord{}, quarantine("missing resize_state")
+	}
+	// A non-empty unrecognized resize_state is deliberately *not* a
+	// quarantine. A record written by a newer control plane must not brick
+	// scheduling on an older one during a rollback, so unknown states are
+	// carried through unchanged and never acknowledged or advanced here.
 	return record, nil
 }
 

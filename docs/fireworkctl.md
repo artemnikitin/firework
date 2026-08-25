@@ -119,6 +119,10 @@ Storage-related pending and refusal reasons:
 - `shrink_below_minimum`: the requested shrink is smaller than the filesystem's
   current contents allow.
 
+`configcheck --node-config <file>` validates a hand-authored node config with
+the same semantic checks the control plane applies before rendering, and warns
+about a volume size declared with no `resize_generation`.
+
 Host-port claims have their own reasons — `host_port_conflict` and
 `duplicate_host_port_claims` — described in
 [docs/configs](configs/README.md#host-port-claims).

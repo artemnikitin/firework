@@ -124,10 +124,13 @@ second state machine:
   non-blocking condition false — the peer-route condition
   (`peer_routes_degraded`), or `VolumeSizesApplied`
   (`volume_size_rejected`), meaning a volume is running at an effective size
-  because the requested one was refused. A service whose retained volume
-  record could not be read is also degraded rather than converged: it keeps
-  running its last applied configuration, but the desired revision was not
-  applied to it;
+  because the requested one was refused. The revision itself also reports
+  `volume_size_rejected` while any retained record carries a standing refusal:
+  once the refusal is acknowledged the rendered config carries the effective
+  size, so the record is the only thing that still knows the operator's request
+  stands. A service whose retained volume record could not be read is likewise
+  degraded rather than converged: it keeps running its last applied
+  configuration, but the desired revision was not applied to it;
 - `failed`: scheduling left a service pending, or a relevant agent reports a
   blocking failure for the current revision;
 - `unknown`: required node status is missing, unsupported, truncated, stale,

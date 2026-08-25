@@ -96,7 +96,12 @@ also flagged with the reason it was refused.
 
 To recover, change the requested size to something feasible. That is a new
 request, so it is measured and admitted from scratch. Reverting the request to
-the effective size simply clears the refusal without performing any resize.
+the effective size withdraws it: the refusal stops being reported and no resize
+is performed.
+
+While a refusal stands, the deployment status reports the revision `degraded`
+with reason `volume_size_rejected` rather than converged — a cluster running a
+size nobody asked for is not converged, even though every workload is healthy.
 
 ### Direct-Git node configs must bump `resize_generation`
 
@@ -108,9 +113,11 @@ Hand-authored node configs (see [docs/configs](configs/README.md)) carry
 `resize_generation` themselves, and Firework cannot mint one for them.
 **Bump `resize_generation` whenever you change a volume's `size_bytes`.** A
 corrected size at an unchanged generation is still re-measured rather than
-clamped, but leaving the generation at `0` or omitting it means no resize is
-ever recognized at all. `configcheck --node-config <file>` warns when a config
-declares a volume size with an absent or zero generation.
+clamped, and reverting to the size already running withdraws the request at any
+generation — but leaving the generation at `0` or omitting it means no resize
+is ever recognized at all. `configcheck --node-config <file>` validates the
+config and warns when it declares a volume size with an absent or zero
+generation.
 
 Deleting application YAML never deletes a volume. Permanent deletion is a
 manual operator action: first stop/remove the service placement, back up the

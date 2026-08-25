@@ -400,9 +400,13 @@ func TestAcknowledgedRejectionConvergesWithTheRunningConfig(t *testing.T) {
 			services[0].Volumes[0], running.Volumes[0])
 	}
 
-	// And the refusal is still reported, so this converges without becoming
-	// invisible.
-	if got := manager.VolumeRejections()["app/data"]; got.RequestedSizeBytes != 2*config.MiB {
-		t.Fatalf("the rejection stopped being reported: %#v", got)
+	// The agent stops reporting a refusal here, and that is deliberate. These
+	// bytes are exactly what a direct-Git operator writes to *withdraw* the
+	// request, so the agent cannot tell a standing request from a withdrawn
+	// one and must not degrade the node forever on the ambiguity. Only the
+	// record still knows the operator's request, so that half of the
+	// visibility is the control plane's — see refusedVolumes there.
+	if got := manager.VolumeRejections(); len(got) != 0 {
+		t.Fatalf("the acknowledged shape must not keep reporting a refusal: %#v", got)
 	}
 }

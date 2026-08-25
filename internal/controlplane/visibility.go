@@ -362,6 +362,19 @@ func desiredVolumeStatuses(service config.ServiceConfig, records map[string]Volu
 	return volumes
 }
 
+// refusedVolumes lists the logical IDs whose record carries a standing
+// refusal, in deterministic order.
+func (s visibilitySnapshot) refusedVolumes() []string {
+	var refused []string
+	for id, record := range s.volumeByID {
+		if record.rejectionStands() {
+			refused = append(refused, id)
+		}
+	}
+	sort.Strings(refused)
+	return refused
+}
+
 func mergeVolumeStatuses(base, observed []statusmodel.VolumeStatus) []statusmodel.VolumeStatus {
 	merged := append([]statusmodel.VolumeStatus(nil), base...)
 	indexByID := make(map[string]int, len(merged))
@@ -685,6 +698,19 @@ func (s visibilitySnapshot) revisionStatus() RevisionStatus {
 		status.Phase = "failed"
 		status.ReasonCode = s.placement.PendingServices[0].ReasonCode
 		status.Message = statusmodel.BoundedMessage(s.placement.PendingServices[0].Message)
+		return status
+	}
+	// A volume running at an effective size because its request was refused is
+	// not converged, and after the agent's refusal is acknowledged the record
+	// is the only place that still knows the operator's request stands — the
+	// rendered config carries the effective size by then, so the agent cannot
+	// tell a standing request from a withdrawn one. That half of the
+	// visibility therefore lives here.
+	if refused := s.refusedVolumes(); len(refused) > 0 {
+		status.Phase = "degraded"
+		status.ReasonCode = "volume_size_rejected"
+		status.Message = statusmodel.BoundedMessage(fmt.Sprintf(
+			"running an effective size for: %s", strings.Join(refused, ", ")))
 		return status
 	}
 	if len(s.placement.HeldServices) > 0 {

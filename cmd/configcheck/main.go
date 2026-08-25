@@ -88,6 +88,15 @@ func runNodeConfig(path string) error {
 	if err != nil {
 		return err
 	}
+	// Parsing only proves the YAML is well formed. A hand-authored node config
+	// is the direct-Git equivalent of an enriched one, so it gets the same
+	// semantic validation the control plane applies before rendering —
+	// otherwise this command reports OK for a config with no node name, no
+	// image or kernel, zero compute, or a negative volume size, which defeats
+	// the point of running it in CI.
+	if err := enricher.ValidateOutput(nc); err != nil {
+		return fmt.Errorf("validation failed:\n%v", err)
+	}
 	for _, warning := range config.NodeConfigWarnings(nc) {
 		fmt.Fprintf(os.Stderr, "warning [volume_size_without_generation]: %s\n", warning)
 	}

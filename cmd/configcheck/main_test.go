@@ -128,3 +128,26 @@ services:
 		t.Fatalf("a declared generation must not warn, got %#v", got)
 	}
 }
+
+// --node-config must validate, not just parse: a plainly invalid node config
+// reporting OK defeats the point of running this in CI.
+func TestNodeConfigIsSemanticallyValidated(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "node.yaml")
+	if err := os.WriteFile(path, []byte(`node: ""
+services:
+  - name: broken
+    vcpus: 0
+    memory_mb: 0
+    volumes:
+      - name: data
+        type: local
+        mount_path: /var/lib/db
+        size_bytes: -1
+`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := runNodeConfig(path); err == nil {
+		t.Fatal("a node config with no name, no image/kernel, zero compute and a negative volume size must not validate")
+	}
+}

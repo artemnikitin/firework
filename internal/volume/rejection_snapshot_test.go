@@ -80,3 +80,32 @@ func TestRemovedVolumeDropsOutOfTheRejectionSnapshot(t *testing.T) {
 		t.Fatalf("expected the stale rejection to be pruned, got %#v", got)
 	}
 }
+
+// After a refusal, asking for the size already running withdraws the request. The refusal must stop being reported — otherwise the node is
+// degraded forever with no way out but a generation bump.
+func TestWithdrawnRequestStopsBeingReported(t *testing.T) {
+	manager, _ := hardeningManager(t, &fakeRunner{})
+	if _, err := manager.Prepare(context.Background(), localService(16*config.MiB, 1)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := manager.Prepare(context.Background(), localService(2*config.MiB, 2)); err != nil {
+		t.Fatal(err)
+	}
+	if len(manager.Rejections()) != 1 {
+		t.Fatal("precondition: expected a standing rejection")
+	}
+
+	// The request is now the size already running, at the same generation.
+	withdrawn := []config.ServiceConfig{localService(16*config.MiB, 2)}
+	manager.NormalizeVolumes(withdrawn)
+
+	// The clamp must still hold, so no restart is planned...
+	got := withdrawn[0].Volumes[0]
+	if got.SizeBytes != 16*config.MiB || got.ResizeGeneration != 1 {
+		t.Fatalf("expected the effective configuration, got (%d, %d)", got.SizeBytes, got.ResizeGeneration)
+	}
+	// ...but nothing is being refused any more.
+	if len(manager.Rejections()) != 0 {
+		t.Fatalf("a withdrawn request is not a standing refusal: %#v", manager.Rejections())
+	}
+}

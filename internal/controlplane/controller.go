@@ -206,8 +206,7 @@ func (c *Controller) runReconcile(ctx context.Context) {
 		return
 	}
 
-	existingPlacement, err := c.readExistingPlacement(ctx)
-	placementUnavailable := err != nil
+	existingPlacement, placementFound, err := c.readExistingPlacement(ctx)
 	if err != nil {
 		c.logger.Warn("reading existing placement failed; will re-place all", "error", err)
 		existingPlacement = nil
@@ -219,7 +218,7 @@ func (c *Controller) runReconcile(ctx context.Context) {
 	// into a delete. Publishing anything here would evict a healthy workload
 	// over a transient read failure, so nothing is published and the next tick
 	// retries. Omission is eviction; there is no partial answer to give.
-	if heldPlacementUnrecoverable(placementUnavailable, admission.Held) {
+	if heldPlacementUnrecoverable(placementFound, admission.Held) {
 		c.logger.Error("holding services but the previous placement is unreadable; not publishing",
 			"held", len(admission.Held))
 		return
@@ -362,26 +361,40 @@ type renderedPlacement struct {
 	Service config.ServiceConfig
 }
 
-func (c *Controller) readExistingPlacement(ctx context.Context) (map[string]renderedPlacement, error) {
+// readExistingPlacement returns the previous placement and whether it could be
+// established at all.
+//
+// found is false both for a read error and for missing state, and the
+// difference matters to exactly one caller. A pointer that names a revision
+// whose object is gone is *not* the same as "nothing has been placed yet":
+// services may well be running under it. Treating a missing object as an empty
+// placement is what lets a held service be classified as never-placed and
+// dropped from the rendered configs, which the agent turns into a delete.
+//
+// An absent pointer is genuinely a cluster that has never placed anything, but
+// it is reported the same way because the only caller that consults found also
+// requires a held service — which requires a retained volume record, which a
+// cluster that has never placed anything does not have.
+func (c *Controller) readExistingPlacement(ctx context.Context) (placement map[string]renderedPlacement, found bool, err error) {
 	var ptr RevisionPointer
 	_, exists, err := c.store.GetJSON(ctx, placementCurrentKey(c.cfg.State.Prefix), &ptr)
 	if err != nil || !exists || ptr.Revision == "" {
-		return nil, err
+		return nil, false, err
 	}
 
 	var rev PlacementRevision
 	_, exists, err = c.store.GetJSON(ctx, placementRevisionKey(c.cfg.State.Prefix, ptr.Revision), &rev)
 	if err != nil || !exists {
-		return nil, err
+		return nil, false, err
 	}
 
-	placement := make(map[string]renderedPlacement)
+	placement = make(map[string]renderedPlacement)
 	for _, nc := range rev.NodeConfigs {
 		for _, svc := range nc.Services {
 			placement[svc.Name] = renderedPlacement{Node: nc.Node, Service: svc}
 		}
 	}
-	return placement, nil
+	return placement, true, nil
 }
 
 // splitHeldServices separates the services that can be scheduled from their
@@ -447,8 +460,8 @@ func splitHeldServices(services []config.ServiceConfig, admission volumeAdmissio
 // With nothing held, a failed placement read is harmless: the scheduler simply
 // re-places everything from the desired revision, which is the pre-existing
 // behavior.
-func heldPlacementUnrecoverable(placementUnavailable bool, held map[string]string) bool {
-	return placementUnavailable && len(held) > 0
+func heldPlacementUnrecoverable(placementFound bool, held map[string]string) bool {
+	return !placementFound && len(held) > 0
 }
 
 // heldPortClaims collects the node-exclusive host-port claims a held service is

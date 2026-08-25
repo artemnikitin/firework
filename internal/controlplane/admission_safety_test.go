@@ -2,6 +2,7 @@ package controlplane
 
 import (
 	"context"
+	"strings"
 	"testing"
 	"time"
 
@@ -18,19 +19,19 @@ func TestUnreadablePlacementHoldsPublicationWhenServicesAreHeld(t *testing.T) {
 	held := map[string]string{"running": scheduler.ReasonVolumeRecordInvalid}
 
 	tests := []struct {
-		name                 string
-		placementUnavailable bool
-		held                 map[string]string
-		wantHold             bool
+		name           string
+		placementFound bool
+		held           map[string]string
+		wantHold       bool
 	}{
-		{name: "unreadable placement with a held service", placementUnavailable: true, held: held, wantHold: true},
-		{name: "unreadable placement with nothing held", placementUnavailable: true, wantHold: false},
-		{name: "readable placement with a held service", held: held, wantHold: false},
-		{name: "readable placement with nothing held", wantHold: false},
+		{name: "unrecoverable placement with a held service", held: held, wantHold: true},
+		{name: "unrecoverable placement with nothing held", wantHold: false},
+		{name: "recovered placement with a held service", placementFound: true, held: held, wantHold: false},
+		{name: "recovered placement with nothing held", placementFound: true, wantHold: false},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			if got := heldPlacementUnrecoverable(test.placementUnavailable, test.held); got != test.wantHold {
+			if got := heldPlacementUnrecoverable(test.placementFound, test.held); got != test.wantHold {
 				t.Fatalf("heldPlacementUnrecoverable = %v, want %v", got, test.wantHold)
 			}
 		})
@@ -50,9 +51,12 @@ func TestCorruptPlacementRevisionIsReportedAsAnError(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	placement, err := controller.readExistingPlacement(ctx)
+	placement, found, err := controller.readExistingPlacement(ctx)
 	if err == nil {
 		t.Fatalf("expected a corrupt placement revision to be an error, got placement %#v", placement)
+	}
+	if found {
+		t.Fatal("a failed read must not report the placement as found")
 	}
 	if placement != nil {
 		t.Fatalf("a failed read must not return a partial placement: %#v", placement)
@@ -114,5 +118,125 @@ func TestUnknownResizeStateIsNotOverwrittenByAdmission(t *testing.T) {
 	// The rendered configuration must follow the record, not the request.
 	if got := services[0].Volumes[0].SizeBytes; got != 10*config.GiB {
 		t.Fatalf("expected the record's size to render, got %d", got)
+	}
+}
+
+// The agent stops reporting a refusal once the rendered config carries the
+// effective size, because those bytes are ambiguous to it. The record is not
+// ambiguous, so the revision status has to carry that half — otherwise a
+// cluster running a size nobody asked for reports plain convergence.
+func TestStandingRecordRefusalDegradesTheRevision(t *testing.T) {
+	refused := VolumeRecord{
+		LogicalID: "db/data", Type: config.VolumeTypeLocal, BoundNode: "node-1",
+		DesiredSizeBytes: 10 * config.GiB, AppliedSizeBytes: 10 * config.GiB,
+		RequestedSizeBytes: 2 * config.GiB, ResizeGeneration: 2,
+		ResizeState: VolumeResizeRejected, RejectedReason: "shrink_below_minimum",
+	}
+	snapshot := visibilitySnapshot{
+		desired:          DesiredRevision{Revision: "rev-1"},
+		placementCurrent: true,
+		placement:        PlacementRevision{Revision: "placement-1"},
+		volumeByID:       map[string]VolumeRecord{"db/data": refused},
+	}
+
+	status := snapshot.revisionStatus()
+	if status.Phase != "degraded" {
+		t.Fatalf("a standing refusal must not read as convergence, got %q", status.Phase)
+	}
+	if status.ReasonCode != "volume_size_rejected" {
+		t.Fatalf("unexpected reason: %q", status.ReasonCode)
+	}
+	if !strings.Contains(status.Message, "db/data") {
+		t.Fatalf("expected the refused volume to be named, got %q", status.Message)
+	}
+
+	// Once the refusal is cleared the revision converges again.
+	cleared := refused
+	cleared.clearRejection()
+	cleared.ResizeState = VolumeResizeApplied
+	snapshot.volumeByID = map[string]VolumeRecord{"db/data": cleared}
+	if got := snapshot.revisionStatus(); got.Phase == "degraded" {
+		t.Fatalf("a cleared refusal must stop degrading the revision: %#v", got)
+	}
+}
+
+// A missing placement object is not a read error, so a guard keyed on the
+// error alone never fires and a held running service is dropped.
+func TestMissingPlacementObjectCountsAsUnrecoverable(t *testing.T) {
+	ctx := context.Background()
+	controller, store := admissionController(t)
+
+	// The pointer exists and names a revision whose object is gone.
+	if _, err := store.PutJSON(ctx, placementCurrentKey("cp/v1/"), RevisionPointer{Revision: "placement-1"}); err != nil {
+		t.Fatal(err)
+	}
+
+	placement, found, err := controller.readExistingPlacement(ctx)
+	if err != nil {
+		t.Fatalf("a missing object is not a read error, got %v", err)
+	}
+	if placement != nil {
+		t.Fatalf("expected no placement, got %#v", placement)
+	}
+	// The guard keys on found, not on err: a pointer naming a revision whose
+	// object is gone is not "nothing has been placed yet".
+	if found {
+		t.Fatal("a missing placement object must not report as found")
+	}
+	if !heldPlacementUnrecoverable(found, map[string]string{"running": "volume_record_invalid"}) {
+		t.Fatal("a missing placement object must count as unrecoverable for a held service")
+	}
+}
+
+// An absent resize_state is an empty string, which is malformed rather than a
+// state owned by a newer protocol.
+func TestAbsentResizeStateIsQuarantinedAsMalformed(t *testing.T) {
+	ctx := context.Background()
+	controller, store := admissionController(t)
+	record := appliedRecord("db/data", 10*config.GiB)
+	record.ResizeState = ""
+	putRecord(t, store, "db", "data", record)
+
+	set, err := controller.loadVolumeRecords(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, quarantined := set.Quarantined["db/data"]; !quarantined {
+		t.Fatalf("an absent resize_state must be quarantined as malformed, got record %#v", set.Records["db/data"].Record)
+	}
+}
+
+// The withdrawn-request shape is not direct-Git-only. In controller-managed mode, reverting the
+// GitOps size: to the effective size clears the *record's* rejection — but the
+// controller still renders that same (effective size, refused generation)
+// shape, so the agent-side refusal survives on the identical bytes.
+func TestControllerModeAlsoRendersTheWithdrawnShape(t *testing.T) {
+	ctx := context.Background()
+	controller, store := admissionController(t)
+	putRecord(t, store, "db", "data", VolumeRecord{
+		LogicalID: "db/data", Type: config.VolumeTypeLocal, BoundNode: "node-1",
+		DesiredSizeBytes: 10 * config.GiB, AppliedSizeBytes: 10 * config.GiB,
+		RequestedSizeBytes: 2 * config.GiB, ResizeGeneration: 2,
+		ResizeState: VolumeResizeRejected, RejectedReason: "shrink_below_minimum",
+	})
+
+	set, err := controller.loadVolumeRecords(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The operator reverts size: to the effective size.
+	services := []config.ServiceConfig{serviceWithVolume("db", 10*config.GiB)}
+	if _, err := controller.applyExistingVolumeRecords(ctx, services, set, poolNodes(100*config.GiB)); err != nil {
+		t.Fatal(err)
+	}
+	if set.Records["db/data"].Record.rejectionStands() {
+		t.Fatal("reverting to the effective size must clear the record's rejection")
+	}
+	// And the rendered shape is exactly the one the agent must not keep
+	// refusing: the effective size at the refused generation.
+	got := services[0].Volumes[0]
+	if got.SizeBytes != 10*config.GiB || got.ResizeGeneration != 2 {
+		t.Fatalf("expected the effective size at the refused generation, got (%d, %d)",
+			got.SizeBytes, got.ResizeGeneration)
 	}
 }

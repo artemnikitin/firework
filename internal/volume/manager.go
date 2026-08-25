@@ -176,6 +176,30 @@ func (m manifest) matchesRejection(volume config.VolumeConfig) bool {
 	return volume.SizeBytes == m.RejectedSizeBytes || volume.SizeBytes == m.AppliedSizeBytes
 }
 
+// refusesRequest reports whether the config in front of the agent is still
+// asking for the size that was refused.
+//
+// This is deliberately narrower than matchesRejection, and the two must not be
+// conflated. Clamping has to keep applying to both shapes for as long as the
+// refused generation stands, or the generation diverges from the running
+// instance and the service restarts on every reconcile. But a *report* of a
+// standing refusal is only true while the refused size is actually being
+// requested: once the config asks for the size already running — because a
+// direct-Git operator withdrew the request, or the control plane acknowledged
+// the refusal and now renders the effective size — nothing is being refused
+// here any more. Reporting one anyway leaves the node degraded forever with no
+// exit but a generation bump.
+//
+// After the control plane acknowledges, the two shapes become identical bytes
+// and the agent genuinely cannot tell whether the operator still wants the
+// refused size. Only the record knows, so that half of the visibility belongs
+// to the control plane; see §7.3.2 of the hardening plan.
+func (m manifest) refusesRequest(volume config.VolumeConfig) bool {
+	return m.RejectedGeneration != 0 &&
+		m.RejectedGeneration == volume.ResizeGeneration &&
+		m.RejectedSizeBytes == volume.SizeBytes
+}
+
 func (m *manifest) clearRejection() {
 	m.RejectedGeneration = 0
 	m.RejectedSizeBytes = 0
@@ -437,9 +461,12 @@ func (m *Manager) preflightResize(ctx context.Context, service string, volume co
 		}
 		return nil, err
 	}
-	if current.matchesRejection(volume) {
+	if current.refusesRequest(volume) {
 		// Already refused, for exactly this request. Re-measuring would be the
-		// unbounded loop this record exists to stop.
+		// unbounded loop this record exists to stop. A config that merely
+		// carries the refused *generation* at the effective size is not a
+		// refusal — nothing is being asked for that was denied — and falls
+		// through to the size comparison below, which finds nothing to do.
 		rejection := current.rejectionFor(volume.ResizeGeneration)
 		return &rejection, nil
 	}
@@ -903,7 +930,10 @@ func (m *Manager) rebuildRejections(services []config.ServiceConfig) {
 			if declared.Type != config.VolumeTypeLocal {
 				continue
 			}
-			if rejection, ok := m.storedRejection(svc.Name, declared.Name); ok {
+			// Evaluated against the *raw* desired config, before the clamp
+			// below rewrites it. After clamping, the size is the applied one
+			// and the request that was refused is no longer visible.
+			if rejection, refusing, _ := m.storedRejection(svc.Name, declared); refusing {
 				rebuilt[svc.Name+"/"+declared.Name] = rejection
 			}
 		}
@@ -913,17 +943,20 @@ func (m *Manager) rebuildRejections(services []config.ServiceConfig) {
 	m.rejections = rebuilt
 }
 
-// storedRejection reads one volume's durable refusal, if it has one.
-func (m *Manager) storedRejection(service, volumeName string) (Rejection, bool) {
-	dir, err := volumeDir(m.storage.Local.Path, service, volumeName)
+// storedRejection reads one volume's durable refusal and reports whether it
+// still describes the request being made. hasRecord distinguishes "no refusal
+// recorded at all" from "recorded, but no longer being requested", which the
+// callers need in order to prune correctly.
+func (m *Manager) storedRejection(service string, declared config.VolumeConfig) (rejection Rejection, refusing, hasRecord bool) {
+	dir, err := volumeDir(m.storage.Local.Path, service, declared.Name)
 	if err != nil {
-		return Rejection{}, false
+		return Rejection{}, false, false
 	}
 	var current manifest
 	if err := readJSON(filepath.Join(dir, manifestFilename), &current); err != nil || current.RejectedGeneration == 0 {
-		return Rejection{}, false
+		return Rejection{}, false, false
 	}
-	return current.rejectionFor(current.RejectedGeneration), true
+	return current.rejectionFor(current.RejectedGeneration), current.refusesRequest(declared), true
 }
 
 // refreshRejections updates the refusal snapshot for one service from the
@@ -940,24 +973,35 @@ func (m *Manager) refreshRejections(svc config.ServiceConfig) {
 	if m == nil || m.storage.Local == nil {
 		return
 	}
-	current := make(map[string]Rejection, len(svc.Volumes))
+	type outcome struct {
+		rejection Rejection
+		refusing  bool
+		hasRecord bool
+	}
+	current := make(map[string]outcome, len(svc.Volumes))
 	for _, declared := range svc.Volumes {
 		if declared.Type != config.VolumeTypeLocal {
 			continue
 		}
-		if rejection, ok := m.storedRejection(svc.Name, declared.Name); ok {
-			current[svc.Name+"/"+declared.Name] = rejection
-		}
+		rejection, refusing, hasRecord := m.storedRejection(svc.Name, declared)
+		current[svc.Name+"/"+declared.Name] = outcome{rejection, refusing, hasRecord}
 	}
 	m.rejectionMu.Lock()
 	defer m.rejectionMu.Unlock()
-	for _, declared := range svc.Volumes {
-		logicalID := svc.Name + "/" + declared.Name
-		if rejection, ok := current[logicalID]; ok {
-			m.rejections[logicalID] = rejection
-			continue
+	for logicalID, got := range current {
+		switch {
+		case !got.hasRecord:
+			// The refusal is gone from the manifest — a resize applied — so
+			// it stops being reported immediately rather than a tick later.
+			delete(m.rejections, logicalID)
+		case got.refusing:
+			m.rejections[logicalID] = got.rejection
 		}
-		delete(m.rejections, logicalID)
+		// Otherwise leave the entry alone. By this point the config has
+		// already been normalized, so the refused size is no longer visible in
+		// it and this function cannot tell a withdrawn request from a standing
+		// one. rebuildRejections makes that call once per tick against the raw
+		// config; this pass only ever adds a refusal it has just discovered.
 	}
 }
 
