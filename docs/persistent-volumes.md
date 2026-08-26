@@ -99,9 +99,12 @@ request, so it is measured and admitted from scratch. Reverting the request to
 the effective size withdraws it: the refusal stops being reported and no resize
 is performed.
 
-While a refusal stands, the deployment status reports the revision `degraded`
-with reason `volume_size_rejected` rather than converged — a cluster running a
-size nobody asked for is not converged, even though every workload is healthy.
+While a refusal stands for a volume the desired revision still declares, the
+deployment status reports the revision `degraded` with reason
+`volume_size_rejected` rather than converged — a cluster running a size nobody
+asked for is not converged, even though every workload is healthy. Deleting the
+service ends that: its record is retained, but nothing is asking for the size
+any more.
 
 ### Direct-Git node configs must bump `resize_generation`
 

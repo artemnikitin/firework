@@ -1150,6 +1150,52 @@ func readRetained(root string) (map[string]int64, error) {
 	return retained, err
 }
 
+// ValidateNodeVolumes checks every volume declaration in a node config against
+// the invariants the agent enforces before it will run them.
+//
+// It is exported for `configcheck --node-config`, which validates hand-authored
+// direct-Git configs. It deliberately reuses the agent's own rules rather than
+// restating them: a second copy would drift, and the failure mode of drift here
+// is a config that validates in CI and then cannot start on the node.
+//
+// It checks declarations only. Anything requiring the host — a retained
+// manifest, pool capacity, free space, the node's own identity — is not
+// knowable from a config file and is left to the agent's Preflight.
+func ValidateNodeVolumes(nc config.NodeConfig) error {
+	var problems []string
+	for _, svc := range nc.Services {
+		if len(svc.Volumes) == 0 {
+			continue
+		}
+		if err := validateServiceVolumes(svc.Volumes); err != nil {
+			problems = append(problems, fmt.Sprintf("service %s: %v", svc.Name, err))
+			continue
+		}
+		for _, declared := range svc.Volumes {
+			logicalID := svc.Name + "/" + declared.Name
+			switch declared.Type {
+			case config.VolumeTypeLocal:
+				// A local volume is durably bound to one physical node, and
+				// the agent refuses any volume whose bound_node does not match
+				// its own stable node_id. A config that omits it can never
+				// start.
+				if declared.BoundNode == "" {
+					problems = append(problems, fmt.Sprintf(
+						"volume %s: local volumes must declare bound_node matching the agent's node_id", logicalID))
+				}
+			case config.VolumeTypeShared:
+				problems = append(problems, fmt.Sprintf("volume %s: %v", logicalID, ErrSharedUnsupported))
+			default:
+				problems = append(problems, fmt.Sprintf("volume %s: unsupported type %q", logicalID, declared.Type))
+			}
+		}
+	}
+	if len(problems) > 0 {
+		return fmt.Errorf("%s", strings.Join(problems, "\n"))
+	}
+	return nil
+}
+
 func validateServiceVolumes(volumes []config.VolumeConfig) error {
 	if len(volumes) > config.MaxServiceVolumes {
 		return fmt.Errorf("at most %d volumes are supported", config.MaxServiceVolumes)

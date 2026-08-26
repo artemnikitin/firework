@@ -120,8 +120,12 @@ Storage-related pending and refusal reasons:
   current contents allow.
 
 `configcheck --node-config <file>` validates a hand-authored node config with
-the same semantic checks the control plane applies before rendering, and warns
-about a volume size declared with no `resize_generation`.
+the same semantic checks the control plane applies before rendering, plus the
+volume contract the agent itself enforces — a local volume must declare
+`bound_node`, mount paths must be absolute and outside the reserved set, and
+shared volumes are not yet runnable. It warns about a volume size declared with
+no `resize_generation`, and about a `bound_node` naming a different node than
+the config is for.
 
 Host-port claims have their own reasons — `host_port_conflict` and
 `duplicate_host_port_claims` — described in

@@ -132,8 +132,13 @@ func TestStandingRecordRefusalDegradesTheRevision(t *testing.T) {
 		RequestedSizeBytes: 2 * config.GiB, ResizeGeneration: 2,
 		ResizeState: VolumeResizeRejected, RejectedReason: "shrink_below_minimum",
 	}
+	// The desired revision still declares the volume — a refusal only matters
+	// while something is asking for the size.
 	snapshot := visibilitySnapshot{
-		desired:          DesiredRevision{Revision: "rev-1"},
+		desired: DesiredRevision{
+			Revision: "rev-1",
+			Services: []config.ServiceConfig{serviceWithVolume("db", 2*config.GiB)},
+		},
 		placementCurrent: true,
 		placement:        PlacementRevision{Revision: "placement-1"},
 		volumeByID:       map[string]VolumeRecord{"db/data": refused},
@@ -238,5 +243,60 @@ func TestControllerModeAlsoRendersTheWithdrawnShape(t *testing.T) {
 	if got.SizeBytes != 10*config.GiB || got.ResizeGeneration != 2 {
 		t.Fatalf("expected the effective size at the refused generation, got (%d, %d)",
 			got.SizeBytes, got.ResizeGeneration)
+	}
+}
+
+// Retained records outlive their service by design. A refusal on a record
+// whose service is no longer desired must not degrade every later revision.
+func TestRefusalOnADeletedServiceDoesNotDegradeTheRevision(t *testing.T) {
+	refused := VolumeRecord{
+		LogicalID: "gone/data", Type: config.VolumeTypeLocal, BoundNode: "node-1",
+		DesiredSizeBytes: 10 * config.GiB, AppliedSizeBytes: 10 * config.GiB,
+		RequestedSizeBytes: 2 * config.GiB, ResizeGeneration: 2,
+		ResizeState: VolumeResizeRejected, RejectedReason: "shrink_below_minimum",
+	}
+	// An empty desired revision: the service was deleted, its record retained.
+	snapshot := visibilitySnapshot{
+		desired:          DesiredRevision{Revision: "rev-2"},
+		placementCurrent: true,
+		placement:        PlacementRevision{Revision: "placement-2"},
+		volumeByID:       map[string]VolumeRecord{"gone/data": refused},
+	}
+	if got := snapshot.revisionStatus(); got.Phase == "degraded" {
+		t.Fatalf("a refusal for a service no longer desired must not degrade the revision: %#v", got)
+	}
+}
+
+// Withdrawing a request must leave the record self-consistent. Clearing the
+// rejection fields while ResizeState stays "rejected" makes status report
+// state: rejected with rejected: false, and nothing later repairs it.
+func TestWithdrawnRefusalLeavesNoContradictoryState(t *testing.T) {
+	ctx := context.Background()
+	controller, store := admissionController(t)
+	putRecord(t, store, "db", "data", VolumeRecord{
+		LogicalID: "db/data", Type: config.VolumeTypeLocal, BoundNode: "node-1",
+		DesiredSizeBytes: 10 * config.GiB, AppliedSizeBytes: 10 * config.GiB,
+		RequestedSizeBytes: 2 * config.GiB, ResizeGeneration: 2,
+		ResizeState: VolumeResizeRejected, RejectedReason: "shrink_below_minimum",
+		LastError: "below the safe minimum",
+	})
+
+	set, err := controller.loadVolumeRecords(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	services := []config.ServiceConfig{serviceWithVolume("db", 10*config.GiB)}
+	if _, err := controller.applyExistingVolumeRecords(ctx, services, set, poolNodes(100*config.GiB)); err != nil {
+		t.Fatal(err)
+	}
+	got := set.Records["db/data"].Record
+	if got.rejectionStands() {
+		t.Fatalf("precondition: the rejection fields must clear, got %#v", got)
+	}
+	if got.ResizeState == VolumeResizeRejected {
+		t.Fatalf("state stayed rejected while the rejection was cleared: %#v", got)
+	}
+	if got.LastError != "" {
+		t.Fatalf("the refusal message outlived the refusal: %q", got.LastError)
 	}
 }

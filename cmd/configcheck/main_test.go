@@ -1,6 +1,7 @@
 package main
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -149,5 +150,81 @@ services:
 	}
 	if err := runNodeConfig(path); err == nil {
 		t.Fatal("a node config with no name, no image/kernel, zero compute and a negative volume size must not validate")
+	}
+}
+
+// ValidateOutput covers generic service fields, not the volume invariants the
+// agent enforces. A local volume with no bound_node is unusable, and
+// configcheck must say so rather than printing OK.
+func TestLocalVolumeWithoutBoundNodeIsRejected(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "node.yaml")
+	if err := os.WriteFile(path, []byte(`node: node-1
+services:
+  - name: db
+    image: /images/db.ext4
+    kernel: /images/vmlinux
+    vcpus: 1
+    memory_mb: 512
+    volumes:
+      - name: data
+        type: local
+        mount_path: /var/lib/db
+        size_bytes: 10737418240
+        resize_generation: 1
+`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := runNodeConfig(path); err == nil {
+		t.Fatal("a local volume with no bound_node is unusable and must not validate")
+	}
+}
+
+// The volume contract is checked through the agent's own rules, so the two
+// cannot drift into a config that passes CI and then fails to start.
+func TestNodeConfigVolumeContractMatchesTheAgent(t *testing.T) {
+	valid := `node: node-1
+services:
+  - name: db
+    image: /images/db.ext4
+    kernel: /images/vmlinux
+    vcpus: 1
+    memory_mb: 512
+    volumes:
+      - name: data
+        type: local
+        mount_path: %s
+        size_bytes: 10737418240
+        bound_node: %s
+        resize_generation: 1
+`
+	tests := []struct {
+		name      string
+		mountPath string
+		boundNode string
+		wantErr   bool
+	}{
+		{name: "valid", mountPath: "/var/lib/db", boundNode: "node-1"},
+		{name: "reserved mount path", mountPath: "/proc/db", boundNode: "node-1", wantErr: true},
+		{name: "relative mount path", mountPath: "var/lib/db", boundNode: "node-1", wantErr: true},
+		// A bound_node naming another node is only probably wrong — the agent
+		// matches its stable node_id, which need not equal the config key — so
+		// it warns rather than failing.
+		{name: "bound elsewhere warns only", mountPath: "/var/lib/db", boundNode: "node-2"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "node.yaml")
+			if err := os.WriteFile(path, []byte(fmt.Sprintf(valid, test.mountPath, test.boundNode)), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			err := runNodeConfig(path)
+			if test.wantErr && err == nil {
+				t.Fatal("expected the volume contract to reject this config")
+			}
+			if !test.wantErr && err != nil {
+				t.Fatalf("expected the config to validate, got %v", err)
+			}
+		})
 	}
 }

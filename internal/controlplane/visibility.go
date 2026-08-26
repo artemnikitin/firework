@@ -362,11 +362,28 @@ func desiredVolumeStatuses(service config.ServiceConfig, records map[string]Volu
 	return volumes
 }
 
-// refusedVolumes lists the logical IDs whose record carries a standing
-// refusal, in deterministic order.
+// refusedVolumes lists the logical IDs whose record carries a standing refusal
+// *and* whose volume the desired revision still declares, in deterministic
+// order.
+//
+// The desired-revision filter is the whole point. Records outlive their
+// service by design — deleting application YAML never deletes a volume or its
+// record — so scanning every retained record means one refused resize followed
+// by a service deletion degrades that revision and every revision after it,
+// forever, with no service left to repair. A refusal is only a convergence
+// problem while something is still asking for the size.
 func (s visibilitySnapshot) refusedVolumes() []string {
+	desired := make(map[string]struct{})
+	for _, service := range s.desired.Services {
+		for _, volume := range service.Volumes {
+			desired[service.Name+"/"+volume.Name] = struct{}{}
+		}
+	}
 	var refused []string
 	for id, record := range s.volumeByID {
+		if _, wanted := desired[id]; !wanted {
+			continue
+		}
 		if record.rejectionStands() {
 			refused = append(refused, id)
 		}

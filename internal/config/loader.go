@@ -204,6 +204,14 @@ func NodeConfigWarnings(nc NodeConfig) []string {
 					"service %s volume %s declares a size with no resize_generation; bump resize_generation whenever you change size_bytes",
 					service.Name, volume.Name))
 			}
+			// The agent matches bound_node against its stable node_id, which
+			// need not equal the config's node key — so a mismatch is only
+			// probably wrong, and warns rather than failing.
+			if volume.Type == VolumeTypeLocal && volume.BoundNode != "" && volume.BoundNode != nc.Node {
+				warnings = append(warnings, fmt.Sprintf(
+					"service %s volume %s is bound to %q but this config is for node %q; bound_node must match the agent's node_id",
+					service.Name, volume.Name, volume.BoundNode, nc.Node))
+			}
 		}
 	}
 	return warnings

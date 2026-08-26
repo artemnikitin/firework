@@ -173,17 +173,35 @@ type VolumeRecord struct {
 // refused before it became a resize never entered that state machine.
 func (r VolumeRecord) rejectionStands() bool { return r.RejectedReason != "" }
 
-// clearRejection drops the rejection fields and reports whether anything
-// changed, so a caller can avoid a no-op write.
+// clearRejection ends a refusal and reports whether anything changed, so a
+// caller can avoid a no-op write.
+//
+// It resets the resize state as well as the rejection fields, because the two
+// describe one condition. Clearing only the fields publishes state "rejected"
+// alongside rejected:false, and that contradiction does not self-heal: the
+// agent reports the *applied* generation once the config is normalized, while
+// acknowledgement only matches an observation at the *refused* generation, so
+// nothing ever revisits the record.
 func (r *VolumeRecord) clearRejection() bool {
-	if r.RequestedSizeBytes == 0 && r.RejectedReason == "" && r.RejectedAvailableBytes == 0 && r.RejectedAt.IsZero() {
-		return false
+	changed := false
+	if r.RequestedSizeBytes != 0 || r.RejectedReason != "" || r.RejectedAvailableBytes != 0 || !r.RejectedAt.IsZero() {
+		r.RequestedSizeBytes = 0
+		r.RejectedReason = ""
+		r.RejectedAvailableBytes = 0
+		r.RejectedAt = time.Time{}
+		changed = true
 	}
-	r.RequestedSizeBytes = 0
-	r.RejectedReason = ""
-	r.RejectedAvailableBytes = 0
-	r.RejectedAt = time.Time{}
-	return true
+	if r.ResizeState == VolumeResizeRejected {
+		// The refusal is over, so the state describes what is on disk again.
+		r.ResizeState = VolumeResizePending
+		if r.AppliedSizeBytes == r.DesiredSizeBytes {
+			r.ResizeState = VolumeResizeApplied
+		}
+		// LastError held the measured minimum for the refused request.
+		r.LastError = ""
+		changed = true
+	}
+	return changed
 }
 
 // RevisionPointer points to the current immutable revision.

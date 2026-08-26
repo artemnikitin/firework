@@ -22,6 +22,7 @@ import (
 
 	"github.com/artemnikitin/firework/internal/config"
 	"github.com/artemnikitin/firework/internal/enricher"
+	"github.com/artemnikitin/firework/internal/volume"
 )
 
 func main() {
@@ -95,6 +96,12 @@ func runNodeConfig(path string) error {
 	// image or kernel, zero compute, or a negative volume size, which defeats
 	// the point of running it in CI.
 	if err := enricher.ValidateOutput(nc); err != nil {
+		return fmt.Errorf("validation failed:\n%v", err)
+	}
+	// ValidateOutput covers generic service fields. The volume contract is
+	// enforced separately, by the agent's own rules, so a config cannot pass
+	// here and then fail to start on the node.
+	if err := volume.ValidateNodeVolumes(nc); err != nil {
 		return fmt.Errorf("validation failed:\n%v", err)
 	}
 	for _, warning := range config.NodeConfigWarnings(nc) {
