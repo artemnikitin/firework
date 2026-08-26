@@ -234,6 +234,14 @@ type resizeTransaction struct {
 // detached from the caller's context. It has to accommodate mkfs, e2fsck, and
 // resize2fs on a pool-sized image, so it is generous: the point is that the
 // operation is not killed by an agent restart, not that it is killed promptly.
+//
+// Detaching from the Go context is only half of the protection, and the other
+// half is not in this repository. Under systemd's default
+// KillMode=control-group, stopping the agent's unit signals every process in
+// its cgroup — including this child — and force-kills the group at
+// TimeoutStopSec. The unit must set KillMode=mixed and a TimeoutStopSec above
+// this value; see docs/persistent-volumes.md. Raising this constant without
+// raising that one reopens the gap it exists to close.
 const destructiveCommandTimeout = 30 * time.Minute
 
 // destructiveCommandGrace is how long a timed-out destructive command is given
@@ -882,8 +890,14 @@ func (m *Manager) checkCapacity(pool *config.LocalStorageConfig, desired map[str
 		retained[id] = size
 	}
 	var reserved int64
-	for _, size := range retained {
-		if size > 0 && reserved > (1<<63-1)-size {
+	for id, size := range retained {
+		// Defence in depth: readRetained rejects a non-positive retained size,
+		// but the desired sizes merged in above come from a node config, and a
+		// reservation total that can be driven downwards is a capacity bypass.
+		if size <= 0 {
+			return fmt.Errorf("volume %s has non-positive size %d", id, size)
+		}
+		if reserved > (1<<63-1)-size {
 			return fmt.Errorf("local volume reservations overflow")
 		}
 		reserved += size
@@ -1141,6 +1155,13 @@ func readRetained(root string) (map[string]int64, error) {
 		if err := readJSON(path, &m); err != nil {
 			return fmt.Errorf("read retained manifest %s: %w", path, err)
 		}
+		// A retained size feeds pool arithmetic directly, and a non-positive
+		// one *subtracts* from the reserved total — so a single corrupt or
+		// hand-edited manifest can admit a volume the pool cannot hold. There
+		// is no safe number to assume for it, so it fails closed.
+		if m.AppliedSizeBytes <= 0 {
+			return fmt.Errorf("retained manifest %s has non-positive applied size %d; quarantined", path, m.AppliedSizeBytes)
+		}
 		retained[m.LogicalID] = m.AppliedSizeBytes
 		return nil
 	})
@@ -1165,6 +1186,14 @@ func ValidateNodeVolumes(nc config.NodeConfig) error {
 	var problems []string
 	for _, svc := range nc.Services {
 		if len(svc.Volumes) == 0 {
+			continue
+		}
+		// The agent derives a filesystem path from the service name as well as
+		// the volume name, so a name that is not a safe path component fails at
+		// preflight. Checking it through volumeDir rather than restating the
+		// pattern keeps the two from drifting.
+		if _, err := volumeDir("", svc.Name, svc.Volumes[0].Name); err != nil {
+			problems = append(problems, fmt.Sprintf("service %s: %v", svc.Name, err))
 			continue
 		}
 		if err := validateServiceVolumes(svc.Volumes); err != nil {

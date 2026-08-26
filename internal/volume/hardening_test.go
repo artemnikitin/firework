@@ -197,3 +197,44 @@ func TestRunDestructiveSurvivesParentCancellation(t *testing.T) {
 		t.Fatal("expected a read-only command to remain promptly cancellable")
 	}
 }
+
+// A retained manifest carrying a non-positive applied size subtracts from the
+// pool's reserved total, admitting a volume the pool cannot hold.
+func TestMalformedRetainedSizeCannotBypassPoolCapacity(t *testing.T) {
+	manager, root := hardeningManager(t, &fakeRunner{})
+	// A neighbouring service's retained manifest with a negative applied size.
+	dir := filepath.Join(root, "other", "data")
+	if err := os.MkdirAll(dir, 0o750); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeJSONAtomic(filepath.Join(dir, manifestFilename), manifest{
+		LogicalID: "other/data", Type: config.VolumeTypeLocal, BoundNode: "node-1",
+		Filesystem: "ext4", AppliedSizeBytes: -100 * config.MiB, ResizeGeneration: 1,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	// The pool is 100 MiB; 150 MiB must not fit regardless of the bad record.
+	_, err := manager.Preflight(context.Background(), localService(150*config.MiB, 1))
+	if err == nil {
+		t.Fatal("a negative retained size let an oversized volume into the pool")
+	}
+	if !strings.Contains(err.Error(), "capacity") && !strings.Contains(err.Error(), "quarantined") {
+		t.Fatalf("expected a capacity or quarantine failure, got %v", err)
+	}
+}
+
+// The agent derives a filesystem path from the service name, so a name that is
+// not a safe path component fails at preflight. configcheck must reject it too.
+func TestServiceNameIsValidatedByTheExportedValidator(t *testing.T) {
+	nc := config.NodeConfig{Node: "node-1", Services: []config.ServiceConfig{{
+		Name: "bad/name", Image: "/i", Kernel: "/k", VCPUs: 1, MemoryMB: 128,
+		Volumes: []config.VolumeConfig{{
+			Name: "data", Type: config.VolumeTypeLocal, MountPath: "/var/lib/app",
+			SizeBytes: config.MiB, BoundNode: "node-1", ResizeGeneration: 1,
+		}},
+	}}}
+	if err := ValidateNodeVolumes(nc); err == nil {
+		t.Fatal("a service name that is not a safe path component must be rejected")
+	}
+}

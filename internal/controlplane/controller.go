@@ -436,13 +436,14 @@ func splitHeldServices(services []config.ServiceConfig, admission volumeAdmissio
 			})
 			continue
 		}
-		rendered := placed.Service
-		if len(rendered.Volumes) == 0 {
-			// No prior snapshot of the volume configuration; render the
-			// desired one unchanged rather than dropping the service.
-			rendered = service
-		}
-		held[placed.Node] = append(held[placed.Node], rendered)
+		// The prior render is used exactly as it was, including when it
+		// declared no volumes at all — that is valid prior state, not a
+		// missing snapshot, and substituting the desired configuration there
+		// renders precisely the unvalidated volume config the hold exists to
+		// gate. A genuinely missing snapshot cannot reach here: it is the
+		// unrecoverable case, and heldPlacementUnrecoverable stops the cycle
+		// before anything is published.
+		held[placed.Node] = append(held[placed.Node], placed.Service)
 	}
 	return schedulable, held, pending
 }

@@ -8,6 +8,7 @@ import (
 
 	"github.com/artemnikitin/firework/internal/config"
 	"github.com/artemnikitin/firework/internal/scheduler"
+	"github.com/artemnikitin/firework/internal/statusmodel"
 )
 
 // when the previous placement cannot be read, a held service has no
@@ -298,5 +299,70 @@ func TestWithdrawnRefusalLeavesNoContradictoryState(t *testing.T) {
 	}
 	if got.LastError != "" {
 		t.Fatalf("the refusal message outlived the refusal: %q", got.LastError)
+	}
+}
+
+// A stale heartbeat at the same generation must not reopen a refusal the
+// desired state has already withdrawn — that produces two durable writes per
+// tick, and a crash between them leaves the degraded state behind.
+func TestStaleRejectionDoesNotReopenAWithdrawnRefusal(t *testing.T) {
+	ctx := context.Background()
+	controller, store := admissionController(t)
+	recordKey := mustVolumeRecordKey("cp/v1/", "db", "data")
+	// The refusal was withdrawn: fields cleared, state settled back to applied.
+	putRecord(t, store, "db", "data", VolumeRecord{
+		LogicalID: "db/data", Type: config.VolumeTypeLocal, BoundNode: "node-1",
+		DesiredSizeBytes: 10 * config.GiB, AppliedSizeBytes: 10 * config.GiB,
+		ResizeGeneration: 2, ResizeState: VolumeResizeApplied,
+	})
+
+	// An agent heartbeat still carrying the old refusal at the same generation.
+	nodeKey, err := nodeRecordKey("cp/v1/", "node-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	node := NodeRecord{NodeID: "node-1", AgentStatus: &statusmodel.AgentStatus{Services: []statusmodel.ServiceStatus{{
+		Name: "db", Volumes: []statusmodel.VolumeStatus{{
+			LogicalID: "db/data", Type: "local", BoundNode: "node-1",
+			AppliedSizeBytes: 10 * config.GiB, RequestedSizeBytes: 2 * config.GiB,
+			ResizeGeneration: 2, State: "rejected", Rejected: true,
+			RejectedReason: "shrink_below_minimum",
+		}},
+	}}}}
+	if _, err := store.PutJSON(ctx, nodeKey, node); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := controller.acknowledgeVolumeRecords(ctx); err != nil {
+		t.Fatal(err)
+	}
+	var got VolumeRecord
+	if _, exists, err := store.GetJSON(ctx, recordKey, &got); err != nil || !exists {
+		t.Fatalf("read record: %v", err)
+	}
+	if got.rejectionStands() || got.ResizeState == VolumeResizeRejected {
+		t.Fatalf("a stale heartbeat reopened a withdrawn refusal: %#v", got)
+	}
+}
+
+// Zero volumes is valid prior state, not a missing snapshot. Substituting the
+// desired configuration there reintroduces exactly the unvalidated volume
+// config the hold exists to gate.
+func TestZeroVolumePriorSnapshotIsNotAMissingOne(t *testing.T) {
+	// The prior render legitimately had no volumes.
+	prior := config.ServiceConfig{Name: "svc", VCPUs: 1, MemoryMB: 512}
+	// The desired revision now adds one, which is what is being gated.
+	desired := []config.ServiceConfig{serviceWithVolume("svc", 90*config.GiB)}
+	admission := volumeAdmission{Held: map[string]string{"svc": scheduler.ReasonVolumeRecordInvalid}}
+	placement := map[string]renderedPlacement{"svc": {Node: "node-1", Service: prior}}
+
+	_, held, _ := splitHeldServices(desired, admission, placement)
+
+	rendered := held["node-1"]
+	if len(rendered) != 1 {
+		t.Fatalf("the held service must still be rendered: %#v", held)
+	}
+	if len(rendered[0].Volumes) != 0 {
+		t.Fatalf("the unvalidated desired volume config was rendered for a held service: %#v", rendered[0].Volumes)
 	}
 }

@@ -489,6 +489,19 @@ func (c *Controller) acknowledgeVolumeRecords(ctx context.Context) error {
 					record.ResizeState = VolumeResizeApplied
 					record.LastError = ""
 				case "rejected":
+					// The generation alone does not say the refusal is still
+					// outstanding. A record whose refusal was withdrawn sits at
+					// the same generation, so a stale heartbeat would reopen it
+					// — and the next desired-state pass clears it again, two
+					// durable writes every tick, with a crash between them
+					// leaving the degraded state behind. Accept the
+					// observation only while the record is still refusing, or
+					// while it already records this same refusal.
+					if !record.rejectionStands() && record.ResizeState != VolumeResizeRejected {
+						if record.DesiredSizeBytes != observed.RequestedSizeBytes {
+							continue
+						}
+					}
 					// The agent refused this size. Converge the record on the
 					// effective size in one write: RequestedSizeBytes keeps the
 					// refused size for display, DesiredSizeBytes becomes what

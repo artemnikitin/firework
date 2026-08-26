@@ -66,6 +66,37 @@ identity, binding, capacity, filesystem health, and shrink feasibility. It then
 records a durable resize transaction, grows the file before ext4, or shrinks
 ext4 before truncating the file. Ambiguous states fail closed.
 
+### The agent's service unit must not kill filesystem utilities
+
+Creating, checking, and resizing a volume runs `mkfs.ext4`, `e2fsck`, and
+`resize2fs` as child processes. Interrupting one mid-operation is what the
+resize transaction and `e2fsck -f -y` exist to recover from, and the agent
+therefore detaches those commands from its own shutdown: they keep running when
+the agent's context is cancelled, with their own timeout and a SIGTERM-then-wait
+cancellation rather than an immediate kill.
+
+**That protection is defeated by the default systemd supervision.** With
+`KillMode=control-group`, systemd's default, stopping or restarting the unit
+signals *every* process in its control group, including the detached utility,
+and escalates to SIGKILL for the whole group once `TimeoutStopSec` expires. A
+node drain during a shrink then kills `resize2fs` exactly as if the agent had
+never detached it.
+
+A unit running `firework-agent` must therefore set:
+
+```ini
+[Service]
+# SIGTERM reaches only the agent, so a detached utility keeps running.
+KillMode=mixed
+# Must exceed the agent's destructive-command deadline (30m) plus its grace
+# period, or systemd force-kills the utility at the timeout.
+TimeoutStopSec=2100
+```
+
+The two numbers are a contract: `destructiveCommandTimeout` in
+`internal/volume` bounds the command, and `TimeoutStopSec` must stay above it.
+Raising one without the other reopens the gap.
+
 ### Guest data is not flushed before a microVM is stopped
 
 Stopping a microVM — including every service update and every volume resize,
