@@ -220,7 +220,7 @@ func TestBlockedOwnersAreHeldOrPendingButNeverDropped(t *testing.T) {
 	}}
 	placement := map[string]renderedPlacement{"running": {Node: "node-1", Service: held}}
 
-	schedulable, heldByNode, pending := splitHeldServices(desired, admission, placement)
+	schedulable, heldByNode, pending := splitHeldServices(desired, admission, placement, map[string]struct{}{"node-1": {}})
 
 	if len(schedulable) != 0 {
 		t.Fatalf("both services are blocked, got %#v", schedulable)

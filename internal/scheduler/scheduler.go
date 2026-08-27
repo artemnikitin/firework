@@ -48,6 +48,25 @@ type StorageReservations struct {
 	// therefore no narrower scope — could be determined.
 	LocalClassUnknown  bool
 	SharedClassUnknown bool
+	// UnknownCapacityKeys names one offending record per blocked scope, keyed
+	// by node ID, backend ID, or the storage class for a class-wide block.
+	// A block with no repair target named is one an operator cannot act on:
+	// the record is somewhere in the pool, and the message is all they have.
+	UnknownCapacityKeys map[string]string
+}
+
+// UnknownCapacityTarget returns a record key an operator should repair to lift
+// a scope's block, preferring the narrowest scope that names one.
+func (r StorageReservations) UnknownCapacityTarget(node, backend string, class config.VolumeType) string {
+	for _, scope := range []string{node, backend, string(class)} {
+		if scope == "" {
+			continue
+		}
+		if key := r.UnknownCapacityKeys[scope]; key != "" {
+			return key
+		}
+	}
+	return ""
 }
 
 // Pending reason codes. They are a bounded vocabulary because the status API,
@@ -92,11 +111,17 @@ func storageRank(reason string) int {
 	}
 }
 
-func storageReasonMessage(reason string) string {
-	switch reason {
+func storageReasonMessage(rejected storageRejection) string {
+	switch rejected.Reason {
 	case ReasonNodeStorageExhausted:
 		return "no active node has room for the requested volume reservation"
 	case ReasonStorageCapacityUnknown:
+		// The offending key is the whole value of this message. A cluster-wide
+		// block whose cause is only in the controller log leaves an operator
+		// grepping for an object they cannot name.
+		if rejected.Target != "" {
+			return fmt.Sprintf("remaining volume capacity cannot be verified; repair volume record %s", rejected.Target)
+		}
 		return "remaining volume capacity cannot be verified; repair the quarantined volume record"
 	default:
 		return "no active node satisfies volume binding and capacity"
@@ -357,7 +382,7 @@ func ScheduleWithStorage(services []config.ServiceConfig, nodes []Node, existing
 		claims := service.PortClaims()
 		chosen := ""
 		chosenService := service
-		dominantStorageReason := ""
+		var dominantStorage storageRejection
 		portConflict := ""
 		for _, node := range candidates {
 			if boundNode != "" && node.InstanceID != boundNode {
@@ -374,13 +399,13 @@ func ScheduleWithStorage(services []config.ServiceConfig, nodes []Node, existing
 				}
 				continue
 			}
-			candidateService, localDelta, sharedDelta, storageReason := fitStorage(service, node, reservations, usedLocal, usedShared)
-			if storageReason != "" {
+			candidateService, localDelta, sharedDelta, rejected := fitStorage(service, node, reservations, usedLocal, usedShared)
+			if rejected.Reason != "" {
 				// Keep the most actionable cause seen across candidates. The
 				// dominant reason tells the operator whether the placement is
 				// wrong or the chosen node is simply full.
-				if storageRank(storageReason) > storageRank(dominantStorageReason) {
-					dominantStorageReason = storageReason
+				if storageRank(rejected.Reason) > storageRank(dominantStorage.Reason) {
+					dominantStorage = rejected
 				}
 				continue
 			}
@@ -395,9 +420,9 @@ func ScheduleWithStorage(services []config.ServiceConfig, nodes []Node, existing
 		if chosen == "" {
 			reason := ReasonInsufficientCompute
 			message := "no active node satisfies compute capacity"
-			if dominantStorageReason != "" {
-				reason = dominantStorageReason
-				message = storageReasonMessage(dominantStorageReason)
+			if dominantStorage.Reason != "" {
+				reason = dominantStorage.Reason
+				message = storageReasonMessage(dominantStorage)
 			}
 			if portConflict != "" {
 				reason = ReasonHostPortConflict
@@ -461,7 +486,15 @@ func hasSharedVolume(service config.ServiceConfig) bool {
 // not when they cannot. The reason separates a placement fact (the volume
 // cannot bind here at all) from a capacity fact (it could bind, but the pool
 // has no room), because the two have opposite operator remedies.
-func fitStorage(service config.ServiceConfig, node Node, reservations StorageReservations, usedLocal, usedShared map[string]int64) (config.ServiceConfig, int64, int64, string) {
+// storageRejection is why a node was refused, and where to look to fix it.
+type storageRejection struct {
+	Reason string
+	// Target names a quarantined record to repair, for the reasons where one
+	// exists. Empty otherwise.
+	Target string
+}
+
+func fitStorage(service config.ServiceConfig, node Node, reservations StorageReservations, usedLocal, usedShared map[string]int64) (config.ServiceConfig, int64, int64, storageRejection) {
 	candidate := service
 	candidate.Volumes = append([]config.VolumeConfig(nil), service.Volumes...)
 	var localDelta, sharedDelta int64
@@ -471,7 +504,7 @@ func fitStorage(service config.ServiceConfig, node Node, reservations StorageRes
 		switch volume.Type {
 		case config.VolumeTypeLocal:
 			if node.LocalCapacityBytes <= 0 || (volume.BoundNode != "" && volume.BoundNode != node.InstanceID) {
-				return service, 0, 0, ReasonVolumeCapacityUnavailable
+				return service, 0, 0, storageRejection{Reason: ReasonVolumeCapacityUnavailable}
 			}
 			volume.BoundNode = node.InstanceID
 			if !reservations.RecordedLogicalIDs[logicalID] {
@@ -479,7 +512,7 @@ func fitStorage(service config.ServiceConfig, node Node, reservations StorageRes
 			}
 		case config.VolumeTypeShared:
 			if node.SharedBackendID == "" || (volume.SharedBackendID != "" && volume.SharedBackendID != node.SharedBackendID) {
-				return service, 0, 0, ReasonVolumeCapacityUnavailable
+				return service, 0, 0, storageRejection{Reason: ReasonVolumeCapacityUnavailable}
 			}
 			volume.SharedBackendID = node.SharedBackendID
 			if !reservations.RecordedLogicalIDs[logicalID] {
@@ -494,26 +527,26 @@ func fitStorage(service config.ServiceConfig, node Node, reservations StorageRes
 	// not make the node reject either of them. Only a genuinely new
 	// allocation is checked against the pool.
 	if localDelta > 0 && reservations.LocalByNode[node.InstanceID]+usedLocal[node.InstanceID]+localDelta > node.LocalCapacityBytes {
-		return service, 0, 0, ReasonNodeStorageExhausted
+		return service, 0, 0, storageRejection{Reason: ReasonNodeStorageExhausted}
 	}
 	if sharedDelta > 0 && node.SharedCapacityBytes > 0 && reservations.SharedByBackend[node.SharedBackendID]+usedShared[node.SharedBackendID]+sharedDelta > node.SharedCapacityBytes {
-		return service, 0, 0, ReasonNodeStorageExhausted
+		return service, 0, 0, storageRejection{Reason: ReasonNodeStorageExhausted}
 	}
 	// A quarantined record whose reservation could not be read makes the
 	// node's remaining pool unknowable. New volume-bearing placement is
 	// withheld there rather than allocated against capacity that may already
 	// be occupied; an already-placed service is re-rendered untouched.
-	if localDelta > 0 && reservations.LocalUnknownByNode[node.InstanceID] {
-		return service, 0, 0, ReasonStorageCapacityUnknown
+	if localDelta > 0 && (reservations.LocalUnknownByNode[node.InstanceID] || reservations.LocalClassUnknown) {
+		return service, 0, 0, storageRejection{
+			Reason: ReasonStorageCapacityUnknown,
+			Target: reservations.UnknownCapacityTarget(node.InstanceID, "", config.VolumeTypeLocal),
+		}
 	}
-	if sharedDelta > 0 && reservations.SharedUnknownByBackend[node.SharedBackendID] {
-		return service, 0, 0, ReasonStorageCapacityUnknown
+	if sharedDelta > 0 && (reservations.SharedUnknownByBackend[node.SharedBackendID] || reservations.SharedClassUnknown) {
+		return service, 0, 0, storageRejection{
+			Reason: ReasonStorageCapacityUnknown,
+			Target: reservations.UnknownCapacityTarget("", node.SharedBackendID, config.VolumeTypeShared),
+		}
 	}
-	if localDelta > 0 && reservations.LocalClassUnknown {
-		return service, 0, 0, ReasonStorageCapacityUnknown
-	}
-	if sharedDelta > 0 && reservations.SharedClassUnknown {
-		return service, 0, 0, ReasonStorageCapacityUnknown
-	}
-	return candidate, localDelta, sharedDelta, ""
+	return candidate, localDelta, sharedDelta, storageRejection{}
 }

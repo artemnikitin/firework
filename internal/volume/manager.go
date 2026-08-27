@@ -1162,7 +1162,21 @@ func readRetained(root string) (map[string]int64, error) {
 		if m.AppliedSizeBytes <= 0 {
 			return fmt.Errorf("retained manifest %s has non-positive applied size %d; quarantined", path, m.AppliedSizeBytes)
 		}
-		retained[m.LogicalID] = m.AppliedSizeBytes
+		// The map key must come from the volume's location, not from what its
+		// manifest claims to be. Keying by the declared logical ID lets two
+		// manifests collapse onto one entry, and the second volume's bytes
+		// disappear from the reserved total — the same capacity bypass a
+		// negative size produces, by a different route. A disagreement between
+		// the two is itself the corruption, so it fails closed.
+		located, err := logicalIDFromManifestPath(root, path)
+		if err != nil {
+			return err
+		}
+		if m.LogicalID != located {
+			return fmt.Errorf("retained manifest %s declares logical id %q but is stored at %q; quarantined",
+				path, m.LogicalID, located)
+		}
+		retained[located] = m.AppliedSizeBytes
 		return nil
 	})
 	if os.IsNotExist(err) {
@@ -1190,10 +1204,10 @@ func ValidateNodeVolumes(nc config.NodeConfig) error {
 		}
 		// The agent derives a filesystem path from the service name as well as
 		// the volume name, so a name that is not a safe path component fails at
-		// preflight. Checking it through volumeDir rather than restating the
-		// pattern keeps the two from drifting.
-		if _, err := volumeDir("", svc.Name, svc.Volumes[0].Name); err != nil {
-			problems = append(problems, fmt.Sprintf("service %s: %v", svc.Name, err))
+		// preflight. It shares volumeDir's predicate rather than restating it,
+		// so the two cannot drift.
+		if err := validatePathComponent("service", svc.Name); err != nil {
+			problems = append(problems, err.Error())
 			continue
 		}
 		if err := validateServiceVolumes(svc.Volumes); err != nil {
@@ -1223,6 +1237,20 @@ func ValidateNodeVolumes(nc config.NodeConfig) error {
 		return fmt.Errorf("%s", strings.Join(problems, "\n"))
 	}
 	return nil
+}
+
+// logicalIDFromManifestPath recovers "service/volume" from a manifest's
+// location under the pool root, which is the volume's real identity.
+func logicalIDFromManifestPath(root, path string) (string, error) {
+	rel, err := filepath.Rel(root, path)
+	if err != nil {
+		return "", fmt.Errorf("locate retained manifest %s: %w", path, err)
+	}
+	parts := strings.Split(filepath.ToSlash(rel), "/")
+	if len(parts) != 3 || parts[0] == "" || parts[1] == "" {
+		return "", fmt.Errorf("retained manifest %s is not at <service>/<volume>/%s; quarantined", path, manifestFilename)
+	}
+	return parts[0] + "/" + parts[1], nil
 }
 
 func validateServiceVolumes(volumes []config.VolumeConfig) error {
@@ -1260,12 +1288,21 @@ func validateServiceVolumes(volumes []config.VolumeConfig) error {
 	return nil
 }
 
-func volumeDir(root, service, volume string) (string, error) {
-	if !componentPattern.MatchString(service) || strings.Contains(service, "..") {
-		return "", fmt.Errorf("invalid service name %q for volume path", service)
+// validatePathComponent is the single predicate for anything that becomes a
+// directory name under the volume pool.
+func validatePathComponent(kind, name string) error {
+	if !componentPattern.MatchString(name) || strings.Contains(name, "..") {
+		return fmt.Errorf("invalid %s name %q for volume path", kind, name)
 	}
-	if !componentPattern.MatchString(volume) || strings.Contains(volume, "..") {
-		return "", fmt.Errorf("invalid volume name %q", volume)
+	return nil
+}
+
+func volumeDir(root, service, volume string) (string, error) {
+	if err := validatePathComponent("service", service); err != nil {
+		return "", err
+	}
+	if err := validatePathComponent("volume", volume); err != nil {
+		return "", err
 	}
 	return filepath.Join(root, service, volume), nil
 }

@@ -231,7 +231,11 @@ func (c *Controller) runReconcile(ctx context.Context) {
 	// A service whose own volume record cannot be used is held, not dropped.
 	// Omitting it from the rendered node configs is what the agent turns into
 	// a delete, so a malformed *record* would stop a healthy *workload*.
-	schedulable, held, heldPending := splitHeldServices(services, admission, existingPlacement)
+	activeNodeIDs := make(map[string]struct{}, len(activeNodes))
+	for _, node := range activeNodes {
+		activeNodeIDs[node.InstanceID] = struct{}{}
+	}
+	schedulable, held, heldPending := splitHeldServices(services, admission, existingPlacement, activeNodeIDs)
 	schedulingNodes := reserveHeldCapacity(activeNodes, held)
 
 	assignments, pending := scheduler.ScheduleWithStorage(
@@ -415,7 +419,7 @@ func (c *Controller) readExistingPlacement(ctx context.Context) (placement map[s
 // desired revision instead, and charged no reservation; the scope block from
 // storageReservations is what keeps anything new from being admitted against
 // capacity that cannot be proved.
-func splitHeldServices(services []config.ServiceConfig, admission volumeAdmission, placement map[string]renderedPlacement) ([]config.ServiceConfig, map[string][]config.ServiceConfig, []scheduler.Pending) {
+func splitHeldServices(services []config.ServiceConfig, admission volumeAdmission, placement map[string]renderedPlacement, activeNodes map[string]struct{}) ([]config.ServiceConfig, map[string][]config.ServiceConfig, []scheduler.Pending) {
 	if len(admission.Held) == 0 {
 		return services, nil, nil
 	}
@@ -429,6 +433,17 @@ func splitHeldServices(services []config.ServiceConfig, admission volumeAdmissio
 			continue
 		}
 		placed, wasPlaced := placement[service.Name]
+		if wasPlaced {
+			// Holding a placement is only meaningful while that node is still
+			// there to honour it. Once it is gone the service is running
+			// nowhere, so re-rendering it onto the departed node produces a
+			// config no agent reads and reports the service as neither running
+			// nor pending. There is nothing left to disturb, which is exactly
+			// the condition under which the rule below withholds placement.
+			if _, active := activeNodes[placed.Node]; !active {
+				wasPlaced = false
+			}
+		}
 		if !wasPlaced {
 			pending = append(pending, scheduler.Pending{
 				Service: service.Name, ReasonCode: reason,

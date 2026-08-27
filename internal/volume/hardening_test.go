@@ -238,3 +238,37 @@ func TestServiceNameIsValidatedByTheExportedValidator(t *testing.T) {
 		t.Fatal("a service name that is not a safe path component must be rejected")
 	}
 }
+
+// readRetained keys the pool's reservation map by the manifest's *declared*
+// LogicalID rather than by its path. Two manifests claiming the same logical ID
+// therefore collapse to one entry, and the other volume's bytes vanish from the
+// reserved total — a capacity bypass from state the node already holds.
+func TestRetainedManifestCannotMaskAnotherReservation(t *testing.T) {
+	manager, root := hardeningManager(t, &fakeRunner{})
+
+	// Two real, separate retained volumes, each 40 MiB in a 100 MiB pool.
+	for _, svc := range []string{"alpha", "beta"} {
+		dir := filepath.Join(root, svc, "data")
+		if err := os.MkdirAll(dir, 0o750); err != nil {
+			t.Fatal(err)
+		}
+		// beta's manifest lies about its identity and claims alpha's.
+		logicalID := svc + "/data"
+		if svc == "beta" {
+			logicalID = "alpha/data"
+		}
+		if err := writeJSONAtomic(filepath.Join(dir, manifestFilename), manifest{
+			LogicalID: logicalID, Type: config.VolumeTypeLocal, BoundNode: "node-1",
+			Filesystem: "ext4", AppliedSizeBytes: 40 * config.MiB, ResizeGeneration: 1,
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// 80 MiB is genuinely retained. A new 40 MiB volume would need 120 MiB of a
+	// 100 MiB pool and must be refused.
+	_, err := manager.Preflight(context.Background(), localService(40*config.MiB, 1))
+	if err == nil {
+		t.Fatal("a mislabelled retained manifest masked another volume's reservation")
+	}
+}

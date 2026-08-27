@@ -356,7 +356,7 @@ func TestZeroVolumePriorSnapshotIsNotAMissingOne(t *testing.T) {
 	admission := volumeAdmission{Held: map[string]string{"svc": scheduler.ReasonVolumeRecordInvalid}}
 	placement := map[string]renderedPlacement{"svc": {Node: "node-1", Service: prior}}
 
-	_, held, _ := splitHeldServices(desired, admission, placement)
+	_, held, _ := splitHeldServices(desired, admission, placement, map[string]struct{}{"node-1": {}})
 
 	rendered := held["node-1"]
 	if len(rendered) != 1 {
@@ -364,5 +364,92 @@ func TestZeroVolumePriorSnapshotIsNotAMissingOne(t *testing.T) {
 	}
 	if len(rendered[0].Volumes) != 0 {
 		t.Fatalf("the unvalidated desired volume config was rendered for a held service: %#v", rendered[0].Volumes)
+	}
+}
+
+// A held service is re-rendered at its previous placement. If that node is no
+// longer active, rendering it there produces a node config nothing reads while
+// the service is, in reality, running nowhere.
+func TestHeldServiceOnADepartedNodeIsPendingNotRendered(t *testing.T) {
+	prior := config.ServiceConfig{Name: "svc", VCPUs: 1, MemoryMB: 512, Volumes: []config.VolumeConfig{{
+		Name: "data", Type: config.VolumeTypeLocal, MountPath: "/data",
+		SizeBytes: 10 * config.GiB, BoundNode: "node-gone", ResizeGeneration: 1,
+	}}}
+	desired := []config.ServiceConfig{serviceWithVolume("svc", 10*config.GiB)}
+	admission := volumeAdmission{Held: map[string]string{"svc": scheduler.ReasonVolumeRecordInvalid}}
+	placement := map[string]renderedPlacement{"svc": {Node: "node-gone", Service: prior}}
+
+	// Only node-1 is active now; node-gone has left the fleet.
+	active := map[string]struct{}{"node-1": {}}
+	_, held, pending := splitHeldServices(desired, admission, placement, active)
+
+	if len(held) != 0 {
+		t.Fatalf("a held service must not be rendered onto a departed node: %#v", held)
+	}
+	if len(pending) != 1 || pending[0].Service != "svc" {
+		t.Fatalf("a service running nowhere must be reported pending, got %#v", pending)
+	}
+}
+
+// A tier-3 quarantine blocks new volume-bearing placement for a whole storage
+// class. If that block survives the deletion of the service the record belongs
+// to, one corrupt object permanently prevents every future volume placement in
+// the cluster, with no service left to repair.
+func TestQuarantineBlocksCapacityEvenForADeletedService(t *testing.T) {
+	set := volumeRecordSet{
+		Records: map[string]storedVolumeRecord{},
+		Quarantined: map[string]volumeQuarantine{
+			// Unreadable object: no binding, no class -> blocks both classes.
+			"deleted-service/data": {Key: "k", LogicalID: "deleted-service/data", Tier: quarantineTierUnattributable},
+		},
+	}
+	reservations := storageReservations(set)
+	if !reservations.LocalClassUnknown {
+		t.Skip("precondition changed")
+	}
+
+	// A brand-new, unrelated service wants a volume on a healthy node.
+	nodes := []scheduler.Node{{
+		InstanceID: "node-1", CapacityVCPUs: 8, CapacityMemMB: 8192,
+		LocalCapacityBytes: 100 * config.GiB,
+	}}
+	fresh := []config.ServiceConfig{serviceWithVolume("fresh", 10*config.GiB)}
+	assignments, pending := scheduler.ScheduleWithStorage(fresh, nodes, nil, reservations, nil)
+
+	// This is correct, not a defect: a retained volume's bytes are still on
+	// disk after its service is deleted, so an unreadable record still hides
+	// real capacity. It is the opposite of a *refusal*, which ends with the
+	// service because nobody is asking for the size any more.
+	if len(assignments["node-1"]) != 0 {
+		t.Fatalf("unverifiable capacity must not be handed out: %#v", assignments)
+	}
+	if len(pending) != 1 || pending[0].ReasonCode != scheduler.ReasonStorageCapacityUnknown {
+		t.Fatalf("expected an unknown-capacity block, got %#v", pending)
+	}
+}
+
+// §4.4 requires every tier to name the offending key so the repair target is
+// unambiguous. A cluster-wide block whose cause is only in the controller log
+// leaves an operator grepping for an object they cannot name.
+func TestCapacityBlockNamesItsRepairTarget(t *testing.T) {
+	set := volumeRecordSet{
+		Records: map[string]storedVolumeRecord{},
+		Quarantined: map[string]volumeQuarantine{
+			"svc/data": {Key: "k", LogicalID: "svc/data", Tier: quarantineTierUnattributable},
+		},
+	}
+	reservations := storageReservations(set)
+	nodes := []scheduler.Node{{
+		InstanceID: "node-1", CapacityVCPUs: 8, CapacityMemMB: 8192,
+		LocalCapacityBytes: 100 * config.GiB,
+	}}
+	_, pending := scheduler.ScheduleWithStorage(
+		[]config.ServiceConfig{serviceWithVolume("fresh", 10*config.GiB)}, nodes, nil, reservations, nil)
+
+	if len(pending) != 1 || pending[0].ReasonCode != scheduler.ReasonStorageCapacityUnknown {
+		t.Fatalf("expected an unknown-capacity block, got %#v", pending)
+	}
+	if !strings.Contains(pending[0].Message, "svc/data") {
+		t.Fatalf("the block must name the record to repair, got %q", pending[0].Message)
 	}
 }

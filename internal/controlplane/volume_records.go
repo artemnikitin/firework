@@ -245,7 +245,14 @@ func (c *Controller) admitLocalRaise(record VolumeRecord, requested int64, nodeB
 	}
 	candidate += fresh
 	if candidate > node.LocalCapacityBytes {
-		return scheduler.ReasonNodeStorageExhausted, node.LocalCapacityBytes - (total - old)
+		// Headroom, floored at zero: a pool that is already over-committed
+		// would otherwise report a negative "available", which reads as a
+		// bug rather than as "there is none".
+		available := node.LocalCapacityBytes - (total - old)
+		if available < 0 {
+			available = 0
+		}
+		return scheduler.ReasonNodeStorageExhausted, available
 	}
 	return "", 0
 }
@@ -339,7 +346,18 @@ func storageReservations(set volumeRecordSet) scheduler.StorageReservations {
 		RecordedLogicalIDs:     make(map[string]bool, len(set.Records)+len(set.Quarantined)),
 		LocalUnknownByNode:     make(map[string]bool),
 		SharedUnknownByBackend: make(map[string]bool),
+		UnknownCapacityKeys:    make(map[string]string),
 		SharedEnabled:          false,
+	}
+	// One quarantined key per blocked scope, chosen deterministically so the
+	// reported repair target does not change between controllers or leaders.
+	nameTarget := func(scope, key string) {
+		if scope == "" {
+			return
+		}
+		if existing, ok := reservations.UnknownCapacityKeys[scope]; !ok || key < existing {
+			reservations.UnknownCapacityKeys[scope] = key
+		}
 	}
 	for id, stored := range set.Records {
 		record := stored.Record
@@ -366,11 +384,13 @@ func storageReservations(set volumeRecordSet) scheduler.StorageReservations {
 				reservations.LocalByNode[quarantine.BoundNode] += quarantine.ReservedBytes
 				if quarantine.Tier == quarantineTierPartial {
 					reservations.LocalUnknownByNode[quarantine.BoundNode] = true
+					nameTarget(quarantine.BoundNode, id)
 				}
 			case config.VolumeTypeShared:
 				reservations.SharedByBackend[quarantine.SharedBackendID] += quarantine.ReservedBytes
 				if quarantine.Tier == quarantineTierPartial {
 					reservations.SharedUnknownByBackend[quarantine.SharedBackendID] = true
+					nameTarget(quarantine.SharedBackendID, id)
 				}
 			}
 		default:
@@ -380,11 +400,15 @@ func storageReservations(set volumeRecordSet) scheduler.StorageReservations {
 			switch quarantine.Class {
 			case config.VolumeTypeLocal:
 				reservations.LocalClassUnknown = true
+				nameTarget(string(config.VolumeTypeLocal), id)
 			case config.VolumeTypeShared:
 				reservations.SharedClassUnknown = true
+				nameTarget(string(config.VolumeTypeShared), id)
 			default:
 				reservations.LocalClassUnknown = true
 				reservations.SharedClassUnknown = true
+				nameTarget(string(config.VolumeTypeLocal), id)
+				nameTarget(string(config.VolumeTypeShared), id)
 			}
 		}
 	}
