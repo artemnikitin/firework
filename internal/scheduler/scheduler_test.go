@@ -255,7 +255,7 @@ func TestScheduleWithStorageBindsLocalVolumeAndHonorsRetainedBinding(t *testing.
 		{InstanceID: "small", CapacityVCPUs: 4, CapacityMemMB: 1024, LocalCapacityBytes: 5 * config.GiB},
 		{InstanceID: "large", CapacityVCPUs: 4, CapacityMemMB: 1024, LocalCapacityBytes: 20 * config.GiB},
 	}
-	result, pending := ScheduleWithStorage([]config.ServiceConfig{service}, nodes, nil, StorageReservations{})
+	result, pending := ScheduleWithStorage([]config.ServiceConfig{service}, nodes, nil, StorageReservations{}, nil)
 	if len(pending) != 0 || len(result["large"]) != 1 {
 		t.Fatalf("unexpected placement result=%#v pending=%#v", result, pending)
 	}
@@ -264,7 +264,7 @@ func TestScheduleWithStorageBindsLocalVolumeAndHonorsRetainedBinding(t *testing.
 	}
 
 	service.Volumes[0].BoundNode = "lost"
-	_, pending = ScheduleWithStorage([]config.ServiceConfig{service}, nodes, nil, StorageReservations{})
+	_, pending = ScheduleWithStorage([]config.ServiceConfig{service}, nodes, nil, StorageReservations{}, nil)
 	if len(pending) != 1 || pending[0].ReasonCode != "local_volume_node_unavailable" {
 		t.Fatalf("unexpected retained binding result: %#v", pending)
 	}
@@ -274,7 +274,7 @@ func TestScheduleWithStorageKeepsSharedPendingUntilSafetyGate(t *testing.T) {
 	service := svc("db", 1, 256)
 	service.Volumes = []config.VolumeConfig{{Name: "data", Type: config.VolumeTypeShared, MountPath: "/data", SizeBytes: config.GiB}}
 	nodes := []Node{{InstanceID: "node", CapacityVCPUs: 4, CapacityMemMB: 1024, SharedBackendID: "primary"}}
-	_, pending := ScheduleWithStorage([]config.ServiceConfig{service}, nodes, nil, StorageReservations{})
+	_, pending := ScheduleWithStorage([]config.ServiceConfig{service}, nodes, nil, StorageReservations{}, nil)
 	if len(pending) != 1 || pending[0].ReasonCode != "shared_volume_runtime_unavailable" {
 		t.Fatalf("unexpected pending result: %#v", pending)
 	}
@@ -309,7 +309,7 @@ func TestScheduleWithStorageSeparatesServicesSharingHostPort(t *testing.T) {
 	}
 	nodes := []Node{node("i-001", 32, 16384), node("i-002", 4, 2048)}
 
-	result, pending := ScheduleWithStorage(services, nodes, nil, StorageReservations{})
+	result, pending := ScheduleWithStorage(services, nodes, nil, StorageReservations{}, nil)
 	if len(pending) != 0 {
 		t.Fatalf("unexpected pending services: %#v", pending)
 	}
@@ -327,7 +327,7 @@ func TestScheduleWithStorageKeepsRepeatedHostPortsOnDifferentNodes(t *testing.T)
 	nodes := []Node{node("i-001", 8, 4096), node("i-002", 8, 4096)}
 	existing := map[string]string{"a": "i-001", "b": "i-002"}
 
-	result, pending := ScheduleWithStorage(services, nodes, existing, StorageReservations{})
+	result, pending := ScheduleWithStorage(services, nodes, existing, StorageReservations{}, nil)
 	if len(pending) != 0 {
 		t.Fatalf("unexpected pending services: %#v", pending)
 	}
@@ -343,7 +343,7 @@ func TestScheduleWithStorageLeavesConflictingServicePending(t *testing.T) {
 	}
 	nodes := []Node{node("i-001", 8, 4096)}
 
-	result, pending := ScheduleWithStorage(services, nodes, nil, StorageReservations{})
+	result, pending := ScheduleWithStorage(services, nodes, nil, StorageReservations{}, nil)
 	if len(result["i-001"]) != 1 {
 		t.Fatalf("expected exactly one service placed, got %#v", result)
 	}
@@ -367,7 +367,7 @@ func TestScheduleWithStorageRelocatesExistingPlacementOnNewConflict(t *testing.T
 	nodes := []Node{node("i-001", 8, 4096), node("i-002", 8, 4096)}
 	existing := map[string]string{"a": "i-001", "b": "i-001"}
 
-	result, pending := ScheduleWithStorage(services, nodes, existing, StorageReservations{})
+	result, pending := ScheduleWithStorage(services, nodes, existing, StorageReservations{}, nil)
 	if len(pending) != 0 {
 		t.Fatalf("unexpected pending services: %#v", pending)
 	}
@@ -389,7 +389,7 @@ func TestScheduleWithStorageTreatsMultipleClaimsAtomically(t *testing.T) {
 	nodes := []Node{node("i-001", 16, 8192), node("i-002", 8, 4096)}
 	existing := map[string]string{"keeper": "i-001"}
 
-	result, pending := ScheduleWithStorage(services, nodes, existing, StorageReservations{})
+	result, pending := ScheduleWithStorage(services, nodes, existing, StorageReservations{}, nil)
 	if len(pending) != 0 {
 		t.Fatalf("unexpected pending services: %#v", pending)
 	}
@@ -408,7 +408,7 @@ func TestScheduleWithStorageRejectsSelfConflictingService(t *testing.T) {
 	service := withPorts("broken", 2, 512, 8080, 8080)
 	nodes := []Node{node("i-001", 8, 4096), node("i-002", 8, 4096)}
 
-	result, pending := ScheduleWithStorage([]config.ServiceConfig{service}, nodes, nil, StorageReservations{})
+	result, pending := ScheduleWithStorage([]config.ServiceConfig{service}, nodes, nil, StorageReservations{}, nil)
 	if len(pending) != 1 || pending[0].ReasonCode != "duplicate_host_port_claims" {
 		t.Fatalf("unexpected pending result: %#v", pending)
 	}

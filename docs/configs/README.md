@@ -309,7 +309,12 @@ Notes:
   acknowledge a stable rendered revision. Direct-Git configs may omit them.
 - `size_bytes`, `bound_node`, `shared_backend_id`, and `resize_generation` are
   resolved/system-owned volume fields. Direct-Git local configs must contain a
-  `bound_node` matching the agent's stable `node_id`.
+  `bound_node` matching the agent's stable `node_id`, and must **bump
+  `resize_generation` whenever `size_bytes` changes** — the control plane mints
+  one automatically, but a hand-authored file carries its own, and a size change
+  at an unchanged generation is not recognized as a resize. Run
+  `configcheck --node-config <file>` to catch a declared size with no
+  generation. See [persistent volumes](../persistent-volumes.md).
 - `metadata.subdomain` is the portable, deployment-neutral form: it is exactly one DNS
   label and the agent forms the final hostname as `<subdomain>.<ingress_domain>`. It
   requires the agent's `ingress_domain` to be set and `traefik_config_dir` to be enabled;

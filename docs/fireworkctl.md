@@ -89,10 +89,47 @@ fireworkctl services --help
 
 `fireworkctl service SERVICE_NAME` also prints a persistent-volume table when
 the service declares volumes. It shows the logical ID, type, guest mount path,
-local node binding or shared backend, desired/applied bytes, resize generation,
-and preparation state. `local_volume_node_unavailable` means retained data is
-still bound to a node that is not currently schedulable; Firework does not
-replace it with an empty volume elsewhere.
+local node binding or shared backend, requested/effective/applied bytes, resize
+generation, and preparation state.
+
+Requested is what the repo asked for, effective is what the control plane
+accepted and rendered, and applied is what exists on disk. They differ only
+when a size request was refused, and in that case the state column names the
+refusal reason. See [persistent volumes](persistent-volumes.md).
+
+Storage-related pending and refusal reasons:
+
+- `local_volume_node_unavailable`: retained data is still bound to a node that
+  is not currently schedulable. Firework does not replace it with an empty
+  volume elsewhere;
+- `volume_capacity_unavailable`: the volume cannot bind to any candidate node
+  at all — no local pool there, or its binding names somewhere else. A
+  placement problem;
+- `node_storage_exhausted`: the volume could bind, but no node's pool has room
+  for the new reservation. A capacity problem, resolved by freeing retained
+  volumes or growing the pool;
+- `storage_capacity_unknown`: remaining capacity cannot be verified, because a
+  retained record could not be fully read or its bound node is not active.
+  New volume-bearing placement waits rather than being allocated against
+  capacity that may already be occupied;
+- `volume_record_invalid`: the service's own retained record could not be
+  parsed. An already-running service keeps running at its last applied
+  configuration; one that was never placed stays pending until the record is
+  repaired;
+- `shrink_below_minimum`: the requested shrink is smaller than the filesystem's
+  current contents allow.
+
+`configcheck --node-config <file>` validates a hand-authored node config with
+the same semantic checks the control plane applies before rendering, plus the
+volume contract the agent itself enforces — a local volume must declare
+`bound_node`, mount paths must be absolute and outside the reserved set, and
+shared volumes are not yet runnable. It warns about a volume size declared with
+no `resize_generation`, and about a `bound_node` naming a different node than
+the config is for.
+
+Host-port claims have their own reasons — `host_port_conflict` and
+`duplicate_host_port_claims` — described in
+[docs/configs](configs/README.md#host-port-claims).
 
 `unknown` is intentional: it means the control plane cannot safely confirm the
 current state. For example, a stale node or an agent that has not converged to

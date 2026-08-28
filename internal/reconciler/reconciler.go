@@ -18,6 +18,7 @@ import (
 	"github.com/artemnikitin/firework/internal/healthcheck"
 	"github.com/artemnikitin/firework/internal/network"
 	"github.com/artemnikitin/firework/internal/vm"
+	"github.com/artemnikitin/firework/internal/volume"
 )
 
 // Action represents a reconciliation action the agent needs to take.
@@ -44,7 +45,7 @@ type VMManager interface {
 }
 
 type volumePreflighter interface {
-	Preflight(context.Context, config.ServiceConfig) error
+	Preflight(context.Context, config.ServiceConfig) ([]volume.Rejection, error)
 }
 
 type vmRecoverer interface {
@@ -552,9 +553,13 @@ func (r *Reconciler) applyAllAtOnce(ctx context.Context, actions []Action) error
 
 		case ActionUpdate:
 			r.logger.Info("updating service (stop + start)", "service", action.Service.Name)
-			if err := r.preflight(ctx, action.Service); err != nil {
+			rejections, err := r.preflight(ctx, action.Service)
+			if err != nil {
 				r.logger.Error("volume preflight failed; keeping current VM running", "service", action.Service.Name, "error", err)
 				errs = append(errs, stageError(FailureStageVM, fmt.Errorf("preflight update %s: %w", action.Service.Name, err)))
+				continue
+			}
+			if r.settleRejections(&action, rejections) {
 				continue
 			}
 			prev := action.Service
@@ -623,10 +628,14 @@ func (r *Reconciler) applyRolling(ctx context.Context, actions []Action) error {
 
 	for i, action := range updates {
 		r.logger.Info("updating service (stop + start)", "service", action.Service.Name)
-		if err := r.preflight(ctx, action.Service); err != nil {
+		rejections, err := r.preflight(ctx, action.Service)
+		if err != nil {
 			r.logger.Error("volume preflight failed; keeping current VM running", "service", action.Service.Name, "error", err)
 			errs = append(errs, stageError(FailureStageVM, fmt.Errorf("preflight update %s: %w", action.Service.Name, err)))
 			break
+		}
+		if r.settleRejections(&action, rejections) {
+			continue
 		}
 		prev := action.Service
 		if action.PreviousService != nil {
@@ -657,11 +666,71 @@ func (r *Reconciler) applyRolling(ctx context.Context, actions []Action) error {
 	return nil
 }
 
-func (r *Reconciler) preflight(ctx context.Context, svc config.ServiceConfig) error {
+func (r *Reconciler) preflight(ctx context.Context, svc config.ServiceConfig) ([]volume.Rejection, error) {
 	if manager, ok := r.vmManager.(volumePreflighter); ok {
 		return manager.Preflight(ctx, svc)
 	}
-	return nil
+	return nil, nil
+}
+
+// settleRejections applies a preflight refusal to a planned update and reports
+// whether the update is now a no-op.
+//
+// This is what makes an advisory preflight rejection *terminal*. The VM is
+// still live at this point, and once the clamp lands the desired configuration
+// no longer differs from the running one, so no further update is planned —
+// not merely no further failure. Without it the measurement repeats on every
+// tick forever.
+func (r *Reconciler) settleRejections(action *Action, rejections []volume.Rejection) bool {
+	if !clampRejected(&action.Service, rejections) {
+		return false
+	}
+	instance := r.vmManager.List()[action.Service.Name]
+	if instance == nil || needsUpdate(instance, action.Service) {
+		// Something else about the service still differs — an image change,
+		// for instance — so the update proceeds, now carrying the effective
+		// volume size and performing no resize.
+		return false
+	}
+	r.logger.Info("volume size request refused; keeping the effective size and skipping the update",
+		"service", action.Service.Name)
+	return true
+}
+
+// clampRejected substitutes the effective size for every volume the preflight
+// refused, and reports whether anything changed.
+//
+// The refusal is applied by clamping rather than by failing the update, so an
+// update that changes the image *and* requests a refused shrink still deploys
+// the image. Failing the preflight would wedge every unrelated change behind a
+// size the node will never accept.
+func clampRejected(svc *config.ServiceConfig, rejections []volume.Rejection) bool {
+	if len(rejections) == 0 {
+		return false
+	}
+	byID := make(map[string]volume.Rejection, len(rejections))
+	for _, rejection := range rejections {
+		byID[rejection.LogicalID] = rejection
+	}
+	clamped := false
+	for i := range svc.Volumes {
+		rejection, ok := byID[svc.Name+"/"+svc.Volumes[i].Name]
+		if !ok {
+			continue
+		}
+		if svc.Volumes[i].SizeBytes == rejection.AppliedSizeBytes &&
+			svc.Volumes[i].ResizeGeneration == rejection.AppliedGeneration {
+			continue
+		}
+		// Substitute the whole effective configuration. Clamping only the size
+		// leaves the generation differing forever, and needsUpdate compares
+		// whole volume configs — so the update would be re-planned on every
+		// tick, which is worse than the single failure this replaces.
+		svc.Volumes[i].SizeBytes = rejection.AppliedSizeBytes
+		svc.Volumes[i].ResizeGeneration = rejection.AppliedGeneration
+		clamped = true
+	}
+	return clamped
 }
 
 // Reconcile is a convenience method that plans and applies in one step.

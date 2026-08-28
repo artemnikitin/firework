@@ -63,7 +63,13 @@ var (
 		"ConfigFetched", "ConfigParsed", "NetworkReady", "CapacityReady",
 		"ImagesReady", "VMsReconciled", "Reconciled", "LocalRoutesReady",
 	}
-	nonBlockingConditionTypes = []string{"PeerRoutesReady"}
+	// VolumeSizesApplied is false while this node is running a volume at a
+	// size other than the one the desired revision asked for. It is
+	// non-blocking because the workload is healthy — it is running, just not
+	// at the requested quota — but it must not read as ordinary convergence,
+	// or the operator sees a service quietly running at the wrong size with no
+	// explanation.
+	nonBlockingConditionTypes = []string{"PeerRoutesReady", "VolumeSizesApplied"}
 )
 
 // BlockingConditionTypes returns the conditions whose failure is fatal.
@@ -152,6 +158,13 @@ type VolumeStatus struct {
 	ResizeGeneration int64  `json:"resize_generation,omitempty"`
 	State            string `json:"state"`
 	LastError        string `json:"last_error,omitempty"`
+	// RequestedSizeBytes is what the desired revision asked for, when that
+	// differs from the effective DesiredSizeBytes the cluster accepted and
+	// rendered. Equal sizes are reported only through DesiredSizeBytes, so an
+	// unrejected volume's surface is unchanged.
+	RequestedSizeBytes int64  `json:"requested_size_bytes,omitempty"`
+	Rejected           bool   `json:"rejected,omitempty"`
+	RejectedReason     string `json:"rejected_reason,omitempty"`
 }
 
 type AgentStatus struct {

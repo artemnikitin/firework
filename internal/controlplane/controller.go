@@ -166,6 +166,16 @@ func (c *Controller) runReconcile(ctx context.Context) {
 		c.logger.Warn("desired revision pointer targets missing object", "revision", desiredPtr.Revision)
 		return
 	}
+	// Node discovery is hoisted above the record work because admission needs
+	// node capacity in scope: a size request is only feasible relative to the
+	// pool it would land in. discoverActiveNodes does not read volume records,
+	// so the move is safe, and schedulingInputSignature is computed after both
+	// either way.
+	activeNodes, hostIPByNode, err := c.discoverActiveNodes(ctx)
+	if err != nil {
+		c.logger.Error("discovering active nodes failed", "error", err)
+		return
+	}
 	if err := c.acknowledgeVolumeRecords(ctx); err != nil {
 		c.logger.Warn("acknowledging volume records failed", "error", err)
 	}
@@ -178,16 +188,12 @@ func (c *Controller) runReconcile(ctx context.Context) {
 	for i := range services {
 		services[i].Volumes = append([]config.VolumeConfig(nil), desired.Services[i].Volumes...)
 	}
-	if err := c.applyExistingVolumeRecords(ctx, services, volumeRecords); err != nil {
+	admission, err := c.applyExistingVolumeRecords(ctx, services, volumeRecords, activeNodes)
+	if err != nil {
 		c.logger.Error("reconciling volume records failed", "error", err)
 		return
 	}
 
-	activeNodes, hostIPByNode, err := c.discoverActiveNodes(ctx)
-	if err != nil {
-		c.logger.Error("discovering active nodes failed", "error", err)
-		return
-	}
 	inputSig, err := schedulingInputSignature(desired.Revision, activeNodes, hostIPByNode, volumeRecordsDigest(volumeRecords))
 	if err != nil {
 		c.logger.Error("failed to compute scheduling input signature; skipping signature cache optimization", "error", err)
@@ -200,13 +206,45 @@ func (c *Controller) runReconcile(ctx context.Context) {
 		return
 	}
 
-	existingAssignment, err := c.readExistingAssignment(ctx)
+	existingPlacement, placementFound, err := c.readExistingPlacement(ctx)
 	if err != nil {
 		c.logger.Warn("reading existing placement failed; will re-place all", "error", err)
-		existingAssignment = nil
+		existingPlacement = nil
+	}
+	// A held service is one already running that must keep running, and the
+	// prior placement is the only source for where. Without it the service
+	// would be classified as never-placed and left pending, which drops it
+	// from the rendered node configs — and the agent turns an absent service
+	// into a delete. Publishing anything here would evict a healthy workload
+	// over a transient read failure, so nothing is published and the next tick
+	// retries. Omission is eviction; there is no partial answer to give.
+	if heldPlacementUnrecoverable(placementFound, admission.Held) {
+		c.logger.Error("holding services but the previous placement is unreadable; not publishing",
+			"held", len(admission.Held))
+		return
+	}
+	existingAssignment := make(map[string]string, len(existingPlacement))
+	for name, placed := range existingPlacement {
+		existingAssignment[name] = placed.Node
 	}
 
-	assignments, pending := scheduler.ScheduleWithStorage(services, activeNodes, existingAssignment, storageReservations(volumeRecords))
+	// A service whose own volume record cannot be used is held, not dropped.
+	// Omitting it from the rendered node configs is what the agent turns into
+	// a delete, so a malformed *record* would stop a healthy *workload*.
+	activeNodeIDs := make(map[string]struct{}, len(activeNodes))
+	for _, node := range activeNodes {
+		activeNodeIDs[node.InstanceID] = struct{}{}
+	}
+	schedulable, held, heldPending := splitHeldServices(services, admission, existingPlacement, activeNodeIDs)
+	schedulingNodes := reserveHeldCapacity(activeNodes, held)
+
+	assignments, pending := scheduler.ScheduleWithStorage(
+		schedulable, schedulingNodes, existingAssignment, storageReservations(volumeRecords), heldPortClaims(held))
+	for node, services := range held {
+		assignments[node] = append(assignments[node], services...)
+	}
+	pending = append(pending, heldPending...)
+	sort.Slice(pending, func(i, j int) bool { return pending[i].Service < pending[j].Service })
 
 	nodeConfigs := scheduler.BuildNodeConfigs(assignments)
 	nodeConfigs = appendRetiredNodeConfigs(nodeConfigs, activeNodes)
@@ -235,6 +273,17 @@ func (c *Controller) runReconcile(ctx context.Context) {
 			Service: item.Service, ReasonCode: item.ReasonCode, Message: item.Message,
 		})
 	}
+	for _, services := range held {
+		for _, service := range services {
+			placementRev.HeldServices = append(placementRev.HeldServices, PendingPlacement{
+				Service: service.Name, ReasonCode: admission.Held[service.Name],
+				Message: "running the last applied configuration; the desired one could not be resolved",
+			})
+		}
+	}
+	sort.Slice(placementRev.HeldServices, func(i, j int) bool {
+		return placementRev.HeldServices[i].Service < placementRev.HeldServices[j].Service
+	})
 	if err := c.publishPlacement(ctx, placementRev); err != nil {
 		c.logger.Error("publishing placement failed", "error", err)
 		return
@@ -302,26 +351,182 @@ func (c *Controller) discoverActiveNodes(ctx context.Context) ([]scheduler.Node,
 	return nodes, hostIPByNode, nil
 }
 
-func (c *Controller) readExistingAssignment(ctx context.Context) (map[string]string, error) {
+// renderedPlacement is one service as the previous cycle actually rendered it:
+// its node together with its complete configuration at the effective volume
+// sizes the cluster accepted.
+//
+// The placement map alone (service to node) cannot supply that configuration,
+// and the malformed record is by definition not a source either. Without this
+// third source, "re-render its last effective configuration" is unimplementable
+// and the obvious shortcut — re-rendering the desired revision's volume config
+// — silently reintroduces the very size the record was supposed to gate.
+type renderedPlacement struct {
+	Node    string
+	Service config.ServiceConfig
+}
+
+// readExistingPlacement returns the previous placement and whether it could be
+// established at all.
+//
+// found is false both for a read error and for missing state, and the
+// difference matters to exactly one caller. A pointer that names a revision
+// whose object is gone is *not* the same as "nothing has been placed yet":
+// services may well be running under it. Treating a missing object as an empty
+// placement is what lets a held service be classified as never-placed and
+// dropped from the rendered configs, which the agent turns into a delete.
+//
+// An absent pointer is genuinely a cluster that has never placed anything, but
+// it is reported the same way because the only caller that consults found also
+// requires a held service — which requires a retained volume record, which a
+// cluster that has never placed anything does not have.
+func (c *Controller) readExistingPlacement(ctx context.Context) (placement map[string]renderedPlacement, found bool, err error) {
 	var ptr RevisionPointer
 	_, exists, err := c.store.GetJSON(ctx, placementCurrentKey(c.cfg.State.Prefix), &ptr)
 	if err != nil || !exists || ptr.Revision == "" {
-		return nil, err
+		return nil, false, err
 	}
 
 	var rev PlacementRevision
 	_, exists, err = c.store.GetJSON(ctx, placementRevisionKey(c.cfg.State.Prefix, ptr.Revision), &rev)
 	if err != nil || !exists {
-		return nil, err
+		return nil, false, err
 	}
 
-	assignment := make(map[string]string)
+	placement = make(map[string]renderedPlacement)
 	for _, nc := range rev.NodeConfigs {
 		for _, svc := range nc.Services {
-			assignment[svc.Name] = nc.Node
+			placement[svc.Name] = renderedPlacement{Node: nc.Node, Service: svc}
 		}
 	}
-	return assignment, nil
+	return placement, true, nil
+}
+
+// splitHeldServices separates the services that can be scheduled from their
+// desired configuration from those whose volume records cannot be used.
+//
+// Blocking is scoped by whether the owner is already running:
+//
+//   - already placed: hold the last placement and re-render it at its last
+//     known effective volume configuration. The service keeps running, and no
+//     resize, rebinding, or capacity change is applied while the record is
+//     unreadable.
+//   - not yet placed: withhold placement. There is nothing running to disturb,
+//     and admitting it would allocate against capacity that cannot be verified.
+//
+// When the prior rendered snapshot is unavailable — a first reconcile after a
+// prefix change, or an unreadable placement revision — the service is *still*
+// never omitted, because omission is eviction. It is re-rendered from the
+// desired revision instead, and charged no reservation; the scope block from
+// storageReservations is what keeps anything new from being admitted against
+// capacity that cannot be proved.
+func splitHeldServices(services []config.ServiceConfig, admission volumeAdmission, placement map[string]renderedPlacement, activeNodes map[string]struct{}) ([]config.ServiceConfig, map[string][]config.ServiceConfig, []scheduler.Pending) {
+	if len(admission.Held) == 0 {
+		return services, nil, nil
+	}
+	schedulable := make([]config.ServiceConfig, 0, len(services))
+	held := make(map[string][]config.ServiceConfig)
+	var pending []scheduler.Pending
+	for _, service := range services {
+		reason, blocked := admission.Held[service.Name]
+		if !blocked {
+			schedulable = append(schedulable, service)
+			continue
+		}
+		placed, wasPlaced := placement[service.Name]
+		if wasPlaced {
+			// Holding a placement is only meaningful while that node is still
+			// there to honour it. Once it is gone the service is running
+			// nowhere, so re-rendering it onto the departed node produces a
+			// config no agent reads and reports the service as neither running
+			// nor pending. There is nothing left to disturb, which is exactly
+			// the condition under which the rule below withholds placement.
+			if _, active := activeNodes[placed.Node]; !active {
+				wasPlaced = false
+			}
+		}
+		if !wasPlaced {
+			pending = append(pending, scheduler.Pending{
+				Service: service.Name, ReasonCode: reason,
+				Message: "volume record cannot be read; placement withheld until it is repaired",
+			})
+			continue
+		}
+		// The prior render is used exactly as it was, including when it
+		// declared no volumes at all — that is valid prior state, not a
+		// missing snapshot, and substituting the desired configuration there
+		// renders precisely the unvalidated volume config the hold exists to
+		// gate. A genuinely missing snapshot cannot reach here: it is the
+		// unrecoverable case, and heldPlacementUnrecoverable stops the cycle
+		// before anything is published.
+		held[placed.Node] = append(held[placed.Node], placed.Service)
+	}
+	return schedulable, held, pending
+}
+
+// heldPlacementUnrecoverable reports whether publishing this cycle could evict
+// a running service.
+//
+// A held service is one already running that must keep running, and the prior
+// placement is the only source for where it runs. When that read fails, a held
+// service would be classified as never-placed and left pending, which drops it
+// from the rendered node configs — and the agent turns an absent service into a
+// delete. Omission is eviction, and there is no partial answer to give, so the
+// cycle publishes nothing and the next tick retries.
+//
+// With nothing held, a failed placement read is harmless: the scheduler simply
+// re-places everything from the desired revision, which is the pre-existing
+// behavior.
+func heldPlacementUnrecoverable(placementFound bool, held map[string]string) bool {
+	return !placementFound && len(held) > 0
+}
+
+// heldPortClaims collects the node-exclusive host-port claims a held service is
+// still holding.
+//
+// A held service is re-rendered outside the scheduler, so the scheduler cannot
+// see its claims and would otherwise place a new service claiming the same
+// (tcp, host_port) on the same node. The agent rejects a node config with a
+// duplicate claim outright, so that would take down every service on the node —
+// a strictly worse outcome than the unreadable record that caused the hold.
+func heldPortClaims(held map[string][]config.ServiceConfig) map[string]map[config.PortClaim]string {
+	if len(held) == 0 {
+		return nil
+	}
+	claims := make(map[string]map[config.PortClaim]string, len(held))
+	for node, services := range held {
+		for _, service := range services {
+			for _, claim := range service.PortClaims() {
+				if claims[node] == nil {
+					claims[node] = make(map[config.PortClaim]string)
+				}
+				claims[node][claim] = service.Name
+			}
+		}
+	}
+	return claims
+}
+
+// reserveHeldCapacity removes the compute a held service is still using from
+// the capacity offered to the scheduler, so re-rendering it outside the
+// scheduler cannot over-commit the node it runs on.
+func reserveHeldCapacity(nodes []scheduler.Node, held map[string][]config.ServiceConfig) []scheduler.Node {
+	if len(held) == 0 {
+		return nodes
+	}
+	adjusted := append([]scheduler.Node(nil), nodes...)
+	for i := range adjusted {
+		for _, service := range held[adjusted[i].InstanceID] {
+			adjusted[i].CapacityVCPUs -= service.VCPUs
+			adjusted[i].CapacityMemMB -= service.MemoryMB
+		}
+		if adjusted[i].CapacityVCPUs < 0 {
+			adjusted[i].CapacityVCPUs = 0
+		}
+		if adjusted[i].CapacityMemMB < 0 {
+			adjusted[i].CapacityMemMB = 0
+		}
+	}
+	return adjusted
 }
 
 func (c *Controller) stillLeader(ctx context.Context) bool {
