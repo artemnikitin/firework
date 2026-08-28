@@ -73,29 +73,20 @@ func (c *registryClient) register(ctx context.Context, nodeID string, labels []s
 		NodeID:     nodeID,
 		Generation: c.generation,
 		Labels:     labels,
-		Capacity: registryapi.Resources{
-			VCPUs:    cap.VCPUs,
-			MemoryMB: cap.MemoryMB,
-		},
-		State:   registryapi.NodeStateReady,
-		HostIP:  c.hostIP,
-		Storage: c.storagePayload(),
+		Capacity:   registryapi.Resources(cap),
+		State:      registryapi.NodeStateReady,
+		HostIP:     c.hostIP,
+		Storage:    c.storagePayload(),
 	}
 	return c.postMTLS(ctx, "/v1/nodes/register", req, nil)
 }
 
 func (c *registryClient) heartbeat(ctx context.Context, nodeID string, cap, used capacity.NodeCapacity, status *statusmodel.AgentStatus) error {
 	req := registryapi.HeartbeatRequest{
-		NodeID:     nodeID,
-		Generation: c.generation,
-		Capacity: registryapi.Resources{
-			VCPUs:    cap.VCPUs,
-			MemoryMB: cap.MemoryMB,
-		},
-		Used: registryapi.Resources{
-			VCPUs:    used.VCPUs,
-			MemoryMB: used.MemoryMB,
-		},
+		NodeID:      nodeID,
+		Generation:  c.generation,
+		Capacity:    registryapi.Resources(cap),
+		Used:        registryapi.Resources(used),
 		HostIP:      c.hostIP,
 		AgentStatus: status,
 		Storage:     c.storagePayload(),

@@ -1,3 +1,5 @@
+// Package agentconfig owns agent process configuration, defaults, loading,
+// secret resolution, and validation.
 package agentconfig
 
 import "time"

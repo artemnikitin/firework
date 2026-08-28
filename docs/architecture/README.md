@@ -56,9 +56,9 @@ cmd/controlplane -> internal/controlplane -> internal/registryapi
 cmd/fireworkctl -> internal/operatorapi
 ```
 
-`internal/architecturetest` checks these rules against the Linux production
-dependency closures of shipped commands. Test-only imports do not create a
-runtime exception.
+`internal/architecturetest` checks the exact internal production dependency
+closure of every shipped command across its release operating systems and
+architectures. Test-only imports do not create a runtime exception.
 
 ## Control-Plane State Model (Object Storage)
 

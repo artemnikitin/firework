@@ -18,65 +18,86 @@ type packageInfo struct {
 	Standard   bool
 }
 
-func TestCommandRuntimeBoundaries(t *testing.T) {
-	tests := []struct {
-		name      string
-		root      string
-		forbidden []string
-	}{
-		{
-			name: "agent does not depend on control plane",
-			root: modulePath + "/cmd/agent",
-			forbidden: []string{
-				modulePath + "/internal/controlplane",
-			},
-		},
-		{
-			name: "control plane does not depend on agent runtime",
-			root: modulePath + "/cmd/controlplane",
-			forbidden: []string{
-				modulePath + "/internal/agent",
-				modulePath + "/internal/agentconfig",
-				modulePath + "/internal/api",
-				modulePath + "/internal/capacity",
-				modulePath + "/internal/healthcheck",
-				modulePath + "/internal/imagesync",
-				modulePath + "/internal/network",
-				modulePath + "/internal/reconciler",
-				modulePath + "/internal/store",
-				modulePath + "/internal/traefik",
-				modulePath + "/internal/vm",
-				modulePath + "/internal/volume",
-			},
-		},
-	}
-
-	graph := loadProductionGraph(t, "./cmd/agent", "./cmd/controlplane")
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			path := dependencyPath(graph, tt.root, func(importPath string) bool {
-				return matchesAnyPrefix(importPath, tt.forbidden)
-			})
-			if len(path) > 0 {
-				t.Fatalf("forbidden production dependency:\n%s", strings.Join(path, "\n  -> "))
-			}
-		})
-	}
+type buildTarget struct {
+	goos   string
+	goarch string
 }
 
-func TestFireworkctlInternalDependencies(t *testing.T) {
-	const root = modulePath + "/cmd/fireworkctl"
-	allowed := map[string]bool{
-		root:                                 true,
-		modulePath + "/internal/operatorapi": true,
-		modulePath + "/internal/version":     true,
+func (target buildTarget) String() string {
+	return target.goos + "/" + target.goarch
+}
+
+var (
+	linuxReleaseTargets = []buildTarget{
+		{goos: "linux", goarch: "amd64"},
+		{goos: "linux", goarch: "arm64"},
 	}
-	graph := loadProductionGraph(t, "./cmd/fireworkctl")
-	path := dependencyPath(graph, root, func(importPath string) bool {
-		return strings.HasPrefix(importPath, modulePath+"/") && !allowed[importPath]
-	})
-	if len(path) > 0 {
-		t.Fatalf("unexpected internal dependency:\n%s", strings.Join(path, "\n  -> "))
+	allReleaseTargets = []buildTarget{
+		{goos: "linux", goarch: "amd64"},
+		{goos: "linux", goarch: "arm64"},
+		{goos: "darwin", goarch: "amd64"},
+		{goos: "darwin", goarch: "arm64"},
+	}
+)
+
+func TestCommandRuntimeBoundaries(t *testing.T) {
+	tests := []struct {
+		command              string
+		targets              []buildTarget
+		internalDependencies []string
+	}{
+		{
+			command: "agent", targets: linuxReleaseTargets,
+			internalDependencies: []string{
+				"agent", "agentconfig", "api", "capacity", "config", "healthcheck",
+				"imagesync", "ingress", "network", "objectstorage", "reconciler",
+				"registryapi", "statusmodel", "store", "traefik", "version", "vm", "volume",
+			},
+		},
+		{
+			command: "controlplane", targets: linuxReleaseTargets,
+			internalDependencies: []string{
+				"config", "controlplane", "enricher", "ingress", "objectstorage",
+				"operatorapi", "registryapi", "scheduler", "statusmodel", "version",
+			},
+		},
+		{
+			command: "fireworkctl", targets: allReleaseTargets,
+			internalDependencies: []string{"operatorapi", "version"},
+		},
+		{
+			command: "configcheck", targets: linuxReleaseTargets,
+			internalDependencies: []string{
+				"agentconfig", "config", "enricher", "ingress", "statusmodel", "volume",
+			},
+		},
+		{command: "fc-init", targets: linuxReleaseTargets},
+	}
+
+	for _, tt := range tests {
+		for _, target := range tt.targets {
+			t.Run(tt.command+"/"+target.String(), func(t *testing.T) {
+				root := modulePath + "/cmd/" + tt.command
+				graph := loadProductionGraph(t, target, "./cmd/"+tt.command)
+				allowed := make(map[string]bool, len(tt.internalDependencies))
+				for _, name := range tt.internalDependencies {
+					allowed[modulePath+"/internal/"+name] = true
+				}
+
+				path := dependencyPath(graph, root, func(importPath string) bool {
+					return strings.HasPrefix(importPath, modulePath+"/internal/") && !allowed[importPath]
+				})
+				if len(path) > 0 {
+					t.Fatalf("unexpected internal dependency:\n%s", strings.Join(path, "\n  -> "))
+				}
+				for _, name := range tt.internalDependencies {
+					importPath := modulePath + "/internal/" + name
+					if _, ok := graph[importPath]; !ok {
+						t.Errorf("expected internal dependency is absent: %s", importPath)
+					}
+				}
+			})
+		}
 	}
 }
 
@@ -94,25 +115,27 @@ func TestContractPackageDependencies(t *testing.T) {
 	}
 
 	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			root := modulePath + "/internal/" + tt.target
-			allowed := map[string]bool{root: true}
-			for _, importPath := range tt.allowed {
-				if strings.Contains(importPath, ".") {
-					allowed[importPath] = true
-				} else {
-					allowed[modulePath+"/internal/"+importPath] = true
+		for _, target := range allReleaseTargets {
+			t.Run(tt.name+"/"+target.String(), func(t *testing.T) {
+				root := modulePath + "/internal/" + tt.target
+				allowed := map[string]bool{root: true}
+				for _, importPath := range tt.allowed {
+					if strings.Contains(importPath, ".") {
+						allowed[importPath] = true
+					} else {
+						allowed[modulePath+"/internal/"+importPath] = true
+					}
 				}
-			}
-			graph := loadProductionGraph(t, "./internal/"+tt.target)
-			path := dependencyPath(graph, root, func(importPath string) bool {
-				pkg, ok := graph[importPath]
-				return ok && !pkg.Standard && !allowed[importPath]
+				graph := loadProductionGraph(t, target, "./internal/"+tt.target)
+				path := dependencyPath(graph, root, func(importPath string) bool {
+					pkg, ok := graph[importPath]
+					return ok && !pkg.Standard && !allowed[importPath]
+				})
+				if len(path) > 0 {
+					t.Fatalf("unexpected dependency:\n%s", strings.Join(path, "\n  -> "))
+				}
 			})
-			if len(path) > 0 {
-				t.Fatalf("unexpected dependency:\n%s", strings.Join(path, "\n  -> "))
-			}
-		})
+		}
 	}
 }
 
@@ -132,21 +155,14 @@ func TestDependencyPath(t *testing.T) {
 	}
 }
 
-func TestMatchesAnyPrefixIncludesSubpackages(t *testing.T) {
-	prefix := modulePath + "/internal/controlplane"
-	if !matchesAnyPrefix(prefix+"/registry", []string{prefix}) {
-		t.Fatal("subpackages must match a forbidden package prefix")
-	}
-}
-
-func loadProductionGraph(t *testing.T, targets ...string) map[string]packageInfo {
+func loadProductionGraph(t *testing.T, target buildTarget, packages ...string) map[string]packageInfo {
 	t.Helper()
 
 	root := moduleRoot(t)
-	args := append([]string{"list", "-deps", "-json"}, targets...)
+	args := append([]string{"list", "-deps", "-json"}, packages...)
 	cmd := exec.Command("go", args...)
 	cmd.Dir = root
-	cmd.Env = append(os.Environ(), "GOOS=linux")
+	cmd.Env = buildEnvironment(target)
 	out, err := cmd.Output()
 	if err != nil {
 		if exitErr, ok := err.(*exec.ExitError); ok {
@@ -165,6 +181,17 @@ func loadProductionGraph(t *testing.T, targets ...string) map[string]packageInfo
 		graph[pkg.ImportPath] = pkg
 	}
 	return graph
+}
+
+func buildEnvironment(target buildTarget) []string {
+	env := make([]string, 0, len(os.Environ())+2)
+	for _, entry := range os.Environ() {
+		if strings.HasPrefix(entry, "GOOS=") || strings.HasPrefix(entry, "GOARCH=") {
+			continue
+		}
+		env = append(env, entry)
+	}
+	return append(env, "GOOS="+target.goos, "GOARCH="+target.goarch)
 }
 
 func dependencyPath(graph map[string]packageInfo, root string, forbidden func(string) bool) []string {
@@ -193,15 +220,6 @@ func dependencyPath(graph map[string]packageInfo, root string, forbidden func(st
 		}
 	}
 	return nil
-}
-
-func matchesAnyPrefix(importPath string, prefixes []string) bool {
-	for _, prefix := range prefixes {
-		if importPath == prefix || strings.HasPrefix(importPath, prefix+"/") {
-			return true
-		}
-	}
-	return false
 }
 
 func moduleRoot(t *testing.T) string {
