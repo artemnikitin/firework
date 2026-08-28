@@ -25,6 +25,41 @@ Roles:
 All roles use the same object-storage-backed state layout under `cp/v1/`.
 The configured backend can be S3 or GCS.
 
+## Package ownership and dependencies
+
+The runtime commands remain separate composition roots. Shared packages own
+contracts or provider-neutral data, not runtime orchestration.
+
+- `internal/agentconfig` owns the agent process configuration, including its
+  storage pools, defaults, YAML loading, secret resolution, and validation.
+- `internal/config` owns resolved workload configuration. Both direct Git mode
+  and control-plane-managed agents consume this contract.
+- `internal/registryapi` owns the HTTP wire types exchanged by agents and the
+  registry. Durable node records, state keys, and compare-and-swap logic stay
+  private to `internal/controlplane`.
+- `internal/operatorapi` owns the response types consumed by `fireworkctl` and
+  other operator clients. Visibility derivation and persistence stay private
+  to `internal/controlplane`.
+- `internal/statusmodel` owns bounded agent telemetry. `internal/registryapi`
+  may reference it because heartbeats carry that telemetry.
+
+The intended dependency direction is:
+
+```text
+cmd/agent -> internal/agentconfig
+          -> internal/agent -> internal/registryapi -> internal/statusmodel
+                            -> internal/volume -> internal/agentconfig
+
+cmd/controlplane -> internal/controlplane -> internal/registryapi
+                                         -> internal/operatorapi
+
+cmd/fireworkctl -> internal/operatorapi
+```
+
+`internal/architecturetest` checks these rules against the Linux production
+dependency closures of shipped commands. Test-only imports do not create a
+runtime exception.
+
 ## Control-Plane State Model (Object Storage)
 
 - `cp/v1/registry/nodes/<node>.json` — node records (state, generation,

@@ -8,8 +8,13 @@ Firework is a lightweight pull-based orchestrator for Firecracker microVMs writt
 
 - `cmd/agent`: `firework-agent` entry point.
 - `cmd/controlplane`: control-plane entry point.
+- `cmd/fireworkctl`: operator CLI; depends on API contracts, not control-plane runtime code.
 - `cmd/fc-init`: guest init process used inside microVM rootfs images.
-- `internal/config`: YAML config types and loading.
+- `internal/agentconfig`: agent operational config types, defaults, loading, and validation.
+- `internal/config`: provider-neutral resolved workload config used by direct Git mode and the control plane.
+- `internal/registryapi`: agent-to-control-plane registry wire types.
+- `internal/operatorapi`: control-plane-to-operator response types.
+- `internal/statusmodel`: bounded agent telemetry shared by the registry contract.
 - `internal/enricher`: GitOps input expansion and defaults.
 - `internal/scheduler`: placement and bin-packing logic.
 - `internal/reconciler`: desired-vs-running VM plan/apply logic.
@@ -30,6 +35,10 @@ Firework is a lightweight pull-based orchestrator for Firecracker microVMs writt
 - The scheduler and enricher are pure functions — keep them that way.
 - Keep integrations/dependencies (cloud object storage, Git, Firecracker,
   filesystem, etc.) behind interfaces.
+- Keep `internal/operatorapi` standard-library-only. Keep `internal/registryapi`
+  free of runtime dependencies. It may depend on `internal/statusmodel`.
+- Do not import `internal/controlplane` from agent commands or clients, or
+  agent runtime packages from the control-plane command.
 - Version/commit/build time are injected via ldflags at build time; never hardcode them.
 - When changing config schemas, CLI behavior, APIs, or user-visible runtime behavior, update `docs/`, `examples/`, and relevant tests.
 
