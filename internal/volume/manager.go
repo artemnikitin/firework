@@ -19,6 +19,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/artemnikitin/firework/internal/agentconfig"
 	"github.com/artemnikitin/firework/internal/config"
 )
 
@@ -336,7 +337,7 @@ func decodeMountPath(value string) string {
 // disabled until its durable supervisor safety gate is satisfied.
 type Manager struct {
 	nodeID   string
-	storage  config.StorageConfig
+	storage  agentconfig.StorageConfig
 	runner   CommandRunner
 	mounts   MountVerifier
 	observer Observer
@@ -351,17 +352,17 @@ type Manager struct {
 	rejections  map[string]Rejection
 }
 
-func NewManager(nodeID string, storage config.StorageConfig) *Manager {
+func NewManager(nodeID string, storage agentconfig.StorageConfig) *Manager {
 	return &Manager{nodeID: nodeID, storage: storage, runner: execRunner{}, mounts: procMountVerifier{}, rejections: make(map[string]Rejection)}
 }
 
-func NewManagerWithObserver(nodeID string, storage config.StorageConfig, observer Observer) *Manager {
+func NewManagerWithObserver(nodeID string, storage agentconfig.StorageConfig, observer Observer) *Manager {
 	manager := NewManager(nodeID, storage)
 	manager.observer = observer
 	return manager
 }
 
-func NewManagerWithDependencies(nodeID string, storage config.StorageConfig, runner CommandRunner, mounts MountVerifier) *Manager {
+func NewManagerWithDependencies(nodeID string, storage agentconfig.StorageConfig, runner CommandRunner, mounts MountVerifier) *Manager {
 	return &Manager{nodeID: nodeID, storage: storage, runner: runner, mounts: mounts, rejections: make(map[string]Rejection)}
 }
 
@@ -881,7 +882,7 @@ func (m *Manager) recordShrinkRejection(dir string, current *manifest, desired c
 	return &rejection, nil
 }
 
-func (m *Manager) checkCapacity(pool *config.LocalStorageConfig, desired map[string]int64) error {
+func (m *Manager) checkCapacity(pool *agentconfig.LocalStorageConfig, desired map[string]int64) error {
 	retained, err := readRetained(pool.Path)
 	if err != nil {
 		return err

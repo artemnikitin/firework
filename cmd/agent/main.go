@@ -10,7 +10,7 @@ import (
 	"syscall"
 
 	"github.com/artemnikitin/firework/internal/agent"
-	"github.com/artemnikitin/firework/internal/config"
+	"github.com/artemnikitin/firework/internal/agentconfig"
 	"github.com/artemnikitin/firework/internal/store"
 	"github.com/artemnikitin/firework/internal/version"
 )
@@ -33,7 +33,7 @@ func main() {
 
 func run(configPath string) error {
 	// Load agent configuration.
-	cfg, err := config.LoadAgentConfig(configPath)
+	cfg, err := agentconfig.LoadAgentConfig(configPath)
 	if err != nil {
 		return fmt.Errorf("loading config: %w", err)
 	}

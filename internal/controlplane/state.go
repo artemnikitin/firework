@@ -49,33 +49,6 @@ type NodeRecord struct {
 	Storage      StorageResources         `json:"storage,omitempty"`
 }
 
-// NodeRegisterRequest is the request payload for node registration.
-type NodeRegisterRequest struct {
-	NodeID     string           `json:"node_id"`
-	Generation int64            `json:"generation"`
-	Labels     []string         `json:"labels,omitempty"`
-	Capacity   Resources        `json:"capacity"`
-	State      NodeState        `json:"state,omitempty"`
-	HostIP     string           `json:"host_ip,omitempty"`
-	Storage    StorageResources `json:"storage,omitempty"`
-}
-
-// NodeHeartbeatRequest is the request payload for node heartbeat.
-type NodeHeartbeatRequest struct {
-	NodeID      string                   `json:"node_id"`
-	Generation  int64                    `json:"generation"`
-	Capacity    Resources                `json:"capacity,omitempty"`
-	Used        Resources                `json:"used,omitempty"`
-	HostIP      string                   `json:"host_ip,omitempty"`
-	AgentStatus *statusmodel.AgentStatus `json:"agent_status,omitempty"`
-	Storage     StorageResources         `json:"storage,omitempty"`
-}
-
-// NodeStateRequest updates node state.
-type NodeStateRequest struct {
-	State NodeState `json:"state"`
-}
-
 // DesiredRevision stores normalized services from events.
 type DesiredRevision struct {
 	Revision  string                 `json:"revision"`
@@ -222,32 +195,6 @@ type LeaderLock struct {
 type EventDedupeMarker struct {
 	EventID    string    `json:"event_id"`
 	ReceivedAt time.Time `json:"received_at"`
-}
-
-// EnrollRequest requests a node certificate.
-type EnrollRequest struct {
-	NodeID         string `json:"node_id"`
-	BootstrapToken string `json:"bootstrap_token"`
-	CSRPEM         string `json:"csr_pem"`
-}
-
-// RenewRequest requests node certificate rotation.
-type RenewRequest struct {
-	CSRPEM string `json:"csr_pem"`
-}
-
-// CertResponse is returned by enrollment endpoints.
-type CertResponse struct {
-	CertPEM   string    `json:"cert_pem"`
-	ExpiresAt time.Time `json:"expires_at"`
-}
-
-// NodeResponse is a generic node response payload.
-type NodeResponse struct {
-	NodeID     string    `json:"node_id"`
-	Generation int64     `json:"generation"`
-	State      NodeState `json:"state"`
-	LastSeenAt time.Time `json:"last_seen_at"`
 }
 
 func stateRoot(prefix string) string { return strings.TrimSuffix(prefix, "/") + "/" }
