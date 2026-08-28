@@ -52,6 +52,27 @@ func TestOperatorAPIConversionsPreserveFields(t *testing.T) {
 	}
 }
 
+func TestOperatorConditionShapeMatchesStatusModel(t *testing.T) {
+	source := reflect.TypeOf(statusmodel.Condition{})
+	destination := reflect.TypeOf(operatorapi.Condition{})
+	if source.NumField() != destination.NumField() {
+		t.Fatalf("status and operator conditions have %d and %d fields", source.NumField(), destination.NumField())
+	}
+	for i := 0; i < source.NumField(); i++ {
+		sourceField := source.Field(i)
+		destinationField, ok := destination.FieldByName(sourceField.Name)
+		if !ok {
+			t.Fatalf("operator condition is missing field %s", sourceField.Name)
+		}
+		if sourceField.Tag.Get("json") != destinationField.Tag.Get("json") {
+			t.Fatalf("condition field %s has JSON tags %q and %q", sourceField.Name, sourceField.Tag.Get("json"), destinationField.Tag.Get("json"))
+		}
+		if !sourceField.Type.ConvertibleTo(destinationField.Type) {
+			t.Fatalf("condition field %s cannot convert from %s to %s", sourceField.Name, sourceField.Type, destinationField.Type)
+		}
+	}
+}
+
 func TestVisibilityDerivedStates(t *testing.T) {
 	ctx := context.Background()
 	store := newBlobStateStore(newMemBlob())

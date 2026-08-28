@@ -561,14 +561,11 @@ func (s *RegistryServer) handleState(w http.ResponseWriter, r *http.Request) {
 }
 
 func resourcesFromRegistry(resources registryapi.Resources) Resources {
-	return Resources{VCPUs: resources.VCPUs, MemoryMB: resources.MemoryMB}
+	return Resources(resources)
 }
 
 func storageFromRegistry(storage registryapi.StorageResources) StorageResources {
-	return StorageResources{
-		LocalCapacityBytes: storage.LocalCapacityBytes, SharedBackendID: storage.SharedBackendID,
-		SharedCapacityBytes: storage.SharedCapacityBytes,
-	}
+	return StorageResources(storage)
 }
 
 func nodeResponse(record *NodeRecord) registryapi.NodeResponse {

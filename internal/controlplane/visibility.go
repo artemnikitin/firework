@@ -203,7 +203,7 @@ func toOperatorConditions(conditions []statusmodel.Condition) []operatorapi.Cond
 func toOperatorPortForwards(portForwards []config.PortForward) []operatorapi.PortForward {
 	out := make([]operatorapi.PortForward, len(portForwards))
 	for i, portForward := range portForwards {
-		out[i] = operatorapi.PortForward{HostPort: portForward.HostPort, VMPort: portForward.VMPort}
+		out[i] = operatorapi.PortForward(portForward)
 	}
 	return out
 }
@@ -211,13 +211,7 @@ func toOperatorPortForwards(portForwards []config.PortForward) []operatorapi.Por
 func toOperatorVolumeStatuses(volumes []statusmodel.VolumeStatus) []operatorapi.VolumeStatus {
 	out := make([]operatorapi.VolumeStatus, len(volumes))
 	for i, volume := range volumes {
-		out[i] = operatorapi.VolumeStatus{
-			LogicalID: volume.LogicalID, Type: volume.Type, MountPath: volume.MountPath,
-			BoundNode: volume.BoundNode, SharedBackendID: volume.SharedBackendID,
-			DesiredSizeBytes: volume.DesiredSizeBytes, AppliedSizeBytes: volume.AppliedSizeBytes,
-			ResizeGeneration: volume.ResizeGeneration, State: volume.State, LastError: volume.LastError,
-			RequestedSizeBytes: volume.RequestedSizeBytes, Rejected: volume.Rejected, RejectedReason: volume.RejectedReason,
-		}
+		out[i] = operatorapi.VolumeStatus(volume)
 	}
 	return out
 }
@@ -507,7 +501,7 @@ func (s visibilitySnapshot) nodeSummary(record NodeRecord) operatorapi.NodeSumma
 }
 
 func toOperatorResources(resources Resources) operatorapi.Resources {
-	return operatorapi.Resources{VCPUs: resources.VCPUs, MemoryMB: resources.MemoryMB}
+	return operatorapi.Resources(resources)
 }
 
 func (s visibilitySnapshot) nodeStorageSummary(record NodeRecord) operatorapi.NodeStorageSummary {
