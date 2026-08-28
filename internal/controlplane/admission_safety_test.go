@@ -2,6 +2,7 @@ package controlplane
 
 import (
 	"context"
+	"encoding/json"
 	"strings"
 	"testing"
 	"time"
@@ -451,5 +452,229 @@ func TestCapacityBlockNamesItsRepairTarget(t *testing.T) {
 	}
 	if !strings.Contains(pending[0].Message, "svc/data") {
 		t.Fatalf("the block must name the record to repair, got %q", pending[0].Message)
+	}
+}
+
+// The rejection fields must survive a store round-trip unchanged, or the
+// no-op-write guards compare unequal every tick and the digest never settles.
+func TestRejectionFieldsSurviveRoundTripWithoutChurn(t *testing.T) {
+	ctx := context.Background()
+	controller, store := admissionController(t)
+	original := VolumeRecord{
+		LogicalID: "db/data", Type: config.VolumeTypeLocal, BoundNode: "node-1",
+		DesiredSizeBytes: 10 * config.GiB, AppliedSizeBytes: 10 * config.GiB,
+		RequestedSizeBytes: 2 * config.GiB, ResizeGeneration: 2,
+		ResizeState: VolumeResizeRejected, RejectedReason: "shrink_below_minimum",
+		RejectedAvailableBytes: 5 * config.GiB,
+		RejectedAt:             time.Now().UTC().Truncate(time.Second),
+	}
+	putRecord(t, store, "db", "data", original)
+
+	set, err := controller.loadVolumeRecords(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := set.Records["db/data"].Record
+	for _, c := range []struct {
+		name      string
+		got, want any
+	}{
+		{"requested", got.RequestedSizeBytes, original.RequestedSizeBytes},
+		{"reason", got.RejectedReason, original.RejectedReason},
+		{"available", got.RejectedAvailableBytes, original.RejectedAvailableBytes},
+		{"state", got.ResizeState, original.ResizeState},
+	} {
+		if c.got != c.want {
+			t.Fatalf("%s did not survive the round trip: %v != %v", c.name, c.got, c.want)
+		}
+	}
+	if !got.RejectedAt.Equal(original.RejectedAt) {
+		t.Fatalf("rejected_at did not survive: %v != %v", got.RejectedAt, original.RejectedAt)
+	}
+
+	// The first pass may correct the stored available-capacity figure, which
+	// §4.2.4 permits. Every pass after it must write nothing, or a standing
+	// rejection churns the store and invalidates the signature cache forever.
+	services := []config.ServiceConfig{serviceWithVolume("db", 2*config.GiB)}
+	if _, err := controller.applyExistingVolumeRecords(ctx, services, set, poolNodes(100*config.GiB)); err != nil {
+		t.Fatal(err)
+	}
+	settled := set.Records["db/data"].Token
+	firstDigest := volumeRecordsDigest(set)
+	for pass := 0; pass < 3; pass++ {
+		services = []config.ServiceConfig{serviceWithVolume("db", 2*config.GiB)}
+		if _, err := controller.applyExistingVolumeRecords(ctx, services, set, poolNodes(100*config.GiB)); err != nil {
+			t.Fatal(err)
+		}
+		if set.Records["db/data"].Token != settled {
+			t.Fatalf("pass %d rewrote a settled standing rejection", pass)
+		}
+		if volumeRecordsDigest(set) != firstDigest {
+			t.Fatalf("pass %d moved the records digest for an unchanged rejection", pass)
+		}
+	}
+}
+
+// omitempty does nothing for a zero time.Time, so a record with no rejection
+// still serializes rejected_at. Harmless on the wire, but it must not make an
+// unrejected record look different from itself.
+func TestCleanRecordIsStableAcrossRoundTrip(t *testing.T) {
+	clean := VolumeRecord{
+		LogicalID: "db/data", Type: config.VolumeTypeLocal, BoundNode: "node-1",
+		DesiredSizeBytes: config.GiB, AppliedSizeBytes: config.GiB,
+		ResizeGeneration: 1, ResizeState: VolumeResizeApplied,
+	}
+	first, err := json.Marshal(clean)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var round VolumeRecord
+	if err := json.Unmarshal(first, &round); err != nil {
+		t.Fatal(err)
+	}
+	second, err := json.Marshal(round)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(first) != string(second) {
+		t.Fatalf("record is not stable across a round trip:\n%s\n%s", first, second)
+	}
+	if round.rejectionStands() {
+		t.Fatal("a clean record must not read as rejected after a round trip")
+	}
+	t.Logf("zero rejected_at serialized: %v", strings.Contains(string(first), "rejected_at"))
+}
+
+// The whole refusal lifecycle, driven as consecutive controller passes. Each
+// step asserts the invariant that must hold at that point; the value is in the
+// accumulated state between them, not in any single step.
+func TestFullRefusalLifecycle(t *testing.T) {
+	ctx := context.Background()
+	controller, store := admissionController(t)
+	pool := poolNodes(100 * config.GiB)
+
+	pass := func(requested int64) (config.VolumeConfig, VolumeRecord) {
+		t.Helper()
+		set, err := controller.loadVolumeRecords(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		services := []config.ServiceConfig{serviceWithVolume("db", requested)}
+		if _, err := controller.applyExistingVolumeRecords(ctx, services, set, pool); err != nil {
+			t.Fatal(err)
+		}
+		return services[0].Volumes[0], set.Records["db/data"].Record
+	}
+
+	putRecord(t, store, "db", "data", appliedRecord("db/data", 10*config.GiB))
+
+	// 1. A feasible grow is accepted and mints exactly one generation.
+	rendered, record := pass(20 * config.GiB)
+	if record.ResizeGeneration != 2 || record.DesiredSizeBytes != 20*config.GiB {
+		t.Fatalf("grow not accepted: %#v", record)
+	}
+	if rendered.SizeBytes != 20*config.GiB {
+		t.Fatalf("grow not rendered: %#v", rendered)
+	}
+
+	// 2. The agent applies it and reports back.
+	applied := record
+	applied.AppliedSizeBytes = 20 * config.GiB
+	applied.ResizeState = VolumeResizeApplied
+	putRecord(t, store, "db", "data", applied)
+
+	// 3. An infeasible raise is refused; the effective size keeps rendering and
+	//    no generation is minted.
+	rendered, record = pass(500 * config.GiB)
+	if !record.rejectionStands() || record.ResizeGeneration != 2 {
+		t.Fatalf("infeasible raise not refused cleanly: %#v", record)
+	}
+	if rendered.SizeBytes != 20*config.GiB || rendered.ResizeGeneration != 2 {
+		t.Fatalf("effective config not rendered during refusal: %#v", rendered)
+	}
+
+	// 4. The refusal is idempotent across further passes.
+	for i := 0; i < 3; i++ {
+		_, again := pass(500 * config.GiB)
+		if again.ResizeGeneration != 2 || !again.RejectedAt.Equal(record.RejectedAt) {
+			t.Fatalf("pass %d disturbed a standing refusal: %#v", i, again)
+		}
+	}
+
+	// 5. Withdrawing to the effective size clears it completely — no generation
+	//    minted, and no contradictory leftover state.
+	rendered, record = pass(20 * config.GiB)
+	if record.rejectionStands() || record.ResizeState == VolumeResizeRejected {
+		t.Fatalf("withdrawal left a partial refusal: %#v", record)
+	}
+	if record.ResizeGeneration != 2 {
+		t.Fatalf("withdrawal minted a generation: %d", record.ResizeGeneration)
+	}
+	if record.LastError != "" {
+		t.Fatalf("withdrawal left a stale message: %q", record.LastError)
+	}
+
+	// 6. A feasible correction after all that still works, minting exactly one.
+	rendered, record = pass(30 * config.GiB)
+	if record.ResizeGeneration != 3 || record.DesiredSizeBytes != 30*config.GiB {
+		t.Fatalf("correction after a refusal did not apply: %#v", record)
+	}
+	if rendered.SizeBytes != 30*config.GiB {
+		t.Fatalf("correction not rendered: %#v", rendered)
+	}
+
+	// 7. Throughout, the volume must never have been dropped from scheduling.
+	set, err := controller.loadVolumeRecords(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reservations := storageReservations(set)
+	if reservations.LocalByNode["node-1"] != 30*config.GiB {
+		t.Fatalf("reservation drifted from the effective size: %d", reservations.LocalByNode["node-1"])
+	}
+	assignments, pending := scheduler.ScheduleWithStorage(
+		[]config.ServiceConfig{serviceWithVolume("db", 30*config.GiB)}, pool, map[string]string{"db": "node-1"}, reservations, nil)
+	if len(pending) != 0 || len(assignments["node-1"]) != 1 {
+		t.Fatalf("the service was not schedulable after the lifecycle: %#v %#v", assignments, pending)
+	}
+}
+
+// A fresh controller — a leader change — must reach the same decisions from
+// the durable record alone, with no in-memory carry-over.
+func TestLeaderChangeMidRefusalIsIdempotent(t *testing.T) {
+	ctx := context.Background()
+	first, store := admissionController(t)
+	putRecord(t, store, "db", "data", appliedRecord("db/data", 10*config.GiB))
+
+	set, err := first.loadVolumeRecords(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	services := []config.ServiceConfig{serviceWithVolume("db", 500*config.GiB)}
+	if _, err := first.applyExistingVolumeRecords(ctx, services, set, poolNodes(100*config.GiB)); err != nil {
+		t.Fatal(err)
+	}
+	established := set.Records["db/data"].Record
+
+	// A new leader over the same store.
+	second := NewController(Config{State: StateConfig{Prefix: "cp/v1/"}}, store, first.logger)
+	set2, err := second.loadVolumeRecords(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	services2 := []config.ServiceConfig{serviceWithVolume("db", 500*config.GiB)}
+	if _, err := second.applyExistingVolumeRecords(ctx, services2, set2, poolNodes(100*config.GiB)); err != nil {
+		t.Fatal(err)
+	}
+	got := set2.Records["db/data"].Record
+	if !got.RejectedAt.Equal(established.RejectedAt) {
+		t.Fatalf("a leader change restamped the refusal: %v vs %v", got.RejectedAt, established.RejectedAt)
+	}
+	if got.ResizeGeneration != established.ResizeGeneration {
+		t.Fatalf("a leader change minted a generation: %d vs %d", got.ResizeGeneration, established.ResizeGeneration)
+	}
+	if services2[0].Volumes[0] != services[0].Volumes[0] {
+		t.Fatalf("a leader change rendered a different config: %#v vs %#v",
+			services2[0].Volumes[0], services[0].Volumes[0])
 	}
 }

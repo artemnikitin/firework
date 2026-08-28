@@ -228,3 +228,48 @@ services:
 		})
 	}
 }
+
+func TestNodeConfigEdgeInputs(t *testing.T) {
+	dir := t.TempDir()
+	t.Run("missing file", func(t *testing.T) {
+		if err := runNodeConfig(filepath.Join(dir, "nope.yaml")); err == nil {
+			t.Fatal("a missing node config must be an error")
+		}
+	})
+	t.Run("directory", func(t *testing.T) {
+		if err := runNodeConfig(dir); err == nil {
+			t.Fatal("a directory must be an error")
+		}
+	})
+	t.Run("empty file", func(t *testing.T) {
+		p := filepath.Join(dir, "empty.yaml")
+		if err := os.WriteFile(p, nil, 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if err := runNodeConfig(p); err == nil {
+			t.Fatal("an empty node config has no node name and must be an error")
+		}
+	})
+	t.Run("service with volumes but no name", func(t *testing.T) {
+		p := filepath.Join(dir, "noname.yaml")
+		if err := os.WriteFile(p, []byte(`node: node-1
+services:
+  - image: /i
+    kernel: /k
+    vcpus: 1
+    memory_mb: 128
+    volumes:
+      - name: data
+        type: local
+        mount_path: /var/lib/app
+        size_bytes: 1048576
+        bound_node: node-1
+        resize_generation: 1
+`), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if err := runNodeConfig(p); err == nil {
+			t.Fatal("a service with no name must be an error")
+		}
+	})
+}

@@ -272,3 +272,159 @@ func TestRetainedManifestCannotMaskAnotherReservation(t *testing.T) {
 		t.Fatal("a mislabelled retained manifest masked another volume's reservation")
 	}
 }
+
+// Normalization runs on every desired service every tick, including shapes it
+// must leave alone. None may panic or corrupt the config.
+func TestNormalizeIgnoresWhatItMustNotTouch(t *testing.T) {
+	manager, _ := hardeningManager(t, &fakeRunner{})
+	if _, err := manager.Prepare(context.Background(), localService(16*config.MiB, 1)); err != nil {
+		t.Fatal(err)
+	}
+
+	services := []config.ServiceConfig{
+		{Name: "app", Volumes: []config.VolumeConfig{
+			// shared: not this manager's business
+			{Name: "s", Type: config.VolumeTypeShared, MountPath: "/s", SizeBytes: config.MiB, ResizeGeneration: 1},
+			// name that is not a path component
+			{Name: "bad/name", Type: config.VolumeTypeLocal, MountPath: "/b", SizeBytes: config.MiB, ResizeGeneration: 1},
+			// no manifest on disk
+			{Name: "absent", Type: config.VolumeTypeLocal, MountPath: "/a", SizeBytes: config.MiB, ResizeGeneration: 1},
+		}},
+		{Name: "no-volumes"},
+	}
+	before := append([]config.VolumeConfig(nil), services[0].Volumes...)
+	manager.NormalizeVolumes(services)
+	for i := range before {
+		if services[0].Volumes[i] != before[i] {
+			t.Fatalf("normalization altered a volume it should not touch: %#v -> %#v", before[i], services[0].Volumes[i])
+		}
+	}
+	if len(manager.Rejections()) != 0 {
+		t.Fatalf("no refusal exists, got %#v", manager.Rejections())
+	}
+}
+
+// A retained manifest at an unexpected depth has no recoverable identity, so
+// it must fail closed rather than being silently skipped from capacity.
+func TestMisplacedRetainedManifestFailsClosed(t *testing.T) {
+	manager, root := hardeningManager(t, &fakeRunner{})
+	stray := filepath.Join(root, "stray")
+	if err := os.MkdirAll(stray, 0o750); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeJSONAtomic(filepath.Join(stray, manifestFilename), manifest{
+		LogicalID: "stray/data", Type: config.VolumeTypeLocal, BoundNode: "node-1",
+		Filesystem: "ext4", AppliedSizeBytes: 90 * config.MiB, ResizeGeneration: 1,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err := manager.Preflight(context.Background(), localService(50*config.MiB, 1))
+	if err == nil {
+		t.Fatal("a retained manifest with no recoverable identity must fail closed")
+	}
+	if !strings.Contains(err.Error(), "quarantined") {
+		t.Fatalf("expected a quarantine, got %v", err)
+	}
+}
+
+// The exported validator must reject more volumes than the agent will run.
+func TestValidatorEnforcesTheVolumeCountCap(t *testing.T) {
+	volumes := make([]config.VolumeConfig, config.MaxServiceVolumes+1)
+	for i := range volumes {
+		volumes[i] = config.VolumeConfig{
+			Name: "v" + string(rune('a'+i%26)) + string(rune('a'+i/26)),
+			Type: config.VolumeTypeLocal, MountPath: "/mnt/" + string(rune('a'+i%26)) + string(rune('a'+i/26)),
+			SizeBytes: config.MiB, BoundNode: "node-1", ResizeGeneration: 1,
+		}
+	}
+	nc := config.NodeConfig{Node: "node-1", Services: []config.ServiceConfig{{Name: "app", Volumes: volumes}}}
+	if err := ValidateNodeVolumes(nc); err == nil {
+		t.Fatalf("expected the %d-volume cap to be enforced", config.MaxServiceVolumes)
+	}
+}
+
+// The agent-side half of the same lifecycle, driven as consecutive ticks with
+// an agent restart in the middle. Each tick is normalize -> prepare, which is
+// the real order, and the invariant checked throughout is that no tick ever
+// produces a configuration differing from what is running.
+func TestAgentLifecycleAcrossARestart(t *testing.T) {
+	manager, root := hardeningManager(t, &fakeRunner{})
+
+	// A tick: normalize the desired config, then prepare it.
+	tick := func(m *Manager, size, generation int64) (config.VolumeConfig, PreparedVolume) {
+		t.Helper()
+		services := []config.ServiceConfig{localService(size, generation)}
+		m.NormalizeVolumes(services)
+		prepared, err := m.Prepare(context.Background(), services[0])
+		if err != nil {
+			t.Fatalf("prepare failed for (%d, %d): %v", size, generation, err)
+		}
+		return services[0].Volumes[0], prepared[0]
+	}
+
+	// Create, then refuse a shrink.
+	tick(manager, 16*config.MiB, 1)
+	tick(manager, 2*config.MiB, 2)
+	if len(manager.Rejections()) != 1 {
+		t.Fatalf("expected a standing refusal, got %#v", manager.Rejections())
+	}
+
+	// Two more ticks at the same request must converge on the effective config
+	// and keep reporting the refusal.
+	for i := 0; i < 2; i++ {
+		rendered, prepared := tick(manager, 2*config.MiB, 2)
+		if rendered.SizeBytes != 16*config.MiB || rendered.ResizeGeneration != 1 {
+			t.Fatalf("tick %d did not converge: %#v", i, rendered)
+		}
+		if prepared.SizeBytes != 16*config.MiB {
+			t.Fatalf("tick %d prepared the refused size: %#v", i, prepared)
+		}
+		if len(manager.Rejections()) != 1 {
+			t.Fatalf("tick %d lost the refusal", i)
+		}
+	}
+
+	// Restart the agent over the same pool: the refusal must come back from
+	// disk on the first tick, not a tick later.
+	restarted, _ := hardeningManager(t, &fakeRunner{})
+	restarted.storage.Local.Path = root
+	rendered, _ := tick(restarted, 2*config.MiB, 2)
+	if rendered.SizeBytes != 16*config.MiB || rendered.ResizeGeneration != 1 {
+		t.Fatalf("the restarted agent did not converge: %#v", rendered)
+	}
+	if len(restarted.Rejections()) != 1 {
+		t.Fatalf("the restarted agent lost the refusal: %#v", restarted.Rejections())
+	}
+
+	// The control plane acknowledges: it now renders the effective size at the
+	// refused generation. That must converge and stop reporting a refusal.
+	rendered, _ = tick(restarted, 16*config.MiB, 2)
+	if rendered.SizeBytes != 16*config.MiB || rendered.ResizeGeneration != 1 {
+		t.Fatalf("the acknowledged shape did not converge: %#v", rendered)
+	}
+	if len(restarted.Rejections()) != 0 {
+		t.Fatalf("the withdrawn request still reports a refusal: %#v", restarted.Rejections())
+	}
+
+	// A corrected, feasible shrink then applies for real.
+	rendered, prepared := tick(restarted, 8*config.MiB, 3)
+	if prepared.Rejected || prepared.SizeBytes != 8*config.MiB {
+		t.Fatalf("the corrected shrink did not apply: %#v", prepared)
+	}
+	if rendered.SizeBytes != 8*config.MiB {
+		t.Fatalf("the corrected shrink was clamped: %#v", rendered)
+	}
+	if len(restarted.Rejections()) != 0 {
+		t.Fatalf("an applied resize left a refusal behind: %#v", restarted.Rejections())
+	}
+
+	// And the pool's accounting followed the effective size the whole way.
+	retained, err := readRetained(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if retained["app/data"] != 8*config.MiB {
+		t.Fatalf("retained accounting drifted: %#v", retained)
+	}
+}

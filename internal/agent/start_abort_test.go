@@ -166,3 +166,42 @@ func TestTick_StandingVolumeRejectionDegradesRatherThanConverges(t *testing.T) {
 		t.Fatal("a standing rejection must not publish the node as failed")
 	}
 }
+
+// A standing refusal is a *converged* state at the effective size, not a
+// failure and not an incomplete tick. The revision must advance and be marked
+// applied — the node really is running what was rendered — while the
+// non-blocking condition carries the fact that it is not what was asked for.
+// Getting either half wrong hides the refusal or wedges the revision.
+func TestTick_StandingRejectionStillAppliesTheRevision(t *testing.T) {
+	a := agentWithVMManager(t, abortStore(), &abortingVMManager{}, "")
+	a.vmManager.SeedVolumeRejectionsForTest(map[string]volume.Rejection{"app/data": {
+		LogicalID: "app/data", ResizeGeneration: 2, AppliedGeneration: 1,
+		RequestedSizeBytes: 2 << 20, AppliedSizeBytes: 16 << 20, MinimumSizeBytes: 4 << 20,
+	}})
+
+	a.tick(context.Background())
+
+	if a.lastRevision != "rev-1" {
+		t.Fatalf("a refusal is terminal, so the revision must advance, got %q", a.lastRevision)
+	}
+	status := a.agentStatusSnapshot()
+	if status.AppliedRevision == "" {
+		t.Fatal("the node applied what was rendered and must say so")
+	}
+	condition, ok := agentCondition(status, "VolumeSizesApplied")
+	if !ok || condition.Status != statusmodel.ConditionFalse {
+		t.Fatalf("the refusal must still be visible on the condition: %#v", condition)
+	}
+	if statusmodel.IsBlockingCondition("VolumeSizesApplied") {
+		t.Fatal("a refusal must not be a blocking failure")
+	}
+
+	// Clearing the refusal returns the node to plain convergence.
+	a.vmManager.SeedVolumeRejectionsForTest(nil)
+	a.lastRevision = ""
+	a.tick(context.Background())
+	cleared, ok := agentCondition(a.agentStatusSnapshot(), "VolumeSizesApplied")
+	if !ok || cleared.Status != statusmodel.ConditionTrue {
+		t.Fatalf("a cleared refusal must restore convergence: %#v", cleared)
+	}
+}

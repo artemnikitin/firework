@@ -2,6 +2,7 @@ package vm
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"io"
 	"log/slog"
@@ -408,5 +409,116 @@ func TestAcknowledgedRejectionConvergesWithTheRunningConfig(t *testing.T) {
 	// visibility is the control plane's — see refusedVolumes there.
 	if got := manager.VolumeRejections(); len(got) != 0 {
 		t.Fatalf("the acknowledged shape must not keep reporting a refusal: %#v", got)
+	}
+}
+
+// The ownership manifest carries the prepared volume set, and an adopted VM is
+// reconstructed from it. A rejected volume's effective size must survive, or
+// adoption resurrects the refused configuration.
+func TestPreparedVolumeSurvivesTheOwnershipManifest(t *testing.T) {
+	original := &instanceManifest{
+		SchemaVersion: manifestSchemaVersion, Service: "app", InstanceID: "i-1",
+		Volumes: []volume.PreparedVolume{{
+			LogicalID: "app/data", PathOnHost: "/pool/app/data/volume.ext4",
+			MountPath: "/var/lib/app", Type: config.VolumeTypeLocal,
+			SizeBytes: 16 * config.MiB, ResizeGeneration: 1,
+			Rejected: true, RequestedGeneration: 2, RequestedSizeBytes: 2 * config.MiB,
+			MinimumSizeBytes: 4 * config.MiB,
+		}},
+	}
+	data, err := json.Marshal(original)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var round instanceManifest
+	if err := json.Unmarshal(data, &round); err != nil {
+		t.Fatal(err)
+	}
+	got := round.Volumes[0]
+	if got.SizeBytes != 16*config.MiB || got.ResizeGeneration != 1 {
+		t.Fatalf("the effective configuration did not survive adoption: %#v", got)
+	}
+	if !got.Rejected || got.RequestedSizeBytes != 2*config.MiB || got.RequestedGeneration != 2 {
+		t.Fatalf("the refusal did not survive adoption: %#v", got)
+	}
+}
+
+// Only the rejected volumes are clamped; a healthy sibling keeps exactly what
+// was asked for.
+func TestClampTouchesOnlyRejectedVolumes(t *testing.T) {
+	svc := config.ServiceConfig{Name: "app", Volumes: []config.VolumeConfig{
+		{Name: "data", Type: config.VolumeTypeLocal, MountPath: "/d", SizeBytes: 2 * config.MiB, ResizeGeneration: 2},
+		{Name: "cache", Type: config.VolumeTypeLocal, MountPath: "/c", SizeBytes: 8 * config.MiB, ResizeGeneration: 2},
+	}}
+	prepared := []volume.PreparedVolume{
+		{LogicalID: "app/data", SizeBytes: 16 * config.MiB, ResizeGeneration: 1, Rejected: true, RequestedSizeBytes: 2 * config.MiB},
+		{LogicalID: "app/cache", SizeBytes: 8 * config.MiB, ResizeGeneration: 2},
+	}
+
+	clamped := clampToPrepared(svc, prepared)
+	if clamped.Volumes[0].SizeBytes != 16*config.MiB || clamped.Volumes[0].ResizeGeneration != 1 {
+		t.Fatalf("the rejected volume was not clamped: %#v", clamped.Volumes[0])
+	}
+	if clamped.Volumes[1] != svc.Volumes[1] {
+		t.Fatalf("a healthy volume was altered: %#v", clamped.Volumes[1])
+	}
+	// The input must not be mutated: the caller still holds the desired config.
+	if svc.Volumes[0].SizeBytes != 2*config.MiB {
+		t.Fatal("clampToPrepared mutated its input")
+	}
+}
+
+// The barrier, the volume manager's refusal snapshot, and the volume-error map
+// are three pieces of shared state touched by phases that deliberately do not
+// hold the same lock. Drive them concurrently under -race.
+func TestBarrierAndSnapshotUnderConcurrentPressure(t *testing.T) {
+	runner := &blockingRunner{entered: make(chan struct{}), release: make(chan struct{})}
+	manager, launcher := barrierManager(t, runner)
+	svc := barrierService()
+
+	started := make(chan error, 1)
+	go func() { started <- manager.Start(context.Background(), svc) }()
+	<-runner.entered
+
+	// While phase 2 holds no lock, hammer every reader and both aborters.
+	var wg sync.WaitGroup
+	for i := 0; i < 12; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			switch i % 6 {
+			case 0:
+				_ = manager.List()
+			case 1:
+				_ = manager.VolumeError(svc.Name)
+			case 2:
+				_ = manager.VolumeRejections()
+			case 3:
+				manager.NormalizeVolumes([]config.ServiceConfig{svc})
+			case 4:
+				_ = manager.Stop(svc.Name)
+			case 5:
+				_ = manager.Remove(svc.Name)
+			}
+		}(i)
+	}
+	wg.Wait()
+	close(runner.release)
+
+	err := <-started
+	// Stop and Remove both ran, so the start must have aborted without
+	// launching anything.
+	if !errors.Is(err, ErrStartAborted) {
+		t.Fatalf("expected the start to abort, got %v", err)
+	}
+	if launcher.count() != 0 {
+		t.Fatalf("an aborted start launched %d process(es)", launcher.count())
+	}
+	if inst := manager.List()[svc.Name]; inst != nil {
+		t.Fatalf("the placeholder outlived the aborted start: %#v", inst)
+	}
+	// Repeated aborts after the fact stay idempotent.
+	if err := manager.Stop(svc.Name); err == nil {
+		t.Fatal("stopping an absent service should report not found")
 	}
 }
