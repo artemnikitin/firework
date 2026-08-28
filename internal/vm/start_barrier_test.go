@@ -14,6 +14,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/artemnikitin/firework/internal/agentconfig"
 	"github.com/artemnikitin/firework/internal/config"
 	"github.com/artemnikitin/firework/internal/volume"
 )
@@ -97,8 +98,8 @@ func barrierManager(t *testing.T, runner volume.CommandRunner) (*Manager, *count
 	t.Helper()
 	stateDir := t.TempDir()
 	pool := t.TempDir()
-	volumeMgr := volume.NewManagerWithDependencies("node-1", config.StorageConfig{
-		Local: &config.LocalStorageConfig{Path: pool, CapacityBytes: 1 << 30},
+	volumeMgr := volume.NewManagerWithDependencies("node-1", agentconfig.StorageConfig{
+		Local: &agentconfig.LocalStorageConfig{Path: pool, CapacityBytes: 1 << 30},
 	}, runner, acceptingMounts{})
 	manager := NewManagerWithVolumes("/bin/true", stateDir, slog.New(slog.NewTextHandler(io.Discard, nil)), volumeMgr)
 	launcher := &countingLauncher{}

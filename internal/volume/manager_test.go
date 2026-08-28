@@ -8,6 +8,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/artemnikitin/firework/internal/agentconfig"
 	"github.com/artemnikitin/firework/internal/config"
 )
 
@@ -49,7 +50,7 @@ func localService(size int64, generation int64) config.ServiceConfig {
 func TestManagerCreatesReusesGrowsAndShrinksLocalVolume(t *testing.T) {
 	root := t.TempDir()
 	runner := &fakeRunner{}
-	manager := NewManagerWithDependencies("node-1", config.StorageConfig{Local: &config.LocalStorageConfig{
+	manager := NewManagerWithDependencies("node-1", agentconfig.StorageConfig{Local: &agentconfig.LocalStorageConfig{
 		Path: root, CapacityBytes: 100 * config.MiB,
 	}}, runner, acceptingMounts{})
 
@@ -88,7 +89,7 @@ func TestManagerCreatesReusesGrowsAndShrinksLocalVolume(t *testing.T) {
 
 func TestManagerRejectsBindingCapacityAndSharedRuntime(t *testing.T) {
 	root := t.TempDir()
-	manager := NewManagerWithDependencies("node-1", config.StorageConfig{Local: &config.LocalStorageConfig{Path: root, CapacityBytes: 8 * config.MiB}}, &fakeRunner{}, acceptingMounts{})
+	manager := NewManagerWithDependencies("node-1", agentconfig.StorageConfig{Local: &agentconfig.LocalStorageConfig{Path: root, CapacityBytes: 8 * config.MiB}}, &fakeRunner{}, acceptingMounts{})
 	if _, err := manager.Preflight(context.Background(), localService(16*config.MiB, 1)); err == nil || !strings.Contains(err.Error(), "capacity exceeded") {
 		t.Fatalf("expected capacity error, got %v", err)
 	}
@@ -113,7 +114,7 @@ func TestManagerRecoversInterruptedGrowAndShrink(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			root := t.TempDir()
-			manager := NewManagerWithDependencies("node-1", config.StorageConfig{Local: &config.LocalStorageConfig{
+			manager := NewManagerWithDependencies("node-1", agentconfig.StorageConfig{Local: &agentconfig.LocalStorageConfig{
 				Path: root, CapacityBytes: 100 * config.MiB,
 			}}, &fakeRunner{}, acceptingMounts{})
 			prepared, err := manager.Prepare(context.Background(), localService(tc.oldSize, 1))
@@ -147,7 +148,7 @@ func TestManagerRecoversInterruptedGrowAndShrink(t *testing.T) {
 
 func TestManagerClearsTransactionLeftAfterManifestCommit(t *testing.T) {
 	root := t.TempDir()
-	manager := NewManagerWithDependencies("node-1", config.StorageConfig{Local: &config.LocalStorageConfig{
+	manager := NewManagerWithDependencies("node-1", agentconfig.StorageConfig{Local: &agentconfig.LocalStorageConfig{
 		Path: root, CapacityBytes: 100 * config.MiB,
 	}}, &fakeRunner{}, acceptingMounts{})
 	prepared, err := manager.Prepare(context.Background(), localService(16*config.MiB, 1))
@@ -179,7 +180,7 @@ func TestManagerQuarantinesAmbiguousRetainedState(t *testing.T) {
 		if err := createSparseImage(filepath.Join(dir, imageFilename), 16*config.MiB); err != nil {
 			t.Fatal(err)
 		}
-		manager := NewManagerWithDependencies("node-1", config.StorageConfig{Local: &config.LocalStorageConfig{Path: root, CapacityBytes: 100 * config.MiB}}, &fakeRunner{}, acceptingMounts{})
+		manager := NewManagerWithDependencies("node-1", agentconfig.StorageConfig{Local: &agentconfig.LocalStorageConfig{Path: root, CapacityBytes: 100 * config.MiB}}, &fakeRunner{}, acceptingMounts{})
 		if _, err := manager.Preflight(context.Background(), localService(16*config.MiB, 1)); err == nil || !strings.Contains(err.Error(), "quarantined") {
 			t.Fatalf("expected quarantine error, got %v", err)
 		}
@@ -187,7 +188,7 @@ func TestManagerQuarantinesAmbiguousRetainedState(t *testing.T) {
 
 	t.Run("truncated image without transaction", func(t *testing.T) {
 		root := t.TempDir()
-		manager := NewManagerWithDependencies("node-1", config.StorageConfig{Local: &config.LocalStorageConfig{Path: root, CapacityBytes: 100 * config.MiB}}, &fakeRunner{}, acceptingMounts{})
+		manager := NewManagerWithDependencies("node-1", agentconfig.StorageConfig{Local: &agentconfig.LocalStorageConfig{Path: root, CapacityBytes: 100 * config.MiB}}, &fakeRunner{}, acceptingMounts{})
 		prepared, err := manager.Prepare(context.Background(), localService(24*config.MiB, 1))
 		if err != nil {
 			t.Fatal(err)
@@ -203,7 +204,7 @@ func TestManagerQuarantinesAmbiguousRetainedState(t *testing.T) {
 
 func TestManagerRejectsShrinkBelowSafeMinimum(t *testing.T) {
 	root := t.TempDir()
-	manager := NewManagerWithDependencies("node-1", config.StorageConfig{Local: &config.LocalStorageConfig{
+	manager := NewManagerWithDependencies("node-1", agentconfig.StorageConfig{Local: &agentconfig.LocalStorageConfig{
 		Path: root, CapacityBytes: 100 * config.MiB,
 	}}, &fakeRunner{}, acceptingMounts{})
 	if _, err := manager.Prepare(context.Background(), localService(16*config.MiB, 1)); err != nil {

@@ -1,0 +1,177 @@
+package agentconfig
+
+import (
+	"fmt"
+	"os"
+	"path/filepath"
+	"strings"
+	"time"
+
+	"github.com/artemnikitin/firework/internal/config"
+	"github.com/artemnikitin/firework/internal/ingress"
+	"github.com/artemnikitin/firework/internal/statusmodel"
+	"gopkg.in/yaml.v3"
+)
+
+// DefaultAgentConfig returns sensible defaults for the agent configuration.
+func DefaultAgentConfig() AgentConfig {
+	return AgentConfig{
+		StoreType:                 "git",
+		StoreBranch:               "main",
+		PollInterval:              30 * time.Second,
+		FirecrackerBin:            "/usr/bin/firecracker",
+		StateDir:                  "/var/lib/firework",
+		LogLevel:                  "info",
+		ImagesDir:                 "/var/lib/images",
+		VMSubnet:                  "172.16.0.0/24",
+		VMGateway:                 "172.16.0.1",
+		VMBridge:                  "br-firework",
+		RegistryCertRenewBefore:   6 * time.Hour,
+		RegistryHeartbeatInterval: 15 * time.Second,
+	}
+}
+
+// LoadAgentConfig reads the agent configuration from a YAML file and applies
+// defaults for any unset fields.
+func LoadAgentConfig(path string) (AgentConfig, error) {
+	cfg := DefaultAgentConfig()
+
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return cfg, fmt.Errorf("reading agent config %s: %w", path, err)
+	}
+
+	if err := yaml.Unmarshal(data, &cfg); err != nil {
+		return cfg, fmt.Errorf("parsing agent config %s: %w", path, err)
+	}
+
+	if cfg.NodeName == "" && len(cfg.NodeNames) == 0 {
+		hostname, err := os.Hostname()
+		if err != nil {
+			return cfg, fmt.Errorf("node_name not set and hostname unavailable: %w", err)
+		}
+		cfg.NodeName = hostname
+	}
+
+	if len(cfg.NodeNames) == 0 && cfg.NodeName != "" {
+		cfg.NodeNames = []string{cfg.NodeName}
+	}
+	if cfg.NodeName == "" && len(cfg.NodeNames) > 0 {
+		cfg.NodeName = cfg.NodeNames[0]
+	}
+	if cfg.NodeID == "" {
+		cfg.NodeID = cfg.NodeName
+	}
+
+	switch cfg.StoreType {
+	case "git":
+		if cfg.StoreURL == "" {
+			return cfg, fmt.Errorf("store_url is required for git store")
+		}
+	case "s3":
+		if cfg.S3Bucket == "" {
+			return cfg, fmt.Errorf("s3_bucket is required for s3 store")
+		}
+	case "gcs":
+		if cfg.GCSBucket == "" {
+			return cfg, fmt.Errorf("gcs_bucket is required for gcs store")
+		}
+	default:
+		return cfg, fmt.Errorf("unsupported store_type: %q (expected \"git\", \"s3\", or \"gcs\")", cfg.StoreType)
+	}
+
+	if cfg.S3ImagesBucket != "" && cfg.GCSImagesBucket != "" {
+		return cfg, fmt.Errorf("s3_images_bucket and gcs_images_bucket are mutually exclusive")
+	}
+
+	if cfg.IngressDomain != "" {
+		normalized, err := ingress.NormalizeDomain(cfg.IngressDomain)
+		if err != nil {
+			return cfg, fmt.Errorf("ingress_domain: %w", err)
+		}
+		cfg.IngressDomain = normalized
+	}
+
+	if cfg.RegistryURL != "" {
+		if cfg.RegistryCertFile == "" || cfg.RegistryKeyFile == "" || cfg.RegistryCAFile == "" {
+			return cfg, fmt.Errorf("registry_cert_file, registry_key_file and registry_ca_file are required when registry_url is set")
+		}
+		token, err := resolveRegistryBootstrapToken(cfg.RegistryBootstrapToken, cfg.RegistryBootstrapTokenFile)
+		if err != nil {
+			return cfg, err
+		}
+		cfg.RegistryBootstrapToken = token
+		cfg.NodeID = strings.TrimSpace(cfg.NodeID)
+		if cfg.NodeID == "" {
+			return cfg, fmt.Errorf("node_id is required when registry_url is set")
+		}
+		if len(cfg.NodeID) > statusmodel.MaxVolumeIDLen {
+			return cfg, fmt.Errorf("node_id is %d bytes, exceeding the %d-byte limit enforced on reported volume bound_node",
+				len(cfg.NodeID), statusmodel.MaxVolumeIDLen)
+		}
+	}
+
+	if cfg.Storage.Local != nil {
+		if err := validateStoragePath("storage.local.path", cfg.Storage.Local.Path); err != nil {
+			return cfg, err
+		}
+		capacity, err := config.ParseStorageCapacity(cfg.Storage.Local.Capacity)
+		if err != nil {
+			return cfg, fmt.Errorf("storage.local.capacity: %w", err)
+		}
+		cfg.Storage.Local.CapacityBytes = capacity
+	}
+	if cfg.Storage.Shared != nil {
+		cfg.Storage.Shared.BackendID = strings.TrimSpace(cfg.Storage.Shared.BackendID)
+		if cfg.Storage.Shared.BackendID == "" {
+			return cfg, fmt.Errorf("storage.shared.backend_id is required")
+		}
+		if len(cfg.Storage.Shared.BackendID) > statusmodel.MaxVolumeIDLen {
+			return cfg, fmt.Errorf("storage.shared.backend_id is %d bytes, exceeding the %d-byte limit enforced on reported volume shared_backend_id",
+				len(cfg.Storage.Shared.BackendID), statusmodel.MaxVolumeIDLen)
+		}
+		if err := validateStoragePath("storage.shared.path", cfg.Storage.Shared.Path); err != nil {
+			return cfg, err
+		}
+		if cfg.Storage.Shared.Capacity != "" {
+			capacity, err := config.ParseStorageCapacity(cfg.Storage.Shared.Capacity)
+			if err != nil {
+				return cfg, fmt.Errorf("storage.shared.capacity: %w", err)
+			}
+			cfg.Storage.Shared.CapacityBytes = capacity
+		}
+	}
+
+	return cfg, nil
+}
+
+func validateStoragePath(field, value string) error {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return fmt.Errorf("%s is required", field)
+	}
+	if !filepath.IsAbs(value) || filepath.Clean(value) != value || value == "/" {
+		return fmt.Errorf("%s must be a clean absolute path below /", field)
+	}
+	return nil
+}
+
+func resolveRegistryBootstrapToken(token, tokenFile string) (string, error) {
+	t := strings.TrimSpace(os.ExpandEnv(token))
+	f := strings.TrimSpace(os.ExpandEnv(tokenFile))
+	if t != "" && f != "" {
+		return "", fmt.Errorf("registry_bootstrap_token and registry_bootstrap_token_file are mutually exclusive")
+	}
+	if f == "" {
+		return t, nil
+	}
+	data, err := os.ReadFile(f)
+	if err != nil {
+		return "", fmt.Errorf("reading registry_bootstrap_token_file %s: %w", f, err)
+	}
+	t = strings.TrimSpace(string(data))
+	if t == "" {
+		return "", fmt.Errorf("registry_bootstrap_token_file %s is empty", f)
+	}
+	return t, nil
+}

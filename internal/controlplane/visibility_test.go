@@ -2,14 +2,76 @@ package controlplane
 
 import (
 	"context"
-	"encoding/json"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/artemnikitin/firework/internal/config"
+	"github.com/artemnikitin/firework/internal/operatorapi"
 	"github.com/artemnikitin/firework/internal/statusmodel"
 )
+
+func TestOperatorAPIConversionsPreserveFields(t *testing.T) {
+	stamp := time.Date(2026, time.January, 2, 3, 4, 5, 0, time.UTC)
+	conditions := toOperatorConditions([]statusmodel.Condition{{
+		Type: "Ready", Status: statusmodel.ConditionFalse, ReasonCode: "blocked",
+		Message: "waiting", LastTransitionAt: stamp,
+	}})
+	wantConditions := []operatorapi.Condition{{
+		Type: "Ready", Status: "false", ReasonCode: "blocked",
+		Message: "waiting", LastTransitionAt: stamp,
+	}}
+	if !reflect.DeepEqual(conditions, wantConditions) {
+		t.Fatalf("conditions = %#v, want %#v", conditions, wantConditions)
+	}
+
+	portForwards := toOperatorPortForwards([]config.PortForward{{HostPort: 8080, VMPort: 80}})
+	if want := []operatorapi.PortForward{{HostPort: 8080, VMPort: 80}}; !reflect.DeepEqual(portForwards, want) {
+		t.Fatalf("port forwards = %#v, want %#v", portForwards, want)
+	}
+
+	volumes := toOperatorVolumeStatuses([]statusmodel.VolumeStatus{{
+		LogicalID: "api/data", Type: "local", MountPath: "/data", BoundNode: "node-1",
+		SharedBackendID: "shared-1", DesiredSizeBytes: 20, AppliedSizeBytes: 10,
+		ResizeGeneration: 2, State: "rejected", LastError: "cannot shrink",
+		RequestedSizeBytes: 5, Rejected: true, RejectedReason: "shrink_not_supported",
+	}})
+	wantVolumes := []operatorapi.VolumeStatus{{
+		LogicalID: "api/data", Type: "local", MountPath: "/data", BoundNode: "node-1",
+		SharedBackendID: "shared-1", DesiredSizeBytes: 20, AppliedSizeBytes: 10,
+		ResizeGeneration: 2, State: "rejected", LastError: "cannot shrink",
+		RequestedSizeBytes: 5, Rejected: true, RejectedReason: "shrink_not_supported",
+	}}
+	if !reflect.DeepEqual(volumes, wantVolumes) {
+		t.Fatalf("volumes = %#v, want %#v", volumes, wantVolumes)
+	}
+
+	if got, want := toOperatorResources(Resources{VCPUs: 4, MemoryMB: 8192}), (operatorapi.Resources{VCPUs: 4, MemoryMB: 8192}); got != want {
+		t.Fatalf("resources = %#v, want %#v", got, want)
+	}
+}
+
+func TestOperatorConditionShapeMatchesStatusModel(t *testing.T) {
+	source := reflect.TypeOf(statusmodel.Condition{})
+	destination := reflect.TypeOf(operatorapi.Condition{})
+	if source.NumField() != destination.NumField() {
+		t.Fatalf("status and operator conditions have %d and %d fields", source.NumField(), destination.NumField())
+	}
+	for i := 0; i < source.NumField(); i++ {
+		sourceField := source.Field(i)
+		destinationField, ok := destination.FieldByName(sourceField.Name)
+		if !ok {
+			t.Fatalf("operator condition is missing field %s", sourceField.Name)
+		}
+		if sourceField.Tag.Get("json") != destinationField.Tag.Get("json") {
+			t.Fatalf("condition field %s has JSON tags %q and %q", sourceField.Name, sourceField.Tag.Get("json"), destinationField.Tag.Get("json"))
+		}
+		if !sourceField.Type.ConvertibleTo(destinationField.Type) {
+			t.Fatalf("condition field %s cannot convert from %s to %s", sourceField.Name, sourceField.Type, destinationField.Type)
+		}
+	}
+}
 
 func TestVisibilityDerivedStates(t *testing.T) {
 	ctx := context.Background()
@@ -94,32 +156,6 @@ func TestVisibilityDerivedStates(t *testing.T) {
 	}
 	if detail.ServiceObservedAt.IsZero() || !detail.ServiceObservedAt.Equal(now) {
 		t.Fatalf("service observation timestamp = %v, want %v", detail.ServiceObservedAt, now)
-	}
-}
-
-func TestServiceDetailJSONUsesStableFieldNames(t *testing.T) {
-	detail := ServiceDetail{
-		ObservedAt:        time.Date(2026, time.January, 1, 12, 0, 0, 0, time.UTC),
-		ServiceObservedAt: time.Date(2025, time.December, 31, 12, 0, 0, 0, time.UTC),
-		PortForwards: []config.PortForward{{
-			HostPort: 8080,
-			VMPort:   80,
-		}},
-	}
-	payload, err := json.Marshal(detail)
-	if err != nil {
-		t.Fatal(err)
-	}
-	encoded := string(payload)
-	for _, field := range []string{`"observed_at"`, `"service_observed_at"`, `"host_port"`, `"vm_port"`} {
-		if !strings.Contains(encoded, field) {
-			t.Errorf("JSON payload does not contain %s: %s", field, encoded)
-		}
-	}
-	for _, field := range []string{`"HostPort"`, `"VMPort"`} {
-		if strings.Contains(encoded, field) {
-			t.Errorf("JSON payload contains unstable field %s: %s", field, encoded)
-		}
 	}
 }
 
@@ -580,7 +616,7 @@ func TestVisibilityKeepsFreshServiceStateOnANodeThatCannotConverge(t *testing.T)
 	if err != nil {
 		t.Fatal(err)
 	}
-	byName := make(map[string]ServiceSummary, len(list.Items))
+	byName := make(map[string]operatorapi.ServiceSummary, len(list.Items))
 	for _, item := range list.Items {
 		byName[item.Name] = item
 	}

@@ -10,6 +10,7 @@ import (
 	"github.com/artemnikitin/firework/internal/agent"
 	"github.com/artemnikitin/firework/internal/config"
 	"github.com/artemnikitin/firework/internal/healthcheck"
+	"github.com/artemnikitin/firework/internal/registryapi"
 	"github.com/artemnikitin/firework/internal/statusmodel"
 	"github.com/artemnikitin/firework/internal/vm"
 )
@@ -118,7 +119,7 @@ func TestMaxRegistryRequestBytesExceedsLargestValidHeartbeat(t *testing.T) {
 		t.Fatalf("maximalAgentStatus was rejected by the real validator, so it does not describe the largest accepted heartbeat: %v", err)
 	}
 
-	body, err := json.Marshal(NodeHeartbeatRequest{
+	body, err := json.Marshal(registryapi.HeartbeatRequest{
 		NodeID:      nodeID,
 		Generation:  1,
 		HostIP:      "255.255.255.255",
@@ -210,7 +211,7 @@ func TestMaxRegistryRequestBytesThroughAgentStatusPath(t *testing.T) {
 	if _, err := validatedHeartbeatAgentStatus(nodeID, status); err != nil {
 		t.Fatalf("agent-produced status was rejected by the real validator: %v", err)
 	}
-	body, err := json.Marshal(NodeHeartbeatRequest{
+	body, err := json.Marshal(registryapi.HeartbeatRequest{
 		NodeID: nodeID, Generation: 1, HostIP: "255.255.255.255", AgentStatus: status,
 	})
 	if err != nil {
