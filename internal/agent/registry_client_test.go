@@ -13,7 +13,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/artemnikitin/firework/internal/config"
+	"github.com/artemnikitin/firework/internal/agentconfig"
 )
 
 func TestSelectHostIPv4_SkipsBridgeAndVirtualInterfaces(t *testing.T) {
@@ -64,7 +64,7 @@ func TestSelectHostIPv4_UsesConfiguredVMBridgeFilter(t *testing.T) {
 func TestMTLSHTTPClient_ReusesClientInstance(t *testing.T) {
 	caFile := writeTestCA(t)
 	c := &registryClient{
-		cfg: config.AgentConfig{
+		cfg: agentconfig.AgentConfig{
 			RegistryCAFile:     caFile,
 			RegistryServerName: "registry.internal",
 			RegistryCertFile:   "/tmp/node.crt",

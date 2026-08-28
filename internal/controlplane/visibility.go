@@ -10,152 +10,9 @@ import (
 
 	"github.com/artemnikitin/firework/internal/config"
 	"github.com/artemnikitin/firework/internal/ingress"
+	"github.com/artemnikitin/firework/internal/operatorapi"
 	"github.com/artemnikitin/firework/internal/statusmodel"
 )
-
-const visibilityAPIVersion = "v1"
-
-type ListEnvelope[T any] struct {
-	APIVersion string    `json:"api_version"`
-	ObservedAt time.Time `json:"observed_at"`
-	Count      int       `json:"count"`
-	Items      []T       `json:"items"`
-}
-
-type NodeSummary struct {
-	NodeID           string             `json:"node_id"`
-	Labels           []string           `json:"labels,omitempty"`
-	State            string             `json:"state"`
-	LastSeenAt       time.Time          `json:"last_seen_at,omitempty"`
-	StatusAgeSeconds int64              `json:"status_age_seconds,omitempty"`
-	AgentVersion     string             `json:"agent_version,omitempty"`
-	Capacity         Resources          `json:"capacity"`
-	Allocated        Resources          `json:"allocated"`
-	Available        Resources          `json:"available"`
-	Storage          NodeStorageSummary `json:"storage"`
-	DesiredServices  int                `json:"desired_services"`
-	RunningServices  int                `json:"running_services"`
-	ReasonCode       string             `json:"reason_code,omitempty"`
-}
-
-// StorageCapacitySummary describes storage reserved by persistent volumes
-// against the admission capacity reported by agents. It is allocation data,
-// not filesystem I/O or block-device utilization telemetry.
-type StorageCapacitySummary struct {
-	CapacityBytes  int64 `json:"capacity_bytes"`
-	AllocatedBytes int64 `json:"allocated_bytes"`
-	AvailableBytes int64 `json:"available_bytes"`
-}
-
-// NodeStorageSummary groups node-local capacity and the optional shared
-// backend capacity visible from a node.
-type NodeStorageSummary struct {
-	Local           StorageCapacitySummary `json:"local"`
-	Shared          StorageCapacitySummary `json:"shared"`
-	SharedBackendID string                 `json:"shared_backend_id,omitempty"`
-}
-
-type NodeDetail struct {
-	APIVersion string    `json:"api_version"`
-	ObservedAt time.Time `json:"observed_at"`
-	NodeSummary
-	HostIP            string                  `json:"host_ip,omitempty"`
-	RegisteredAt      time.Time               `json:"registered_at,omitempty"`
-	UpdatedAt         time.Time               `json:"updated_at,omitempty"`
-	DesiredRevision   string                  `json:"desired_revision,omitempty"`
-	PlacementRevision string                  `json:"placement_revision,omitempty"`
-	ObservedRevision  string                  `json:"observed_revision,omitempty"`
-	AppliedRevision   string                  `json:"applied_revision,omitempty"`
-	Reconciliation    string                  `json:"reconciliation"`
-	Message           string                  `json:"message,omitempty"`
-	StatusMissing     bool                    `json:"status_missing"`
-	StatusStale       bool                    `json:"status_stale"`
-	Conditions        []statusmodel.Condition `json:"conditions,omitempty"`
-	Services          []ServiceSummary        `json:"services"`
-}
-
-// RevisionStatus is a point-in-time derivation from current desired,
-// placement, rendered, and registry state. It is observational and is never
-// persisted as a second reconciliation state machine.
-type RevisionStatus struct {
-	APIVersion        string    `json:"api_version"`
-	ObservedAt        time.Time `json:"observed_at"`
-	Phase             string    `json:"phase"`
-	DesiredRevision   string    `json:"desired_revision,omitempty"`
-	PlacementRevision string    `json:"placement_revision,omitempty"`
-	RenderedRevision  string    `json:"rendered_revision,omitempty"`
-	RelevantNodes     int       `json:"relevant_nodes"`
-	ConvergedNodes    []string  `json:"converged_nodes"`
-	DegradedNodes     []string  `json:"degraded_nodes"`
-	ProgressingNodes  []string  `json:"progressing_nodes"`
-	FailedNodes       []string  `json:"failed_nodes"`
-	StaleNodes        []string  `json:"stale_nodes"`
-	DownNodes         []string  `json:"down_nodes"`
-	UnknownNodes      []string  `json:"unknown_nodes"`
-	ReasonCode        string    `json:"reason_code,omitempty"`
-	Message           string    `json:"message,omitempty"`
-}
-
-type ServiceSummary struct {
-	Name             string                `json:"name"`
-	Node             string                `json:"node,omitempty"`
-	State            string                `json:"state"`
-	Health           string                `json:"health"`
-	VCPUs            int                   `json:"vcpus"`
-	MemoryMB         int                   `json:"memory_mb"`
-	Storage          ServiceStorageSummary `json:"storage"`
-	ObservedAt       time.Time             `json:"observed_at,omitempty"`
-	LastTransitionAt time.Time             `json:"last_transition_at,omitempty"`
-	ReasonCode       string                `json:"reason_code,omitempty"`
-	Message          string                `json:"message,omitempty"`
-}
-
-// VolumeAllocationSummary aggregates persistent-volume reservations for one
-// service and storage type. AllocatedBytes matches scheduler accounting by
-// taking the larger desired/applied size for each volume.
-type VolumeAllocationSummary struct {
-	Count          int   `json:"count"`
-	DesiredBytes   int64 `json:"desired_bytes"`
-	AppliedBytes   int64 `json:"applied_bytes"`
-	AllocatedBytes int64 `json:"allocated_bytes"`
-}
-
-// ServiceStorageSummary separates node-local and shared volume allocations.
-type ServiceStorageSummary struct {
-	Local  VolumeAllocationSummary `json:"local"`
-	Shared VolumeAllocationSummary `json:"shared"`
-}
-
-type ServiceHealthDetail struct {
-	Type          string    `json:"type,omitempty"`
-	State         string    `json:"state"`
-	LastCheckedAt time.Time `json:"last_checked_at,omitempty"`
-	Failures      int       `json:"failures"`
-	LastError     string    `json:"last_error,omitempty"`
-}
-
-type ServiceDetail struct {
-	APIVersion string    `json:"api_version"`
-	ObservedAt time.Time `json:"observed_at"`
-	ServiceSummary
-	ServiceObservedAt time.Time                  `json:"service_observed_at,omitempty"`
-	DesiredImage      string                     `json:"desired_image,omitempty"`
-	DesiredKernel     string                     `json:"desired_kernel,omitempty"`
-	DesiredNode       string                     `json:"desired_node,omitempty"`
-	ActualNode        string                     `json:"actual_node,omitempty"`
-	PID               int                        `json:"pid,omitempty"`
-	HealthCheck       ServiceHealthDetail        `json:"health_check"`
-	NetworkAddress    string                     `json:"network_address,omitempty"`
-	PortForwards      []config.PortForward       `json:"port_forwards,omitempty"`
-	RoutingHostname   string                     `json:"routing_hostname,omitempty"`
-	PublicURL         string                     `json:"public_url,omitempty"`
-	RestartCount      int                        `json:"restart_count"`
-	DesiredRevision   string                     `json:"desired_revision,omitempty"`
-	PlacementRevision string                     `json:"placement_revision,omitempty"`
-	RenderedRevision  string                     `json:"rendered_revision,omitempty"`
-	AppliedRevision   string                     `json:"applied_revision,omitempty"`
-	Volumes           []statusmodel.VolumeStatus `json:"volumes,omitempty"`
-}
 
 type visibilitySnapshot struct {
 	now                time.Time
@@ -186,20 +43,20 @@ func NewVisibilityService(cfg Config, store StateStore) *VisibilityService {
 }
 
 // Revision derives fleet convergence for the current rendered revision.
-func (s *VisibilityService) Revision(ctx context.Context) (RevisionStatus, error) {
+func (s *VisibilityService) Revision(ctx context.Context) (operatorapi.RevisionStatus, error) {
 	snapshot, err := s.load(ctx)
 	if err != nil {
-		return RevisionStatus{}, err
+		return operatorapi.RevisionStatus{}, err
 	}
 	return snapshot.revisionStatus(), nil
 }
 
-func (s *VisibilityService) Nodes(ctx context.Context, stateFilter string) (ListEnvelope[NodeSummary], error) {
+func (s *VisibilityService) Nodes(ctx context.Context, stateFilter string) (operatorapi.ListEnvelope[operatorapi.NodeSummary], error) {
 	snapshot, err := s.load(ctx)
 	if err != nil {
-		return ListEnvelope[NodeSummary]{}, err
+		return operatorapi.ListEnvelope[operatorapi.NodeSummary]{}, err
 	}
-	items := make([]NodeSummary, 0, len(snapshot.nodes))
+	items := make([]operatorapi.NodeSummary, 0, len(snapshot.nodes))
 	for _, record := range snapshot.nodes {
 		summary := snapshot.nodeSummary(record)
 		if stateFilter != "" && summary.State != stateFilter {
@@ -207,25 +64,25 @@ func (s *VisibilityService) Nodes(ctx context.Context, stateFilter string) (List
 		}
 		items = append(items, summary)
 	}
-	return ListEnvelope[NodeSummary]{APIVersion: visibilityAPIVersion, ObservedAt: snapshot.now, Count: len(items), Items: items}, nil
+	return operatorapi.ListEnvelope[operatorapi.NodeSummary]{APIVersion: operatorapi.APIVersion, ObservedAt: snapshot.now, Count: len(items), Items: items}, nil
 }
 
-func (s *VisibilityService) Node(ctx context.Context, nodeID string) (NodeDetail, bool, error) {
+func (s *VisibilityService) Node(ctx context.Context, nodeID string) (operatorapi.NodeDetail, bool, error) {
 	snapshot, err := s.load(ctx)
 	if err != nil {
-		return NodeDetail{}, false, err
+		return operatorapi.NodeDetail{}, false, err
 	}
 	record, ok := snapshot.nodeByID[nodeID]
 	if !ok {
-		return NodeDetail{}, false, nil
+		return operatorapi.NodeDetail{}, false, nil
 	}
 	summary := snapshot.nodeSummary(record)
 	status, statusFresh := snapshot.freshStatus(record)
-	detail := NodeDetail{
-		APIVersion: visibilityAPIVersion, ObservedAt: snapshot.now, NodeSummary: summary,
+	detail := operatorapi.NodeDetail{
+		APIVersion: operatorapi.APIVersion, ObservedAt: snapshot.now, NodeSummary: summary,
 		HostIP: record.HostIP, RegisteredAt: record.RegisteredAt, UpdatedAt: record.UpdatedAt,
 		Reconciliation: "unknown", StatusMissing: record.AgentStatus == nil, StatusStale: record.AgentStatus != nil && !statusFresh,
-		Services: make([]ServiceSummary, 0),
+		Services: make([]operatorapi.ServiceSummary, 0),
 	}
 	if statusFresh {
 		detail.DesiredRevision = status.DesiredRevision
@@ -234,7 +91,7 @@ func (s *VisibilityService) Node(ctx context.Context, nodeID string) (NodeDetail
 		detail.AppliedRevision = status.AppliedRevision
 		detail.Reconciliation = string(status.Phase)
 		detail.Message = status.Message
-		detail.Conditions = append([]statusmodel.Condition(nil), status.Conditions...)
+		detail.Conditions = toOperatorConditions(status.Conditions)
 	}
 	for _, desired := range snapshot.desired.Services {
 		placed, exists := snapshot.placementByService[desired.Name]
@@ -247,12 +104,12 @@ func (s *VisibilityService) Node(ctx context.Context, nodeID string) (NodeDetail
 	return detail, true, nil
 }
 
-func (s *VisibilityService) Services(ctx context.Context, stateFilter, healthFilter, nodeFilter string) (ListEnvelope[ServiceSummary], error) {
+func (s *VisibilityService) Services(ctx context.Context, stateFilter, healthFilter, nodeFilter string) (operatorapi.ListEnvelope[operatorapi.ServiceSummary], error) {
 	snapshot, err := s.load(ctx)
 	if err != nil {
-		return ListEnvelope[ServiceSummary]{}, err
+		return operatorapi.ListEnvelope[operatorapi.ServiceSummary]{}, err
 	}
-	items := make([]ServiceSummary, 0, len(snapshot.desired.Services))
+	items := make([]operatorapi.ServiceSummary, 0, len(snapshot.desired.Services))
 	for _, desired := range snapshot.desired.Services {
 		summary := snapshot.serviceSummary(desired)
 		if stateFilter != "" && summary.State != stateFilter {
@@ -266,13 +123,13 @@ func (s *VisibilityService) Services(ctx context.Context, stateFilter, healthFil
 		}
 		items = append(items, summary)
 	}
-	return ListEnvelope[ServiceSummary]{APIVersion: visibilityAPIVersion, ObservedAt: snapshot.now, Count: len(items), Items: items}, nil
+	return operatorapi.ListEnvelope[operatorapi.ServiceSummary]{APIVersion: operatorapi.APIVersion, ObservedAt: snapshot.now, Count: len(items), Items: items}, nil
 }
 
-func (s *VisibilityService) Service(ctx context.Context, name string) (ServiceDetail, bool, error) {
+func (s *VisibilityService) Service(ctx context.Context, name string) (operatorapi.ServiceDetail, bool, error) {
 	snapshot, err := s.load(ctx)
 	if err != nil {
-		return ServiceDetail{}, false, err
+		return operatorapi.ServiceDetail{}, false, err
 	}
 	var desired *config.ServiceConfig
 	for i := range snapshot.desired.Services {
@@ -282,16 +139,17 @@ func (s *VisibilityService) Service(ctx context.Context, name string) (ServiceDe
 		}
 	}
 	if desired == nil {
-		return ServiceDetail{}, false, nil
+		return operatorapi.ServiceDetail{}, false, nil
 	}
 	summary := snapshot.serviceSummary(*desired)
-	detail := ServiceDetail{
-		APIVersion: visibilityAPIVersion, ObservedAt: snapshot.now, ServiceSummary: summary,
+	volumeStatuses := desiredVolumeStatuses(*desired, snapshot.volumeByID)
+	detail := operatorapi.ServiceDetail{
+		APIVersion: operatorapi.APIVersion, ObservedAt: snapshot.now, ServiceSummary: summary,
 		ServiceObservedAt: summary.ObservedAt,
 		DesiredImage:      safeIdentifier(desired.Image), DesiredKernel: safeIdentifier(desired.Kernel),
-		DesiredNode: summary.Node, PortForwards: append([]config.PortForward(nil), desired.PortForwards...),
-		HealthCheck: ServiceHealthDetail{State: summary.Health}, DesiredRevision: snapshot.desired.Revision,
-		RenderedRevision: snapshot.renderedRevision, Volumes: desiredVolumeStatuses(*desired, snapshot.volumeByID),
+		DesiredNode: summary.Node, PortForwards: toOperatorPortForwards(desired.PortForwards),
+		HealthCheck: operatorapi.ServiceHealthDetail{State: summary.Health}, DesiredRevision: snapshot.desired.Revision,
+		RenderedRevision: snapshot.renderedRevision,
 	}
 	if desired.Network != nil {
 		detail.NetworkAddress = desired.Network.GuestIP
@@ -299,7 +157,7 @@ func (s *VisibilityService) Service(ctx context.Context, name string) (ServiceDe
 	detail.RoutingHostname, detail.PublicURL = servicePublicRoute(desired.Name, desired.Metadata, s.cfg.IngressDomain)
 	placed, placedOK := snapshot.placementByService[name]
 	if placedOK {
-		detail.Volumes = desiredVolumeStatuses(placed.config, snapshot.volumeByID)
+		volumeStatuses = desiredVolumeStatuses(placed.config, snapshot.volumeByID)
 		detail.PlacementRevision = snapshot.placement.Revision
 		record, nodeExists := snapshot.nodeByID[placed.node.Node]
 		if nodeExists {
@@ -310,7 +168,7 @@ func (s *VisibilityService) Service(ctx context.Context, name string) (ServiceDe
 					detail.ActualNode = record.NodeID
 					detail.PID = actual.PID
 					detail.RestartCount = actual.RestartCount
-					detail.Volumes = mergeVolumeStatuses(detail.Volumes, actual.Volumes)
+					volumeStatuses = mergeVolumeStatuses(volumeStatuses, actual.Volumes)
 					if actual.NetworkAddress != "" {
 						detail.NetworkAddress = actual.NetworkAddress
 					}
@@ -318,7 +176,7 @@ func (s *VisibilityService) Service(ctx context.Context, name string) (ServiceDe
 					if actual.ReasonCode == "health_check_failed" {
 						lastHealthError = actual.Message
 					}
-					detail.HealthCheck = ServiceHealthDetail{Type: actual.HealthCheckType, State: actual.Health, LastCheckedAt: actual.HealthLastCheckedAt, Failures: actual.HealthFailures, LastError: lastHealthError}
+					detail.HealthCheck = operatorapi.ServiceHealthDetail{Type: actual.HealthCheckType, State: actual.Health, LastCheckedAt: actual.HealthLastCheckedAt, Failures: actual.HealthFailures, LastError: lastHealthError}
 				}
 			}
 		}
@@ -326,8 +184,42 @@ func (s *VisibilityService) Service(ctx context.Context, name string) (ServiceDe
 	if desired.HealthCheck != nil && detail.HealthCheck.Type == "" {
 		detail.HealthCheck.Type = desired.HealthCheck.Type
 	}
-	detail.Storage = summarizeServiceStorage(detail.Volumes)
+	detail.Storage = summarizeServiceStorage(volumeStatuses)
+	detail.Volumes = toOperatorVolumeStatuses(volumeStatuses)
 	return detail, true, nil
+}
+
+func toOperatorConditions(conditions []statusmodel.Condition) []operatorapi.Condition {
+	out := make([]operatorapi.Condition, len(conditions))
+	for i, condition := range conditions {
+		out[i] = operatorapi.Condition{
+			Type: condition.Type, Status: string(condition.Status), ReasonCode: condition.ReasonCode,
+			Message: condition.Message, LastTransitionAt: condition.LastTransitionAt,
+		}
+	}
+	return out
+}
+
+func toOperatorPortForwards(portForwards []config.PortForward) []operatorapi.PortForward {
+	out := make([]operatorapi.PortForward, len(portForwards))
+	for i, portForward := range portForwards {
+		out[i] = operatorapi.PortForward{HostPort: portForward.HostPort, VMPort: portForward.VMPort}
+	}
+	return out
+}
+
+func toOperatorVolumeStatuses(volumes []statusmodel.VolumeStatus) []operatorapi.VolumeStatus {
+	out := make([]operatorapi.VolumeStatus, len(volumes))
+	for i, volume := range volumes {
+		out[i] = operatorapi.VolumeStatus{
+			LogicalID: volume.LogicalID, Type: volume.Type, MountPath: volume.MountPath,
+			BoundNode: volume.BoundNode, SharedBackendID: volume.SharedBackendID,
+			DesiredSizeBytes: volume.DesiredSizeBytes, AppliedSizeBytes: volume.AppliedSizeBytes,
+			ResizeGeneration: volume.ResizeGeneration, State: volume.State, LastError: volume.LastError,
+			RequestedSizeBytes: volume.RequestedSizeBytes, Rejected: volume.Rejected, RejectedReason: volume.RejectedReason,
+		}
+	}
+	return out
 }
 
 func desiredVolumeStatuses(service config.ServiceConfig, records map[string]VolumeRecord) []statusmodel.VolumeStatus {
@@ -460,10 +352,10 @@ func mergeVolumeStatuses(base, observed []statusmodel.VolumeStatus) []statusmode
 	return merged
 }
 
-func summarizeServiceStorage(volumes []statusmodel.VolumeStatus) ServiceStorageSummary {
-	var summary ServiceStorageSummary
+func summarizeServiceStorage(volumes []statusmodel.VolumeStatus) operatorapi.ServiceStorageSummary {
+	var summary operatorapi.ServiceStorageSummary
 	for _, volume := range volumes {
-		var target *VolumeAllocationSummary
+		var target *operatorapi.VolumeAllocationSummary
 		switch volume.Type {
 		case string(config.VolumeTypeLocal):
 			target = &summary.Local
@@ -566,7 +458,7 @@ func loadCurrentRevision(ctx context.Context, store StateStore, pointerKey strin
 	return nil
 }
 
-func (s visibilitySnapshot) nodeSummary(record NodeRecord) NodeSummary {
+func (s visibilitySnapshot) nodeSummary(record NodeRecord) operatorapi.NodeSummary {
 	state := string(record.State)
 	if record.LastSeenAt.IsZero() || s.now.Sub(record.LastSeenAt) > s.staleTTL {
 		state = "stale"
@@ -583,7 +475,7 @@ func (s visibilitySnapshot) nodeSummary(record NodeRecord) NodeSummary {
 		}
 	}
 	available := Resources{VCPUs: max(record.Capacity.VCPUs-allocated.VCPUs, 0), MemoryMB: max(record.Capacity.MemoryMB-allocated.MemoryMB, 0)}
-	summary := NodeSummary{NodeID: record.NodeID, Labels: append([]string(nil), record.Labels...), State: state, LastSeenAt: record.LastSeenAt, Capacity: record.Capacity, Allocated: allocated, Available: available, Storage: s.nodeStorageSummary(record), DesiredServices: desiredCount}
+	summary := operatorapi.NodeSummary{NodeID: record.NodeID, Labels: append([]string(nil), record.Labels...), State: state, LastSeenAt: record.LastSeenAt, Capacity: toOperatorResources(record.Capacity), Allocated: toOperatorResources(allocated), Available: toOperatorResources(available), Storage: s.nodeStorageSummary(record), DesiredServices: desiredCount}
 	if !record.LastSeenAt.IsZero() {
 		summary.StatusAgeSeconds = max(int64(s.now.Sub(record.LastSeenAt).Seconds()), 0)
 	}
@@ -614,7 +506,11 @@ func (s visibilitySnapshot) nodeSummary(record NodeRecord) NodeSummary {
 	return summary
 }
 
-func (s visibilitySnapshot) nodeStorageSummary(record NodeRecord) NodeStorageSummary {
+func toOperatorResources(resources Resources) operatorapi.Resources {
+	return operatorapi.Resources{VCPUs: resources.VCPUs, MemoryMB: resources.MemoryMB}
+}
+
+func (s visibilitySnapshot) nodeStorageSummary(record NodeRecord) operatorapi.NodeStorageSummary {
 	var localAllocated, sharedAllocated int64
 	for _, volume := range s.volumeByID {
 		size := max64(volume.DesiredSizeBytes, volume.AppliedSizeBytes)
@@ -630,17 +526,17 @@ func (s visibilitySnapshot) nodeStorageSummary(record NodeRecord) NodeStorageSum
 			}
 		}
 	}
-	return NodeStorageSummary{
+	return operatorapi.NodeStorageSummary{
 		Local:           storageCapacitySummary(record.Storage.LocalCapacityBytes, localAllocated),
 		Shared:          storageCapacitySummary(record.Storage.SharedCapacityBytes, sharedAllocated),
 		SharedBackendID: record.Storage.SharedBackendID,
 	}
 }
 
-func storageCapacitySummary(capacity, allocated int64) StorageCapacitySummary {
+func storageCapacitySummary(capacity, allocated int64) operatorapi.StorageCapacitySummary {
 	capacity = max64(capacity, 0)
 	allocated = max64(allocated, 0)
-	return StorageCapacitySummary{
+	return operatorapi.StorageCapacitySummary{
 		CapacityBytes: capacity, AllocatedBytes: allocated,
 		AvailableBytes: max64(capacity-allocated, 0),
 	}
@@ -683,9 +579,9 @@ func (s visibilitySnapshot) statusObservedCurrent(status statusmodel.AgentStatus
 		status.ObservedRevision == s.renderedRevision
 }
 
-func (s visibilitySnapshot) revisionStatus() RevisionStatus {
-	status := RevisionStatus{
-		APIVersion: visibilityAPIVersion, ObservedAt: s.now, Phase: "unknown",
+func (s visibilitySnapshot) revisionStatus() operatorapi.RevisionStatus {
+	status := operatorapi.RevisionStatus{
+		APIVersion: operatorapi.APIVersion, ObservedAt: s.now, Phase: "unknown",
 		DesiredRevision: s.desired.Revision, PlacementRevision: s.placement.Revision,
 		RenderedRevision: s.renderedRevision,
 		ConvergedNodes:   []string{}, DegradedNodes: []string{}, ProgressingNodes: []string{},
@@ -967,12 +863,12 @@ func assessConditions(conditions []statusmodel.Condition) (blockingFailure, unkn
 	return blockingFailure, unknown, degraded
 }
 
-func (s visibilitySnapshot) serviceSummary(desired config.ServiceConfig) ServiceSummary {
+func (s visibilitySnapshot) serviceSummary(desired config.ServiceConfig) operatorapi.ServiceSummary {
 	reason := "unplaced"
 	if !s.placementCurrent {
 		reason = "placement_pending"
 	}
-	summary := ServiceSummary{Name: desired.Name, State: "pending", Health: "unknown", VCPUs: desired.VCPUs, MemoryMB: desired.MemoryMB, Storage: summarizeServiceStorage(desiredVolumeStatuses(desired, s.volumeByID)), ReasonCode: reason}
+	summary := operatorapi.ServiceSummary{Name: desired.Name, State: "pending", Health: "unknown", VCPUs: desired.VCPUs, MemoryMB: desired.MemoryMB, Storage: summarizeServiceStorage(desiredVolumeStatuses(desired, s.volumeByID)), ReasonCode: reason}
 	if pending, ok := s.pendingByService[desired.Name]; ok && s.placementCurrent {
 		summary.ReasonCode = pending.ReasonCode
 		summary.Message = pending.Message
@@ -1032,7 +928,7 @@ func (s visibilitySnapshot) serviceSummary(desired config.ServiceConfig) Service
 
 // applyAgentServiceState copies an agent's per-service observation into a
 // summary, mapping any value outside the published vocabulary to unknown.
-func applyAgentServiceState(summary *ServiceSummary, actual statusmodel.ServiceStatus) {
+func applyAgentServiceState(summary *operatorapi.ServiceSummary, actual statusmodel.ServiceStatus) {
 	switch actual.VMState {
 	case "running", "stopped", "failed":
 		summary.State = actual.VMState

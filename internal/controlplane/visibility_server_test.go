@@ -8,6 +8,8 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+
+	"github.com/artemnikitin/firework/internal/operatorapi"
 )
 
 func TestVisibilityServerAuthentication(t *testing.T) {
@@ -48,7 +50,7 @@ func TestVisibilityStatusEndpointReturnsRevisionDerivation(t *testing.T) {
 	if recorder.Code != http.StatusOK {
 		t.Fatalf("status endpoint returned %d: %s", recorder.Code, recorder.Body.String())
 	}
-	var status RevisionStatus
+	var status operatorapi.RevisionStatus
 	if err := json.NewDecoder(recorder.Body).Decode(&status); err != nil {
 		t.Fatal(err)
 	}
