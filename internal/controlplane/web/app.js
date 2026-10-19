@@ -2,6 +2,8 @@ const content = document.querySelector('#content');
 const toolbar = document.querySelector('#toolbar');
 const search = document.querySelector('#search');
 const filter = document.querySelector('#filter');
+const healthFilter = document.querySelector('#health-filter');
+const nodeFilter = document.querySelector('#node-filter');
 const updated = document.querySelector('#updated');
 const errorBox = document.querySelector('#error');
 const navButtons = [...document.querySelectorAll('[data-view]')];
@@ -10,10 +12,16 @@ const states = {
   nodes: ['ready', 'draining', 'down', 'stale', 'unknown'],
   services: ['pending', 'running', 'stopped', 'failed', 'unknown'],
 };
+const healthStates = ['healthy', 'unhealthy', 'unknown', 'not_configured'];
 
 let view = 'overview';
 let data = [];
+let problems = [];
 let requestedFilter = '';
+// Each load cancels the previous one and carries a sequence number, so a slow
+// response for an earlier view can never render over a newer navigation.
+let loadSequence = 0;
+let loadController = null;
 
 const esc = value => String(value ?? '').replace(/[&<>'"]/g, character => ({
   '&': '&amp;',
@@ -106,8 +114,8 @@ const serviceDisk = storage => {
   return entries.length ? `<div class="service-disk">${entries.join('')}</div>` : '<span class="muted">—</span>';
 };
 
-async function api(path) {
-  const response = await fetch(path, {credentials: 'same-origin'});
+async function api(path, signal) {
+  const response = await fetch(path, {credentials: 'same-origin', signal});
   if (response.status === 401) {
     location = '/login';
     throw new Error('Authentication required');
@@ -129,12 +137,32 @@ function setActiveView(nextView) {
   });
 }
 
+function fillSelect(select, label, values, selected) {
+  select.innerHTML = `<option value="">${esc(label)}</option>` + values.map(value => `<option value="${esc(value)}">${esc(value)}</option>`).join('');
+  select.value = values.includes(selected) ? selected : '';
+}
+
 function setFilters() {
-  const values = states[view] || [];
-  const selected = requestedFilter || filter.value;
-  filter.innerHTML = '<option value="">All states</option>' + values.map(value => `<option value="${value}">${value}</option>`).join('');
-  filter.value = values.includes(selected) ? selected : '';
+  fillSelect(filter, 'All states', states[view] || [], requestedFilter || filter.value);
   requestedFilter = '';
+  const services = view === 'services';
+  healthFilter.hidden = !services;
+  nodeFilter.hidden = !services;
+  if (services) fillSelect(healthFilter, 'All health', healthStates, healthFilter.value);
+}
+
+// Node choices come from the loaded services, so they always name a node the
+// filter can match.
+function setNodeChoices() {
+  if (view !== 'services') return;
+  const nodes = [...new Set(data.map(item => item.node).filter(Boolean))].sort();
+  fillSelect(nodeFilter, 'All nodes', nodes, nodeFilter.value);
+}
+
+function problemsNotice(list) {
+  if (!(list || []).length) return '';
+  const items = list.map(problem => `<li>${esc(problem.kind)} <code>${esc(problem.id)}</code>: ${esc(problem.reason_code)}</li>`).join('');
+  return `<div class="notice" role="status"><strong>Some records could not be read and are not shown.</strong><ul>${items}</ul></div>`;
 }
 
 function table(headers, rows, emptyMessage) {
@@ -155,9 +183,12 @@ function section(title, body) {
 function renderList() {
   const query = search.value.trim().toLowerCase();
   const state = filter.value;
+  const health = view === 'services' ? healthFilter.value : '';
+  const node = view === 'services' ? nodeFilter.value : '';
   const items = data.filter(item => {
     const name = item.node_id || item.name || '';
-    return name.toLowerCase().includes(query) && (!state || item.state === state);
+    return name.toLowerCase().includes(query) && (!state || item.state === state) &&
+      (!health || item.health === health) && (!node || item.node === node);
   });
 
   if (view === 'nodes') {
@@ -170,7 +201,7 @@ function renderList() {
       <td>${capacity(node.allocated.memory_mb, node.capacity.memory_mb, node.available.memory_mb, ' MB')}</td>
       <td>${byteCapacity(node.storage?.local)}</td>
     </tr>`);
-    content.innerHTML = `<div class="page-heading"><div><p class="eyebrow">Infrastructure</p><h1>Nodes</h1></div><span class="result-count">${items.length} of ${data.length}</span></div>${table(['Node', 'State', 'Last seen', 'Services', 'vCPU', 'Memory', 'Local disk'], rows, 'No nodes match the current filters.')}`;
+    content.innerHTML = `<div class="page-heading"><div><p class="eyebrow">Infrastructure</p><h1>Nodes</h1></div><span class="result-count">${items.length} of ${data.length}</span></div>${problemsNotice(problems)}${table(['Node', 'State', 'Last seen', 'Services', 'vCPU', 'Memory', 'Local disk'], rows, 'No nodes match the current filters.')}`;
     return;
   }
 
@@ -183,7 +214,7 @@ function renderList() {
     <td>${service.memory_mb} MB</td>
     <td>${serviceDisk(service.storage)}</td>
   </tr>`);
-  content.innerHTML = `<div class="page-heading"><div><p class="eyebrow">Workloads</p><h1>Services</h1></div><span class="result-count">${items.length} of ${data.length}</span></div>${table(['Service', 'Node', 'State', 'Health', 'vCPU', 'Memory', 'Disk'], rows, 'No services match the current filters.')}`;
+  content.innerHTML = `<div class="page-heading"><div><p class="eyebrow">Workloads</p><h1>Services</h1></div><span class="result-count">${items.length} of ${data.length}</span></div>${problemsNotice(problems)}${table(['Service', 'Node', 'State', 'Health', 'vCPU', 'Memory', 'Disk'], rows, 'No services match the current filters.')}`;
 }
 
 function stateCounts(items, expectedStates) {
@@ -213,6 +244,11 @@ function overviewPanel(kind, items) {
 }
 
 const nodeSet = values => (values || []).length ? esc(values.join(', ')) : '<span class="muted">—</span>';
+const serviceSet = values => (values || []).length ? values.map(serviceLink).join(', ') : '<span class="muted">—</span>';
+const serviceCounts = counts => {
+  if (!counts) return '<span class="muted">—</span>';
+  return esc(`${counts.ready ?? 0} of ${counts.desired ?? 0} ready · ${counts.running ?? 0} running · ${counts.pending ?? 0} pending · ${counts.unhealthy ?? 0} unhealthy · ${counts.unknown ?? 0} unknown`);
+};
 
 function renderOverview(nodes, services, status) {
   const convergence = detailTable([
@@ -228,6 +264,8 @@ function renderOverview(nodes, services, status) {
     ['Stale', nodeSet(status.stale_nodes)],
     ['Down', nodeSet(status.down_nodes)],
     ['Unknown', nodeSet(status.unknown_nodes)],
+    ['Services', serviceCounts(status.services)],
+    ['Unhealthy services', serviceSet(status.unhealthy_services)],
     ['Reason', display(status.reason_code)],
     ['Message', display(status.message)],
   ]);
@@ -236,6 +274,7 @@ function renderOverview(nodes, services, status) {
     <h1>Platform overview</h1>
     <p>Current node availability and service lifecycle state across the platform.</p>
   </div>
+  ${problemsNotice(status.problems)}
   ${section('Revision convergence', convergence)}
   <div class="overview-grid">
     ${overviewPanel('nodes', nodes)}
@@ -376,8 +415,9 @@ function renderServiceDetail(service) {
     ${(service.volumes || []).length ? section('Persistent volumes', table(['Volume', 'Type', 'Mount path', 'Bound node', 'Backend', 'Requested', 'Effective', 'Applied', 'State', 'Last error'], volumeRows, '')) : ''}`;
 }
 
-async function detail(kind, id) {
-  const value = await api(`/v1/${kind}/${encodeURIComponent(decodeURIComponent(id))}`);
+async function detail(kind, id, signal, current) {
+  const value = await api(`/v1/${kind}/${encodeURIComponent(decodeURIComponent(id))}`, signal);
+  if (!current()) return;
   updated.textContent = `Updated ${new Date(value.observed_at).toLocaleTimeString()}`;
   if (kind === 'nodes') {
     renderNodeDetail(value);
@@ -387,31 +427,41 @@ async function detail(kind, id) {
 }
 
 async function load() {
+  if (loadController) loadController.abort();
+  const controller = new AbortController();
+  loadController = controller;
+  const sequence = ++loadSequence;
+  const current = () => sequence === loadSequence;
+  const signal = controller.signal;
   errorBox.hidden = true;
   try {
     const hash = location.hash.slice(1);
     if (hash.startsWith('node/')) {
       setActiveView('nodes');
       toolbar.hidden = true;
-      return await detail('nodes', hash.slice(5));
+      return await detail('nodes', hash.slice(5), signal, current);
     }
     if (hash.startsWith('service/')) {
       setActiveView('services');
       toolbar.hidden = true;
-      return await detail('services', hash.slice(8));
+      return await detail('services', hash.slice(8), signal, current);
     }
     if (hash === 'nodes' || hash === 'services') {
       setActiveView(hash);
       setFilters();
-      const result = await api(`/v1/${view}`);
+      const result = await api(`/v1/${view}`, signal);
+      if (!current()) return;
       data = result.items;
+      problems = result.problems || [];
+      setNodeChoices();
       updated.textContent = `Updated ${new Date(result.observed_at).toLocaleTimeString()}`;
       renderList();
       return;
     }
 
     setActiveView('overview');
-    const [statusResult, nodesResult, servicesResult] = await Promise.allSettled([api('/v1/status'), api('/v1/nodes'), api('/v1/services')]);
+    const [statusResult, nodesResult, servicesResult] = await Promise.allSettled([api('/v1/status', signal), api('/v1/nodes', signal), api('/v1/services', signal)]);
+    if (!current()) return;
     if (nodesResult.status === 'rejected') throw nodesResult.reason;
     if (servicesResult.status === 'rejected') throw servicesResult.reason;
     const nodes = nodesResult.value;
@@ -429,6 +479,8 @@ async function load() {
     updated.textContent = `Updated ${observedAt.toLocaleTimeString()}`;
     renderOverview(nodes.items, services.items, status);
   } catch (error) {
+    // A superseded load was aborted on purpose; only the current one reports.
+    if (!current() || error.name === 'AbortError') return;
     errorBox.textContent = error.message;
     errorBox.hidden = false;
   }
@@ -438,6 +490,8 @@ navButtons.forEach(button => {
   button.addEventListener('click', () => {
     requestedFilter = '';
     filter.value = '';
+    healthFilter.value = '';
+    nodeFilter.value = '';
     const hash = button.dataset.view === 'overview' ? '' : button.dataset.view;
     if (location.hash.slice(1) === hash) {
       load();
@@ -448,6 +502,8 @@ navButtons.forEach(button => {
 });
 search.addEventListener('input', renderList);
 filter.addEventListener('change', renderList);
+healthFilter.addEventListener('change', renderList);
+nodeFilter.addEventListener('change', renderList);
 window.addEventListener('hashchange', load);
 load();
 setInterval(load, 7500);

@@ -290,14 +290,21 @@ in local storage or exposed to JavaScript. The default overview groups node and
 service totals by lifecycle state. Each state links to its filtered list, and
 the Nodes and Services views link to fixed-order detail tables. Node CPU,
 memory, and local-volume storage are shown with allocated/available values and
-capacity bars. Shared storage is a backend-level resource, so it is not
-duplicated on every node. Service lists show a prominent disk summary, and
+capacity bars; a pool the node does not have reads "Not configured", never
+0 B / 0 B. Node details also show the node's shared pool and backend. Service
+lists show a prominent disk summary, and
 details show local/shared reservation and applied size plus the per-volume
 table, which carries requested, effective, and applied sizes so a refused
 request is visible rather than left to a revision diff. Service details also
 include a clickable HTTPS public URL when routing
 metadata resolves through the API role's `ingress_domain` (or uses an exact
-`metadata.host`). All views refresh automatically.
+`metadata.host`). The overview's convergence table includes service counts and
+links to unhealthy services, and every list and the overview show a notice
+naming any record the API skipped. The Services view filters by state,
+health, and node, matching the API and CLI filters. All views refresh
+automatically; each refresh or navigation cancels the previous request, and a
+response that arrives after a newer one started is discarded, so a slow
+refresh can never overwrite the view you navigated to.
 
 Rotate access by replacing the operator token secret and restarting the API
 role. Existing browser sessions become invalid because their derived session
