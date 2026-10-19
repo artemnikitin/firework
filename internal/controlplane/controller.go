@@ -624,7 +624,6 @@ func (c *Controller) publishRendered(ctx context.Context, renderRev string, node
 type nodeTombstone struct {
 	config config.NodeConfig
 	token  objectstorage.WriteToken
-	exists bool
 }
 
 // publishTombstone writes an empty config for a node outside the placement.
@@ -639,12 +638,7 @@ func (c *Controller) publishTombstone(ctx context.Context, renderRev string, tom
 		return false, fmt.Errorf("marshal node tombstone %s: %w", tombstone.config.Node, err)
 	}
 	legacyKey := legacyNodeConfigKey(c.cfg.State.Prefix, tombstone.config.Node)
-	var written bool
-	if tombstone.exists {
-		written, _, err = c.store.PutRawIfMatch(ctx, legacyKey, tombstone.token, data, "application/x-yaml")
-	} else {
-		written, _, err = c.store.PutRawIfAbsent(ctx, legacyKey, data, "application/x-yaml")
-	}
+	written, _, err := c.store.PutRawIfMatch(ctx, legacyKey, tombstone.token, data, "application/x-yaml")
 	if err != nil {
 		return false, err
 	}
@@ -679,9 +673,13 @@ func (c *Controller) publishTombstone(ctx context.Context, renderRev string, tom
 // placement — a pending service has already dropped out of the placement, but
 // not out of the config its node is still running. A node is tombstoned when
 // every service in that config is either gone from desired state or placed on
-// an active node in this cycle. A missing config holds nothing and is safe to
-// tombstone; an unreadable or unparseable one is left untouched, because its
-// contents are unknown.
+// an active node in this cycle. A missing, unreadable, or unparseable config
+// is left untouched, because its contents are unknown. Missing is not empty:
+// a controller before explicit empty state deleted the config of a node that
+// left the placement while its agent kept running the services, which may be
+// the only running copies if they could not be placed elsewhere. A node that
+// genuinely never had a config runs nothing, so leaving it absent costs
+// nothing.
 //
 // deferred reports a failed read, so the cycle is not cached as complete and
 // the next tick evaluates the node again. An unparseable config is not
@@ -714,22 +712,23 @@ func (c *Controller) inactiveNodeTombstones(ctx context.Context, knownNodeIDs []
 			deferred = true
 			continue
 		}
-		if exists {
-			current, err := config.ParseNodeConfig(data)
-			if err != nil {
-				c.logger.Warn("inactive node config is unreadable; leaving it untouched", "node", nodeID, "error", err)
-				continue
-			}
-			if service, stranded := strandedService(current, desiredServices, placedServices); stranded {
-				c.logger.Info("inactive node still holds an unplaced desired service; leaving its config untouched",
-					"node", nodeID, "service", service)
-				continue
-			}
+		if !exists {
+			c.logger.Debug("inactive node has no config; leaving it absent", "node", nodeID)
+			continue
+		}
+		current, err := config.ParseNodeConfig(data)
+		if err != nil {
+			c.logger.Warn("inactive node config is unreadable; leaving it untouched", "node", nodeID, "error", err)
+			continue
+		}
+		if service, stranded := strandedService(current, desiredServices, placedServices); stranded {
+			c.logger.Info("inactive node still holds an unplaced desired service; leaving its config untouched",
+				"node", nodeID, "service", service)
+			continue
 		}
 		tombstones = append(tombstones, nodeTombstone{
 			config: config.NodeConfig{Node: nodeID, Services: []config.ServiceConfig{}},
 			token:  token,
-			exists: exists,
 		})
 	}
 	return tombstones, deferred

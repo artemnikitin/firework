@@ -175,6 +175,9 @@ func TestStaleNodesKeepConfigsHoldingUnplacedServices(t *testing.T) {
 	webConfig := nodeConfigYAML(t, "node-a", "web")
 	putNodeConfig(t, store, "node-a", webConfig)
 	putNodeConfig(t, store, "node-b", nodeConfigYAML(t, "node-b", "removed"))
+	// node-c's config was deleted by an older controller; it may be running
+	// the only copy of web.
+	putEmptyStateNode(t, store, "node-c", NodeStateReady, stale)
 
 	c.runReconcile(context.Background())
 
@@ -186,17 +189,23 @@ func TestStaleNodesKeepConfigsHoldingUnplacedServices(t *testing.T) {
 		t.Fatalf("config holding an unplaced desired service was rewritten:\n%s", got)
 	}
 	requireExplicitEmpty(t, store, "node-b", placement)
+	if got, exists := readNodeConfig(t, store, "node-c"); exists {
+		t.Fatalf("missing config on a stale node was emptied:\n%s", got)
+	}
 }
 
 // Unknown contents are not evidence that a node may be emptied, and a key
 // without a registry record is not the controller's to rewrite or delete.
+// Missing is unknown too: an older controller deleted the config of a node
+// that left the placement while its agent kept running the services, so an
+// absent config can describe a node still running the only copies.
 func TestUnknownNodeConfigsAreLeftUntouched(t *testing.T) {
 	c, store := emptyStateController(t)
 	now := time.Now().UTC()
 	putDesired(t, store, "desired-1", testService("web"))
 	putEmptyStateNode(t, store, "node-a", NodeStateReady, now)
 	putEmptyStateNode(t, store, "node-corrupt", NodeStateDown, now)
-	putEmptyStateNode(t, store, "node-new", NodeStateDraining, now)
+	putEmptyStateNode(t, store, "node-missing", NodeStateDraining, now)
 	corrupt := []byte("{not yaml")
 	putNodeConfig(t, store, "node-corrupt", corrupt)
 	orphan := nodeConfigYAML(t, "node-orphan", "legacy")
@@ -204,15 +213,16 @@ func TestUnknownNodeConfigsAreLeftUntouched(t *testing.T) {
 
 	c.runReconcile(context.Background())
 
-	placement := currentPlacement(t, store)
+	currentPlacement(t, store)
 	if got, _ := readNodeConfig(t, store, "node-corrupt"); !bytes.Equal(got, corrupt) {
 		t.Fatalf("unparseable config was rewritten:\n%s", got)
 	}
 	if got, exists := readNodeConfig(t, store, "node-orphan"); !exists || !bytes.Equal(got, orphan) {
 		t.Fatalf("config with no registry record was changed or deleted: exists=%v\n%s", exists, got)
 	}
-	// A known node that never had a config holds nothing and gets an explicit one.
-	requireExplicitEmpty(t, store, "node-new", placement)
+	if got, exists := readNodeConfig(t, store, "node-missing"); exists {
+		t.Fatalf("missing config was treated as empty and written:\n%s", got)
+	}
 }
 
 // A newly registered node with no assignment, under a desired revision with no

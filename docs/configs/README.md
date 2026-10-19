@@ -366,7 +366,10 @@ In the control-plane flow, the controller never deletes `cp/v1/nodes/<node>.yaml
   desired state or placed on an active node. A config that still holds a desired
   service with no active placement is left as it is, so a fleet-wide registry
   outage cannot empty every node;
-- an unreadable config, or one with no registry record, is left untouched.
+- a missing or unreadable config, or one with no registry record, is left
+  untouched. Missing is unknown, not empty: an older controller deleted the
+  config of a node that left the placement, and that node may still be running
+  the only copies of its services.
 
 **Direct Git mode:** to stop everything a label runs, commit its file with
 `services: []`. Deleting `nodes/<label>.yaml` does not stop anything — the agent
