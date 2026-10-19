@@ -3,7 +3,9 @@ package enricher
 import (
 	"context"
 	"fmt"
+	"io"
 	"slices"
+	"strings"
 	"testing"
 
 	"github.com/artemnikitin/firework/internal/config"
@@ -38,11 +40,24 @@ func TestS3Writer_NodeKey(t *testing.T) {
 type fakeWriterS3 struct {
 	existingKeys []string
 	putKeys      []string
-	deleteKeys   []string
+	putBodies    map[string][]byte
+	failPutKey   string
 }
 
 func (f *fakeWriterS3) PutObject(_ context.Context, in *s3.PutObjectInput, _ ...func(*s3.Options)) (*s3.PutObjectOutput, error) {
-	f.putKeys = append(f.putKeys, aws.ToString(in.Key))
+	key := aws.ToString(in.Key)
+	if key == f.failPutKey {
+		return nil, fmt.Errorf("put failed for %s", key)
+	}
+	body, err := io.ReadAll(in.Body)
+	if err != nil {
+		return nil, err
+	}
+	if f.putBodies == nil {
+		f.putBodies = make(map[string][]byte)
+	}
+	f.putKeys = append(f.putKeys, key)
+	f.putBodies[key] = body
 	return &s3.PutObjectOutput{}, nil
 }
 
@@ -50,7 +65,7 @@ func (f *fakeWriterS3) ListObjectsV2(_ context.Context, in *s3.ListObjectsV2Inpu
 	prefix := aws.ToString(in.Prefix)
 	var contents []types.Object
 	for _, key := range f.existingKeys {
-		if len(prefix) == 0 || len(key) >= len(prefix) && key[:len(prefix)] == prefix {
+		if strings.HasPrefix(key, prefix) {
 			contents = append(contents, types.Object{Key: aws.String(key)})
 		}
 	}
@@ -60,64 +75,73 @@ func (f *fakeWriterS3) ListObjectsV2(_ context.Context, in *s3.ListObjectsV2Inpu
 	}, nil
 }
 
-func (f *fakeWriterS3) DeleteObject(_ context.Context, in *s3.DeleteObjectInput, _ ...func(*s3.Options)) (*s3.DeleteObjectOutput, error) {
-	key := aws.ToString(in.Key)
-	f.deleteKeys = append(f.deleteKeys, key)
-	return &s3.DeleteObjectOutput{}, nil
+func requireEmptyNodeConfig(t *testing.T, fake *fakeWriterS3, key, node string) {
+	t.Helper()
+	body, ok := fake.putBodies[key]
+	if !ok {
+		t.Fatalf("expected %s to be overwritten with an empty config, got puts %v", key, fake.putKeys)
+	}
+	nc, err := config.ParseNodeConfig(body)
+	if err != nil {
+		t.Fatalf("%s is not an authoritative empty config: %v\n%s", key, err, body)
+	}
+	if nc.Node != node || len(nc.Services) != 0 {
+		t.Fatalf("%s is not empty for node %s: %#v", key, node, nc)
+	}
 }
 
-func TestS3Writer_WriteAll_DeletesStaleNodeConfigs(t *testing.T) {
+// A node type omitted by a successful enrichment run lost its last service.
+// Deleting its config left the agent treating the missing file as a fetch
+// failure and running that service forever, so it is emptied instead.
+func TestS3Writer_WriteAll_EmptiesOmittedNodeConfigs(t *testing.T) {
 	fake := &fakeWriterS3{
 		existingKeys: []string{
-			"nodes/web.yaml",
-			"nodes/backend.yaml",
-			"nodes/readme.txt",
+			"cfg/nodes/web.yaml",
+			"cfg/nodes/backend.yaml",
+			"cfg/nodes/readme.txt",
 			"other/preserve.yaml",
 		},
 	}
-	w := newS3WriterWithClient(fake, "test-bucket", "")
+	w := newS3WriterWithClient(fake, "test-bucket", "cfg/")
 
 	configs := []config.NodeConfig{
-		{Node: "web", Services: []config.ServiceConfig{}},
+		{Node: "web", Services: []config.ServiceConfig{{Name: "web"}}},
 		{Node: "api", Services: []config.ServiceConfig{}},
 	}
-
 	if err := w.WriteAll(context.Background(), configs); err != nil {
 		t.Fatalf("WriteAll() error = %v", err)
 	}
 
-	wantPut := []string{"nodes/web.yaml", "nodes/api.yaml"}
-	for _, k := range wantPut {
+	for _, k := range []string{"cfg/nodes/web.yaml", "cfg/nodes/api.yaml"} {
 		if !slices.Contains(fake.putKeys, k) {
 			t.Fatalf("expected PutObject for key %q, got %v", k, fake.putKeys)
 		}
 	}
-
-	if len(fake.deleteKeys) != 1 || fake.deleteKeys[0] != "nodes/backend.yaml" {
-		t.Fatalf("expected one stale delete for nodes/backend.yaml, got %v", fake.deleteKeys)
+	requireEmptyNodeConfig(t, fake, "cfg/nodes/backend.yaml", "backend")
+	for _, k := range []string{"cfg/nodes/readme.txt", "other/preserve.yaml"} {
+		if slices.Contains(fake.putKeys, k) {
+			t.Fatalf("non-node-config key %q was written", k)
+		}
 	}
 }
 
-type failingDeleteWriterS3 struct {
-	fakeWriterS3
-	failKey string
-}
+// A successful run with no node types at all is a genuine "run nothing", and
+// it empties every existing node config rather than being skipped.
+func TestS3Writer_WriteAll_EmptyResultEmptiesEveryNodeConfig(t *testing.T) {
+	fake := &fakeWriterS3{existingKeys: []string{"nodes/web.yaml", "nodes/api.yaml"}}
+	w := newS3WriterWithClient(fake, "test-bucket", "")
 
-func (f *failingDeleteWriterS3) DeleteObject(_ context.Context, in *s3.DeleteObjectInput, _ ...func(*s3.Options)) (*s3.DeleteObjectOutput, error) {
-	key := aws.ToString(in.Key)
-	f.deleteKeys = append(f.deleteKeys, key)
-	if key == f.failKey {
-		return nil, fmt.Errorf("delete failed for %s", key)
+	if err := w.WriteAll(context.Background(), nil); err != nil {
+		t.Fatalf("WriteAll() error = %v", err)
 	}
-	return &s3.DeleteObjectOutput{}, nil
+	requireEmptyNodeConfig(t, fake, "nodes/web.yaml", "web")
+	requireEmptyNodeConfig(t, fake, "nodes/api.yaml", "api")
 }
 
-func TestS3Writer_WriteAll_DeleteError(t *testing.T) {
-	fake := &failingDeleteWriterS3{
-		fakeWriterS3: fakeWriterS3{
-			existingKeys: []string{"nodes/stale.yaml"},
-		},
-		failKey: "nodes/stale.yaml",
+func TestS3Writer_WriteAll_EmptyingError(t *testing.T) {
+	fake := &fakeWriterS3{
+		existingKeys: []string{"nodes/stale.yaml"},
+		failPutKey:   "nodes/stale.yaml",
 	}
 	w := newS3WriterWithClient(fake, "test-bucket", "")
 
@@ -125,6 +149,6 @@ func TestS3Writer_WriteAll_DeleteError(t *testing.T) {
 		{Node: "web", Services: []config.ServiceConfig{}},
 	})
 	if err == nil {
-		t.Fatal("expected delete error, got nil")
+		t.Fatal("expected an error emptying the omitted node config, got nil")
 	}
 }
