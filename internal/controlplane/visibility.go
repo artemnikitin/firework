@@ -142,7 +142,7 @@ func (s *VisibilityService) Service(ctx context.Context, name string) (operatora
 		return operatorapi.ServiceDetail{}, false, nil
 	}
 	summary := snapshot.serviceSummary(*desired)
-	volumeStatuses := desiredVolumeStatuses(*desired, snapshot.volumeByID)
+	volumeStatuses := snapshot.serviceVolumeStatuses(*desired)
 	detail := operatorapi.ServiceDetail{
 		APIVersion: operatorapi.APIVersion, ObservedAt: snapshot.now, ServiceSummary: summary,
 		ServiceObservedAt: summary.ObservedAt,
@@ -157,7 +157,6 @@ func (s *VisibilityService) Service(ctx context.Context, name string) (operatora
 	detail.RoutingHostname, detail.PublicURL = servicePublicRoute(desired.Name, desired.Metadata, s.cfg.IngressDomain)
 	placed, placedOK := snapshot.placementByService[name]
 	if placedOK {
-		volumeStatuses = desiredVolumeStatuses(placed.config, snapshot.volumeByID)
 		detail.PlacementRevision = snapshot.placement.Revision
 		record, nodeExists := snapshot.nodeByID[placed.node.Node]
 		if nodeExists {
@@ -168,7 +167,6 @@ func (s *VisibilityService) Service(ctx context.Context, name string) (operatora
 					detail.ActualNode = record.NodeID
 					detail.PID = actual.PID
 					detail.RestartCount = actual.RestartCount
-					volumeStatuses = mergeVolumeStatuses(volumeStatuses, actual.Volumes)
 					if actual.NetworkAddress != "" {
 						detail.NetworkAddress = actual.NetworkAddress
 					}
@@ -276,6 +274,30 @@ func (s visibilitySnapshot) refusedVolumes() []string {
 	}
 	sort.Strings(refused)
 	return refused
+}
+
+// serviceVolumeStatuses is the single merged volume view used by the service
+// list, service detail, and their disk totals: the durable records for the
+// placed (or, when unplaced, desired) config, overlaid with the current
+// node's observation only when that observation is current.
+func (s visibilitySnapshot) serviceVolumeStatuses(desired config.ServiceConfig) []statusmodel.VolumeStatus {
+	placed, ok := s.placementByService[desired.Name]
+	if !ok {
+		return desiredVolumeStatuses(desired, s.volumeByID)
+	}
+	volumes := desiredVolumeStatuses(placed.config, s.volumeByID)
+	record, exists := s.nodeByID[placed.node.Node]
+	if !exists {
+		return volumes
+	}
+	status, current := s.currentStatus(record)
+	if !current {
+		return volumes
+	}
+	if actual, found := findAgentService(status, desired.Name); found {
+		volumes = mergeVolumeStatuses(volumes, actual.Volumes)
+	}
+	return volumes
 }
 
 func mergeVolumeStatuses(base, observed []statusmodel.VolumeStatus) []statusmodel.VolumeStatus {
@@ -495,24 +517,6 @@ func (s visibilitySnapshot) nodeSummary(record NodeRecord) operatorapi.NodeSumma
 	return summary
 }
 
-// nodeLifecycleState derives the operator-facing lifecycle state. An explicit
-// shutdown is a lifecycle fact, not a transport observation, so a down node
-// stays down after its last heartbeat ages out; only ready and draining
-// records derive stale from last_seen_at.
-func nodeLifecycleState(record NodeRecord, now time.Time, staleTTL time.Duration) string {
-	switch record.State {
-	case NodeStateDown:
-		return "down"
-	case NodeStateReady, NodeStateDraining:
-		if record.LastSeenAt.IsZero() || now.Sub(record.LastSeenAt) > staleTTL {
-			return "stale"
-		}
-		return string(record.State)
-	default:
-		return "unknown"
-	}
-}
-
 func toOperatorResources(resources Resources) operatorapi.Resources {
 	return operatorapi.Resources(resources)
 }
@@ -533,11 +537,15 @@ func (s visibilitySnapshot) nodeStorageSummary(record NodeRecord) operatorapi.No
 			}
 		}
 	}
-	return operatorapi.NodeStorageSummary{
-		Local:           storageCapacitySummary(record.Storage.LocalCapacityBytes, localAllocated),
-		Shared:          storageCapacitySummary(record.Storage.SharedCapacityBytes, sharedAllocated),
-		SharedBackendID: record.Storage.SharedBackendID,
-	}
+	// The agent rejects a configured local pool without a positive capacity,
+	// so zero means none is configured. A shared pool is configured whenever
+	// it has a backend ID; zero capacity then means no aggregate limit.
+	local := storageCapacitySummary(record.Storage.LocalCapacityBytes, localAllocated)
+	local.Configured = record.Storage.LocalCapacityBytes > 0
+	shared := storageCapacitySummary(record.Storage.SharedCapacityBytes, sharedAllocated)
+	shared.Configured = record.Storage.SharedBackendID != ""
+	shared.Unbounded = shared.Configured && record.Storage.SharedCapacityBytes <= 0
+	return operatorapi.NodeStorageSummary{Local: local, Shared: shared, SharedBackendID: record.Storage.SharedBackendID}
 }
 
 func storageCapacitySummary(capacity, allocated int64) operatorapi.StorageCapacitySummary {
@@ -550,19 +558,7 @@ func storageCapacitySummary(capacity, allocated int64) operatorapi.StorageCapaci
 }
 
 func (s visibilitySnapshot) freshStatus(record NodeRecord) (statusmodel.AgentStatus, bool) {
-	if record.AgentStatus == nil || record.AgentStatus.SchemaVersion != statusmodel.SchemaVersion {
-		return statusmodel.AgentStatus{}, false
-	}
-	if record.State == NodeStateDown {
-		return statusmodel.AgentStatus{}, false
-	}
-	if record.LastSeenAt.IsZero() || s.now.Sub(record.LastSeenAt) > s.staleTTL {
-		return statusmodel.AgentStatus{}, false
-	}
-	if record.AgentStatus.ObservedAt.IsZero() || s.now.Sub(record.AgentStatus.ObservedAt) > s.staleTTL {
-		return statusmodel.AgentStatus{}, false
-	}
-	return *record.AgentStatus, true
+	return freshAgentStatus(record, s.now, s.staleTTL)
 }
 
 func (s visibilitySnapshot) currentStatus(record NodeRecord) (statusmodel.AgentStatus, bool) {
@@ -875,7 +871,7 @@ func (s visibilitySnapshot) serviceSummary(desired config.ServiceConfig) operato
 	if !s.placementCurrent {
 		reason = "placement_pending"
 	}
-	summary := operatorapi.ServiceSummary{Name: desired.Name, State: "pending", Health: "unknown", VCPUs: desired.VCPUs, MemoryMB: desired.MemoryMB, Storage: summarizeServiceStorage(desiredVolumeStatuses(desired, s.volumeByID)), ReasonCode: reason}
+	summary := operatorapi.ServiceSummary{Name: desired.Name, State: "pending", Health: "unknown", VCPUs: desired.VCPUs, MemoryMB: desired.MemoryMB, Storage: summarizeServiceStorage(s.serviceVolumeStatuses(desired)), ReasonCode: reason}
 	if pending, ok := s.pendingByService[desired.Name]; ok && s.placementCurrent {
 		summary.ReasonCode = pending.ReasonCode
 		summary.Message = pending.Message

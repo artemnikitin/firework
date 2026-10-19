@@ -35,10 +35,25 @@ Storage allocation is the durable persistent-volume reservation used by the
 scheduler, including retained volumes and the larger of effective/applied size
 during a shrink. `available` is capacity minus allocated with a floor of zero;
 these values do not represent filesystem I/O or blocks written by guests.
-Service list/detail responses aggregate local and shared volume counts plus
-desired, applied, and allocated bytes. Service detail also retains the durable
-per-volume view when an agent observation is empty or only contains a subset
-of the service's volumes.
+Node storage reports `configured: false` for a pool the node does not have,
+so it is never shown as zero capacity; a shared pool configured without an
+aggregate capacity (for example, elastic storage) reports `unbounded: true`,
+and its capacity and available bytes are not meaningful.
+
+Service list and detail responses build their volume view through one merge,
+so their counts and desired, applied, and allocated bytes always agree for
+the same snapshot. The merge starts from the durable records, which are kept
+when an agent observation is empty or covers only some of the service's
+volumes, and overlays the placed node's observation only when it is current.
+A zero or omitted observed applied size never replaces a positive durable
+one.
+
+The controller folds an agent's volume observation into the durable record
+only when it is current evidence: the node is not down, the status is
+supported and was received within `node_stale_ttl`, it was made against the
+currently published placement and rendered revisions, and it comes from the
+node that placement assigns the service to. So neither a stale heartbeat nor
+a previous placement of a shared volume can change its resize state.
 
 Missing data fails closed:
 

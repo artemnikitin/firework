@@ -19,8 +19,13 @@ type Resources struct {
 }
 
 // StorageCapacitySummary reports reserved storage capacity. It does not
-// report filesystem or block-device utilization.
+// report filesystem or block-device utilization. Configured is false when the
+// node has no such pool, so zero capacity is never ambiguous; Unbounded marks
+// a configured pool without aggregate capacity (for example, elastic shared
+// storage), whose capacity and available bytes are then not meaningful.
 type StorageCapacitySummary struct {
+	Configured     bool  `json:"configured"`
+	Unbounded      bool  `json:"unbounded,omitempty"`
 	CapacityBytes  int64 `json:"capacity_bytes"`
 	AllocatedBytes int64 `json:"allocated_bytes"`
 	AvailableBytes int64 `json:"available_bytes"`

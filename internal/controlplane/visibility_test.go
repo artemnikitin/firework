@@ -276,8 +276,12 @@ func TestServiceStorageSummaryAndDetailPreserveDurableVolumes(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// The list and the detail project the same merged view: the current
+	// observation's 20 GiB applied overrides the durable record's older 15 GiB
+	// in both, rather than the list showing durable values and the detail
+	// showing observed ones for the same snapshot.
 	storage := services.Items[0].Storage
-	if storage.Local.Count != 1 || storage.Local.DesiredBytes != 20*config.GiB || storage.Local.AppliedBytes != 15*config.GiB || storage.Local.AllocatedBytes != 20*config.GiB {
+	if storage.Local.Count != 1 || storage.Local.DesiredBytes != 20*config.GiB || storage.Local.AppliedBytes != 20*config.GiB || storage.Local.AllocatedBytes != 20*config.GiB {
 		t.Fatalf("local service storage = %#v", storage.Local)
 	}
 	if storage.Shared.Count != 1 || storage.Shared.AppliedBytes != 10*config.GiB || storage.Shared.AllocatedBytes != 10*config.GiB {
@@ -293,6 +297,37 @@ func TestServiceStorageSummaryAndDetailPreserveDurableVolumes(t *testing.T) {
 	}
 	if detail.Storage.Local.AppliedBytes != 20*config.GiB || detail.Storage.Shared.AppliedBytes != 10*config.GiB {
 		t.Fatalf("detail storage did not merge agent and durable state: %#v", detail.Storage)
+	}
+	if detail.Storage != storage {
+		t.Fatalf("service list storage %#v disagrees with detail %#v", storage, detail.Storage)
+	}
+}
+
+func TestNodeStorageDistinguishesUnconfiguredAndUnboundedPools(t *testing.T) {
+	snapshot := visibilitySnapshot{volumeByID: map[string]VolumeRecord{}}
+	tests := []struct {
+		name                string
+		storage             StorageResources
+		local, shared       bool
+		sharedUnbounded     bool
+		wantLocalCapacity   int64
+		wantSharedAvailable int64
+	}{
+		{name: "nothing configured"},
+		{name: "local pool", storage: StorageResources{LocalCapacityBytes: config.GiB}, local: true, wantLocalCapacity: config.GiB},
+		{name: "bounded shared", storage: StorageResources{SharedBackendID: "efs", SharedCapacityBytes: config.GiB}, shared: true, wantSharedAvailable: config.GiB},
+		{name: "elastic shared", storage: StorageResources{SharedBackendID: "efs"}, shared: true, sharedUnbounded: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := snapshot.nodeStorageSummary(NodeRecord{NodeID: "node-1", Storage: tt.storage})
+			if got.Local.Configured != tt.local || got.Local.CapacityBytes != tt.wantLocalCapacity {
+				t.Fatalf("local = %#v", got.Local)
+			}
+			if got.Shared.Configured != tt.shared || got.Shared.Unbounded != tt.sharedUnbounded || got.Shared.AvailableBytes != tt.wantSharedAvailable {
+				t.Fatalf("shared = %#v", got.Shared)
+			}
+		})
 	}
 }
 

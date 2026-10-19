@@ -65,7 +65,16 @@ const capacity = (used, total, available, unit = '') => {
 };
 const byteCapacity = storage => {
   const value = storage || {};
+  // An absent pool and an empty one are different facts; never render the
+  // former as 0 B / 0 B.
+  if (value.configured === false) return '<span class="muted">Not configured</span>';
   const allocated = Math.max(0, Number(value.allocated_bytes) || 0);
+  if (value.unbounded) {
+    return `<div class="capacity-value">
+    <span>${esc(formatBytes(allocated))} reserved</span>
+    <span class="muted">No capacity limit</span>
+  </div>`;
+  }
   const total = Math.max(0, Number(value.capacity_bytes) || 0);
   const available = Math.max(0, Number(value.available_bytes) || 0);
   const progressMax = Math.max(1, total);
@@ -253,6 +262,8 @@ function renderNodeDetail(node) {
     ['vCPU', capacity(node.allocated.vcpus, node.capacity.vcpus, node.available.vcpus)],
     ['Memory', capacity(node.allocated.memory_mb, node.capacity.memory_mb, node.available.memory_mb, ' MB')],
     ['Local volumes', byteCapacity(node.storage?.local)],
+    ['Shared volumes', byteCapacity(node.storage?.shared)],
+    ['Shared backend', display(node.storage?.shared_backend_id)],
     ['Registered', formatDate(node.registered_at)],
     ['Updated', formatDate(node.updated_at)],
     ['Status missing', formatBoolean(node.status_missing)],

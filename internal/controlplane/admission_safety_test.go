@@ -330,7 +330,7 @@ func TestStaleRejectionDoesNotReopenAWithdrawnRefusal(t *testing.T) {
 			RejectedReason: "shrink_below_minimum",
 		}},
 	}}}}
-	if _, err := store.PutJSON(ctx, nodeKey, node); err != nil {
+	if _, err := store.PutJSON(ctx, nodeKey, currentAckNode(t, store, node)); err != nil {
 		t.Fatal(err)
 	}
 
