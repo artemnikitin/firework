@@ -12,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/artemnikitin/firework/internal/agentconfig"
 	"github.com/artemnikitin/firework/internal/capacity"
 	"github.com/artemnikitin/firework/internal/config"
 	"github.com/artemnikitin/firework/internal/reconciler"
@@ -85,10 +86,10 @@ func (f *fakeStore) Close() error {
 	return nil
 }
 
-func testAgentConfig(t *testing.T) config.AgentConfig {
+func testAgentConfig(t *testing.T) agentconfig.AgentConfig {
 	t.Helper()
 	disabled := false
-	return config.AgentConfig{
+	return agentconfig.AgentConfig{
 		NodeName:            "web",
 		NodeNames:           []string{"web"},
 		PollInterval:        time.Second,

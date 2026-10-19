@@ -17,7 +17,7 @@ import (
 	"text/tabwriter"
 	"time"
 
-	"github.com/artemnikitin/firework/internal/controlplane"
+	"github.com/artemnikitin/firework/internal/operatorapi"
 	"github.com/artemnikitin/firework/internal/version"
 	"gopkg.in/yaml.v3"
 )
@@ -138,7 +138,7 @@ func runStatus(cfg cliConfig, args []string, out io.Writer) error {
 		return err
 	}
 	return poll(out, *watch, *output == "table", func() error {
-		var response controlplane.RevisionStatus
+		var response operatorapi.RevisionStatus
 		if err := client.get(context.Background(), "/v1/status", &response); err != nil {
 			return err
 		}
@@ -186,7 +186,7 @@ func runNodes(cfg cliConfig, args []string, out io.Writer) error {
 		return err
 	}
 	return poll(out, *watch, *output == "table", func() error {
-		var response controlplane.ListEnvelope[controlplane.NodeSummary]
+		var response operatorapi.ListEnvelope[operatorapi.NodeSummary]
 		if err := client.get(context.Background(), "/v1/nodes?"+url.Values{"state": []string{*state}}.Encode(), &response); err != nil {
 			return err
 		}
@@ -226,7 +226,7 @@ func runNode(cfg cliConfig, args []string, out io.Writer) error {
 	}
 	id := flags.Arg(0)
 	return poll(out, *watch, *output == "table", func() error {
-		var response controlplane.NodeDetail
+		var response operatorapi.NodeDetail
 		if err := client.get(context.Background(), "/v1/nodes/"+url.PathEscape(id), &response); err != nil {
 			return err
 		}
@@ -280,7 +280,7 @@ func runServices(cfg cliConfig, args []string, out io.Writer) error {
 	}
 	return poll(out, *watch, *output == "table", func() error {
 		query := url.Values{"state": []string{*state}, "health": []string{*health}, "node": []string{*node}}
-		var response controlplane.ListEnvelope[controlplane.ServiceSummary]
+		var response operatorapi.ListEnvelope[operatorapi.ServiceSummary]
 		if err := client.get(context.Background(), "/v1/services?"+query.Encode(), &response); err != nil {
 			return err
 		}
@@ -316,7 +316,7 @@ func runService(cfg cliConfig, args []string, out io.Writer) error {
 	}
 	name := flags.Arg(0)
 	return poll(out, *watch, *output == "table", func() error {
-		var response controlplane.ServiceDetail
+		var response operatorapi.ServiceDetail
 		if err := client.get(context.Background(), "/v1/services/"+url.PathEscape(name), &response); err != nil {
 			return err
 		}

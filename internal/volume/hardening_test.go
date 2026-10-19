@@ -9,13 +9,14 @@ import (
 	"testing"
 	"time"
 
+	"github.com/artemnikitin/firework/internal/agentconfig"
 	"github.com/artemnikitin/firework/internal/config"
 )
 
 func hardeningManager(t *testing.T, runner CommandRunner) (*Manager, string) {
 	t.Helper()
 	root := t.TempDir()
-	return NewManagerWithDependencies("node-1", config.StorageConfig{Local: &config.LocalStorageConfig{
+	return NewManagerWithDependencies("node-1", agentconfig.StorageConfig{Local: &agentconfig.LocalStorageConfig{
 		Path: root, CapacityBytes: 100 * config.MiB,
 	}}, runner, acceptingMounts{}), root
 }

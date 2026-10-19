@@ -14,6 +14,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/artemnikitin/firework/internal/agentconfig"
 	"github.com/artemnikitin/firework/internal/api"
 	"github.com/artemnikitin/firework/internal/capacity"
 	"github.com/artemnikitin/firework/internal/config"
@@ -43,7 +44,7 @@ type routeSyncer interface {
 // the desired state from the config store and reconciles it with the actual
 // state of running Firecracker microVMs.
 type Agent struct {
-	cfg            config.AgentConfig
+	cfg            agentconfig.AgentConfig
 	store          store.Store
 	vmManager      *vm.Manager
 	volumeManager  *volume.Manager
@@ -80,7 +81,7 @@ type Agent struct {
 }
 
 // New creates a new Agent with all its dependencies.
-func New(cfg config.AgentConfig, s store.Store, logger *slog.Logger) *Agent {
+func New(cfg agentconfig.AgentConfig, s store.Store, logger *slog.Logger) *Agent {
 	metrics := newRuntimeMetrics(cfg.NodeName)
 	volumeMgr := volume.NewManagerWithObserver(cfg.NodeID, cfg.Storage, metrics)
 	vmMgr := vm.NewManagerWithVolumes(cfg.FirecrackerBin, cfg.StateDir, logger, volumeMgr)

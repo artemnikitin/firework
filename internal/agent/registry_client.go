@@ -23,13 +23,14 @@ import (
 	"sync"
 	"time"
 
+	"github.com/artemnikitin/firework/internal/agentconfig"
 	"github.com/artemnikitin/firework/internal/capacity"
-	"github.com/artemnikitin/firework/internal/config"
+	"github.com/artemnikitin/firework/internal/registryapi"
 	"github.com/artemnikitin/firework/internal/statusmodel"
 )
 
 type registryClient struct {
-	cfg        config.AgentConfig
+	cfg        agentconfig.AgentConfig
 	logger     *slog.Logger
 	generation int64
 	hostIP     string
@@ -40,7 +41,7 @@ type registryClient struct {
 	mtlsClient *http.Client
 }
 
-func newRegistryClient(cfg config.AgentConfig, logger *slog.Logger, generation int64) *registryClient {
+func newRegistryClient(cfg agentconfig.AgentConfig, logger *slog.Logger, generation int64) *registryClient {
 	return &registryClient{
 		cfg:        cfg,
 		logger:     logger,
@@ -67,84 +68,25 @@ func (c *registryClient) sync(ctx context.Context, nodeID string, labels []strin
 	}
 }
 
-type registerRequest struct {
-	NodeID     string         `json:"node_id"`
-	Generation int64          `json:"generation"`
-	Labels     []string       `json:"labels,omitempty"`
-	Capacity   capPayload     `json:"capacity"`
-	State      string         `json:"state"`
-	HostIP     string         `json:"host_ip,omitempty"`
-	Storage    storagePayload `json:"storage,omitempty"`
-}
-
-type heartbeatRequest struct {
-	NodeID      string                   `json:"node_id"`
-	Generation  int64                    `json:"generation"`
-	Capacity    capPayload               `json:"capacity"`
-	Used        capPayload               `json:"used"`
-	HostIP      string                   `json:"host_ip,omitempty"`
-	AgentStatus *statusmodel.AgentStatus `json:"agent_status,omitempty"`
-	Storage     storagePayload           `json:"storage,omitempty"`
-}
-
-type capPayload struct {
-	VCPUs    int `json:"vcpus"`
-	MemoryMB int `json:"memory_mb"`
-}
-
-type storagePayload struct {
-	LocalCapacityBytes  int64  `json:"local_capacity_bytes,omitempty"`
-	SharedBackendID     string `json:"shared_backend_id,omitempty"`
-	SharedCapacityBytes int64  `json:"shared_capacity_bytes,omitempty"`
-}
-
-type certRequest struct {
-	NodeID         string `json:"node_id,omitempty"`
-	BootstrapToken string `json:"bootstrap_token,omitempty"`
-	CSRPEM         string `json:"csr_pem"`
-}
-
-type certResponse struct {
-	CertPEM   string    `json:"cert_pem"`
-	ExpiresAt time.Time `json:"expires_at"`
-}
-
-type stateRequest struct {
-	State string `json:"state"`
-}
-
-const (
-	nodeStateDown = "down"
-)
-
 func (c *registryClient) register(ctx context.Context, nodeID string, labels []string, cap capacity.NodeCapacity) error {
-	req := registerRequest{
+	req := registryapi.RegisterRequest{
 		NodeID:     nodeID,
 		Generation: c.generation,
 		Labels:     labels,
-		Capacity: capPayload{
-			VCPUs:    cap.VCPUs,
-			MemoryMB: cap.MemoryMB,
-		},
-		State:   "ready",
-		HostIP:  c.hostIP,
-		Storage: c.storagePayload(),
+		Capacity:   registryapi.Resources(cap),
+		State:      registryapi.NodeStateReady,
+		HostIP:     c.hostIP,
+		Storage:    c.storagePayload(),
 	}
 	return c.postMTLS(ctx, "/v1/nodes/register", req, nil)
 }
 
 func (c *registryClient) heartbeat(ctx context.Context, nodeID string, cap, used capacity.NodeCapacity, status *statusmodel.AgentStatus) error {
-	req := heartbeatRequest{
-		NodeID:     nodeID,
-		Generation: c.generation,
-		Capacity: capPayload{
-			VCPUs:    cap.VCPUs,
-			MemoryMB: cap.MemoryMB,
-		},
-		Used: capPayload{
-			VCPUs:    used.VCPUs,
-			MemoryMB: used.MemoryMB,
-		},
+	req := registryapi.HeartbeatRequest{
+		NodeID:      nodeID,
+		Generation:  c.generation,
+		Capacity:    registryapi.Resources(cap),
+		Used:        registryapi.Resources(used),
 		HostIP:      c.hostIP,
 		AgentStatus: status,
 		Storage:     c.storagePayload(),
@@ -152,8 +94,8 @@ func (c *registryClient) heartbeat(ctx context.Context, nodeID string, cap, used
 	return c.postMTLS(ctx, "/v1/nodes/heartbeat", req, nil)
 }
 
-func (c *registryClient) storagePayload() storagePayload {
-	var out storagePayload
+func (c *registryClient) storagePayload() registryapi.StorageResources {
+	var out registryapi.StorageResources
 	if c.cfg.Storage.Local != nil {
 		out.LocalCapacityBytes = c.cfg.Storage.Local.CapacityBytes
 	}
@@ -201,23 +143,23 @@ func (c *registryClient) ensureCertificate(ctx context.Context, nodeID string) e
 		return err
 	}
 
-	var out certResponse
+	var out registryapi.CertResponse
 	if hasCert {
-		err = c.postMTLS(ctx, "/v1/nodes/renew", certRequest{CSRPEM: csrPEM}, &out)
+		err = c.postMTLS(ctx, "/v1/nodes/renew", registryapi.RenewRequest{CSRPEM: csrPEM}, &out)
 		if err != nil && shouldFallbackToEnroll(err) {
 			// Renew is identity-bound; if TLS/router rejects current cert, recover
 			// with a fresh enrollment only when a bootstrap token is available.
 			if bootstrapToken == "" {
 				return fmt.Errorf("registry cert renew rejected and registry_bootstrap_token is empty; configure bootstrap token or pre-provision a fresh cert/key: %w", err)
 			}
-			err = c.postEnroll(ctx, certRequest{
+			err = c.postEnroll(ctx, registryapi.EnrollRequest{
 				NodeID:         nodeID,
 				BootstrapToken: bootstrapToken,
 				CSRPEM:         csrPEM,
 			}, &out)
 		}
 	} else {
-		err = c.postEnroll(ctx, certRequest{
+		err = c.postEnroll(ctx, registryapi.EnrollRequest{
 			NodeID:         nodeID,
 			BootstrapToken: bootstrapToken,
 			CSRPEM:         csrPEM,
@@ -264,16 +206,16 @@ func (c *registryClient) postMTLS(ctx context.Context, path string, p any, out a
 }
 
 func (c *registryClient) markDown(ctx context.Context, nodeID string) {
-	if err := c.setState(ctx, nodeID, nodeStateDown); err != nil {
-		c.logger.Warn("registry node state update failed during shutdown", "state", nodeStateDown, "error", err)
+	if err := c.setState(ctx, nodeID, registryapi.NodeStateDown); err != nil {
+		c.logger.Warn("registry node state update failed during shutdown", "state", registryapi.NodeStateDown, "error", err)
 	}
 }
 
-func (c *registryClient) setState(ctx context.Context, nodeID, state string) error {
+func (c *registryClient) setState(ctx context.Context, nodeID string, state registryapi.NodeState) error {
 	if strings.TrimSpace(nodeID) == "" {
 		return fmt.Errorf("node id is required")
 	}
-	req := stateRequest{State: state}
+	req := registryapi.StateRequest{State: state}
 	return c.postMTLS(ctx, "/v1/nodes/"+url.PathEscape(nodeID)+"/state", req, nil)
 }
 

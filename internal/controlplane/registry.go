@@ -14,6 +14,7 @@ import (
 	"unicode"
 
 	"github.com/artemnikitin/firework/internal/config"
+	"github.com/artemnikitin/firework/internal/registryapi"
 	"github.com/artemnikitin/firework/internal/statusmodel"
 )
 
@@ -127,7 +128,7 @@ func (s *RegistryServer) registryTLSConfig() (*tls.Config, error) {
 }
 
 func (s *RegistryServer) handleEnroll(w http.ResponseWriter, r *http.Request) {
-	var req EnrollRequest
+	var req registryapi.EnrollRequest
 	if err := readJSON(r, &req); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid json"})
 		return
@@ -153,7 +154,7 @@ func (s *RegistryServer) handleEnroll(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
 		return
 	}
-	writeJSON(w, http.StatusOK, CertResponse{
+	writeJSON(w, http.StatusOK, registryapi.CertResponse{
 		CertPEM:   certPEM,
 		ExpiresAt: expiresAt,
 	})
@@ -165,7 +166,7 @@ func (s *RegistryServer) handleRenew(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": err.Error()})
 		return
 	}
-	var req RenewRequest
+	var req registryapi.RenewRequest
 	if err := readJSON(r, &req); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid json"})
 		return
@@ -179,7 +180,7 @@ func (s *RegistryServer) handleRenew(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
 		return
 	}
-	writeJSON(w, http.StatusOK, CertResponse{
+	writeJSON(w, http.StatusOK, registryapi.CertResponse{
 		CertPEM:   certPEM,
 		ExpiresAt: expiresAt,
 	})
@@ -191,7 +192,7 @@ func (s *RegistryServer) handleRegister(w http.ResponseWriter, r *http.Request) 
 		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": err.Error()})
 		return
 	}
-	var req NodeRegisterRequest
+	var req registryapi.RegisterRequest
 	if err := readJSON(r, &req); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid json"})
 		return
@@ -205,7 +206,7 @@ func (s *RegistryServer) handleRegister(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 	if req.State == "" {
-		req.State = NodeStateReady
+		req.State = registryapi.NodeStateReady
 	}
 
 	rec, err := s.upsertNodeRecord(r.Context(), req.NodeID, func(cur *NodeRecord) error {
@@ -223,11 +224,11 @@ func (s *RegistryServer) handleRegister(w http.ResponseWriter, r *http.Request) 
 		}
 		cur.NodeID = req.NodeID
 		cur.Generation = req.Generation
-		cur.State = req.State
+		cur.State = NodeState(req.State)
 		cur.Labels = req.Labels
-		cur.Capacity = req.Capacity
+		cur.Capacity = resourcesFromRegistry(req.Capacity)
 		cur.HostIP = req.HostIP
-		cur.Storage = req.Storage
+		cur.Storage = storageFromRegistry(req.Storage)
 		cur.LastSeenAt = now
 		cur.UpdatedAt = now
 		return nil
@@ -241,12 +242,7 @@ func (s *RegistryServer) handleRegister(w http.ResponseWriter, r *http.Request) 
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to persist node"})
 		return
 	}
-	writeJSON(w, http.StatusOK, NodeResponse{
-		NodeID:     rec.NodeID,
-		Generation: rec.Generation,
-		State:      rec.State,
-		LastSeenAt: rec.LastSeenAt,
-	})
+	writeJSON(w, http.StatusOK, nodeResponse(rec))
 }
 
 func (s *RegistryServer) handleHeartbeat(w http.ResponseWriter, r *http.Request) {
@@ -255,7 +251,7 @@ func (s *RegistryServer) handleHeartbeat(w http.ResponseWriter, r *http.Request)
 		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": err.Error()})
 		return
 	}
-	var req NodeHeartbeatRequest
+	var req registryapi.HeartbeatRequest
 	if err := readJSON(r, &req); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid json"})
 		return
@@ -301,8 +297,8 @@ func (s *RegistryServer) handleHeartbeat(w http.ResponseWriter, r *http.Request)
 		if req.Capacity.MemoryMB > 0 {
 			cur.Capacity.MemoryMB = req.Capacity.MemoryMB
 		}
-		cur.Used = req.Used
-		cur.Storage = req.Storage
+		cur.Used = resourcesFromRegistry(req.Used)
+		cur.Storage = storageFromRegistry(req.Storage)
 		if req.HostIP != "" {
 			cur.HostIP = req.HostIP
 		}
@@ -320,12 +316,7 @@ func (s *RegistryServer) handleHeartbeat(w http.ResponseWriter, r *http.Request)
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to persist node"})
 		return
 	}
-	writeJSON(w, http.StatusOK, NodeResponse{
-		NodeID:     rec.NodeID,
-		Generation: rec.Generation,
-		State:      rec.State,
-		LastSeenAt: rec.LastSeenAt,
-	})
+	writeJSON(w, http.StatusOK, nodeResponse(rec))
 }
 
 func validatedHeartbeatAgentStatus(nodeID string, incoming *statusmodel.AgentStatus) (*statusmodel.AgentStatus, error) {
@@ -537,12 +528,12 @@ func (s *RegistryServer) handleState(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusForbidden, map[string]string{"error": "path node id does not match mTLS identity"})
 		return
 	}
-	var req NodeStateRequest
+	var req registryapi.StateRequest
 	if err := readJSON(r, &req); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid json"})
 		return
 	}
-	if req.State != NodeStateReady && req.State != NodeStateDraining && req.State != NodeStateDown {
+	if req.State != registryapi.NodeStateReady && req.State != registryapi.NodeStateDraining && req.State != registryapi.NodeStateDown {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid node state"})
 		return
 	}
@@ -556,7 +547,7 @@ func (s *RegistryServer) handleState(w http.ResponseWriter, r *http.Request) {
 		if cur.RegisteredAt.IsZero() {
 			cur.RegisteredAt = now
 		}
-		cur.State = req.State
+		cur.State = NodeState(req.State)
 		cur.LastSeenAt = now
 		cur.UpdatedAt = now
 		return nil
@@ -566,12 +557,22 @@ func (s *RegistryServer) handleState(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to persist node"})
 		return
 	}
-	writeJSON(w, http.StatusOK, NodeResponse{
-		NodeID:     rec.NodeID,
-		Generation: rec.Generation,
-		State:      rec.State,
-		LastSeenAt: rec.LastSeenAt,
-	})
+	writeJSON(w, http.StatusOK, nodeResponse(rec))
+}
+
+func resourcesFromRegistry(resources registryapi.Resources) Resources {
+	return Resources(resources)
+}
+
+func storageFromRegistry(storage registryapi.StorageResources) StorageResources {
+	return StorageResources(storage)
+}
+
+func nodeResponse(record *NodeRecord) registryapi.NodeResponse {
+	return registryapi.NodeResponse{
+		NodeID: record.NodeID, Generation: record.Generation,
+		State: registryapi.NodeState(record.State), LastSeenAt: record.LastSeenAt,
+	}
 }
 
 var errStaleGeneration = errors.New("stale generation")

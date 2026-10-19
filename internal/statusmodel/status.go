@@ -39,7 +39,9 @@ const (
 	MaxAgentVersionLen   = 256
 	MaxEnumLen           = 32 // VMState, Health, HealthCheckType, VolumeStatus.Type, VolumeStatus.State
 	MaxNetworkAddressLen = 64
-	MaxVolumeIDLen       = 128 // BoundNode, SharedBackendID: a node/backend identifier, not a composed name.
+	// BoundNode and SharedBackendID are exact-match identity keys. Reject
+	// overlong values at input boundaries because truncation changes identity.
+	MaxVolumeIDLen = 128
 	// MaxLogicalIDLen must cover visibility.go's composed
 	// "service.Name + "/" + volume.Name": up to MaxServiceNameLen (128) plus
 	// "/" plus a volume name, which the enricher caps at 63 characters
