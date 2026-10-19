@@ -729,9 +729,9 @@ func strandedService(current config.NodeConfig, desired, placed map[string]struc
 
 // appendRetiredNodeConfigs adds an explicit empty config for every active node
 // the placement assigned no services to. scheduler.BuildNodeConfigs omits such
-// a node entirely, and publishRendered then deletes its nodes/<node>.yaml —
-// but an agent treats a missing config as a fetch failure, not as "run
-// nothing", so it keeps every VM it already had. Meanwhile the fleet view
+// a node entirely, which would leave its previous nodes/<node>.yaml in place —
+// and an agent treats a missing config as a fetch failure, not as "run
+// nothing", so neither absence nor a stale config stops it. Meanwhile the fleet view
 // derives its relevant node set from this same placement, so the retired node
 // stops being counted at all and the revision can report converged on the
 // strength of the nodes that did receive work. During an A -> B migration

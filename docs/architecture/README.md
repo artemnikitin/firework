@@ -67,7 +67,9 @@ architectures. Test-only imports do not create a runtime exception.
 - `cp/v1/desired/revisions/<rev>.json` + `cp/v1/desired/current.json`.
 - `cp/v1/placements/revisions/<rev>.json` + `cp/v1/placements/current.json`.
 - `cp/v1/rendered/revisions/<rev>/nodes/<node>.yaml` + `cp/v1/rendered/current.json`.
-- `cp/v1/nodes/<node>.yaml` — current per-node configs polled by agents.
+- `cp/v1/nodes/<node>.yaml` — current per-node configs polled by agents. The
+  controller never deletes one; a node that should run nothing gets
+  `services: []`.
 - `cp/v1/locks/controller.json` — controller leader lease.
 
 The controller writes immutable revisions and flips pointer files atomically.
@@ -129,6 +131,9 @@ You can still run without control plane:
 - Store fully resolved `nodes/*.yaml` directly in Git.
 - Configure agent with `store_type: git`.
 - Agent pulls and reconciles directly from that repo.
+- To stop everything a label runs, commit `services: []`; deleting the file
+  preserves the running services. See
+  [empty and unknown desired state](../configs/README.md#empty-and-unknown-desired-state).
 
 ## See Also
 
