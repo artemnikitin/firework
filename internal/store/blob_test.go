@@ -139,6 +139,20 @@ func TestBlobStoreListAllNodeConfigsFailsOnIncompletePeerSet(t *testing.T) {
 				"nodes/node-2.yaml": {data: []byte("{bad")},
 			},
 		},
+		// A peer config that does not state its services is unknown, not
+		// empty; reading it as empty would delete that peer's live routes.
+		"missing services list": {
+			objects: map[string]fakeBlobObject{
+				"nodes/node-1.yaml": {data: []byte("node: node-1\nservices: []\n")},
+				"nodes/node-2.yaml": {data: []byte("node: node-2\nhost_ip: 10.0.0.2\n")},
+			},
+		},
+		"empty object": {
+			objects: map[string]fakeBlobObject{
+				"nodes/node-1.yaml": {data: []byte("node: node-1\nservices: []\n")},
+				"nodes/node-2.yaml": {data: []byte("")},
+			},
+		},
 	}
 
 	for name, backend := range tests {
