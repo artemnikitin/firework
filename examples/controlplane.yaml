@@ -29,6 +29,7 @@ state:
 leader_lease_ttl: "30s"
 leader_renew_interval: "10s"
 node_stale_ttl: "45s"
+api_snapshot_ttl: "5s"
 controller_tick: "10s"
 
 target_branch: "main"

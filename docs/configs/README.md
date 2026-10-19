@@ -256,6 +256,7 @@ Tenant expansions rewrite links to tenant-prefixed service names automatically.
 | `leader_renew_interval` | controller/all | Leadership renewal interval |
 | `node_stale_ttl` | controller/all | Freshness threshold for schedulable nodes |
 | `controller_tick` | controller/all | Scheduling/publish loop tick |
+| `api_snapshot_ttl` | no | How long the read-only API reuses one deployment snapshot (default `5s`; `0` rebuilds on every request). The controller never uses it |
 | `target_branch` | events/all | Git branch filter (default `main`) |
 | `config_dir` | no | Optional subdirectory in cloned repo for enrichment input |
 | `github_webhook_secret` | events/all | Validates `X-Hub-Signature-256`; mutually exclusive with `github_webhook_secret_file` |

@@ -77,6 +77,27 @@ Missing data fails closed:
 The API returns image and kernel basenames, never environment values, kernel
 arguments, credentials, full logs, or unbounded errors.
 
+Every endpoint reads one immutable deployment snapshot. It is rebuilt from
+object storage at most once per `api_snapshot_ttl` (default 5 s), and
+concurrent requests during a rebuild share it, so the overview's parallel
+requests and several polling operators cost one scan. `observed_at` is the
+snapshot's build time. A failed rebuild is never cached and an older snapshot
+is never served in its place. The controller does not use this cache.
+
+A node or volume record that cannot be read or decoded, or whose identity
+does not match its key, is left out of the snapshot and listed in `problems`
+(`kind`, the identifier from its key, and `record_unreadable` or
+`record_invalid`) on list and status responses, instead of failing every
+endpoint. Such a fleet is never `converged`: it is `degraded` with
+`projection_incomplete`, or `unknown` with `node_record_unreadable` when the
+desired revision is empty and the unreadable node could still be running old
+workloads. Failing to list records, or to read the desired, placement, or
+rendered state, still fails the request.
+
+Lists are not paginated. Each snapshot reads every node and volume record,
+which is intended for deployments of up to a few hundred nodes and a few
+thousand volumes; responses always contain the complete filtered set.
+
 ## Agent convergence status
 
 Registry heartbeats include a bounded `agent_status` schema shared with the

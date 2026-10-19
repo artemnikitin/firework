@@ -7,10 +7,20 @@ import "time"
 const APIVersion = "v1"
 
 type ListEnvelope[T any] struct {
-	APIVersion string    `json:"api_version"`
-	ObservedAt time.Time `json:"observed_at"`
-	Count      int       `json:"count"`
-	Items      []T       `json:"items"`
+	APIVersion string              `json:"api_version"`
+	ObservedAt time.Time           `json:"observed_at"`
+	Count      int                 `json:"count"`
+	Items      []T                 `json:"items"`
+	Problems   []ProjectionProblem `json:"problems,omitempty"`
+}
+
+// ProjectionProblem is a stored record the projection could not read or
+// interpret and therefore left out of the response. ID is the record's
+// identifier taken from its storage key, never its contents.
+type ProjectionProblem struct {
+	Kind       string `json:"kind"` // node or volume
+	ID         string `json:"id"`
+	ReasonCode string `json:"reason_code"` // record_unreadable or record_invalid
 }
 
 type Resources struct {
@@ -100,10 +110,11 @@ type RevisionStatus struct {
 	// Services counts desired services by their projected /v1/services
 	// state, so the overview needs no second request to show unhealthy or
 	// pending work. UnhealthyServices names the unhealthy ones.
-	Services          ServiceCounts `json:"services"`
-	UnhealthyServices []string      `json:"unhealthy_services"`
-	ReasonCode        string        `json:"reason_code,omitempty"`
-	Message           string        `json:"message,omitempty"`
+	Services          ServiceCounts       `json:"services"`
+	UnhealthyServices []string            `json:"unhealthy_services"`
+	Problems          []ProjectionProblem `json:"problems,omitempty"`
+	ReasonCode        string              `json:"reason_code,omitempty"`
+	Message           string              `json:"message,omitempty"`
 }
 
 // ServiceCounts summarizes desired services. Ready counts running services

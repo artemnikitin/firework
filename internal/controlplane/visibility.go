@@ -3,9 +3,11 @@ package controlplane
 import (
 	"context"
 	"fmt"
+	"path"
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/artemnikitin/firework/internal/config"
@@ -26,6 +28,10 @@ type visibilitySnapshot struct {
 	nodeByID           map[string]NodeRecord
 	pendingByService   map[string]PendingPlacement
 	volumeByID         map[string]VolumeRecord
+	// problems lists records left out because they could not be read or
+	// interpreted; one bad record degrades the projection instead of failing
+	// every endpoint.
+	problems []operatorapi.ProjectionProblem
 }
 
 type placedService struct {
@@ -33,9 +39,21 @@ type placedService struct {
 	config config.ServiceConfig
 }
 
+// VisibilityService serves the read-only projection. Every endpoint reads one
+// immutable snapshot, rebuilt at most once per api_snapshot_ttl no matter how
+// many requests arrive; concurrent requests during a rebuild wait for it
+// instead of starting their own. Only the API projection uses this cache —
+// the controller always reads authoritative state.
 type VisibilityService struct {
 	cfg   Config
 	store StateStore
+
+	mu       sync.Mutex
+	cached   *visibilitySnapshot
+	cachedAt time.Time
+	building chan struct{}
+	// builds counts snapshot builds, for tests.
+	builds int
 }
 
 func NewVisibilityService(cfg Config, store StateStore) *VisibilityService {
@@ -64,7 +82,7 @@ func (s *VisibilityService) Nodes(ctx context.Context, stateFilter string) (oper
 		}
 		items = append(items, summary)
 	}
-	return operatorapi.ListEnvelope[operatorapi.NodeSummary]{APIVersion: operatorapi.APIVersion, ObservedAt: snapshot.now, Count: len(items), Items: items}, nil
+	return operatorapi.ListEnvelope[operatorapi.NodeSummary]{APIVersion: operatorapi.APIVersion, ObservedAt: snapshot.now, Count: len(items), Items: items, Problems: snapshot.problems}, nil
 }
 
 func (s *VisibilityService) Node(ctx context.Context, nodeID string) (operatorapi.NodeDetail, bool, error) {
@@ -123,7 +141,7 @@ func (s *VisibilityService) Services(ctx context.Context, stateFilter, healthFil
 		}
 		items = append(items, summary)
 	}
-	return operatorapi.ListEnvelope[operatorapi.ServiceSummary]{APIVersion: operatorapi.APIVersion, ObservedAt: snapshot.now, Count: len(items), Items: items}, nil
+	return operatorapi.ListEnvelope[operatorapi.ServiceSummary]{APIVersion: operatorapi.APIVersion, ObservedAt: snapshot.now, Count: len(items), Items: items, Problems: snapshot.problems}, nil
 }
 
 func (s *VisibilityService) Service(ctx context.Context, name string) (operatorapi.ServiceDetail, bool, error) {
@@ -389,6 +407,48 @@ func summarizeServiceStorage(volumes []statusmodel.VolumeStatus) operatorapi.Ser
 }
 
 func (s *VisibilityService) load(ctx context.Context) (visibilitySnapshot, error) {
+	ttl := s.cfg.APISnapshotTTL
+	if ttl <= 0 {
+		return s.build(ctx)
+	}
+	for {
+		s.mu.Lock()
+		if s.cached != nil && time.Since(s.cachedAt) < ttl {
+			snapshot := *s.cached
+			s.mu.Unlock()
+			return snapshot, nil
+		}
+		if wait := s.building; wait != nil {
+			s.mu.Unlock()
+			select {
+			case <-wait:
+				continue
+			case <-ctx.Done():
+				return visibilitySnapshot{}, ctx.Err()
+			}
+		}
+		done := make(chan struct{})
+		s.building = done
+		s.mu.Unlock()
+
+		snapshot, err := s.build(ctx)
+		s.mu.Lock()
+		// A failed build is not cached: the next request retries rather than
+		// serving an error, or an older snapshot as current, for a full TTL.
+		if err == nil {
+			s.cached, s.cachedAt = &snapshot, time.Now()
+		}
+		s.building = nil
+		close(done)
+		s.mu.Unlock()
+		return snapshot, err
+	}
+}
+
+func (s *VisibilityService) build(ctx context.Context) (visibilitySnapshot, error) {
+	s.mu.Lock()
+	s.builds++
+	s.mu.Unlock()
 	now := time.Now().UTC()
 	snapshot := visibilitySnapshot{now: now, staleTTL: s.cfg.NodeStaleTTL, placementByService: make(map[string]placedService), nodeByID: make(map[string]NodeRecord), pendingByService: make(map[string]PendingPlacement), volumeByID: make(map[string]VolumeRecord)}
 	keys, err := s.store.ListKeys(ctx, registryNodesPrefix(s.cfg.State.Prefix))
@@ -396,15 +456,22 @@ func (s *VisibilityService) load(ctx context.Context) (visibilitySnapshot, error
 		return snapshot, fmt.Errorf("listing nodes: %w", err)
 	}
 	for _, key := range keys {
+		id := projectionID(strings.TrimSuffix(path.Base(key), ".json"))
 		var record NodeRecord
 		_, exists, err := s.store.GetJSON(ctx, key, &record)
 		if err != nil {
-			return snapshot, fmt.Errorf("reading node record: %w", err)
+			snapshot.problems = append(snapshot.problems, operatorapi.ProjectionProblem{Kind: "node", ID: id, ReasonCode: "record_unreadable"})
+			continue
 		}
-		if exists {
-			snapshot.nodes = append(snapshot.nodes, record)
-			snapshot.nodeByID[record.NodeID] = record
+		if !exists {
+			continue
 		}
+		if record.NodeID == "" || projectionID(record.NodeID) != id {
+			snapshot.problems = append(snapshot.problems, operatorapi.ProjectionProblem{Kind: "node", ID: id, ReasonCode: "record_invalid"})
+			continue
+		}
+		snapshot.nodes = append(snapshot.nodes, record)
+		snapshot.nodeByID[record.NodeID] = record
 	}
 	sort.Slice(snapshot.nodes, func(i, j int) bool { return snapshot.nodes[i].NodeID < snapshot.nodes[j].NodeID })
 	if err := loadCurrentRevision(ctx, s.store, desiredCurrentKey(s.cfg.State.Prefix), func(revision string) (string, any) {
@@ -433,14 +500,21 @@ func (s *VisibilityService) load(ctx context.Context) (visibilitySnapshot, error
 		if !strings.HasSuffix(key, ".json") {
 			continue
 		}
+		id := projectionID(strings.TrimSuffix(strings.TrimPrefix(key, volumeRecordsPrefix(s.cfg.State.Prefix)), ".json"))
 		var record VolumeRecord
 		_, exists, err := s.store.GetJSON(ctx, key, &record)
 		if err != nil {
-			return snapshot, fmt.Errorf("reading volume record %s: %w", key, err)
+			snapshot.problems = append(snapshot.problems, operatorapi.ProjectionProblem{Kind: "volume", ID: id, ReasonCode: "record_unreadable"})
+			continue
 		}
-		if exists && record.LogicalID != "" {
-			snapshot.volumeByID[record.LogicalID] = record
+		if !exists {
+			continue
 		}
+		if record.LogicalID == "" {
+			snapshot.problems = append(snapshot.problems, operatorapi.ProjectionProblem{Kind: "volume", ID: id, ReasonCode: "record_invalid"})
+			continue
+		}
+		snapshot.volumeByID[record.LogicalID] = record
 	}
 	snapshot.placementCurrent = snapshot.desired.Revision != "" && snapshot.placement.DesiredRevision == snapshot.desired.Revision
 	if snapshot.placementCurrent {
@@ -455,6 +529,16 @@ func (s *VisibilityService) load(ctx context.Context) (visibilitySnapshot, error
 	}
 	sort.Slice(snapshot.desired.Services, func(i, j int) bool { return snapshot.desired.Services[i].Name < snapshot.desired.Services[j].Name })
 	return snapshot, nil
+}
+
+// projectionID bounds an identifier taken from a storage key before it is
+// echoed in a response.
+func projectionID(id string) string {
+	const maxProjectionIDLen = 256
+	if len(id) > maxProjectionIDLen {
+		id = id[:maxProjectionIDLen]
+	}
+	return strings.ToValidUTF8(id, "")
 }
 
 func loadCurrentRevision(ctx context.Context, store StateStore, pointerKey string, target func(string) (string, any)) error {
@@ -608,6 +692,7 @@ func (s visibilitySnapshot) revisionStatus() operatorapi.RevisionStatus {
 		}
 	}
 	sort.Strings(status.UnhealthyServices)
+	status.Problems = s.problems
 	if status.Phase != "converged" {
 		return status
 	}
@@ -619,8 +704,28 @@ func (s visibilitySnapshot) revisionStatus() operatorapi.RevisionStatus {
 	case status.Services.Ready < status.Services.Running:
 		status.Phase = "progressing"
 		status.ReasonCode = "service_health_pending"
+	case len(s.problems) > 0:
+		// A converged claim needs every record it rests on. A relevant node
+		// whose record could not be read is already unknown above, but with
+		// an empty desired revision every node is relevant, so a skipped
+		// node record could be one still running old workloads.
+		status.Phase = "degraded"
+		status.ReasonCode = "projection_incomplete"
+		if len(s.desired.Services) == 0 && s.hasProblem("node") {
+			status.Phase = "unknown"
+			status.ReasonCode = "node_record_unreadable"
+		}
 	}
 	return status
+}
+
+func (s visibilitySnapshot) hasProblem(kind string) bool {
+	for _, problem := range s.problems {
+		if problem.Kind == kind {
+			return true
+		}
+	}
+	return false
 }
 
 func (s visibilitySnapshot) nodeRevisionStatus() operatorapi.RevisionStatus {

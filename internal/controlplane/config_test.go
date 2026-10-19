@@ -17,6 +17,8 @@ func validConfigForRole(role string) Config {
 	cfg.Enrollment.CAKeyFile = "/tmp/ca.key"
 	cfg.GitHubWebhookSecret = "secret"
 	cfg.OperatorToken = "operator-secret"
+	// Tests read their own writes; the snapshot cache has dedicated tests.
+	cfg.APISnapshotTTL = 0
 	return cfg
 }
 
