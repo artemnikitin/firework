@@ -92,6 +92,11 @@ func ValidateInput(input *InputConfig) error {
 
 		if s.NodeType == "" {
 			ve.addf("service %s: missing node_type", s.Name)
+		} else if err := config.ValidateNodeLabel(s.NodeType); err != nil {
+			// A non-canonical value could never match an agent's validated
+			// node_labels, so accepting it would leave the service
+			// permanently pending instead of failing here.
+			ve.addf("service %s: invalid node_type: %v", s.Name, err)
 		}
 
 		if s.HealthCheck != nil {

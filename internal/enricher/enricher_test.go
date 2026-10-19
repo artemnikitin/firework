@@ -37,6 +37,9 @@ func TestEnrich_EndToEnd(t *testing.T) {
 	if nc1.Services[0].Name != "worker" {
 		t.Errorf("expected worker on compute, got %s", nc1.Services[0].Name)
 	}
+	if nc1.Services[0].NodeType != "compute" {
+		t.Errorf("expected worker to carry node_type compute, got %q", nc1.Services[0].NodeType)
+	}
 
 	// general-purpose should have web.
 	if len(nc2.Services) != 1 {

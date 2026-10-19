@@ -103,6 +103,28 @@ func TestValidateInput_MissingNodeType(t *testing.T) {
 	}
 }
 
+func TestValidateInput_InvalidNodeType(t *testing.T) {
+	for _, nodeType := range []string{"Compute", "general_purpose", "-web"} {
+		input := &InputConfig{
+			Services: []ServiceSpec{{Name: "web", Image: "/img/web.ext4", NodeType: nodeType}},
+		}
+		err := ValidateInput(input)
+		ve, ok := err.(*ValidationError)
+		if !ok {
+			t.Fatalf("node_type %q: expected *ValidationError, got %T (%v)", nodeType, err, err)
+		}
+		found := false
+		for _, e := range ve.Errors {
+			if strings.HasPrefix(e, "service web: invalid node_type:") {
+				found = true
+			}
+		}
+		if !found {
+			t.Errorf("node_type %q: expected invalid node_type error, got: %v", nodeType, ve.Errors)
+		}
+	}
+}
+
 func TestValidateInput_InvalidHealthCheckType(t *testing.T) {
 	input := &InputConfig{
 		Services: []ServiceSpec{
