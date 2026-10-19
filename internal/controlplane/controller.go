@@ -205,6 +205,15 @@ func (c *Controller) runReconcile(ctx context.Context) {
 		)
 		return
 	}
+	// The cached signature claims that what is published matches those
+	// inputs. From here on this cycle may publish placement or node configs
+	// and then stop short — a failed write, a deferred tombstone — leaving the
+	// published state matching neither the old inputs nor a completed new
+	// cycle. Keeping the old signature would then skip the very cycle that
+	// repairs it as soon as the inputs return to their old values (a stale
+	// node whose heartbeat recovers), so it is dropped now and set again only
+	// once this cycle completes.
+	c.lastInputSignature = ""
 
 	existingPlacement, placementFound, err := c.readExistingPlacement(ctx)
 	if err != nil {

@@ -390,3 +390,83 @@ func TestPersistentRegistryReadFailureStillCaches(t *testing.T) {
 		t.Fatalf("a persistently unreadable record republished placement: %s then %s", first, second)
 	}
 }
+
+func putSizedNode(t *testing.T, store StateStore, nodeID string, vcpus int, lastSeen time.Time) {
+	t.Helper()
+	key, err := nodeRecordKey(emptyStatePrefix, nodeID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.PutJSON(context.Background(), key, NodeRecord{
+		NodeID:     nodeID,
+		State:      NodeStateReady,
+		Capacity:   Resources{VCPUs: vcpus, MemoryMB: 4096},
+		LastSeenAt: lastSeen,
+	}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func nodeServices(t *testing.T, store StateStore, nodeID string) []string {
+	t.Helper()
+	data, exists := readNodeConfig(t, store, nodeID)
+	if !exists {
+		t.Fatalf("%s has no config", nodeID)
+	}
+	nc, err := config.ParseNodeConfig(data)
+	if err != nil {
+		t.Fatalf("%s config is not authoritative: %v", nodeID, err)
+	}
+	var names []string
+	for _, svc := range nc.Services {
+		names = append(names, svc.Name)
+	}
+	return names
+}
+
+// A deferred cycle publishes a new placement without completing it. If the
+// cache kept the signature of the cycle before it, inputs returning to their
+// earlier values — a stale node whose heartbeat recovers — would match that
+// old signature and skip the cycle, leaving the service on both nodes.
+func TestDeferredCycleDoesNotLeaveAnOlderSignatureCached(t *testing.T) {
+	c, store := emptyStateController(t)
+	ctx := context.Background()
+	now := time.Now().UTC()
+	putDesired(t, store, "desired-1", testService("web"))
+	// node-a has more free vCPU, so web lands there first.
+	putSizedNode(t, store, "node-a", 8, now)
+	putSizedNode(t, store, "node-b", 4, now)
+
+	c.runReconcile(ctx)
+	if got := nodeServices(t, store, "node-a"); len(got) != 1 || got[0] != "web" {
+		t.Fatalf("setup: web was not placed on node-a: %v", got)
+	}
+	cached := c.lastInputSignature
+	if cached == "" {
+		t.Fatal("setup: the first cycle was not cached")
+	}
+
+	// node-a goes stale: web moves to node-b, but reading node-a's config
+	// fails, so its tombstone is deferred.
+	putSizedNode(t, store, "node-a", 8, now.Add(-time.Hour))
+	c.store = &failingGetStore{StateStore: store, key: legacyNodeConfigKey(emptyStatePrefix, "node-a"), fails: 1}
+	c.runReconcile(ctx)
+	if got := nodeServices(t, store, "node-b"); len(got) != 1 || got[0] != "web" {
+		t.Fatalf("web was not moved to node-b: %v", got)
+	}
+	if got := nodeServices(t, store, "node-a"); len(got) != 1 || got[0] != "web" {
+		t.Fatalf("setup: node-a's config changed despite the failed read: %v", got)
+	}
+
+	// node-a's heartbeat recovers before the next tick, restoring the inputs
+	// the first cycle was cached under.
+	putSizedNode(t, store, "node-a", 8, time.Now().UTC())
+	c.runReconcile(ctx)
+
+	if got := nodeServices(t, store, "node-a"); len(got) != 0 {
+		t.Fatalf("node-a still runs %v beside node-b's copy; the cycle was skipped under signature %s", got, cached)
+	}
+	if got := nodeServices(t, store, "node-b"); len(got) != 1 || got[0] != "web" {
+		t.Fatalf("web left node-b: %v", got)
+	}
+}
