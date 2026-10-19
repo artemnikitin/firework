@@ -106,6 +106,47 @@ func TestLoadAgentConfigNormalizesNodeNames(t *testing.T) {
 	}
 }
 
+func TestLoadAgentConfigNodeLabels(t *testing.T) {
+	tests := []struct {
+		name       string
+		nodeYAML   string
+		wantLabels []string
+		wantSched  []string
+		wantErr    string
+	}{
+		{name: "explicit labels normalized", nodeYAML: "node_name: i-0abc\nnode_labels: [web, backend, web]\n", wantLabels: []string{"backend", "web"}, wantSched: []string{"backend", "web"}},
+		{name: "fallback to node_names", nodeYAML: "node_names: [web, backend]\n", wantSched: []string{"web", "backend"}},
+		{name: "node_names are not validated as labels", nodeYAML: "node_names: [Node_A]\n", wantSched: []string{"Node_A"}},
+		{name: "invalid label rejected", nodeYAML: "node_name: n\nnode_labels: [General_Purpose]\n", wantErr: "node_labels:"},
+		{name: "empty label rejected", nodeYAML: "node_name: n\nnode_labels: [\"\"]\n", wantErr: "node_labels:"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "agent.yaml")
+			data := tt.nodeYAML + "store_type: git\nstore_url: https://example.invalid/config.git\n"
+			if err := os.WriteFile(path, []byte(data), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			cfg, err := LoadAgentConfig(path)
+			if tt.wantErr != "" {
+				if err == nil || !strings.Contains(err.Error(), tt.wantErr) {
+					t.Fatalf("error = %v, want containing %q", err, tt.wantErr)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !reflect.DeepEqual(cfg.NodeLabels, tt.wantLabels) {
+				t.Fatalf("NodeLabels = %v, want %v", cfg.NodeLabels, tt.wantLabels)
+			}
+			if got := cfg.SchedulingLabels(); !reflect.DeepEqual(got, tt.wantSched) {
+				t.Fatalf("SchedulingLabels() = %v, want %v", got, tt.wantSched)
+			}
+		})
+	}
+}
+
 func TestLoadAgentConfigStorageBudgets(t *testing.T) {
 	yaml := `
 node_name: "node-1"
