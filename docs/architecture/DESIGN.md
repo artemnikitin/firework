@@ -68,6 +68,30 @@ Node discovery is based on explicit registry records with lease freshness:
 2. Nodes send periodic heartbeats with current capacity/usage.
 3. Controller schedules only nodes with `state=ready` and non-expired lease.
 
+Every lifecycle mutation is fenced by the agent's process generation (a
+wall-clock value proposed at agent start). Registration is the only request
+that creates a record or advances its generation; a strictly newer generation
+replaces the record, an equal one is idempotent, and an older one is rejected.
+Heartbeat and state requests must name the record's exact generation and
+never create a record:
+
+| Response | Meaning | Agent behavior |
+| --- | --- | --- |
+| `404 node_not_registered` | No record exists for this node | One registration attempt on the next sync |
+| `409 stale_generation` | The record belongs to another incarnation | One registration attempt; if that also conflicts, the agent is terminally `fenced` |
+
+A fenced agent stops all registry traffic, including its shutdown `down`
+update, and exposes `firework_agent_registry_fenced 1`. It recovers only by
+restarting the intended agent, which proposes a new generation. This is what
+prevents an old process shutting down late from marking its replacement
+`down`. Registry errors share one envelope:
+`{"error":{"code":"<stable code>","message":"<text>"}}`; clients branch on the
+HTTP status and `code`, never on the message.
+
+The agent and control plane in this repository must be deployed together:
+an agent built before generation-fenced state requests cannot mark itself
+`down`, and its heartbeats cannot recreate a missing record.
+
 Registry state is persisted in S3 or GCS objects under
 `cp/v1/registry/nodes/*.json`.
 This keeps discovery semantics cloud-agnostic.

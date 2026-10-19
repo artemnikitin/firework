@@ -37,26 +37,46 @@ type registryClient struct {
 
 	mu         sync.Mutex
 	registered bool
+	// fenced is terminal: the registry holds a newer incarnation of this
+	// node, so this process stops all registry traffic instead of churning
+	// register/heartbeat retries. Recovery is an agent restart, which proposes
+	// a new generation.
+	fenced     bool
 	certExpiry time.Time
 	mtlsClient *http.Client
+
+	// post sends an mTLS registry request; tests replace it.
+	post func(ctx context.Context, path string, payload, out any) error
 }
 
 func newRegistryClient(cfg agentconfig.AgentConfig, logger *slog.Logger, generation int64) *registryClient {
-	return &registryClient{
+	c := &registryClient{
 		cfg:        cfg,
 		logger:     logger,
 		generation: generation,
 		hostIP:     detectHostIP(cfg.RegistryURL, cfg.VMBridge),
 	}
+	c.post = c.postMTLS
+	return c
 }
 
 func (c *registryClient) sync(ctx context.Context, nodeID string, labels []string, cap, used capacity.NodeCapacity, status *statusmodel.AgentStatus) {
+	if c.isFenced() {
+		return
+	}
 	if err := c.ensureCertificate(ctx, nodeID); err != nil {
 		c.logger.Warn("registry certificate setup failed", "error", err)
 		return
 	}
 	if !c.isRegistered() {
 		if err := c.register(ctx, nodeID, labels, cap); err != nil {
+			// Registration is the only request that may advance the
+			// generation. A conflict here means a newer process owns this
+			// node ID, so retrying can never succeed.
+			if isRegistryError(err, http.StatusConflict) {
+				c.fence(err)
+				return
+			}
 			c.logger.Warn("registry register failed", "error", err)
 			return
 		}
@@ -64,6 +84,11 @@ func (c *registryClient) sync(ctx context.Context, nodeID string, labels []strin
 	}
 	if err := c.heartbeat(ctx, nodeID, cap, used, status); err != nil {
 		c.logger.Warn("registry heartbeat failed", "error", err)
+		// 404 means the record is gone and 409 means its generation differs
+		// from ours. Both permit exactly one registration attempt on the next
+		// sync: it either restores or supersedes the record, or conflicts and
+		// fences this process. Other failures are transient and re-registering
+		// with the same generation is idempotent.
 		c.setRegistered(false)
 	}
 }
@@ -78,7 +103,7 @@ func (c *registryClient) register(ctx context.Context, nodeID string, labels []s
 		HostIP:     c.hostIP,
 		Storage:    c.storagePayload(),
 	}
-	return c.postMTLS(ctx, "/v1/nodes/register", req, nil)
+	return c.post(ctx, "/v1/nodes/register", req, nil)
 }
 
 func (c *registryClient) heartbeat(ctx context.Context, nodeID string, cap, used capacity.NodeCapacity, status *statusmodel.AgentStatus) error {
@@ -91,7 +116,7 @@ func (c *registryClient) heartbeat(ctx context.Context, nodeID string, cap, used
 		AgentStatus: status,
 		Storage:     c.storagePayload(),
 	}
-	return c.postMTLS(ctx, "/v1/nodes/heartbeat", req, nil)
+	return c.post(ctx, "/v1/nodes/heartbeat", req, nil)
 }
 
 func (c *registryClient) storagePayload() registryapi.StorageResources {
@@ -206,6 +231,9 @@ func (c *registryClient) postMTLS(ctx context.Context, path string, p any, out a
 }
 
 func (c *registryClient) markDown(ctx context.Context, nodeID string) {
+	if c.isFenced() {
+		return
+	}
 	if err := c.setState(ctx, nodeID, registryapi.NodeStateDown); err != nil {
 		c.logger.Warn("registry node state update failed during shutdown", "state", registryapi.NodeStateDown, "error", err)
 	}
@@ -215,8 +243,8 @@ func (c *registryClient) setState(ctx context.Context, nodeID string, state regi
 	if strings.TrimSpace(nodeID) == "" {
 		return fmt.Errorf("node id is required")
 	}
-	req := registryapi.StateRequest{State: state}
-	return c.postMTLS(ctx, "/v1/nodes/"+url.PathEscape(nodeID)+"/state", req, nil)
+	req := registryapi.StateRequest{State: state, Generation: c.generation}
+	return c.post(ctx, "/v1/nodes/"+url.PathEscape(nodeID)+"/state", req, nil)
 }
 
 func (c *registryClient) enrollHTTPClient() (*http.Client, error) {
@@ -326,6 +354,31 @@ type requestError struct {
 
 func (e *requestError) Error() string {
 	return fmt.Sprintf("registry request failed: status=%d body=%s", e.StatusCode, e.Body)
+}
+
+// isRegistryError reports whether err is a registry HTTP response with the
+// given status.
+func isRegistryError(err error, status int) bool {
+	var reqErr *requestError
+	return errors.As(err, &reqErr) && reqErr.StatusCode == status
+}
+
+func (c *registryClient) fence(err error) {
+	c.mu.Lock()
+	alreadyFenced := c.fenced
+	c.fenced = true
+	c.registered = false
+	c.mu.Unlock()
+	if !alreadyFenced {
+		c.logger.Error("registry holds a newer incarnation of this node; stopping registry updates until the agent restarts",
+			"generation", c.generation, "error", err)
+	}
+}
+
+func (c *registryClient) isFenced() bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.fenced
 }
 
 func shouldFallbackToEnroll(err error) bool {

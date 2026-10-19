@@ -453,12 +453,7 @@ func loadCurrentRevision(ctx context.Context, store StateStore, pointerKey strin
 }
 
 func (s visibilitySnapshot) nodeSummary(record NodeRecord) operatorapi.NodeSummary {
-	state := string(record.State)
-	if record.LastSeenAt.IsZero() || s.now.Sub(record.LastSeenAt) > s.staleTTL {
-		state = "stale"
-	} else if state != "ready" && state != "draining" && state != "down" {
-		state = "unknown"
-	}
+	state := nodeLifecycleState(record, s.now, s.staleTTL)
 	allocated := Resources{}
 	desiredCount := 0
 	for _, placed := range s.placementByService {
@@ -498,6 +493,24 @@ func (s visibilitySnapshot) nodeSummary(record NodeRecord) operatorapi.NodeSumma
 		summary.ReasonCode = "agent_status_stale"
 	}
 	return summary
+}
+
+// nodeLifecycleState derives the operator-facing lifecycle state. An explicit
+// shutdown is a lifecycle fact, not a transport observation, so a down node
+// stays down after its last heartbeat ages out; only ready and draining
+// records derive stale from last_seen_at.
+func nodeLifecycleState(record NodeRecord, now time.Time, staleTTL time.Duration) string {
+	switch record.State {
+	case NodeStateDown:
+		return "down"
+	case NodeStateReady, NodeStateDraining:
+		if record.LastSeenAt.IsZero() || now.Sub(record.LastSeenAt) > staleTTL {
+			return "stale"
+		}
+		return string(record.State)
+	default:
+		return "unknown"
+	}
 }
 
 func toOperatorResources(resources Resources) operatorapi.Resources {

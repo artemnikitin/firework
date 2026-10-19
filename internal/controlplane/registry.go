@@ -73,6 +73,23 @@ func NewRegistryServer(cfg Config, store StateStore, logger *slog.Logger) (*Regi
 
 // HTTPServer builds the registry HTTPS server.
 func (s *RegistryServer) HTTPServer() (*http.Server, error) {
+	tlsCfg, err := s.registryTLSConfig()
+	if err != nil {
+		return nil, err
+	}
+
+	return &http.Server{
+		Addr:              s.cfg.RegistryListenAddr,
+		Handler:           s.routes(),
+		TLSConfig:         tlsCfg,
+		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       15 * time.Second,
+		WriteTimeout:      15 * time.Second,
+		IdleTimeout:       60 * time.Second,
+	}, nil
+}
+
+func (s *RegistryServer) routes() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]any{"status": "ok", "time": time.Now().UTC()})
@@ -82,24 +99,10 @@ func (s *RegistryServer) HTTPServer() (*http.Server, error) {
 	mux.HandleFunc("POST /v1/nodes/register", s.handleRegister)
 	mux.HandleFunc("POST /v1/nodes/heartbeat", s.handleHeartbeat)
 	mux.HandleFunc("POST /v1/nodes/{id}/state", s.handleState)
-
-	tlsCfg, err := s.registryTLSConfig()
-	if err != nil {
-		return nil, err
-	}
-
-	return &http.Server{
-		Addr: s.cfg.RegistryListenAddr,
-		// The status bounds allow 256 services with up to 25 volume
-		// observations each. Keep the request cap above that worst-case JSON
-		// while retaining a finite registry request limit.
-		Handler:           http.MaxBytesHandler(mux, maxRegistryRequestBytes),
-		TLSConfig:         tlsCfg,
-		ReadHeaderTimeout: 10 * time.Second,
-		ReadTimeout:       15 * time.Second,
-		WriteTimeout:      15 * time.Second,
-		IdleTimeout:       60 * time.Second,
-	}, nil
+	// The status bounds allow 256 services with up to 25 volume
+	// observations each. Keep the request cap above that worst-case JSON
+	// while retaining a finite registry request limit.
+	return http.MaxBytesHandler(mux, maxRegistryRequestBytes)
 }
 
 func (s *RegistryServer) registryTLSConfig() (*tls.Config, error) {
@@ -130,28 +133,28 @@ func (s *RegistryServer) registryTLSConfig() (*tls.Config, error) {
 func (s *RegistryServer) handleEnroll(w http.ResponseWriter, r *http.Request) {
 	var req registryapi.EnrollRequest
 	if err := readJSON(r, &req); err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid json"})
+		writeRegistryError(w, http.StatusBadRequest, registryapi.ErrorCodeInvalidRequest, "invalid json")
 		return
 	}
 	req.NodeID = strings.TrimSpace(req.NodeID)
 	if req.NodeID == "" || req.CSRPEM == "" || req.BootstrapToken == "" {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "node_id, bootstrap_token and csr_pem are required"})
+		writeRegistryError(w, http.StatusBadRequest, registryapi.ErrorCodeInvalidRequest, "node_id, bootstrap_token and csr_pem are required")
 		return
 	}
 
 	boundNode, ok := s.tokenToNode[req.BootstrapToken]
 	if !ok {
-		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "invalid bootstrap token"})
+		writeRegistryError(w, http.StatusUnauthorized, registryapi.ErrorCodeUnauthorized, "invalid bootstrap token")
 		return
 	}
 	if boundNode != "" && boundNode != req.NodeID {
-		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "bootstrap token not valid for this node_id"})
+		writeRegistryError(w, http.StatusUnauthorized, registryapi.ErrorCodeUnauthorized, "bootstrap token not valid for this node_id")
 		return
 	}
 
 	certPEM, expiresAt, err := s.signer.SignCSR(req.NodeID, req.CSRPEM)
 	if err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+		writeRegistryError(w, http.StatusBadRequest, registryapi.ErrorCodeInvalidRequest, err.Error())
 		return
 	}
 	writeJSON(w, http.StatusOK, registryapi.CertResponse{
@@ -163,21 +166,21 @@ func (s *RegistryServer) handleEnroll(w http.ResponseWriter, r *http.Request) {
 func (s *RegistryServer) handleRenew(w http.ResponseWriter, r *http.Request) {
 	nodeID, err := requireNodeIdentity(r)
 	if err != nil {
-		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": err.Error()})
+		writeRegistryError(w, http.StatusUnauthorized, registryapi.ErrorCodeUnauthorized, err.Error())
 		return
 	}
 	var req registryapi.RenewRequest
 	if err := readJSON(r, &req); err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid json"})
+		writeRegistryError(w, http.StatusBadRequest, registryapi.ErrorCodeInvalidRequest, "invalid json")
 		return
 	}
 	if strings.TrimSpace(req.CSRPEM) == "" {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "csr_pem is required"})
+		writeRegistryError(w, http.StatusBadRequest, registryapi.ErrorCodeInvalidRequest, "csr_pem is required")
 		return
 	}
 	certPEM, expiresAt, err := s.signer.SignCSR(nodeID, req.CSRPEM)
 	if err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+		writeRegistryError(w, http.StatusBadRequest, registryapi.ErrorCodeInvalidRequest, err.Error())
 		return
 	}
 	writeJSON(w, http.StatusOK, registryapi.CertResponse{
@@ -189,20 +192,20 @@ func (s *RegistryServer) handleRenew(w http.ResponseWriter, r *http.Request) {
 func (s *RegistryServer) handleRegister(w http.ResponseWriter, r *http.Request) {
 	certNodeID, err := requireNodeIdentity(r)
 	if err != nil {
-		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": err.Error()})
+		writeRegistryError(w, http.StatusUnauthorized, registryapi.ErrorCodeUnauthorized, err.Error())
 		return
 	}
 	var req registryapi.RegisterRequest
 	if err := readJSON(r, &req); err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid json"})
+		writeRegistryError(w, http.StatusBadRequest, registryapi.ErrorCodeInvalidRequest, "invalid json")
 		return
 	}
 	if req.NodeID == "" || req.Generation == 0 {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "node_id and generation are required"})
+		writeRegistryError(w, http.StatusBadRequest, registryapi.ErrorCodeInvalidRequest, "node_id and generation are required")
 		return
 	}
 	if req.NodeID != certNodeID {
-		writeJSON(w, http.StatusForbidden, map[string]string{"error": "node_id does not match mTLS identity"})
+		writeRegistryError(w, http.StatusForbidden, registryapi.ErrorCodeForbidden, "node_id does not match mTLS identity")
 		return
 	}
 	if req.State == "" {
@@ -224,7 +227,7 @@ func (s *RegistryServer) handleRegister(w http.ResponseWriter, r *http.Request) 
 		}
 		cur.NodeID = req.NodeID
 		cur.Generation = req.Generation
-		cur.State = NodeState(req.State)
+		cur.setState(NodeState(req.State), now)
 		cur.Labels = req.Labels
 		cur.Capacity = resourcesFromRegistry(req.Capacity)
 		cur.HostIP = req.HostIP
@@ -234,12 +237,7 @@ func (s *RegistryServer) handleRegister(w http.ResponseWriter, r *http.Request) 
 		return nil
 	})
 	if err != nil {
-		if errors.Is(err, errStaleGeneration) {
-			writeJSON(w, http.StatusConflict, map[string]string{"error": "stale generation"})
-			return
-		}
-		s.logger.Error("register failed", "node", req.NodeID, "error", err)
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to persist node"})
+		s.writeMutationError(w, "register", req.NodeID, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, nodeResponse(rec))
@@ -248,20 +246,20 @@ func (s *RegistryServer) handleRegister(w http.ResponseWriter, r *http.Request) 
 func (s *RegistryServer) handleHeartbeat(w http.ResponseWriter, r *http.Request) {
 	certNodeID, err := requireNodeIdentity(r)
 	if err != nil {
-		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": err.Error()})
+		writeRegistryError(w, http.StatusUnauthorized, registryapi.ErrorCodeUnauthorized, err.Error())
 		return
 	}
 	var req registryapi.HeartbeatRequest
 	if err := readJSON(r, &req); err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid json"})
+		writeRegistryError(w, http.StatusBadRequest, registryapi.ErrorCodeInvalidRequest, "invalid json")
 		return
 	}
 	if req.NodeID == "" || req.Generation == 0 {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "node_id and generation are required"})
+		writeRegistryError(w, http.StatusBadRequest, registryapi.ErrorCodeInvalidRequest, "node_id and generation are required")
 		return
 	}
 	if req.NodeID != certNodeID {
-		writeJSON(w, http.StatusForbidden, map[string]string{"error": "node_id does not match mTLS identity"})
+		writeRegistryError(w, http.StatusForbidden, registryapi.ErrorCodeForbidden, "node_id does not match mTLS identity")
 		return
 	}
 	if req.AgentStatus != nil {
@@ -278,18 +276,16 @@ func (s *RegistryServer) handleHeartbeat(w http.ResponseWriter, r *http.Request)
 		}
 	}
 
-	rec, err := s.upsertNodeRecord(r.Context(), req.NodeID, func(cur *NodeRecord) error {
-		if cur.Generation > req.Generation {
+	// Heartbeat only refreshes the current incarnation. Registration is the
+	// sole request that creates a record or advances its generation, so a
+	// replaced process cannot revive itself through the liveness path.
+	rec, err := s.updateNodeRecord(r.Context(), req.NodeID, func(cur *NodeRecord) error {
+		if cur.Generation != req.Generation {
 			return errStaleGeneration
 		}
 		now := time.Now().UTC()
-		cur.NodeID = req.NodeID
-		cur.Generation = req.Generation
 		if cur.State == "" {
-			cur.State = NodeStateReady
-		}
-		if cur.RegisteredAt.IsZero() {
-			cur.RegisteredAt = now
+			cur.setState(NodeStateReady, now)
 		}
 		if req.Capacity.VCPUs > 0 {
 			cur.Capacity.VCPUs = req.Capacity.VCPUs
@@ -308,12 +304,7 @@ func (s *RegistryServer) handleHeartbeat(w http.ResponseWriter, r *http.Request)
 		return nil
 	})
 	if err != nil {
-		if errors.Is(err, errStaleGeneration) {
-			writeJSON(w, http.StatusConflict, map[string]string{"error": "stale generation"})
-			return
-		}
-		s.logger.Error("heartbeat failed", "node", req.NodeID, "error", err)
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to persist node"})
+		s.writeMutationError(w, "heartbeat", req.NodeID, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, nodeResponse(rec))
@@ -516,45 +507,47 @@ func validReasonCode(code string) bool {
 func (s *RegistryServer) handleState(w http.ResponseWriter, r *http.Request) {
 	certNodeID, err := requireNodeIdentity(r)
 	if err != nil {
-		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": err.Error()})
+		writeRegistryError(w, http.StatusUnauthorized, registryapi.ErrorCodeUnauthorized, err.Error())
 		return
 	}
 	nodeID := r.PathValue("id")
 	if nodeID == "" {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "missing node id"})
+		writeRegistryError(w, http.StatusBadRequest, registryapi.ErrorCodeInvalidRequest, "missing node id")
 		return
 	}
 	if nodeID != certNodeID {
-		writeJSON(w, http.StatusForbidden, map[string]string{"error": "path node id does not match mTLS identity"})
+		writeRegistryError(w, http.StatusForbidden, registryapi.ErrorCodeForbidden, "path node id does not match mTLS identity")
 		return
 	}
 	var req registryapi.StateRequest
 	if err := readJSON(r, &req); err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid json"})
+		writeRegistryError(w, http.StatusBadRequest, registryapi.ErrorCodeInvalidRequest, "invalid json")
 		return
 	}
 	if req.State != registryapi.NodeStateReady && req.State != registryapi.NodeStateDraining && req.State != registryapi.NodeStateDown {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid node state"})
+		writeRegistryError(w, http.StatusBadRequest, registryapi.ErrorCodeInvalidRequest, "invalid node state")
+		return
+	}
+	if req.Generation == 0 {
+		writeRegistryError(w, http.StatusBadRequest, registryapi.ErrorCodeInvalidRequest, "generation is required")
 		return
 	}
 
-	rec, err := s.upsertNodeRecord(r.Context(), nodeID, func(cur *NodeRecord) error {
+	// A state change applies only to the exact incarnation that sent it. An
+	// old process shutting down after its replacement registered gets 409
+	// and leaves the replacement untouched.
+	rec, err := s.updateNodeRecord(r.Context(), nodeID, func(cur *NodeRecord) error {
+		if cur.Generation != req.Generation {
+			return errStaleGeneration
+		}
 		now := time.Now().UTC()
-		cur.NodeID = nodeID
-		if cur.Generation == 0 {
-			cur.Generation = now.UnixNano()
-		}
-		if cur.RegisteredAt.IsZero() {
-			cur.RegisteredAt = now
-		}
-		cur.State = NodeState(req.State)
+		cur.setState(NodeState(req.State), now)
 		cur.LastSeenAt = now
 		cur.UpdatedAt = now
 		return nil
 	})
 	if err != nil {
-		s.logger.Error("state update failed", "node", nodeID, "error", err)
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to persist node"})
+		s.writeMutationError(w, "state update", nodeID, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, nodeResponse(rec))
@@ -575,9 +568,37 @@ func nodeResponse(record *NodeRecord) registryapi.NodeResponse {
 	}
 }
 
-var errStaleGeneration = errors.New("stale generation")
+var (
+	errStaleGeneration   = errors.New("stale generation")
+	errNodeNotRegistered = errors.New("node not registered")
+)
+
+func (s *RegistryServer) writeMutationError(w http.ResponseWriter, operation, nodeID string, err error) {
+	switch {
+	case errors.Is(err, errStaleGeneration):
+		writeRegistryError(w, http.StatusConflict, registryapi.ErrorCodeStaleGeneration, "node generation is no longer current")
+	case errors.Is(err, errNodeNotRegistered):
+		writeRegistryError(w, http.StatusNotFound, registryapi.ErrorCodeNodeNotRegistered, "node is not registered")
+	default:
+		s.logger.Error(operation+" failed", "node", nodeID, "error", err)
+		writeRegistryError(w, http.StatusInternalServerError, registryapi.ErrorCodeInternal, "failed to persist node")
+	}
+}
+
+func writeRegistryError(w http.ResponseWriter, status int, code, message string) {
+	writeJSON(w, status, registryapi.ErrorResponse{Error: registryapi.ErrorBody{Code: code, Message: message}})
+}
+
+// updateNodeRecord mutates an existing record and never creates one.
+func (s *RegistryServer) updateNodeRecord(ctx context.Context, nodeID string, mutator func(*NodeRecord) error) (*NodeRecord, error) {
+	return s.mutateNodeRecord(ctx, nodeID, false, mutator)
+}
 
 func (s *RegistryServer) upsertNodeRecord(ctx context.Context, nodeID string, mutator func(*NodeRecord) error) (*NodeRecord, error) {
+	return s.mutateNodeRecord(ctx, nodeID, true, mutator)
+}
+
+func (s *RegistryServer) mutateNodeRecord(ctx context.Context, nodeID string, create bool, mutator func(*NodeRecord) error) (*NodeRecord, error) {
 	key, err := nodeRecordKey(s.cfg.State.Prefix, nodeID)
 	if err != nil {
 		return nil, err
@@ -590,6 +611,9 @@ func (s *RegistryServer) upsertNodeRecord(ctx context.Context, nodeID string, mu
 			return nil, err
 		}
 		if !exists {
+			if !create {
+				return nil, errNodeNotRegistered
+			}
 			current = NodeRecord{NodeID: nodeID}
 		}
 		if err := mutator(&current); err != nil {

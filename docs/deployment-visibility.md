@@ -42,7 +42,10 @@ of the service's volumes.
 
 Missing data fails closed:
 
-- expired node leases become `stale`;
+- expired leases of `ready` or `draining` nodes become `stale`; a node whose
+  current agent reported an explicit shutdown stays `down` after its lease
+  ages, because shutdown is a lifecycle fact rather than a transport
+  observation;
 - unplaced desired services are `pending`, carrying the scheduler's reason code
   (for example `insufficient_compute_capacity`, `volume_capacity_unavailable`,
   `node_storage_exhausted`, `storage_capacity_unknown`, `volume_record_invalid`,
