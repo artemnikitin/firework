@@ -77,9 +77,30 @@ fields are all length-bounded too, since 256 services x 25 volumes multiplies
 a single unbounded field into megabytes. When an agent has more than 256
 desired services it sets
 `services_truncated` and reports the full desired count, but that snapshot
-cannot prove convergence. Registry requests are body-size limited and reject
-duplicate or invalid bounded fields. Older heartbeats which omit
-`agent_status` remain valid and are represented as unknown.
+cannot prove convergence. Older heartbeats which omit `agent_status` remain
+valid and are represented as unknown.
+
+Every request body is capped before it is read or decoded, and a body over
+its endpoint's cap receives `413 request_too_large`:
+
+| Endpoint | Cap |
+| --- | --- |
+| `POST /v1/nodes/enroll` (pre-authentication) | 64 KiB |
+| `POST /v1/nodes/renew`, `register`, `{id}/state` | 256 KiB |
+| `POST /v1/nodes/heartbeat` | 16 MiB, above the largest valid status |
+| `POST /v1/events/github` (before signature verification) | 25 MiB, GitHub's delivery ceiling |
+| `POST /login` | 4 KiB |
+
+Status validation is closed-world: `vm_state`, `health`, and volume `type`
+and `state` must be values from the published vocabularies, condition types,
+service names, and volume IDs within a service must be unique, and sizes must
+not be negative. A schema version newer than the control plane supports is
+rejected rather than stored. A heartbeat whose envelope is valid but whose
+`agent_status` is not still updates liveness, capacity, storage, and host IP;
+the stored status is cleared and the response is
+`422 invalid_agent_status`, so the agent keeps its registration and the
+rejection is visible instead of silent. An agent whose heartbeat is refused
+with `413` resends it once without `agent_status` so liveness still lands.
 
 Blocking stages are reported separately: config fetch/parse, capacity, image
 sync, host networking, VM reconciliation, and local route publication. Peer

@@ -12,6 +12,8 @@ import (
 	"github.com/artemnikitin/firework/internal/agentconfig"
 	"github.com/artemnikitin/firework/internal/capacity"
 	"github.com/artemnikitin/firework/internal/registryapi"
+	"github.com/artemnikitin/firework/internal/statusmodel"
+	"github.com/artemnikitin/firework/internal/vm"
 )
 
 // fakeRegistry answers each path with a scripted status and records calls.
@@ -143,5 +145,56 @@ func TestFencingStateIsRaceFree(t *testing.T) {
 	wg.Wait()
 	if !c.isFenced() {
 		t.Fatal("client did not fence")
+	}
+}
+
+// A 422 means liveness was accepted and only telemetry refused, so the agent
+// keeps its registration instead of re-registering every tick.
+func TestRejectedTelemetryKeepsRegistration(t *testing.T) {
+	registry := &fakeRegistry{responses: map[string]int{heartbeatPath: http.StatusUnprocessableEntity}}
+	c := newFencingTestClient(registry, 1)
+	syncN(c, 5)
+	if got := registry.count(registerPath); got != 1 {
+		t.Fatalf("register calls = %d, want 1", got)
+	}
+	if !c.isRegistered() || c.isFenced() {
+		t.Fatalf("registered=%v fenced=%v", c.isRegistered(), c.isFenced())
+	}
+}
+
+// An oversized heartbeat is resent without status so liveness still lands.
+func TestOversizedHeartbeatIsResentWithoutStatus(t *testing.T) {
+	var sent []bool
+	registry := &fakeRegistry{responses: map[string]int{}}
+	c := newFencingTestClient(registry, 1)
+	c.post = func(ctx context.Context, path string, payload, out any) error {
+		if hb, ok := payload.(registryapi.HeartbeatRequest); ok {
+			sent = append(sent, hb.AgentStatus != nil)
+			if hb.AgentStatus != nil {
+				return &requestError{StatusCode: http.StatusRequestEntityTooLarge}
+			}
+		}
+		return registry.post(ctx, path, payload, out)
+	}
+	c.sync(context.Background(), "node-1", nil, capacity.NodeCapacity{}, capacity.NodeCapacity{}, &statusmodel.AgentStatus{SchemaVersion: 1})
+	if len(sent) != 2 || !sent[0] || sent[1] {
+		t.Fatalf("heartbeats with status = %v, want [true false]", sent)
+	}
+	if !c.isRegistered() {
+		t.Fatal("registration dropped after the status-free resend succeeded")
+	}
+}
+
+// statusmodel mirrors the VM states because it must not import the runtime.
+// Every state the VM manager can report must be accepted by the registry, or a
+// real agent's whole status is rejected.
+func TestStatusModelAcceptsEveryVMState(t *testing.T) {
+	for _, state := range []vm.State{vm.StateRunning, vm.StateStopping, vm.StateStopped, vm.StateFailed, vm.StateRecoveryPending, vm.StateStarting, vm.StateStartAborting} {
+		if !statusmodel.IsVMState(string(state)) {
+			t.Errorf("statusmodel rejects vm state %q", state)
+		}
+	}
+	if !statusmodel.IsVMState("unknown") {
+		t.Error("statusmodel rejects the agent's default unknown vm state")
 	}
 }

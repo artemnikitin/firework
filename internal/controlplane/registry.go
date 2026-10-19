@@ -132,8 +132,7 @@ func (s *RegistryServer) registryTLSConfig() (*tls.Config, error) {
 
 func (s *RegistryServer) handleEnroll(w http.ResponseWriter, r *http.Request) {
 	var req registryapi.EnrollRequest
-	if err := readJSON(r, &req); err != nil {
-		writeRegistryError(w, http.StatusBadRequest, registryapi.ErrorCodeInvalidRequest, "invalid json")
+	if !decodeRegistryRequest(w, r, maxEnrollRequestBytes, &req) {
 		return
 	}
 	req.NodeID = strings.TrimSpace(req.NodeID)
@@ -170,8 +169,7 @@ func (s *RegistryServer) handleRenew(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var req registryapi.RenewRequest
-	if err := readJSON(r, &req); err != nil {
-		writeRegistryError(w, http.StatusBadRequest, registryapi.ErrorCodeInvalidRequest, "invalid json")
+	if !decodeRegistryRequest(w, r, maxRegistryControlRequestBytes, &req) {
 		return
 	}
 	if strings.TrimSpace(req.CSRPEM) == "" {
@@ -196,8 +194,7 @@ func (s *RegistryServer) handleRegister(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 	var req registryapi.RegisterRequest
-	if err := readJSON(r, &req); err != nil {
-		writeRegistryError(w, http.StatusBadRequest, registryapi.ErrorCodeInvalidRequest, "invalid json")
+	if !decodeRegistryRequest(w, r, maxRegistryControlRequestBytes, &req) {
 		return
 	}
 	if req.NodeID == "" || req.Generation == 0 {
@@ -250,8 +247,7 @@ func (s *RegistryServer) handleHeartbeat(w http.ResponseWriter, r *http.Request)
 		return
 	}
 	var req registryapi.HeartbeatRequest
-	if err := readJSON(r, &req); err != nil {
-		writeRegistryError(w, http.StatusBadRequest, registryapi.ErrorCodeInvalidRequest, "invalid json")
+	if !decodeRegistryRequest(w, r, maxRegistryRequestBytes, &req) {
 		return
 	}
 	if req.NodeID == "" || req.Generation == 0 {
@@ -262,13 +258,20 @@ func (s *RegistryServer) handleHeartbeat(w http.ResponseWriter, r *http.Request)
 		writeRegistryError(w, http.StatusForbidden, registryapi.ErrorCodeForbidden, "node_id does not match mTLS identity")
 		return
 	}
+	var statusErr error
+	rejected := ""
 	if req.AgentStatus != nil {
 		validated, err := validatedHeartbeatAgentStatus(req.NodeID, req.AgentStatus)
 		if err != nil {
-			// Runtime status is optional telemetry. Do not reject the liveness
-			// heartbeat when a newer or malformed status payload is unusable;
-			// clearing it also prevents stale status from being presented as
-			// current.
+			// Runtime status is optional telemetry. Persist the liveness
+			// heartbeat anyway, clear the status so stale telemetry is not
+			// presented as current, and tell the agent with a 422 instead of
+			// a silent 200.
+			statusErr = err
+			rejected = agentStatusRejectedInvalid
+			if errors.Is(err, errUnsupportedAgentStatusSchema) {
+				rejected = agentStatusRejectedUnsupportedSchema
+			}
 			s.logger.Warn("invalid agent status; accepting heartbeat without status", "node", req.NodeID, "error", err)
 			req.AgentStatus = nil
 		} else {
@@ -299,12 +302,21 @@ func (s *RegistryServer) handleHeartbeat(w http.ResponseWriter, r *http.Request)
 			cur.HostIP = req.HostIP
 		}
 		cur.AgentStatus = req.AgentStatus
+		cur.AgentStatusRejected = rejected
+		cur.AgentStatusReceivedAt = time.Time{}
+		if req.AgentStatus != nil {
+			cur.AgentStatusReceivedAt = now
+		}
 		cur.LastSeenAt = now
 		cur.UpdatedAt = now
 		return nil
 	})
 	if err != nil {
 		s.writeMutationError(w, "heartbeat", req.NodeID, err)
+		return
+	}
+	if statusErr != nil {
+		writeRegistryError(w, http.StatusUnprocessableEntity, registryapi.ErrorCodeInvalidAgentStatus, statusmodel.BoundedMessage(statusErr.Error()))
 		return
 	}
 	writeJSON(w, http.StatusOK, nodeResponse(rec))
@@ -331,6 +343,9 @@ func applyHeartbeatAgentStatus(cur *NodeRecord, nodeID string, incoming *statusm
 	}
 	if incoming.SchemaVersion <= 0 {
 		return fmt.Errorf("agent_status.schema_version is required")
+	}
+	if incoming.SchemaVersion > statusmodel.SchemaVersion {
+		return fmt.Errorf("%w: agent_status.schema_version %d is newer than supported version %d", errUnsupportedAgentStatusSchema, incoming.SchemaVersion, statusmodel.SchemaVersion)
 	}
 	if incoming.NodeID != "" && incoming.NodeID != nodeID {
 		return fmt.Errorf("agent_status.node does not match node_id")
@@ -428,11 +443,11 @@ func validateAgentStatus(status statusmodel.AgentStatus) error {
 		if !validReasonCode(service.ReasonCode) {
 			return fmt.Errorf("agent_status service %q has invalid reason code", service.Name)
 		}
-		if len(service.VMState) > statusmodel.MaxEnumLen {
-			return fmt.Errorf("agent_status service %q vm_state exceeds %d bytes", service.Name, statusmodel.MaxEnumLen)
+		if !statusmodel.IsVMState(service.VMState) {
+			return fmt.Errorf("agent_status service %q has invalid vm_state", service.Name)
 		}
-		if len(service.Health) > statusmodel.MaxEnumLen {
-			return fmt.Errorf("agent_status service %q health exceeds %d bytes", service.Name, statusmodel.MaxEnumLen)
+		if !statusmodel.IsHealthState(service.Health) {
+			return fmt.Errorf("agent_status service %q has invalid health", service.Name)
 		}
 		if len(service.HealthCheckType) > statusmodel.MaxEnumLen {
 			return fmt.Errorf("agent_status service %q health_check_type exceeds %d bytes", service.Name, statusmodel.MaxEnumLen)
@@ -443,10 +458,15 @@ func validateAgentStatus(status statusmodel.AgentStatus) error {
 		if len(service.Volumes) > config.MaxServiceVolumes {
 			return fmt.Errorf("agent_status service %q has too many volumes", service.Name)
 		}
+		volumeIDs := make(map[string]struct{}, len(service.Volumes))
 		for _, volume := range service.Volumes {
 			if err := validateVolumeStatus(service.Name, volume); err != nil {
 				return err
 			}
+			if _, duplicate := volumeIDs[volume.LogicalID]; duplicate {
+				return fmt.Errorf("agent_status service %q volume %q is duplicated", service.Name, volume.LogicalID)
+			}
+			volumeIDs[volume.LogicalID] = struct{}{}
 		}
 	}
 	if !validReasonCode(status.ReasonCode) {
@@ -464,8 +484,11 @@ func validateVolumeStatus(serviceName string, volume statusmodel.VolumeStatus) e
 	if len(volume.LogicalID) > statusmodel.MaxLogicalIDLen {
 		return fmt.Errorf("agent_status service %q volume logical_id exceeds %d bytes", serviceName, statusmodel.MaxLogicalIDLen)
 	}
-	if len(volume.Type) > statusmodel.MaxEnumLen {
-		return fmt.Errorf("agent_status service %q volume type exceeds %d bytes", serviceName, statusmodel.MaxEnumLen)
+	if volume.LogicalID == "" {
+		return fmt.Errorf("agent_status service %q volume logical_id is required", serviceName)
+	}
+	if !statusmodel.IsVolumeType(volume.Type) {
+		return fmt.Errorf("agent_status service %q volume has invalid type", serviceName)
 	}
 	if len(volume.MountPath) > statusmodel.MaxMountPathLen {
 		return fmt.Errorf("agent_status service %q volume mount_path exceeds %d bytes", serviceName, statusmodel.MaxMountPathLen)
@@ -476,8 +499,11 @@ func validateVolumeStatus(serviceName string, volume statusmodel.VolumeStatus) e
 	if len(volume.SharedBackendID) > statusmodel.MaxVolumeIDLen {
 		return fmt.Errorf("agent_status service %q volume shared_backend_id exceeds %d bytes", serviceName, statusmodel.MaxVolumeIDLen)
 	}
-	if len(volume.State) > statusmodel.MaxEnumLen {
-		return fmt.Errorf("agent_status service %q volume state exceeds %d bytes", serviceName, statusmodel.MaxEnumLen)
+	if !statusmodel.IsVolumeState(volume.State) {
+		return fmt.Errorf("agent_status service %q volume has invalid state", serviceName)
+	}
+	if volume.DesiredSizeBytes < 0 || volume.AppliedSizeBytes < 0 || volume.RequestedSizeBytes < 0 || volume.ResizeGeneration < 0 {
+		return fmt.Errorf("agent_status service %q volume sizes must not be negative", serviceName)
 	}
 	if len(volume.RejectedReason) > statusmodel.MaxReasonCodeLen {
 		return fmt.Errorf("agent_status service %q volume rejected_reason exceeds %d bytes", serviceName, statusmodel.MaxReasonCodeLen)
@@ -520,8 +546,7 @@ func (s *RegistryServer) handleState(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var req registryapi.StateRequest
-	if err := readJSON(r, &req); err != nil {
-		writeRegistryError(w, http.StatusBadRequest, registryapi.ErrorCodeInvalidRequest, "invalid json")
+	if !decodeRegistryRequest(w, r, maxRegistryControlRequestBytes, &req) {
 		return
 	}
 	if req.State != registryapi.NodeStateReady && req.State != registryapi.NodeStateDraining && req.State != registryapi.NodeStateDown {
@@ -569,8 +594,9 @@ func nodeResponse(record *NodeRecord) registryapi.NodeResponse {
 }
 
 var (
-	errStaleGeneration   = errors.New("stale generation")
-	errNodeNotRegistered = errors.New("node not registered")
+	errStaleGeneration              = errors.New("stale generation")
+	errNodeNotRegistered            = errors.New("node not registered")
+	errUnsupportedAgentStatusSchema = errors.New("unsupported agent status schema")
 )
 
 func (s *RegistryServer) writeMutationError(w http.ResponseWriter, operation, nodeID string, err error) {
@@ -583,6 +609,21 @@ func (s *RegistryServer) writeMutationError(w http.ResponseWriter, operation, no
 		s.logger.Error(operation+" failed", "node", nodeID, "error", err)
 		writeRegistryError(w, http.StatusInternalServerError, registryapi.ErrorCodeInternal, "failed to persist node")
 	}
+}
+
+// decodeRegistryRequest caps the body at limit before decoding it and writes
+// the error response itself when decoding fails.
+func decodeRegistryRequest(w http.ResponseWriter, r *http.Request, limit int64, out any) bool {
+	limitBody(w, r, limit)
+	if err := readJSON(r, out); err != nil {
+		if isRequestTooLarge(err) {
+			writeRegistryError(w, http.StatusRequestEntityTooLarge, registryapi.ErrorCodeRequestTooLarge, "request body exceeds the endpoint limit")
+			return false
+		}
+		writeRegistryError(w, http.StatusBadRequest, registryapi.ErrorCodeInvalidRequest, "invalid json")
+		return false
+	}
+	return true
 }
 
 func writeRegistryError(w http.ResponseWriter, status int, code, message string) {

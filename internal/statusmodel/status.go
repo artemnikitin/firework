@@ -74,6 +74,32 @@ var (
 	nonBlockingConditionTypes = []string{"PeerRoutesReady", "VolumeSizesApplied"}
 )
 
+// Closed vocabularies for enum-shaped status fields. The registry rejects a
+// status carrying any other value instead of storing telemetry it cannot
+// interpret. The agent's VM states are mirrored here because this package
+// must not import the VM runtime; a parity test in internal/agent keeps the
+// two in step.
+var (
+	vmStates     = []string{"unknown", "starting", "running", "stopping", "stopped", "failed", "recovery_pending", "start_aborting"}
+	healthStates = []string{"healthy", "unhealthy", "unknown", "not_configured"}
+	volumeTypes  = []string{"local", "shared"}
+	volumeStates = []string{"pending", "prepared", "rejected", "error"}
+)
+
+func IsVMState(value string) bool     { return contains(vmStates, value) }
+func IsHealthState(value string) bool { return contains(healthStates, value) }
+func IsVolumeType(value string) bool  { return contains(volumeTypes, value) }
+func IsVolumeState(value string) bool { return contains(volumeStates, value) }
+
+func contains(values []string, value string) bool {
+	for _, known := range values {
+		if known == value {
+			return true
+		}
+	}
+	return false
+}
+
 // BlockingConditionTypes returns the conditions whose failure is fatal.
 func BlockingConditionTypes() []string {
 	return append([]string(nil), blockingConditionTypes...)

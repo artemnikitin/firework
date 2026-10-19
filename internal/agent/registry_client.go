@@ -82,7 +82,21 @@ func (c *registryClient) sync(ctx context.Context, nodeID string, labels []strin
 		}
 		c.setRegistered(true)
 	}
-	if err := c.heartbeat(ctx, nodeID, cap, used, status); err != nil {
+	err := c.heartbeat(ctx, nodeID, cap, used, status)
+	if isRegistryError(err, http.StatusRequestEntityTooLarge) && status != nil {
+		// The status pushed the body over the registry cap, so the liveness
+		// half never arrived. Resend without telemetry so the node stays
+		// schedulable; the registry then reports its status as missing.
+		c.logger.Warn("registry rejected heartbeat as too large; resending without agent status", "error", err)
+		err = c.heartbeat(ctx, nodeID, cap, used, nil)
+	}
+	if isRegistryError(err, http.StatusUnprocessableEntity) {
+		// Liveness was accepted and only the telemetry was refused. The
+		// registration is intact, so re-registering would only add churn.
+		c.logger.Warn("registry rejected agent status; heartbeat accepted without it", "error", err)
+		return
+	}
+	if err != nil {
 		c.logger.Warn("registry heartbeat failed", "error", err)
 		// 404 means the record is gone and 409 means its generation differs
 		// from ours. Both permit exactly one registration attempt on the next
