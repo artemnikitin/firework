@@ -3,11 +3,13 @@ package controlplane
 import (
 	"context"
 	"errors"
+	"strings"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/artemnikitin/firework/internal/config"
+	"github.com/artemnikitin/firework/internal/objectstorage"
 	"github.com/artemnikitin/firework/internal/statusmodel"
 )
 
@@ -168,5 +170,56 @@ func TestUnreadableNodeBlocksEmptyRevisionConvergence(t *testing.T) {
 	}
 	if status.Phase != "unknown" || status.ReasonCode != "node_record_unreadable" {
 		t.Fatalf("status = %s/%s, want unknown/node_record_unreadable", status.Phase, status.ReasonCode)
+	}
+}
+
+// cancellingStore cancels the request on the first read under prefix, then
+// fails like a storage client honouring the cancelled context.
+type cancellingStore struct {
+	StateStore
+	prefix string
+	cancel context.CancelFunc
+}
+
+func (s *cancellingStore) GetJSON(ctx context.Context, key string, out any) (objectstorage.WriteToken, bool, error) {
+	if strings.HasPrefix(key, s.prefix) {
+		s.cancel()
+		return "", false, ctx.Err()
+	}
+	return s.StateStore.GetJSON(ctx, key, out)
+}
+
+// A scan interrupted by the caller's cancellation is not a set of unreadable
+// records: it must fail, not be cached, and leave no false problems for the
+// next operator.
+func TestCancelledScanFailsAndIsNotCached(t *testing.T) {
+	for _, prefix := range []string{registryNodesPrefix("cp/v1"), volumeRecordsPrefix("cp/v1")} {
+		t.Run(prefix, func(t *testing.T) {
+			base := newBlobStateStore(newMemBlob())
+			cfg := validConfigForRole(RoleAPI)
+			putCurrentState(t, context.Background(), base, DesiredRevision{Revision: "desired-1"}, PlacementRevision{Revision: "placement-1", DesiredRevision: "desired-1"}, "rendered-1")
+			putNode(t, context.Background(), base, cfg, NodeRecord{NodeID: "node-1", State: NodeStateReady})
+			putRecord(t, base, "db", "data", VolumeRecord{LogicalID: "db/data", Type: config.VolumeTypeLocal, BoundNode: "node-1", DesiredSizeBytes: config.GiB})
+
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			store := &cancellingStore{StateStore: base, prefix: prefix, cancel: cancel}
+			service := cachedVisibility(store)
+			if _, err := service.Nodes(ctx, ""); !errors.Is(err, context.Canceled) {
+				t.Fatalf("interrupted scan returned %v, want context.Canceled", err)
+			}
+
+			store.prefix = "never-matches/"
+			nodes, err := service.Nodes(context.Background(), "")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if service.builds != 2 {
+				t.Fatalf("builds = %d: the interrupted snapshot was cached", service.builds)
+			}
+			if len(nodes.Problems) != 0 || nodes.Count != 1 {
+				t.Fatalf("next snapshot carried false problems %#v (count %d)", nodes.Problems, nodes.Count)
+			}
+		})
 	}
 }

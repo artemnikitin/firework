@@ -2,6 +2,7 @@ package controlplane
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"path"
 	"path/filepath"
@@ -460,6 +461,9 @@ func (s *VisibilityService) build(ctx context.Context) (visibilitySnapshot, erro
 		var record NodeRecord
 		_, exists, err := s.store.GetJSON(ctx, key, &record)
 		if err != nil {
+			if scanInterrupted(ctx, err) {
+				return snapshot, fmt.Errorf("reading node records: %w", err)
+			}
 			snapshot.problems = append(snapshot.problems, operatorapi.ProjectionProblem{Kind: "node", ID: id, ReasonCode: "record_unreadable"})
 			continue
 		}
@@ -504,6 +508,9 @@ func (s *VisibilityService) build(ctx context.Context) (visibilitySnapshot, erro
 		var record VolumeRecord
 		_, exists, err := s.store.GetJSON(ctx, key, &record)
 		if err != nil {
+			if scanInterrupted(ctx, err) {
+				return snapshot, fmt.Errorf("reading volume records: %w", err)
+			}
 			snapshot.problems = append(snapshot.problems, operatorapi.ProjectionProblem{Kind: "volume", ID: id, ReasonCode: "record_unreadable"})
 			continue
 		}
@@ -529,6 +536,15 @@ func (s *VisibilityService) build(ctx context.Context) (visibilitySnapshot, erro
 	}
 	sort.Slice(snapshot.desired.Services, func(i, j int) bool { return snapshot.desired.Services[i].Name < snapshot.desired.Services[j].Name })
 	return snapshot, nil
+}
+
+// scanInterrupted reports whether a per-record read failed because the
+// request was cancelled or timed out rather than because of the record. That
+// failure describes the scan, not the record: recording it as a problem would
+// turn every remaining record into a false warning and let an incomplete
+// snapshot be cached as a successful one, so the build fails instead.
+func scanInterrupted(ctx context.Context, err error) bool {
+	return ctx.Err() != nil || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)
 }
 
 // projectionID bounds an identifier taken from a storage key before it is
