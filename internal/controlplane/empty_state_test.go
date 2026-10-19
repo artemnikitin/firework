@@ -3,12 +3,14 @@ package controlplane
 import (
 	"bytes"
 	"context"
+	"errors"
 	"io"
 	"log/slog"
 	"testing"
 	"time"
 
 	"github.com/artemnikitin/firework/internal/config"
+	"github.com/artemnikitin/firework/internal/objectstorage"
 	"gopkg.in/yaml.v3"
 )
 
@@ -237,17 +239,68 @@ func TestTombstoneIsNotWrittenOverAConcurrentChange(t *testing.T) {
 	c, store := emptyStateController(t)
 	ctx := context.Background()
 	putNodeConfig(t, store, "node-b", nodeConfigYAML(t, "node-b", "web"))
-	tombstones := c.inactiveNodeTombstones(ctx, []string{"node-b"}, nil, nil)
-	if len(tombstones) != 1 {
+	tombstones, deferred := c.inactiveNodeTombstones(ctx, []string{"node-b"}, nil, nil)
+	if len(tombstones) != 1 || deferred {
 		t.Fatalf("expected node-b to be tombstoned, got %#v", tombstones)
 	}
 	changed := nodeConfigYAML(t, "node-b", "web", "api")
 	putNodeConfig(t, store, "node-b", changed)
 
-	if err := c.publishTombstone(ctx, "rendered-1", tombstones[0]); err != nil {
+	written, err := c.publishTombstone(ctx, "rendered-1", tombstones[0])
+	if err != nil {
 		t.Fatal(err)
+	}
+	if written {
+		t.Fatal("a lost write conflict was reported as written")
 	}
 	if got, _ := readNodeConfig(t, store, "node-b"); !bytes.Equal(got, changed) {
 		t.Fatalf("tombstone overwrote a config written after it was evaluated:\n%s", got)
+	}
+	// The immutable revision must not record an empty config that was never applied.
+	if _, _, exists, err := store.GetRaw(ctx, renderedNodeKey(emptyStatePrefix, "rendered-1", "node-b")); err != nil || exists {
+		t.Fatalf("rendered revision recorded an unapplied tombstone: exists=%v err=%v", exists, err)
+	}
+}
+
+// failingGetStore fails GetRaw for one key a set number of times.
+type failingGetStore struct {
+	StateStore
+	key   string
+	fails int
+}
+
+func (s *failingGetStore) GetRaw(ctx context.Context, key string) ([]byte, objectstorage.WriteToken, bool, error) {
+	if key == s.key && s.fails > 0 {
+		s.fails--
+		return nil, "", false, errors.New("transient read failure")
+	}
+	return s.StateStore.GetRaw(ctx, key)
+}
+
+// A transient failure reading an inactive node's config defers its tombstone.
+// The controller caches a cycle by its scheduling inputs, which do not change
+// while that node stays down, so caching the deferred cycle would skip every
+// later one and leave the node's old workloads running indefinitely.
+func TestDeferredTombstoneIsRetriedOnTheNextCycle(t *testing.T) {
+	c, store := emptyStateController(t)
+	now := time.Now().UTC()
+	putDesired(t, store, "desired-1", testService("web"))
+	putEmptyStateNode(t, store, "node-a", NodeStateReady, now)
+	putEmptyStateNode(t, store, "node-b", NodeStateDown, now)
+	original := nodeConfigYAML(t, "node-b", "web")
+	putNodeConfig(t, store, "node-b", original)
+	c.store = &failingGetStore{StateStore: store, key: legacyNodeConfigKey(emptyStatePrefix, "node-b"), fails: 1}
+
+	c.runReconcile(context.Background())
+	if got, _ := readNodeConfig(t, store, "node-b"); !bytes.Equal(got, original) {
+		t.Fatalf("config was rewritten despite the failed read:\n%s", got)
+	}
+
+	c.runReconcile(context.Background())
+	requireExplicitEmpty(t, store, "node-b", currentPlacement(t, store))
+
+	// With nothing deferred the cycle is cached again.
+	if c.lastInputSignature == "" {
+		t.Fatal("a fully applied cycle was not cached")
 	}
 }

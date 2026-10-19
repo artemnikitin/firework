@@ -254,7 +254,7 @@ func (c *Controller) runReconcile(ctx context.Context) {
 	}
 	applyHostIPAndCrossNodeLinks(nodeConfigs, hostIPByNode)
 
-	tombstones := c.inactiveNodeTombstones(ctx, knownNodeIDs, nodeConfigs, desired.Services)
+	tombstones, tombstonesDeferred := c.inactiveNodeTombstones(ctx, knownNodeIDs, nodeConfigs, desired.Services)
 
 	renderRev := newRevision("rendered")
 	placementID := newRevision("placement")
@@ -296,11 +296,18 @@ func (c *Controller) runReconcile(ctx context.Context) {
 		return
 	}
 
-	if err := c.publishRendered(ctx, renderRev, nodeConfigs, tombstones); err != nil {
+	publishDeferred, err := c.publishRendered(ctx, renderRev, nodeConfigs, tombstones)
+	if err != nil {
 		c.logger.Error("publishing rendered configs failed", "error", err)
 		return
 	}
-	c.lastInputSignature = inputSig
+	// A tombstone deferred by a read failure or a write conflict depends on
+	// object state the input signature does not cover. Caching the signature
+	// would skip every later cycle until desired state or the active set
+	// changed, leaving that node's old workloads running indefinitely.
+	if !tombstonesDeferred && !publishDeferred {
+		c.lastInputSignature = inputSig
+	}
 
 	c.logger.Info("reconcile complete",
 		"desired_revision", desired.Revision,
@@ -575,35 +582,40 @@ func (c *Controller) publishPlacement(ctx context.Context, placement PlacementRe
 // "desired state unknown" and keeps running what it has, so deleting a config
 // is never how a node is told to stop; an explicit `services: []` is. A key
 // outside this publication is either replaced by a tombstone, when that was
-// proven safe, or left exactly as it was.
-func (c *Controller) publishRendered(ctx context.Context, renderRev string, nodeConfigs []config.NodeConfig, tombstones []nodeTombstone) error {
+// proven safe, or left exactly as it was. deferred reports a tombstone that
+// lost a write conflict and must be re-evaluated on a later cycle.
+func (c *Controller) publishRendered(ctx context.Context, renderRev string, nodeConfigs []config.NodeConfig, tombstones []nodeTombstone) (deferred bool, err error) {
 	if !c.stillLeader(ctx) {
-		return fmt.Errorf("lost leadership before rendered publish")
+		return false, fmt.Errorf("lost leadership before rendered publish")
 	}
 
 	for _, nc := range nodeConfigs {
 		data, err := yaml.Marshal(nc)
 		if err != nil {
-			return fmt.Errorf("marshal node config %s: %w", nc.Node, err)
+			return false, fmt.Errorf("marshal node config %s: %w", nc.Node, err)
 		}
 		renderKey := renderedNodeKey(c.cfg.State.Prefix, renderRev, nc.Node)
 		if _, err := c.store.PutRaw(ctx, renderKey, data, "application/x-yaml"); err != nil {
-			return err
+			return false, err
 		}
 
 		legacyKey := legacyNodeConfigKey(c.cfg.State.Prefix, nc.Node)
 		if _, err := c.store.PutRaw(ctx, legacyKey, data, "application/x-yaml"); err != nil {
-			return err
+			return false, err
 		}
 	}
 
 	for _, tombstone := range tombstones {
-		if err := c.publishTombstone(ctx, renderRev, tombstone); err != nil {
-			return err
+		written, err := c.publishTombstone(ctx, renderRev, tombstone)
+		if err != nil {
+			return false, err
+		}
+		if !written {
+			deferred = true
 		}
 	}
 
-	return upsertPointer(ctx, c.store, renderedCurrentKey(c.cfg.State.Prefix), renderRev)
+	return deferred, upsertPointer(ctx, c.store, renderedCurrentKey(c.cfg.State.Prefix), renderRev)
 }
 
 // nodeTombstone is an explicit empty config for a known node outside this
@@ -618,15 +630,13 @@ type nodeTombstone struct {
 // publishTombstone writes an empty config for a node outside the placement.
 // The current key is replaced only if it is still the version that was
 // evaluated: anything written since was not proven safe to empty, and it is
-// left for the next cycle to evaluate rather than overwritten blind.
-func (c *Controller) publishTombstone(ctx context.Context, renderRev string, tombstone nodeTombstone) error {
+// left for the next cycle to evaluate rather than overwritten blind. The
+// immutable rendered copy is written only once the current key holds the
+// tombstone, so a revision never records an empty config that was not applied.
+func (c *Controller) publishTombstone(ctx context.Context, renderRev string, tombstone nodeTombstone) (bool, error) {
 	data, err := yaml.Marshal(tombstone.config)
 	if err != nil {
-		return fmt.Errorf("marshal node tombstone %s: %w", tombstone.config.Node, err)
-	}
-	renderKey := renderedNodeKey(c.cfg.State.Prefix, renderRev, tombstone.config.Node)
-	if _, err := c.store.PutRaw(ctx, renderKey, data, "application/x-yaml"); err != nil {
-		return err
+		return false, fmt.Errorf("marshal node tombstone %s: %w", tombstone.config.Node, err)
 	}
 	legacyKey := legacyNodeConfigKey(c.cfg.State.Prefix, tombstone.config.Node)
 	var written bool
@@ -636,13 +646,18 @@ func (c *Controller) publishTombstone(ctx context.Context, renderRev string, tom
 		written, _, err = c.store.PutRawIfAbsent(ctx, legacyKey, data, "application/x-yaml")
 	}
 	if err != nil {
-		return err
+		return false, err
 	}
 	if !written {
 		c.logger.Warn("node config changed while being retired; leaving it for the next cycle",
 			"node", tombstone.config.Node)
+		return false, nil
 	}
-	return nil
+	renderKey := renderedNodeKey(c.cfg.State.Prefix, renderRev, tombstone.config.Node)
+	if _, err := c.store.PutRaw(ctx, renderKey, data, "application/x-yaml"); err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 // inactiveNodeTombstones decides which known nodes outside this cycle's
@@ -667,7 +682,14 @@ func (c *Controller) publishTombstone(ctx context.Context, renderRev string, tom
 // an active node in this cycle. A missing config holds nothing and is safe to
 // tombstone; an unreadable or unparseable one is left untouched, because its
 // contents are unknown.
-func (c *Controller) inactiveNodeTombstones(ctx context.Context, knownNodeIDs []string, nodeConfigs []config.NodeConfig, desired []config.ServiceConfig) []nodeTombstone {
+//
+// deferred reports a failed read, so the cycle is not cached as complete and
+// the next tick evaluates the node again. An unparseable config is not
+// deferred: it stays unparseable until something rewrites it, and retrying it
+// every tick would mint a new rendered revision each time for nothing. Nor is
+// a stranded service, which can only become safe to empty through a change in
+// desired state or in the active set, both of which invalidate the cache.
+func (c *Controller) inactiveNodeTombstones(ctx context.Context, knownNodeIDs []string, nodeConfigs []config.NodeConfig, desired []config.ServiceConfig) (tombstones []nodeTombstone, deferred bool) {
 	placed := make(map[string]struct{}, len(nodeConfigs))
 	placedServices := make(map[string]struct{})
 	for _, nc := range nodeConfigs {
@@ -681,7 +703,6 @@ func (c *Controller) inactiveNodeTombstones(ctx context.Context, knownNodeIDs []
 		desiredServices[svc.Name] = struct{}{}
 	}
 
-	var tombstones []nodeTombstone
 	for _, nodeID := range knownNodeIDs {
 		if _, ok := placed[nodeID]; ok {
 			continue
@@ -690,6 +711,7 @@ func (c *Controller) inactiveNodeTombstones(ctx context.Context, knownNodeIDs []
 		data, token, exists, err := c.store.GetRaw(ctx, key)
 		if err != nil {
 			c.logger.Warn("reading inactive node config failed; leaving it untouched", "node", nodeID, "error", err)
+			deferred = true
 			continue
 		}
 		if exists {
@@ -710,7 +732,7 @@ func (c *Controller) inactiveNodeTombstones(ctx context.Context, knownNodeIDs []
 			exists: exists,
 		})
 	}
-	return tombstones
+	return tombstones, deferred
 }
 
 // strandedService reports a service in current that is still desired but has
