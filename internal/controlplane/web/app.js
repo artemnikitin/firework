@@ -18,10 +18,15 @@ let view = 'overview';
 let data = [];
 let problems = [];
 let requestedFilter = '';
-// Each load cancels the previous one and carries a sequence number, so a slow
-// response for an earlier view can never render over a newer navigation.
+// Navigation cancels the previous load, and each load carries a sequence
+// number, so a slow response for an earlier view can never render over a newer
+// one. Periodic refresh is scheduled only after a load settles, so polling
+// never cancels a request: a page that takes longer than the interval still
+// renders, and its errors still surface.
+const refreshInterval = 7500;
 let loadSequence = 0;
 let loadController = null;
+let refreshTimer = null;
 
 const esc = value => String(value ?? '').replace(/[&<>'"]/g, character => ({
   '&': '&amp;',
@@ -427,6 +432,7 @@ async function detail(kind, id, signal, current) {
 }
 
 async function load() {
+  clearTimeout(refreshTimer);
   if (loadController) loadController.abort();
   const controller = new AbortController();
   loadController = controller;
@@ -483,6 +489,13 @@ async function load() {
     if (!current() || error.name === 'AbortError') return;
     errorBox.textContent = error.message;
     errorBox.hidden = false;
+  } finally {
+    // Only the newest load schedules the next refresh, so there is exactly
+    // one refresh chain however many navigations superseded each other.
+    if (current()) {
+      loadController = null;
+      refreshTimer = setTimeout(load, refreshInterval);
+    }
   }
 }
 
@@ -506,4 +519,3 @@ healthFilter.addEventListener('change', renderList);
 nodeFilter.addEventListener('change', renderList);
 window.addEventListener('hashchange', load);
 load();
-setInterval(load, 7500);

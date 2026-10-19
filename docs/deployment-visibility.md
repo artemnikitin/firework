@@ -303,9 +303,10 @@ metadata resolves through the API role's `ingress_domain` (or uses an exact
 links to unhealthy services, and every list and the overview show a notice
 naming any record the API skipped. The Services view filters by state,
 health, and node, matching the API and CLI filters. All views refresh
-automatically; each refresh or navigation cancels the previous request, and a
-response that arrives after a newer one started is discarded, so a slow
-refresh can never overwrite the view you navigated to.
+automatically. The next refresh is scheduled only after the current load
+finishes, so polling never cancels a slow page; navigation cancels the
+previous request, and a response that arrives after a newer one started is
+discarded, so a slow load can never overwrite the view you navigated to.
 
 Rotate access by replacing the operator token secret and restarting the API
 role. Existing browser sessions become invalid because their derived session
