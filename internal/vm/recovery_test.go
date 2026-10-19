@@ -2,6 +2,7 @@ package vm
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"io"
 	"log/slog"
@@ -437,4 +438,47 @@ func recoveryFixture(t *testing.T) (*Manager, *instanceManifest, *fakeProcessIns
 		manager.mu.Unlock()
 	})
 	return manager, manifest, inspector
+}
+
+// preNodeTypeConfigJSON and preNodeTypeConfigHash are exactly what an agent
+// built before ServiceConfig gained NodeType wrote into an ownership manifest
+// for the recoveryFixture service (generated at main@faad17e). Adding a field
+// must not change the hash of a config that leaves it empty, or every VM
+// surviving an agent upgrade fails the integrity check and is quarantined.
+const (
+	preNodeTypeConfigJSON = `{"Name":"app","Image":"/image","Kernel":"/kernel","VCPUs":1,"MemoryMB":128,"KernelArgs":"","Network":null,"HealthCheck":null,"PortForwards":null,"Env":null,"Links":null,"Metadata":null,"AntiAffinityGroup":"","CrossNodeLinks":null,"NodeHostIPEnv":"","Volumes":null}`
+	preNodeTypeConfigHash = "e2d4d7929c8b91e663fbc9a66a8ad25afa1e98312a52b03c005b76ef3be37b6c"
+)
+
+func TestRecoverAdoptsSurvivorFromManifestWrittenBeforeNodeType(t *testing.T) {
+	manager, manifest, inspector := recoveryFixture(t)
+	manager.inspector = inspector
+
+	path := manifestPath(manifest.VMDir)
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(data, &raw); err != nil {
+		t.Fatal(err)
+	}
+	raw["config"] = json.RawMessage(preNodeTypeConfigJSON)
+	raw["config_hash"] = json.RawMessage(`"` + preNodeTypeConfigHash + `"`)
+	data, err = json.Marshal(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	adopted, err := manager.Recover(context.Background(), config.NodeConfig{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(adopted) != 1 || adopted[0] != manifest.Service {
+		instance := manager.List()[manifest.Service]
+		t.Fatalf("pre-upgrade survivor was not adopted: adopted=%v instance=%#v", adopted, instance)
+	}
 }

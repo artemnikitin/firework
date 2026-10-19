@@ -65,7 +65,12 @@ type ServiceConfig struct {
 	// placement metadata, not VM runtime configuration, so changing it does
 	// not recreate a VM. Empty means unconstrained, which is how desired
 	// revisions published before the field existed decode.
-	NodeType string `yaml:"node_type,omitempty"`
+	//
+	// The JSON tag keeps the Go-name key the other fields serialize with, but
+	// omits an empty value: VM ownership manifests hash this struct's JSON,
+	// and emitting "NodeType":"" would invalidate every manifest written
+	// before the field existed, quarantining surviving VMs after an upgrade.
+	NodeType string `yaml:"node_type,omitempty" json:"NodeType,omitempty"`
 	// Volumes are persistent ext4 images attached after the root filesystem.
 	// SizeBytes is always resolved by the enricher/controller; agents never
 	// apply application defaults independently.
