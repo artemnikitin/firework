@@ -122,3 +122,50 @@ func TestFailedVMNamesFrom(t *testing.T) {
 		t.Fatalf("expected the failed VMs in sorted order, got %#v", got)
 	}
 }
+
+// A refused size is reported as its own state carrying the requested
+// generation. Reporting it as "prepared" would be dropped by the control plane
+// twice over — the generation guard rejects it, and the prepared arm requires
+// the applied size to equal the record's desired size.
+func TestBuildVolumeStatusesReportsRejectionsWithTheRequestedGeneration(t *testing.T) {
+	// The desired config reaching status has already been normalized to the
+	// effective generation, which is what the running instance carries.
+	service := config.ServiceConfig{Name: "db", Volumes: []config.VolumeConfig{
+		{Name: "data", Type: config.VolumeTypeLocal, MountPath: "/data", SizeBytes: 10 * config.GiB, ResizeGeneration: 1},
+		{Name: "cache", Type: config.VolumeTypeLocal, MountPath: "/cache", SizeBytes: 4 * config.GiB, ResizeGeneration: 1},
+	}}
+	prepared := map[string]volume.PreparedVolume{
+		"db/data":  {LogicalID: "db/data", SizeBytes: 10 * config.GiB, ResizeGeneration: 1},
+		"db/cache": {LogicalID: "db/cache", SizeBytes: 4 * config.GiB, ResizeGeneration: 1},
+	}
+	rejections := map[string]volume.Rejection{"db/data": {
+		LogicalID: "db/data", ResizeGeneration: 2, AppliedGeneration: 1,
+		RequestedSizeBytes: 2 * config.GiB, AppliedSizeBytes: 10 * config.GiB,
+		MinimumSizeBytes: 5 * config.GiB,
+	}}
+
+	statuses := BuildVolumeStatusesWithRejections(service, prepared, rejections)
+	byID := make(map[string]statusmodel.VolumeStatus, len(statuses))
+	for _, status := range statuses {
+		byID[status.LogicalID] = status
+	}
+
+	rejected := byID["db/data"]
+	if rejected.State != "rejected" || !rejected.Rejected {
+		t.Fatalf("expected a rejected state, got %#v", rejected)
+	}
+	if rejected.ResizeGeneration != 2 {
+		t.Fatalf("expected the requested generation to be reported, got %d", rejected.ResizeGeneration)
+	}
+	if rejected.AppliedSizeBytes != 10*config.GiB || rejected.RequestedSizeBytes != 2*config.GiB {
+		t.Fatalf("unexpected sizes on the rejected volume: %#v", rejected)
+	}
+	if rejected.LastError == "" {
+		t.Fatal("expected the measured minimum to be reported")
+	}
+
+	// A volume with no rejection is untouched.
+	if other := byID["db/cache"]; other.State != "prepared" || other.Rejected {
+		t.Fatalf("an unrejected volume was relabelled: %#v", other)
+	}
+}

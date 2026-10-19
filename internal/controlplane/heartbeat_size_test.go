@@ -75,6 +75,15 @@ func maximalAgentStatus(nodeID string) *statusmodel.AgentStatus {
 				SharedBackendID: strings.Repeat("d", statusmodel.MaxVolumeIDLen),
 				State:           strings.Repeat("e", statusmodel.MaxEnumLen),
 				LastError:       wide,
+				// The rejection fields are additive but still per-volume, so
+				// they have to be at their bound here or the measured worst
+				// case understates what an agent can actually send.
+				DesiredSizeBytes:   1<<63 - 1,
+				AppliedSizeBytes:   1<<63 - 1,
+				ResizeGeneration:   1<<63 - 1,
+				RequestedSizeBytes: 1<<63 - 1,
+				Rejected:           true,
+				RejectedReason:     strings.Repeat("r", statusmodel.MaxReasonCodeLen),
 			})
 		}
 		status.Services = append(status.Services, service)

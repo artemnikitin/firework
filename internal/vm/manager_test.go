@@ -411,7 +411,7 @@ func TestPreflightRetainsVisibleVolumeError(t *testing.T) {
 	service := config.ServiceConfig{Name: "app", Volumes: []config.VolumeConfig{{
 		Name: "data", Type: config.VolumeTypeLocal, MountPath: "/data",
 	}}}
-	if err := manager.Preflight(context.Background(), service); err == nil {
+	if _, err := manager.Preflight(context.Background(), service); err == nil {
 		t.Fatal("expected missing storage error")
 	}
 	if got := manager.VolumeError("app"); !strings.Contains(got, "storage is not configured") {

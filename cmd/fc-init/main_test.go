@@ -5,6 +5,8 @@ package main
 import (
 	"encoding/base64"
 	"encoding/json"
+	"os"
+	"path/filepath"
 	"reflect"
 	"testing"
 )
@@ -109,5 +111,79 @@ func TestParseFireworkEnvArg_IgnoresNonEnvArg(t *testing.T) {
 	}
 	if ok {
 		t.Fatal("expected non-env arg to be ignored")
+	}
+}
+
+// A writable path that is a strict parent of a volume mount must still be
+// chowned. Skipping it left a non-root guest process unable to write to its
+// own directory whenever a volume was declared beneath it.
+func TestEnsureWritablePathsChownsParentOfVolumeMount(t *testing.T) {
+	root := t.TempDir()
+	appDir := filepath.Join(root, "var", "lib", "app")
+	volumeDir := filepath.Join(appDir, "data")
+	inVolume := filepath.Join(volumeDir, "payload")
+	sibling := filepath.Join(appDir, "cache")
+	unrelated := filepath.Join(root, "srv")
+	for _, dir := range []string{volumeDir, sibling, unrelated} {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.WriteFile(inVolume, []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// The chown itself is stubbed so the walk can be observed without needing
+	// a second uid to chown to.
+	var walked []string
+	original := chownFn
+	chownFn = func(path string, uid, gid int) error {
+		walked = append(walked, path)
+		return nil
+	}
+	t.Cleanup(func() { chownFn = original })
+
+	if err := ensureWritablePaths([]string{appDir, volumeDir, unrelated}, []string{volumeDir}, os.Getuid(), os.Getgid()); err != nil {
+		t.Fatalf("ensureWritablePaths failed: %v", err)
+	}
+
+	contains := func(want string) bool {
+		for _, got := range walked {
+			if got == want {
+				return true
+			}
+		}
+		return false
+	}
+	if !contains(appDir) {
+		t.Fatalf("expected the parent of a volume mount to be chowned, walked %v", walked)
+	}
+	if !contains(sibling) {
+		t.Fatalf("expected a sibling of a volume mount to be chowned, walked %v", walked)
+	}
+	if !contains(unrelated) {
+		t.Fatalf("expected an unrelated writable path to be chowned, walked %v", walked)
+	}
+	if contains(volumeDir) || contains(inVolume) {
+		t.Fatalf("expected the volume subtree to be pruned, walked %v", walked)
+	}
+}
+
+func TestOverlapsVolumePathMatchesOnlyAtOrBelowAVolumeRoot(t *testing.T) {
+	volumes := []string{"/var/lib/app/data"}
+	tests := []struct {
+		path string
+		want bool
+	}{
+		{"/var/lib/app/data", true},
+		{"/var/lib/app/data/sub", true},
+		{"/var/lib/app", false},
+		{"/var/lib/app/cache", false},
+		{"/srv", false},
+	}
+	for _, test := range tests {
+		if got := overlapsVolumePath(test.path, volumes); got != test.want {
+			t.Fatalf("overlapsVolumePath(%q) = %v, want %v", test.path, got, test.want)
+		}
 	}
 }

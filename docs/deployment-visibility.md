@@ -32,7 +32,7 @@ filters are `state` for nodes and `state`, `health`, and `node` for services.
 Node capacity is requested capacity, not measured utilization. CPU and memory
 `allocated` values are the sum of desired services assigned to the node.
 Storage allocation is the durable persistent-volume reservation used by the
-scheduler, including retained volumes and the larger of desired/applied size
+scheduler, including retained volumes and the larger of effective/applied size
 during a shrink. `available` is capacity minus allocated with a floor of zero;
 these values do not represent filesystem I/O or blocks written by guests.
 Service list/detail responses aggregate local and shared volume counts plus
@@ -45,8 +45,10 @@ Missing data fails closed:
 - expired node leases become `stale`;
 - unplaced desired services are `pending`, carrying the scheduler's reason code
   (for example `insufficient_compute_capacity`, `volume_capacity_unavailable`,
+  `node_storage_exhausted`, `storage_capacity_unknown`, `volume_record_invalid`,
   or `host_port_conflict`, which names the contested port and the service
-  already holding it);
+  already holding it). See [fireworkctl](fireworkctl.md) for what each storage
+  reason means and how to resolve it;
 - placed services with missing, stale, or unsupported agent status are
   `unknown`;
 - VM state and health remain separate, so a service can be `running` and
@@ -118,8 +120,17 @@ second state machine:
 - `progressing`: at least one relevant agent is applying the current revision;
 - `converged`: every relevant node is fresh and has applied it with no false or
   unknown blocking condition;
-- `degraded`: convergence criteria are met, but at least one node reports the
-  non-blocking peer-route condition false;
+- `degraded`: convergence criteria are met, but at least one node reports a
+  non-blocking condition false — the peer-route condition
+  (`peer_routes_degraded`), or `VolumeSizesApplied`
+  (`volume_size_rejected`), meaning a volume is running at an effective size
+  because the requested one was refused. The revision itself also reports
+  `volume_size_rejected` while any retained record carries a standing refusal:
+  once the refusal is acknowledged the rendered config carries the effective
+  size, so the record is the only thing that still knows the operator's request
+  stands. A service whose retained volume record could not be read is likewise
+  degraded rather than converged: it keeps running its last applied
+  configuration, but the desired revision was not applied to it;
 - `failed`: scheduling left a service pending, or a relevant agent reports a
   blocking failure for the current revision;
 - `unknown`: required node status is missing, unsupported, truncated, stale,
@@ -194,7 +205,9 @@ memory, and local-volume storage are shown with allocated/available values and
 capacity bars. Shared storage is a backend-level resource, so it is not
 duplicated on every node. Service lists show a prominent disk summary, and
 details show local/shared reservation and applied size plus the per-volume
-table. Service details also include a clickable HTTPS public URL when routing
+table, which carries requested, effective, and applied sizes so a refused
+request is visible rather than left to a revision diff. Service details also
+include a clickable HTTPS public URL when routing
 metadata resolves through the API role's `ingress_domain` (or uses an exact
 `metadata.host`). All views refresh automatically.
 

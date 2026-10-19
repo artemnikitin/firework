@@ -341,16 +341,55 @@ func desiredVolumeStatuses(service config.ServiceConfig, records map[string]Volu
 		if record, ok := records[status.LogicalID]; ok {
 			status.BoundNode = record.BoundNode
 			status.SharedBackendID = record.SharedBackendID
+			// DesiredSizeBytes is the *effective* size: what the control plane
+			// accepted and rendered. When a request was refused, the operator
+			// edited size: and would otherwise see nothing change with no
+			// explanation, so the refused request is surfaced beside it.
 			status.DesiredSizeBytes = record.DesiredSizeBytes
 			status.AppliedSizeBytes = record.AppliedSizeBytes
 			status.ResizeGeneration = record.ResizeGeneration
 			status.State = string(record.ResizeState)
 			status.LastError = record.LastError
+			if record.rejectionStands() {
+				status.RequestedSizeBytes = record.RequestedSizeBytes
+				status.Rejected = true
+				status.RejectedReason = record.RejectedReason
+			}
 		}
 		volumes = append(volumes, status)
 	}
 	sort.Slice(volumes, func(i, j int) bool { return volumes[i].LogicalID < volumes[j].LogicalID })
 	return volumes
+}
+
+// refusedVolumes lists the logical IDs whose record carries a standing refusal
+// *and* whose volume the desired revision still declares, in deterministic
+// order.
+//
+// The desired-revision filter is the whole point. Records outlive their
+// service by design — deleting application YAML never deletes a volume or its
+// record — so scanning every retained record means one refused resize followed
+// by a service deletion degrades that revision and every revision after it,
+// forever, with no service left to repair. A refusal is only a convergence
+// problem while something is still asking for the size.
+func (s visibilitySnapshot) refusedVolumes() []string {
+	desired := make(map[string]struct{})
+	for _, service := range s.desired.Services {
+		for _, volume := range service.Volumes {
+			desired[service.Name+"/"+volume.Name] = struct{}{}
+		}
+	}
+	var refused []string
+	for id, record := range s.volumeByID {
+		if _, wanted := desired[id]; !wanted {
+			continue
+		}
+		if record.rejectionStands() {
+			refused = append(refused, id)
+		}
+	}
+	sort.Strings(refused)
+	return refused
 }
 
 func mergeVolumeStatuses(base, observed []statusmodel.VolumeStatus) []statusmodel.VolumeStatus {
@@ -377,8 +416,34 @@ func mergeVolumeStatuses(base, observed []statusmodel.VolumeStatus) []statusmode
 			if status.DesiredSizeBytes <= 0 {
 				status.DesiredSizeBytes = fallback.DesiredSizeBytes
 			}
+			// An image that exists on disk has a durable applied size even
+			// when its VM is not running and the agent reports zero. Without
+			// this guard the whole-struct replacement below displays applied
+			// 0 for every stopped service. (The merge still cannot tell
+			// "reported zero" from "did not report"; that distinction is the
+			// volume-status freshness work in #38, which supersedes this
+			// guard rather than fighting it.)
+			if status.AppliedSizeBytes <= 0 {
+				status.AppliedSizeBytes = fallback.AppliedSizeBytes
+			}
 			if status.ResizeGeneration <= 0 {
 				status.ResizeGeneration = fallback.ResizeGeneration
+			}
+			// The capacity rejection in applyExistingVolumeRecords is entirely
+			// control-plane-sourced: the agent is handed the clamped config
+			// and does not know a rejection happened, so its observation
+			// carries none of these. Whole-struct replacement would clear them
+			// on every cycle and make the rejection invisible. A shrink
+			// rejection is the other way round — the agent reports it, so the
+			// observed values are non-empty and authoritative.
+			if status.RequestedSizeBytes <= 0 {
+				status.RequestedSizeBytes = fallback.RequestedSizeBytes
+			}
+			if !status.Rejected {
+				status.Rejected = fallback.Rejected
+			}
+			if status.RejectedReason == "" {
+				status.RejectedReason = fallback.RejectedReason
 			}
 			if status.State == "" {
 				status.State = fallback.State
@@ -652,6 +717,28 @@ func (s visibilitySnapshot) revisionStatus() RevisionStatus {
 		status.Message = statusmodel.BoundedMessage(s.placement.PendingServices[0].Message)
 		return status
 	}
+	// A volume running at an effective size because its request was refused is
+	// not converged, and after the agent's refusal is acknowledged the record
+	// is the only place that still knows the operator's request stands — the
+	// rendered config carries the effective size by then, so the agent cannot
+	// tell a standing request from a withdrawn one. That half of the
+	// visibility therefore lives here.
+	if refused := s.refusedVolumes(); len(refused) > 0 {
+		status.Phase = "degraded"
+		status.ReasonCode = "volume_size_rejected"
+		status.Message = statusmodel.BoundedMessage(fmt.Sprintf(
+			"running an effective size for: %s", strings.Join(refused, ", ")))
+		return status
+	}
+	if len(s.placement.HeldServices) > 0 {
+		// The workloads are running, so this is not a failure — but the
+		// desired revision was not applied to them, so it is not convergence
+		// either.
+		status.Phase = "degraded"
+		status.ReasonCode = s.placement.HeldServices[0].ReasonCode
+		status.Message = statusmodel.BoundedMessage(s.placement.HeldServices[0].Message)
+		return status
+	}
 	expectedRendered := ""
 	for _, node := range s.placement.NodeConfigs {
 		if node.RenderedRevision == "" {
@@ -710,6 +797,7 @@ func (s visibilitySnapshot) revisionStatus() RevisionStatus {
 	}
 
 	observedCurrent := false
+	degradedTypes := make(map[string]struct{})
 	for nodeID := range relevant {
 		record, exists := s.nodeByID[nodeID]
 		if !exists {
@@ -764,6 +852,11 @@ func (s visibilitySnapshot) revisionStatus() RevisionStatus {
 			status.UnknownNodes = append(status.UnknownNodes, nodeID)
 		case degraded:
 			status.DegradedNodes = append(status.DegradedNodes, nodeID)
+			for _, condition := range agentStatus.Conditions {
+				if statusmodel.IsNonBlockingCondition(condition.Type) && condition.Status == statusmodel.ConditionFalse {
+					degradedTypes[condition.Type] = struct{}{}
+				}
+			}
 		default:
 			status.ConvergedNodes = append(status.ConvergedNodes, nodeID)
 		}
@@ -786,7 +879,7 @@ func (s visibilitySnapshot) revisionStatus() RevisionStatus {
 		}
 	case len(status.DegradedNodes) > 0:
 		status.Phase = "degraded"
-		status.ReasonCode = "peer_routes_degraded"
+		status.ReasonCode = degradedFleetReason(degradedTypes)
 	default:
 		status.Phase = "converged"
 	}
@@ -830,6 +923,23 @@ func reportsAllServices(status statusmodel.AgentStatus, expected []string) bool 
 		}
 	}
 	return true
+}
+
+// degradedFleetReason names the fleet-level cause of a degraded phase. The
+// precedence is fixed rather than derived from map order so the reported reason
+// is stable, and a volume running at the wrong size outranks peer-route
+// telemetry because it describes the workload rather than the observability of
+// it.
+func degradedFleetReason(types map[string]struct{}) string {
+	for _, candidate := range []struct{ conditionType, reason string }{
+		{"VolumeSizesApplied", "volume_size_rejected"},
+		{"PeerRoutesReady", "peer_routes_degraded"},
+	} {
+		if _, ok := types[candidate.conditionType]; ok {
+			return candidate.reason
+		}
+	}
+	return "peer_routes_degraded"
 }
 
 func assessConditions(conditions []statusmodel.Condition) (blockingFailure, unknown, degraded bool) {

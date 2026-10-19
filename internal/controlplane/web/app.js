@@ -337,15 +337,20 @@ function renderServiceDetail(service) {
     <td>${esc(port.VMPort ?? port.vm_port)}</td>
   </tr>`);
 
+  // Requested is what the repo asked for and effective is what the cluster
+  // accepted. They differ only when a size request was refused, and that is
+  // precisely the case an operator cannot diagnose from the effective size
+  // alone — so the refusal is shown inline rather than left to a revision diff.
   const volumeRows = (service.volumes || []).map(volume => `<tr>
     <td>${esc(volume.logical_id)}</td>
     <td>${badge(volume.type)}</td>
     <td>${esc(volume.mount_path)}</td>
     <td>${nodeLink(volume.bound_node)}</td>
     <td>${display(volume.shared_backend_id)}</td>
+    <td>${esc(formatBytes(volume.requested_size_bytes || volume.desired_size_bytes))}</td>
     <td>${esc(formatBytes(volume.desired_size_bytes))}</td>
     <td>${esc(formatBytes(volume.applied_size_bytes))}</td>
-    <td>${badge(volume.state)}</td>
+    <td>${badge(volume.state)}${volume.rejected ? ` ${badge(volume.rejected_reason || 'rejected')}` : ''}</td>
     <td>${display(volume.last_error)}</td>
   </tr>`);
 
@@ -357,7 +362,7 @@ function renderServiceDetail(service) {
       ${section('Revisions', revisions)}
     </div>
     ${(service.port_forwards || []).length ? section('Port forwards', table(['Host port', 'VM port'], portRows, '')) : ''}
-    ${(service.volumes || []).length ? section('Persistent volumes', table(['Volume', 'Type', 'Mount path', 'Bound node', 'Backend', 'Desired', 'Applied', 'State', 'Last error'], volumeRows, '')) : ''}`;
+    ${(service.volumes || []).length ? section('Persistent volumes', table(['Volume', 'Type', 'Mount path', 'Bound node', 'Backend', 'Requested', 'Effective', 'Applied', 'State', 'Last error'], volumeRows, '')) : ''}`;
 }
 
 async function detail(kind, id) {

@@ -51,7 +51,33 @@ const (
 	// StateRecoveryPending means durable state exists but ownership could not
 	// be proved. Firework preserves the process and files and blocks duplicates.
 	StateRecoveryPending State = "recovery_pending"
+	// StateStarting is published while a start has released the manager lock
+	// to prepare volumes. It exists so List reports something truthful during
+	// a multi-minute mkfs or resize rather than reporting nothing at all.
+	StateStarting State = "starting"
+	// StateStartAborting means a Stop or Remove arrived while a start was in
+	// its unlocked preparation phase. The start's own final phase observes it
+	// and cleans up without launching anything.
+	StateStartAborting State = "start_aborting"
 )
+
+var (
+	// ErrStartAborted reports that a start was cancelled by a concurrent Stop
+	// or Remove before anything was launched. It is a benign race, not a
+	// fault: the caller must retry rather than record a reconcile failure.
+	ErrStartAborted = errors.New("start aborted by a concurrent stop or remove")
+	// ErrStartInProgress reports that another start for the same service is
+	// still in its preparation phase. Like ErrStartAborted this is a retry
+	// signal, not a failure.
+	ErrStartInProgress = errors.New("start already in progress")
+)
+
+// IsStartRace reports whether an error is one of the benign start-barrier
+// races. Callers use it to classify a reconciliation as incomplete — retry on
+// the next tick without advancing the applied revision — rather than failed.
+func IsStartRace(err error) bool {
+	return errors.Is(err, ErrStartAborted) || errors.Is(err, ErrStartInProgress)
+}
 
 // Instance represents a running Firecracker microVM.
 type Instance struct {
@@ -72,6 +98,10 @@ type Instance struct {
 
 	instanceID string
 	manifest   *instanceManifest
+	// startID identifies one Start attempt. Phase 3 validates against it
+	// rather than against the service name, so a placeholder that was cleared
+	// and replaced by a later attempt is never mistaken for one's own.
+	startID string
 }
 
 // Manager manages the lifecycle of Firecracker microVMs on the local host.
@@ -119,23 +149,54 @@ func NewManagerWithVolumes(firecrackerBin, stateDir string, logger *slog.Logger,
 
 // Preflight validates persistent volumes without changing them. Reconciliation
 // calls this before stopping an existing VM so a failed resize leaves it live.
-func (m *Manager) Preflight(ctx context.Context, svc config.ServiceConfig) error {
+// It also returns any size requests it refused. A rejection never goes through
+// setVolumeError: it is a decision rather than a fault, and recording it there
+// would set a volume_failed reason code and trigger the blanket overwrite that
+// relabels every one of the service's volumes as errored.
+func (m *Manager) Preflight(ctx context.Context, svc config.ServiceConfig) ([]volume.Rejection, error) {
 	if len(svc.Volumes) == 0 {
 		m.setVolumeError(svc.Name, nil)
-		return nil
+		return nil, nil
 	}
 	if err := validateVolumeKernelArgs(svc); err != nil {
 		m.setVolumeError(svc.Name, err)
-		return err
+		return nil, err
 	}
 	if m.volumeManager == nil {
 		err := fmt.Errorf("service %s declares volumes but agent storage is not configured", svc.Name)
 		m.setVolumeError(svc.Name, err)
-		return err
+		return nil, err
 	}
-	err := m.volumeManager.Preflight(ctx, svc)
+	rejections, err := m.volumeManager.Preflight(ctx, svc)
 	m.setVolumeError(svc.Name, err)
-	return err
+	return rejections, err
+}
+
+// VolumeRejections returns the agent's current per-volume refusal snapshot.
+func (m *Manager) VolumeRejections() map[string]volume.Rejection {
+	if m.volumeManager == nil {
+		return nil
+	}
+	return m.volumeManager.Rejections()
+}
+
+// SeedVolumeRejectionsForTest installs a refusal snapshot without running a
+// real filesystem operation, so the status and convergence paths can be
+// exercised without a live pool.
+func (m *Manager) SeedVolumeRejectionsForTest(rejections map[string]volume.Rejection) {
+	if m.volumeManager == nil {
+		return
+	}
+	m.volumeManager.SeedRejectionsForTest(rejections)
+}
+
+// NormalizeVolumes clamps a desired node configuration to the sizes the node
+// is actually able to serve, before anything else in the tick reads it.
+func (m *Manager) NormalizeVolumes(services []config.ServiceConfig) {
+	if m.volumeManager == nil {
+		return
+	}
+	m.volumeManager.NormalizeVolumes(services)
 }
 
 // VolumeError returns the latest persistent-volume preparation failure for a
@@ -144,6 +205,32 @@ func (m *Manager) VolumeError(service string) string {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	return m.volumeErrors[service]
+}
+
+// clampToPrepared substitutes the effective configuration — size and
+// generation — for every volume whose request was refused, so the instance the
+// next tick compares against describes what is actually running. The refused
+// request is reported from the volume manager's rejection snapshot instead,
+// which is what the control-plane acknowledgement matches on.
+func clampToPrepared(svc config.ServiceConfig, prepared []volume.PreparedVolume) config.ServiceConfig {
+	effective := make(map[string]volume.PreparedVolume, len(prepared))
+	for _, preparedVolume := range prepared {
+		if preparedVolume.Rejected {
+			effective[preparedVolume.LogicalID] = preparedVolume
+		}
+	}
+	if len(effective) == 0 {
+		return svc
+	}
+	clamped := svc
+	clamped.Volumes = append([]config.VolumeConfig(nil), svc.Volumes...)
+	for i := range clamped.Volumes {
+		if preparedVolume, ok := effective[svc.Name+"/"+clamped.Volumes[i].Name]; ok {
+			clamped.Volumes[i].SizeBytes = preparedVolume.SizeBytes
+			clamped.Volumes[i].ResizeGeneration = preparedVolume.ResizeGeneration
+		}
+	}
+	return clamped
 }
 
 func (m *Manager) setVolumeError(service string, err error) {
@@ -156,32 +243,64 @@ func (m *Manager) setVolumeError(service string, err error) {
 	m.volumeErrors[service] = err.Error()
 }
 
-func validateVolumeKernelArgs(svc config.ServiceConfig) error {
-	volumes := append([]config.VolumeConfig(nil), svc.Volumes...)
-	sort.Slice(volumes, func(i, j int) bool { return volumes[i].Name < volumes[j].Name })
-	guestVolumes := make([]guestVolume, 0, len(volumes))
-	for i, volume := range volumes {
-		device, err := guestBlockDevice(i)
-		if err != nil {
-			return err
-		}
-		guestVolumes = append(guestVolumes, guestVolume{
-			Name: volume.Name, Device: device, MountPath: volume.MountPath, Type: volume.Type,
-		})
-	}
-	payload, err := json.Marshal(guestVolumePayload{Version: 1, Volumes: guestVolumes})
-	if err != nil {
-		return fmt.Errorf("marshal guest volume payload: %w", err)
-	}
+// defaultKernelArgs is the boot command line used when a service declares none.
+const defaultKernelArgs = "console=ttyS0 reboot=k panic=1 pci=off"
+
+// buildBootArgs composes a service's kernel command line and enforces the
+// command-line length limit.
+//
+// It is the single place boot args are built. Preflight's early check and the
+// launch path previously constructed the payload separately and drifted: the
+// length check lived only in the update path, so ActionCreate could boot a VM
+// with an over-long command line instead of failing with a clear error.
+func buildBootArgs(svc config.ServiceConfig, guestVolumes []guestVolume) (string, error) {
 	kernelArgs := svc.KernelArgs
 	if kernelArgs == "" {
-		kernelArgs = "console=ttyS0 reboot=k panic=1 pci=off"
+		kernelArgs = defaultKernelArgs
 	}
-	kernelArgs = insertBeforeApplicationSeparator(kernelArgs, "firework.volumes64="+base64.RawURLEncoding.EncodeToString(payload))
+	if len(guestVolumes) > 0 {
+		payload, err := json.Marshal(guestVolumePayload{Version: 1, Volumes: guestVolumes})
+		if err != nil {
+			return "", fmt.Errorf("marshal guest volume payload: %w", err)
+		}
+		arg := "firework.volumes64=" + base64.RawURLEncoding.EncodeToString(payload)
+		kernelArgs = insertBeforeApplicationSeparator(kernelArgs, arg)
+	}
 	if len(kernelArgs) > maxKernelCommandLineBytes {
-		return fmt.Errorf("service %s: kernel command line with volume payload is %d bytes; maximum is %d", svc.Name, len(kernelArgs), maxKernelCommandLineBytes)
+		what := "kernel command line"
+		if len(guestVolumes) > 0 {
+			what = "kernel command line with volume payload"
+		}
+		return "", fmt.Errorf("service %s: %s is %d bytes; maximum is %d", svc.Name, what, len(kernelArgs), maxKernelCommandLineBytes)
 	}
-	return nil
+	return kernelArgs, nil
+}
+
+// guestVolumesFromConfig builds the guest payload entries from declared
+// volumes, for the preflight that runs before anything has been prepared.
+func guestVolumesFromConfig(volumes []config.VolumeConfig) ([]guestVolume, error) {
+	ordered := append([]config.VolumeConfig(nil), volumes...)
+	sort.Slice(ordered, func(i, j int) bool { return ordered[i].Name < ordered[j].Name })
+	guestVolumes := make([]guestVolume, 0, len(ordered))
+	for i, declared := range ordered {
+		device, err := guestBlockDevice(i)
+		if err != nil {
+			return nil, err
+		}
+		guestVolumes = append(guestVolumes, guestVolume{
+			Name: declared.Name, Device: device, MountPath: declared.MountPath, Type: declared.Type,
+		})
+	}
+	return guestVolumes, nil
+}
+
+func validateVolumeKernelArgs(svc config.ServiceConfig) error {
+	guestVolumes, err := guestVolumesFromConfig(svc.Volumes)
+	if err != nil {
+		return err
+	}
+	_, err = buildBootArgs(svc, guestVolumes)
+	return err
 }
 
 // List returns a snapshot of all known VM instances.
@@ -198,59 +317,155 @@ func (m *Manager) List() map[string]*Instance {
 }
 
 // Start launches a new Firecracker microVM for the given service config.
+// Start launches a microVM for a service.
+//
+// It runs in three phases so the manager lock is not held across volume
+// preparation, which can spend minutes in mkfs.ext4, e2fsck, or resize2fs.
+// Holding the lock there stalled every reader of it — including the heartbeat
+// goroutine, which reaches it through List — so a node went stale precisely
+// while it was busy resizing its own services' volumes.
+//
+// Releasing the lock opens a window in which a Stop or Remove can arrive, so
+// the phases are governed by a barrier rather than by extra branches:
+//
+//	absent             -> StateStarting       phase 1 publishes the placeholder
+//	StateStarting      -> StateRunning        phase 3, own startID still present
+//	StateStarting      -> StateStartAborting  Stop or Remove during phase 2
+//	StateStartAborting -> absent              phase 3 observes the abort
+//	StateStarting      -> absent              phase 2 failed
+//
+// Phase 3 confirms ownership before any side effect: no manifest is written
+// and nothing is launched unless the placeholder is still this attempt's own.
 func (m *Manager) Start(ctx context.Context, svc config.ServiceConfig) error {
+	startID, vmDir, socketPath, err := m.beginStart(svc)
+	if err != nil {
+		return err
+	}
+
+	// Phase 2 runs without the manager lock. Its side effects — a created or
+	// resized volume image — are durable, retained state by design, so they
+	// are deliberately not rolled back when the start is aborted: the next
+	// start reuses them.
+	prepared, err := m.prepareVolumes(ctx, svc)
+	if err != nil {
+		m.discardStart(svc.Name, startID)
+		return err
+	}
+
+	return m.finishStart(ctx, svc, startID, vmDir, socketPath, prepared)
+}
+
+// beginStart is phase 1: it takes the entry checks and publishes the starting
+// placeholder under the manager lock.
+func (m *Manager) beginStart(svc config.ServiceConfig) (startID, vmDir, socketPath string, err error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
 	if inst, exists := m.instances[svc.Name]; exists {
-		if inst.State == StateRecoveryPending {
-			return fmt.Errorf("service %s has ambiguous surviving state: %s", svc.Name, inst.LastError)
-		}
-		if inst.State == StateRunning || inst.State == StateStopping {
-			return fmt.Errorf("service %s is already active (pid %d, state %s)", svc.Name, inst.PID, inst.State)
+		switch inst.State {
+		case StateRecoveryPending:
+			return "", "", "", fmt.Errorf("service %s has ambiguous surviving state: %s", svc.Name, inst.LastError)
+		case StateRunning, StateStopping:
+			return "", "", "", fmt.Errorf("service %s is already active (pid %d, state %s)", svc.Name, inst.PID, inst.State)
+		case StateStarting, StateStartAborting:
+			// A start already holds this name. Rejecting here is what keeps
+			// the agent API and shutdown paths from racing the reconcile loop.
+			return "", "", "", fmt.Errorf("service %s is in state %s: %w", svc.Name, inst.State, ErrStartInProgress)
 		}
 	}
 
 	m.logger.Info("starting microVM", "service", svc.Name, "vcpus", svc.VCPUs, "memory_mb", svc.MemoryMB)
 
-	vmDir := filepath.Join(m.stateDir, "vms", svc.Name)
+	vmDir = filepath.Join(m.stateDir, "vms", svc.Name)
 	if err := m.reclaimUnownedState(svc.Name, vmDir); err != nil {
-		return err
+		return "", "", "", err
 	}
 	if err := os.MkdirAll(vmDir, 0o755); err != nil {
-		return fmt.Errorf("creating vm dir: %w", err)
+		return "", "", "", fmt.Errorf("creating vm dir: %w", err)
 	}
 
-	socketPath := filepath.Join(vmDir, "firecracker.sock")
+	socketPath = filepath.Join(vmDir, "firecracker.sock")
 	// Remove stale socket if it exists.
 	_ = os.Remove(socketPath)
 
-	var prepared []volume.PreparedVolume
-	var err error
-	if len(svc.Volumes) > 0 {
-		if m.volumeManager == nil {
-			err := fmt.Errorf("service %s declares volumes but agent storage is not configured", svc.Name)
-			m.volumeErrors[svc.Name] = err.Error()
-			return err
-		}
-		prepared, err = m.volumeManager.Prepare(ctx, svc)
-		if err != nil {
-			m.volumeErrors[svc.Name] = err.Error()
-			return fmt.Errorf("preparing volumes: %w", err)
-		}
+	startID, err = newInstanceID()
+	if err != nil {
+		return "", "", "", err
 	}
+	m.instances[svc.Name] = &Instance{
+		Name: svc.Name, Config: svc, State: StateStarting,
+		SocketPath: socketPath, startID: startID,
+	}
+	return startID, vmDir, socketPath, nil
+}
+
+// prepareVolumes is phase 2. It runs without the manager lock, so it records
+// volume errors through setVolumeError rather than writing the map directly.
+func (m *Manager) prepareVolumes(ctx context.Context, svc config.ServiceConfig) ([]volume.PreparedVolume, error) {
+	if len(svc.Volumes) == 0 {
+		return nil, nil
+	}
+	if m.volumeManager == nil {
+		err := fmt.Errorf("service %s declares volumes but agent storage is not configured", svc.Name)
+		m.setVolumeError(svc.Name, err)
+		return nil, err
+	}
+	prepared, err := m.volumeManager.Prepare(ctx, svc)
+	if err != nil {
+		m.setVolumeError(svc.Name, err)
+		return nil, fmt.Errorf("preparing volumes: %w", err)
+	}
+	return prepared, nil
+}
+
+// discardStart removes this attempt's placeholder after a phase-2 failure. It
+// leaves a placeholder belonging to some later attempt alone.
+func (m *Manager) discardStart(name, startID string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if inst, exists := m.instances[name]; exists && inst.startID == startID {
+		delete(m.instances, name)
+	}
+}
+
+// finishStart is phase 3: it re-takes the manager lock, confirms this attempt
+// still owns the placeholder, and only then writes durable state or launches.
+func (m *Manager) finishStart(ctx context.Context, svc config.ServiceConfig, startID, vmDir, socketPath string, prepared []volume.PreparedVolume) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	placeholder, exists := m.instances[svc.Name]
+	if !exists || placeholder.startID != startID || placeholder.State != StateStarting {
+		if exists && placeholder.startID == startID {
+			delete(m.instances, svc.Name)
+		}
+		m.logger.Info("start aborted before launch", "service", svc.Name)
+		return fmt.Errorf("service %s: %w", svc.Name, ErrStartAborted)
+	}
+
+	// Clamp the service configuration to what was actually prepared. A refused
+	// shrink prepares successfully at the applied size, and everything
+	// downstream — the config hash, the Firecracker config, the ownership
+	// manifest, and the instance the next tick compares against — must describe
+	// that effective configuration. Storing it here is what makes needsUpdate
+	// compare equal on the following tick rather than one convergence cycle
+	// later.
+	svc = clampToPrepared(svc, prepared)
 
 	configPath, err := m.writeVMConfig(vmDir, svc, prepared)
 	if err != nil {
+		delete(m.instances, svc.Name)
 		return fmt.Errorf("writing vm config: %w", err)
 	}
 
 	configHash, err := serviceConfigHash(svc)
 	if err != nil {
+		delete(m.instances, svc.Name)
 		return err
 	}
 	instanceID, err := newInstanceID()
 	if err != nil {
+		delete(m.instances, svc.Name)
 		return err
 	}
 	launcherKind, launcherUnit := startingLauncherMetadata(m.launcher, instanceID)
@@ -262,6 +477,7 @@ func (m *Manager) Start(ctx context.Context, svc config.ServiceConfig) error {
 		StartedAt: time.Now().UTC(), Volumes: append([]volume.PreparedVolume(nil), prepared...),
 	}
 	if err := writeManifest(manifestPath(vmDir), manifest); err != nil {
+		delete(m.instances, svc.Name)
 		return err
 	}
 	launched, err := m.launcher.Launch(ctx, launchSpec{
@@ -272,6 +488,7 @@ func (m *Manager) Start(ctx context.Context, svc config.ServiceConfig) error {
 		manifest.Lifecycle = lifecycleFailed
 		manifest.LastError = err.Error()
 		_ = writeManifest(manifestPath(vmDir), manifest)
+		delete(m.instances, svc.Name)
 		return fmt.Errorf("starting firecracker: %w", err)
 	}
 	manifest.PID = launched.PID
@@ -280,12 +497,15 @@ func (m *Manager) Start(ctx context.Context, svc config.ServiceConfig) error {
 	if identityErr := m.recordLaunchedIdentity(manifest, launched); identityErr != nil {
 		if m.abandonLaunch(svc.Name, manifest, launched, identityErr) {
 			m.instances[svc.Name] = instanceFromManifest(manifest, StateRecoveryPending, manifest.LastError)
+		} else {
+			delete(m.instances, svc.Name)
 		}
 		return fmt.Errorf("confirming launched process identity: %w", identityErr)
 	}
 	manifest.Lifecycle = lifecycleRunning
 	if err := writeManifest(manifestPath(vmDir), manifest); err != nil {
 		_ = m.launcher.Stop(manifest, syscall.SIGKILL)
+		delete(m.instances, svc.Name)
 		return err
 	}
 
@@ -298,6 +518,7 @@ func (m *Manager) Start(ctx context.Context, svc config.ServiceConfig) error {
 		Volumes:    append([]volume.PreparedVolume(nil), prepared...),
 		instanceID: instanceID,
 		manifest:   manifest,
+		startID:    startID,
 	}
 	delete(m.volumeErrors, svc.Name)
 
@@ -475,6 +696,18 @@ func (m *Manager) Stop(name string) error {
 		m.mu.Unlock()
 		return err
 	}
+	// A start that is still preparing volumes has launched nothing, so there
+	// is no process to signal. Mark the attempt aborted and return
+	// immediately rather than waiting for a possibly multi-minute mkfs — not
+	// stalling shutdown behind volume work is the point of the barrier.
+	// Marking is idempotent so shutdown and the agent API can both issue a
+	// stop without the loser seeing an error for work the winner already did.
+	if inst.State == StateStarting || inst.State == StateStartAborting {
+		inst.State = StateStartAborting
+		m.mu.Unlock()
+		m.logger.Info("aborting in-flight start instead of stopping", "service", name)
+		return nil
+	}
 	manifest := inst.manifest
 	if manifest == nil {
 		m.mu.Unlock()
@@ -547,7 +780,24 @@ func (m *Manager) Stop(name string) error {
 func (m *Manager) Remove(name string) error {
 	m.mu.Lock()
 	inst, exists := m.instances[name]
+	aborting := exists && (inst.State == StateStarting || inst.State == StateStartAborting)
+	if aborting {
+		inst.State = StateStartAborting
+	}
 	m.mu.Unlock()
+
+	// Removing the VM state directory while phase 2 runs is safe: volume
+	// preparation writes only under the storage pool, and writeVMConfig — the
+	// only writer of this directory — lives in phase 3, which will abort. The
+	// placeholder is left for phase 3 to clear, so a second Remove before then
+	// takes this same branch and also succeeds.
+	if aborting {
+		m.logger.Info("aborting in-flight start instead of removing", "service", name)
+		if err := os.RemoveAll(filepath.Join(m.stateDir, "vms", name)); err != nil {
+			return fmt.Errorf("removing vm dir: %w", err)
+		}
+		return nil
+	}
 
 	if exists && (inst.State == StateRunning || inst.State == StateStopping) {
 		if err := m.Stop(name); err != nil {
@@ -664,11 +914,6 @@ func (m *Manager) quarantine(name string, manifest *instanceManifest, err error)
 
 // writeVMConfig writes a Firecracker JSON config file for the given service.
 func (m *Manager) writeVMConfig(vmDir string, svc config.ServiceConfig, prepared []volume.PreparedVolume) (string, error) {
-	kernelArgs := svc.KernelArgs
-	if kernelArgs == "" {
-		kernelArgs = "console=ttyS0 reboot=k panic=1 pci=off"
-	}
-
 	sort.Slice(prepared, func(i, j int) bool { return prepared[i].LogicalID < prepared[j].LogicalID })
 	drives := []firecrackerDrive{{DriveID: "rootfs", PathOnHost: svc.Image, IsRootDevice: true, IsReadOnly: false}}
 	guestVolumes := make([]guestVolume, 0, len(prepared))
@@ -686,13 +931,11 @@ func (m *Manager) writeVMConfig(vmDir string, svc config.ServiceConfig, prepared
 			MountPath: preparedVolume.MountPath, Type: preparedVolume.Type,
 		})
 	}
-	if len(guestVolumes) > 0 {
-		payload, err := json.Marshal(guestVolumePayload{Version: 1, Volumes: guestVolumes})
-		if err != nil {
-			return "", fmt.Errorf("marshal guest volume payload: %w", err)
-		}
-		arg := "firework.volumes64=" + base64.RawURLEncoding.EncodeToString(payload)
-		kernelArgs = insertBeforeApplicationSeparator(kernelArgs, arg)
+	// The same builder Preflight uses, so an over-long command line now fails
+	// on create too rather than only on update.
+	kernelArgs, err := buildBootArgs(svc, guestVolumes)
+	if err != nil {
+		return "", err
 	}
 
 	var networkInterfaces []firecrackerNetworkInterface
