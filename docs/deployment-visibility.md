@@ -156,9 +156,12 @@ second state machine:
 
 - `published`: desired/rendered state exists, but no relevant fresh agent has
   observed the current rendered revision yet;
-- `progressing`: at least one relevant agent is applying the current revision;
+- `progressing`: at least one relevant agent is applying the current revision,
+  or every node converged but a running service's configured health check has
+  not passed yet (`service_health_pending`);
 - `converged`: every relevant node is fresh and has applied it with no false or
-  unknown blocking condition;
+  unknown blocking condition, and every running service is healthy or has no
+  health check;
 - `degraded`: convergence criteria are met, but at least one node reports a
   non-blocking condition false — the peer-route condition
   (`peer_routes_degraded`), or `VolumeSizesApplied`
@@ -169,14 +172,39 @@ second state machine:
   size, so the record is the only thing that still knows the operator's request
   stands. A service whose retained volume record could not be read is likewise
   degraded rather than converged: it keeps running its last applied
-  configuration, but the desired revision was not applied to it;
+  configuration, but the desired revision was not applied to it. A fleet
+  whose nodes converged but which runs an unhealthy service is degraded with
+  `service_unhealthy`;
 - `failed`: scheduling left a service pending, or a relevant agent reports a
   blocking failure for the current revision;
 - `unknown`: required node status is missing, unsupported, truncated, stale,
   or down.
 
 The response includes deterministic node sets for converged, degraded,
-progressing, failed, stale, down, and unknown nodes. A rendered revision with
+progressing, failed, stale, down, and unknown nodes, plus `services` counts
+(`desired`, `running`, `ready`, `pending`, `unhealthy`, `unknown`) taken from
+the same per-service projection as `/v1/services` and the sorted
+`unhealthy_services` names, so the overview needs no per-node or per-service
+request to show what is not serving. `ready` counts running services whose
+health check passed or that have none; the agent's own `ready_services` uses
+the same rule, so a configured check that has not succeeded yet is never
+counted as ready.
+
+Status freshness uses the control plane's receipt clock: a node's status is
+current only while both its last heartbeat and the receipt of that status are
+within `node_stale_ttl`. The agent's `observed_at` is diagnostic and does not
+gate freshness, so agent clock skew cannot hold status open or expire it
+early. When a node's status cannot be used, its reason code says why:
+
+| Reason | Meaning |
+| --- | --- |
+| `node_down` | The current agent reported an explicit shutdown |
+| `node_stale` | No heartbeat within `node_stale_ttl` |
+| `agent_status_invalid` | The latest heartbeat's status failed validation and was refused with `422` |
+| `agent_status_unsupported_schema` | The agent sends a status schema this control plane does not support |
+| `agent_status_missing` | The heartbeat carried no status (for example, an older agent) |
+| `agent_status_stale` | The stored status is older than `node_stale_ttl` |
+| `agent_status_revision_mismatch` | Status is fresh but describes a different revision | A rendered revision with
 zero relevant nodes can converge only when the desired service set is also
 empty, and even then only once every node the control plane has a record for
 confirms it via a fresh heartbeat that has actually observed the empty

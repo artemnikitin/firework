@@ -52,3 +52,23 @@ func freshAgentStatus(record NodeRecord, now time.Time, ttl time.Duration) (stat
 	}
 	return *record.AgentStatus, true
 }
+
+// statusUnavailableReason names why freshAgentStatus refused a node's status,
+// so a down node, a stale heartbeat, a refused payload, a missing payload, an
+// unsupported schema, and an old observation each read differently.
+func statusUnavailableReason(record NodeRecord, now time.Time, ttl time.Duration) string {
+	switch {
+	case record.State == NodeStateDown:
+		return "node_down"
+	case record.LastSeenAt.IsZero() || now.Sub(record.LastSeenAt) > ttl:
+		return "node_stale"
+	case record.AgentStatus == nil && record.AgentStatusRejected != "":
+		return record.AgentStatusRejected
+	case record.AgentStatus == nil:
+		return "agent_status_missing"
+	case record.AgentStatus.SchemaVersion != statusmodel.SchemaVersion:
+		return agentStatusRejectedUnsupportedSchema
+	default:
+		return "agent_status_stale"
+	}
+}

@@ -332,7 +332,7 @@ func (a *Agent) refreshAgentStatus(phase statusmodel.Phase, code, message string
 				service.ReasonCode = "health_check_failed"
 			}
 		}
-		if service.VMState == "running" && service.Health != "unhealthy" {
+		if serviceReady(service) {
 			ready++
 		}
 		service.RestartCount = a.restartCounts[desired.Name]
@@ -431,6 +431,14 @@ func (a *Agent) agentStatusSnapshot() statusmodel.AgentStatus {
 	out.Conditions = append([]statusmodel.Condition(nil), a.currentStatus.Conditions...)
 	out.Services = append([]statusmodel.ServiceStatus(nil), a.currentStatus.Services...)
 	return out
+}
+
+// serviceReady reports whether a service counts toward ready_services: it is
+// running and either has no health check or a passing one. A configured check
+// that has not succeeded yet is not ready, even though it is not known to be
+// unhealthy either.
+func serviceReady(service statusmodel.ServiceStatus) bool {
+	return service.VMState == "running" && (service.Health == "healthy" || service.Health == "not_configured")
 }
 
 func (a *Agent) refreshAgentStatusFromRuntime() {

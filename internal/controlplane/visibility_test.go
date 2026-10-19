@@ -738,3 +738,93 @@ func putNode(t *testing.T, ctx context.Context, store StateStore, cfg Config, re
 		t.Fatal(err)
 	}
 }
+
+// A fleet whose node converged is still not converged while one of its
+// services is not serving: running does not imply healthy.
+func TestRevisionStatusAccountsForServiceHealth(t *testing.T) {
+	tests := []struct {
+		health     string
+		wantPhase  string
+		wantReason string
+		wantReady  int
+	}{
+		{health: "healthy", wantPhase: "converged", wantReady: 1},
+		{health: "not_configured", wantPhase: "converged", wantReady: 1},
+		{health: "unhealthy", wantPhase: "degraded", wantReason: "service_unhealthy"},
+		{health: "unknown", wantPhase: "progressing", wantReason: "service_health_pending"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.health, func(t *testing.T) {
+			ctx := context.Background()
+			store := newBlobStateStore(newMemBlob())
+			cfg := validConfigForRole(RoleAPI)
+			cfg.NodeStaleTTL = time.Minute
+			now := time.Now().UTC()
+			desired := DesiredRevision{Revision: "desired-1", Services: []config.ServiceConfig{{Name: "service"}}}
+			placement := PlacementRevision{Revision: "placement-1", DesiredRevision: desired.Revision, NodeConfigs: []config.NodeConfig{{Node: "node-1", Services: desired.Services}}}
+			putCurrentState(t, ctx, store, desired, placement, "rendered-1")
+			agent := currentAgentStatus(statusmodel.PhaseReady, "rendered-1")
+			agent.Services[0].Health = tt.health
+			putNode(t, ctx, store, cfg, NodeRecord{NodeID: "node-1", State: NodeStateReady, LastSeenAt: now, AgentStatus: agent})
+
+			got, err := NewVisibilityService(cfg, store).Revision(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got.Phase != tt.wantPhase || got.ReasonCode != tt.wantReason {
+				t.Fatalf("phase/reason = %s/%s, want %s/%s", got.Phase, got.ReasonCode, tt.wantPhase, tt.wantReason)
+			}
+			if got.Services.Desired != 1 || got.Services.Running != 1 || got.Services.Ready != tt.wantReady {
+				t.Fatalf("service counts = %#v", got.Services)
+			}
+			if wantUnhealthy := tt.health == "unhealthy"; (len(got.UnhealthyServices) == 1) != wantUnhealthy || got.Services.Unhealthy != len(got.UnhealthyServices) {
+				t.Fatalf("unhealthy services = %v, counts %#v", got.UnhealthyServices, got.Services)
+			}
+		})
+	}
+}
+
+func TestStatusUnavailableReasonsAreDistinct(t *testing.T) {
+	now := time.Now().UTC()
+	old := now.Add(-time.Hour)
+	tests := []struct {
+		name   string
+		record NodeRecord
+		want   string
+	}{
+		{name: "down", record: NodeRecord{State: NodeStateDown, LastSeenAt: now}, want: "node_down"},
+		{name: "stale heartbeat", record: NodeRecord{State: NodeStateReady, LastSeenAt: old, AgentStatus: &statusmodel.AgentStatus{SchemaVersion: 1}}, want: "node_stale"},
+		{name: "rejected", record: NodeRecord{State: NodeStateReady, LastSeenAt: now, AgentStatusRejected: agentStatusRejectedInvalid}, want: "agent_status_invalid"},
+		{name: "rejected newer schema", record: NodeRecord{State: NodeStateReady, LastSeenAt: now, AgentStatusRejected: agentStatusRejectedUnsupportedSchema}, want: "agent_status_unsupported_schema"},
+		{name: "missing", record: NodeRecord{State: NodeStateReady, LastSeenAt: now}, want: "agent_status_missing"},
+		{name: "stored unsupported schema", record: NodeRecord{State: NodeStateReady, LastSeenAt: now, AgentStatus: &statusmodel.AgentStatus{SchemaVersion: 99}}, want: "agent_status_unsupported_schema"},
+		{name: "old observation", record: NodeRecord{State: NodeStateReady, LastSeenAt: now, AgentStatusReceivedAt: old, AgentStatus: &statusmodel.AgentStatus{SchemaVersion: 1}}, want: "agent_status_stale"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if _, fresh := freshAgentStatus(tt.record, now, time.Minute); fresh {
+				t.Fatal("fixture unexpectedly fresh")
+			}
+			if got := statusUnavailableReason(tt.record, now, time.Minute); got != tt.want {
+				t.Fatalf("reason = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+// Freshness is judged on the registry's receipt clock. An agent whose clock
+// runs far behind still reports current status, and one whose clock runs
+// ahead cannot keep an old status fresh.
+func TestAgentStatusFreshnessUsesReceiptTime(t *testing.T) {
+	now := time.Now().UTC()
+	skewedBehind := NodeRecord{State: NodeStateReady, LastSeenAt: now, AgentStatusReceivedAt: now,
+		AgentStatus: &statusmodel.AgentStatus{SchemaVersion: 1, ObservedAt: now.Add(-24 * time.Hour)}}
+	if _, fresh := freshAgentStatus(skewedBehind, now, time.Minute); !fresh {
+		t.Fatal("status received just now was stale because the agent clock lags")
+	}
+	skewedAhead := NodeRecord{State: NodeStateReady, LastSeenAt: now, AgentStatusReceivedAt: now.Add(-time.Hour),
+		AgentStatus: &statusmodel.AgentStatus{SchemaVersion: 1, ObservedAt: now.Add(time.Hour)}}
+	if _, fresh := freshAgentStatus(skewedAhead, now, time.Minute); fresh {
+		t.Fatal("an hour-old status stayed fresh because the agent clock runs ahead")
+	}
+}

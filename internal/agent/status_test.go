@@ -169,3 +169,22 @@ func TestBuildVolumeStatusesReportsRejectionsWithTheRequestedGeneration(t *testi
 		t.Fatalf("an unrejected volume was relabelled: %#v", other)
 	}
 }
+
+func TestServiceReadyRequiresAPassingOrAbsentHealthCheck(t *testing.T) {
+	tests := []struct {
+		vmState, health string
+		want            bool
+	}{
+		{"running", "healthy", true},
+		{"running", "not_configured", true},
+		{"running", "unknown", false}, // configured but not yet checked
+		{"running", "unhealthy", false},
+		{"starting", "not_configured", false},
+		{"stopped", "healthy", false},
+	}
+	for _, tt := range tests {
+		if got := serviceReady(statusmodel.ServiceStatus{VMState: tt.vmState, Health: tt.health}); got != tt.want {
+			t.Errorf("serviceReady(%s, %s) = %v, want %v", tt.vmState, tt.health, got, tt.want)
+		}
+	}
+}

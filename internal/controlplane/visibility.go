@@ -509,10 +509,8 @@ func (s visibilitySnapshot) nodeSummary(record NodeRecord) operatorapi.NodeSumma
 				}
 			}
 		}
-	} else if record.AgentStatus == nil {
-		summary.ReasonCode = "agent_status_missing"
 	} else {
-		summary.ReasonCode = "agent_status_stale"
+		summary.ReasonCode = statusUnavailableReason(record, s.now, s.staleTTL)
 	}
 	return summary
 }
@@ -582,7 +580,50 @@ func (s visibilitySnapshot) statusObservedCurrent(status statusmodel.AgentStatus
 		status.ObservedRevision == s.renderedRevision
 }
 
+// revisionStatus is the fleet view: the node-level derivation plus service
+// counts from the same per-service projection /v1/services serves. A fleet
+// whose nodes all converged is still not converged while a service is
+// unhealthy or its configured health check has not passed yet, because
+// running does not mean serving.
 func (s visibilitySnapshot) revisionStatus() operatorapi.RevisionStatus {
+	status := s.nodeRevisionStatus()
+	status.UnhealthyServices = []string{}
+	for _, desired := range s.desired.Services {
+		summary := s.serviceSummary(desired)
+		status.Services.Desired++
+		switch summary.State {
+		case "running":
+			status.Services.Running++
+			if summary.Health == "healthy" || summary.Health == "not_configured" {
+				status.Services.Ready++
+			}
+		case "pending":
+			status.Services.Pending++
+		case "unknown":
+			status.Services.Unknown++
+		}
+		if summary.Health == "unhealthy" {
+			status.Services.Unhealthy++
+			status.UnhealthyServices = append(status.UnhealthyServices, desired.Name)
+		}
+	}
+	sort.Strings(status.UnhealthyServices)
+	if status.Phase != "converged" {
+		return status
+	}
+	switch {
+	case status.Services.Unhealthy > 0:
+		status.Phase = "degraded"
+		status.ReasonCode = "service_unhealthy"
+		status.Message = statusmodel.BoundedMessage("unhealthy: " + strings.Join(status.UnhealthyServices, ", "))
+	case status.Services.Ready < status.Services.Running:
+		status.Phase = "progressing"
+		status.ReasonCode = "service_health_pending"
+	}
+	return status
+}
+
+func (s visibilitySnapshot) nodeRevisionStatus() operatorapi.RevisionStatus {
 	status := operatorapi.RevisionStatus{
 		APIVersion: operatorapi.APIVersion, ObservedAt: s.now, Phase: "unknown",
 		DesiredRevision: s.desired.Revision, PlacementRevision: s.placement.Revision,
@@ -900,6 +941,7 @@ func (s visibilitySnapshot) serviceSummary(desired config.ServiceConfig) operato
 		}
 		stale, fresh := s.freshStatus(record)
 		if !fresh {
+			summary.ReasonCode = statusUnavailableReason(record, s.now, s.staleTTL)
 			return summary
 		}
 		// The node has not applied the current revision, which the reason code

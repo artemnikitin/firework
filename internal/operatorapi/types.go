@@ -97,8 +97,24 @@ type RevisionStatus struct {
 	StaleNodes        []string  `json:"stale_nodes"`
 	DownNodes         []string  `json:"down_nodes"`
 	UnknownNodes      []string  `json:"unknown_nodes"`
-	ReasonCode        string    `json:"reason_code,omitempty"`
-	Message           string    `json:"message,omitempty"`
+	// Services counts desired services by their projected /v1/services
+	// state, so the overview needs no second request to show unhealthy or
+	// pending work. UnhealthyServices names the unhealthy ones.
+	Services          ServiceCounts `json:"services"`
+	UnhealthyServices []string      `json:"unhealthy_services"`
+	ReasonCode        string        `json:"reason_code,omitempty"`
+	Message           string        `json:"message,omitempty"`
+}
+
+// ServiceCounts summarizes desired services. Ready counts running services
+// whose health check passed or that have none.
+type ServiceCounts struct {
+	Desired   int `json:"desired"`
+	Running   int `json:"running"`
+	Ready     int `json:"ready"`
+	Pending   int `json:"pending"`
+	Unhealthy int `json:"unhealthy"`
+	Unknown   int `json:"unknown"`
 }
 
 // VolumeAllocationSummary reserves the larger desired or applied size for
