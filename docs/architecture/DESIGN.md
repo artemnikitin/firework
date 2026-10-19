@@ -66,7 +66,9 @@ Node discovery is based on explicit registry records with lease freshness:
 
 1. Nodes enroll with mTLS certs and register identity/capacity.
 2. Nodes send periodic heartbeats with current capacity/usage.
-3. Controller schedules only nodes with `state=ready` and non-expired lease.
+3. Controller schedules only nodes with `state=ready` and non-expired lease,
+   and places a service only on nodes whose registered labels include its
+   `node_type`.
 
 Registry state is persisted in S3 or GCS objects under
 `cp/v1/registry/nodes/*.json`.

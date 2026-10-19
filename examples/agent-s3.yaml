@@ -2,8 +2,8 @@
 # Place on each node at /etc/firework/agent.yaml.
 #
 # In this mode the control-plane controller writes enriched configs to S3 and
-# the agent polls the bucket for changes. The agent's node_name must
-# match a node_type used in the enricher input service specs.
+# the agent polls the bucket for changes. The controller places a service
+# only on nodes whose node_labels include the service's node_type.
 #
 # AWS credentials are resolved from the standard chain:
 #   1. Environment variables (AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY)
@@ -18,6 +18,12 @@ node_id: "node-1"
 # node_names:
 #   - "web"
 #   - "backend"
+
+# Scheduling labels reported to the control-plane registry and matched against
+# service node_type. Defaults to node_names; set it explicitly when node_names
+# holds an instance ID rather than node types.
+# node_labels:
+#   - "general-purpose"
 
 # Config store settings
 store_type: "s3"

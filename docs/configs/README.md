@@ -26,6 +26,9 @@ Examples:
 - `store_type: "gcs"` requires `gcs_bucket`.
 - If `node_name` is empty and `node_names` is empty, hostname is used.
 - If `node_names` is empty but `node_name` is set, `node_names` becomes `[node_name]`.
+- Each `node_labels` value must be a canonical node label: 1-63 lower-case
+  letters, digits, or internal `-` characters. Values are de-duplicated and
+  sorted, never coerced.
 
 ### Field reference
 
@@ -33,7 +36,8 @@ Examples:
 |---|---|---|---|
 | `node_id` | no | derived from `node_name` | Stable registry identity for mTLS control-plane integration. Max 128 bytes when `registry_url` is set (rejected, not truncated, since it is matched for exact equality against reported volume `bound_node`) |
 | `node_name` | no | host name | Display/identity name for this node |
-| `node_names` | no | derived from `node_name` | Labels to fetch and merge (`nodes/<label>.yaml`) |
+| `node_names` | no | derived from `node_name` | Config objects to fetch and merge (`nodes/<label>.yaml`). Reported as scheduling labels only when `node_labels` is empty |
+| `node_labels` | no | `node_names` | Scheduling labels reported to the control-plane registry and matched against service `node_type`. No effect without a control plane. See [Node types and scheduling labels](#node-types-and-scheduling-labels) |
 | `store_type` | no | `git` | `git`, `s3`, or `gcs` |
 | `store_url` | git mode | - | Git repository URL |
 | `store_branch` | no | `main` | Git branch |
@@ -172,7 +176,7 @@ Supported fields:
 |---|---|---|
 | `name` | yes | Service name (unique) |
 | `image` | yes | Rootfs path used by runtime |
-| `node_type` | yes | Group key used by direct enricher output. The control-plane scheduler does not yet enforce it against registry labels; see [issue #21](https://github.com/artemnikitin/firework/issues/21) |
+| `node_type` | yes | Hard placement requirement: the control-plane scheduler places the service only on a node whose registered labels include it. Also the group key, and so the `nodes/<node_type>.yaml` name, of direct enricher output. Canonical node-label syntax (1-63 lower-case letters, digits, or internal `-`). See [Node types and scheduling labels](#node-types-and-scheduling-labels) |
 | `kernel` | no | Kernel path |
 | `vcpus` | no | vCPU count |
 | `memory_mb` | no | Memory in MiB |
@@ -216,6 +220,40 @@ one of them would ever receive traffic.
 - The agent rejects a rendered node config whose services conflict on a host
   port before changing any networking or service state, reporting
   `host_port_conflict` and leaving the revision unapplied.
+
+#### Node types and scheduling labels
+
+`node_type` is a hard requirement; `anti_affinity_group` is a preference.
+
+- An agent registers its `node_labels` (or, when that is empty, its
+  `node_names`) with the control-plane registry. A service with
+  `node_type: compute` is eligible only for a ready node advertising the
+  `compute` label; matching is exact.
+- The label filter runs before capacity, host-port, and storage checks, and
+  anti-affinity is evaluated among eligible nodes only. A node with spare
+  capacity but without the label is never used.
+- When no active node advertises the label the service stays `pending` with
+  reason `no_matching_node_type`. When matching nodes exist but none fits, the
+  usual reason (`insufficient_compute_capacity`, `host_port_conflict`, or a
+  storage reason) is reported for the matching nodes. A service whose local
+  volumes are bound to a node that lacks the label is also
+  `no_matching_node_type`, because its data cannot move.
+- An existing placement is kept only while its node still advertises the
+  label. If the label disappears the service moves to another matching node,
+  or, if there is none, becomes pending — and a pending service is omitted from
+  the rendered configs, so its VM is stopped.
+- Labels are read at registration, so changing `node_labels` takes effect when
+  the agent restarts and re-registers.
+- Desired revisions published before `node_type` was carried into the resolved
+  service have no `node_type` and remain unconstrained until the events role
+  republishes.
+- A service held because its volume record is unreadable keeps running at its
+  last placement, without the label check, until the record is repaired.
+- Direct Git and object-storage modes are unchanged: the agent fetches the
+  `node_names` objects and `node_labels` has no effect.
+
+Deployments whose `node_names` are instance IDs must set `node_labels` to the
+node types they serve before services can be placed on them.
 
 ### 2.3 `tenants/*` (optional)
 

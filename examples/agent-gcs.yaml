@@ -2,8 +2,8 @@
 # Place on each node at /etc/firework/agent.yaml.
 #
 # In this mode the control-plane controller writes enriched configs to GCS and
-# the agent polls the bucket for changes. The agent's node_name must
-# match a node_type used in the enricher input service specs.
+# the agent polls the bucket for changes. The controller places a service
+# only on nodes whose node_labels include the service's node_type.
 #
 # GCP credentials are resolved via Application Default Credentials:
 #   1. GOOGLE_APPLICATION_CREDENTIALS env var (service-account JSON)
@@ -18,6 +18,12 @@ node_id: "node-1"
 # node_names:
 #   - "web"
 #   - "backend"
+
+# Scheduling labels reported to the control-plane registry and matched against
+# service node_type. Defaults to node_names; set it explicitly when node_names
+# holds an instance ID rather than node types.
+# node_labels:
+#   - "general-purpose"
 
 # Config store settings
 store_type: "gcs"
