@@ -9,10 +9,10 @@ import (
 	"log/slog"
 	"os"
 	"sort"
-	"strings"
 	"time"
 
 	"github.com/artemnikitin/firework/internal/config"
+	"github.com/artemnikitin/firework/internal/objectstorage"
 	"github.com/artemnikitin/firework/internal/scheduler"
 	"gopkg.in/yaml.v3"
 )
@@ -171,7 +171,7 @@ func (c *Controller) runReconcile(ctx context.Context) {
 	// pool it would land in. discoverActiveNodes does not read volume records,
 	// so the move is safe, and schedulingInputSignature is computed after both
 	// either way.
-	activeNodes, hostIPByNode, err := c.discoverActiveNodes(ctx)
+	activeNodes, hostIPByNode, knownNodeIDs, err := c.discoverActiveNodes(ctx)
 	if err != nil {
 		c.logger.Error("discovering active nodes failed", "error", err)
 		return
@@ -254,12 +254,19 @@ func (c *Controller) runReconcile(ctx context.Context) {
 	}
 	applyHostIPAndCrossNodeLinks(nodeConfigs, hostIPByNode)
 
+	tombstones := c.inactiveNodeTombstones(ctx, knownNodeIDs, nodeConfigs, desired.Services)
+
 	renderRev := newRevision("rendered")
 	placementID := newRevision("placement")
 	for i := range nodeConfigs {
 		nodeConfigs[i].DesiredRevision = desired.Revision
 		nodeConfigs[i].PlacementRevision = placementID
 		nodeConfigs[i].RenderedRevision = renderRev
+	}
+	for i := range tombstones {
+		tombstones[i].config.DesiredRevision = desired.Revision
+		tombstones[i].config.PlacementRevision = placementID
+		tombstones[i].config.RenderedRevision = renderRev
 	}
 	placementRev := PlacementRevision{
 		Revision:        placementID,
@@ -289,7 +296,7 @@ func (c *Controller) runReconcile(ctx context.Context) {
 		return
 	}
 
-	if err := c.publishRendered(ctx, renderRev, nodeConfigs); err != nil {
+	if err := c.publishRendered(ctx, renderRev, nodeConfigs, tombstones); err != nil {
 		c.logger.Error("publishing rendered configs failed", "error", err)
 		return
 	}
@@ -301,18 +308,24 @@ func (c *Controller) runReconcile(ctx context.Context) {
 		"rendered_revision", renderRev,
 		"services", len(desired.Services),
 		"nodes", len(nodeConfigs),
+		"inactive_tombstones", len(tombstones),
 		"pending_services", len(pending),
 	)
 }
 
-func (c *Controller) discoverActiveNodes(ctx context.Context) ([]scheduler.Node, map[string]string, error) {
+// discoverActiveNodes returns the nodes eligible for scheduling, their host
+// IPs, and the ID of every node with a readable registry record in any state.
+// The known set is what inactive-node tombstones are drawn from; a record that
+// cannot be read is in neither, so its node's config is left untouched.
+func (c *Controller) discoverActiveNodes(ctx context.Context) ([]scheduler.Node, map[string]string, []string, error) {
 	keys, err := c.store.ListKeys(ctx, registryNodesPrefix(c.cfg.State.Prefix))
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 
 	now := time.Now().UTC()
 	var nodes []scheduler.Node
+	var known []string
 	hostIPByNode := make(map[string]string)
 	for _, key := range keys {
 		var rec NodeRecord
@@ -323,6 +336,11 @@ func (c *Controller) discoverActiveNodes(ctx context.Context) ([]scheduler.Node,
 		}
 		if !exists {
 			continue
+		}
+		// Only a record stored under its own node's key identifies that node;
+		// anything else could direct a tombstone at the wrong config.
+		if ownKey, err := nodeRecordKey(c.cfg.State.Prefix, rec.NodeID); err == nil && ownKey == key {
+			known = append(known, rec.NodeID)
 		}
 		if rec.State != NodeStateReady {
 			continue
@@ -348,7 +366,8 @@ func (c *Controller) discoverActiveNodes(ctx context.Context) ([]scheduler.Node,
 	sort.Slice(nodes, func(i, j int) bool {
 		return nodes[i].InstanceID < nodes[j].InstanceID
 	})
-	return nodes, hostIPByNode, nil
+	sort.Strings(known)
+	return nodes, hostIPByNode, known, nil
 }
 
 // renderedPlacement is one service as the previous cycle actually rendered it:
@@ -549,12 +568,18 @@ func (c *Controller) publishPlacement(ctx context.Context, placement PlacementRe
 	return upsertPointer(ctx, c.store, placementCurrentKey(c.cfg.State.Prefix), placement.Revision)
 }
 
-func (c *Controller) publishRendered(ctx context.Context, renderRev string, nodeConfigs []config.NodeConfig) error {
+// publishRendered writes the immutable rendered revision and the current
+// per-node configs, then flips the rendered pointer.
+//
+// It never deletes a nodes/<node>.yaml. An agent reads a missing config as
+// "desired state unknown" and keeps running what it has, so deleting a config
+// is never how a node is told to stop; an explicit `services: []` is. A key
+// outside this publication is either replaced by a tombstone, when that was
+// proven safe, or left exactly as it was.
+func (c *Controller) publishRendered(ctx context.Context, renderRev string, nodeConfigs []config.NodeConfig, tombstones []nodeTombstone) error {
 	if !c.stillLeader(ctx) {
 		return fmt.Errorf("lost leadership before rendered publish")
 	}
-
-	desiredLegacyKeys := make(map[string]struct{}, len(nodeConfigs))
 
 	for _, nc := range nodeConfigs {
 		data, err := yaml.Marshal(nc)
@@ -567,31 +592,139 @@ func (c *Controller) publishRendered(ctx context.Context, renderRev string, node
 		}
 
 		legacyKey := legacyNodeConfigKey(c.cfg.State.Prefix, nc.Node)
-		desiredLegacyKeys[legacyKey] = struct{}{}
 		if _, err := c.store.PutRaw(ctx, legacyKey, data, "application/x-yaml"); err != nil {
 			return err
 		}
 	}
 
-	// Clean stale legacy node configs so agents that still read nodes/<node>.yaml
-	// don't keep obsolete placements forever.
-	keys, err := c.store.ListKeys(ctx, legacyNodesPrefix(c.cfg.State.Prefix))
-	if err != nil {
-		return err
-	}
-	for _, key := range keys {
-		if !strings.HasSuffix(key, ".yaml") {
-			continue
-		}
-		if _, keep := desiredLegacyKeys[key]; keep {
-			continue
-		}
-		if err := c.store.Delete(ctx, key); err != nil {
+	for _, tombstone := range tombstones {
+		if err := c.publishTombstone(ctx, renderRev, tombstone); err != nil {
 			return err
 		}
 	}
 
 	return upsertPointer(ctx, c.store, renderedCurrentKey(c.cfg.State.Prefix), renderRev)
+}
+
+// nodeTombstone is an explicit empty config for a known node outside this
+// cycle's placement, together with the write token of the current config it
+// was proven safe against.
+type nodeTombstone struct {
+	config config.NodeConfig
+	token  objectstorage.WriteToken
+	exists bool
+}
+
+// publishTombstone writes an empty config for a node outside the placement.
+// The current key is replaced only if it is still the version that was
+// evaluated: anything written since was not proven safe to empty, and it is
+// left for the next cycle to evaluate rather than overwritten blind.
+func (c *Controller) publishTombstone(ctx context.Context, renderRev string, tombstone nodeTombstone) error {
+	data, err := yaml.Marshal(tombstone.config)
+	if err != nil {
+		return fmt.Errorf("marshal node tombstone %s: %w", tombstone.config.Node, err)
+	}
+	renderKey := renderedNodeKey(c.cfg.State.Prefix, renderRev, tombstone.config.Node)
+	if _, err := c.store.PutRaw(ctx, renderKey, data, "application/x-yaml"); err != nil {
+		return err
+	}
+	legacyKey := legacyNodeConfigKey(c.cfg.State.Prefix, tombstone.config.Node)
+	var written bool
+	if tombstone.exists {
+		written, _, err = c.store.PutRawIfMatch(ctx, legacyKey, tombstone.token, data, "application/x-yaml")
+	} else {
+		written, _, err = c.store.PutRawIfAbsent(ctx, legacyKey, data, "application/x-yaml")
+	}
+	if err != nil {
+		return err
+	}
+	if !written {
+		c.logger.Warn("node config changed while being retired; leaving it for the next cycle",
+			"node", tombstone.config.Node)
+	}
+	return nil
+}
+
+// inactiveNodeTombstones decides which known nodes outside this cycle's
+// placement receive an explicit empty config.
+//
+// A node leaves the placement when it stops being schedulable — draining,
+// down, stale, or without reported capacity — and its services are then
+// placed elsewhere or left pending. Its agent may still be running them, and
+// may still be polling its config, so that config must eventually say
+// `services: []` or the old copies run forever beside the new ones. But
+// emptying it is only safe when nothing in it is still needed there: a service
+// that is still desired yet placed on no active node is running only on that
+// node, if anywhere, and emptying the config would evict it. That is also the
+// fleet-wide case: when every node goes stale at once (a registry outage),
+// every desired service is pending, every config still holds one, and nothing
+// is touched.
+//
+// So the decision is made against the node's *current* config, not the prior
+// placement — a pending service has already dropped out of the placement, but
+// not out of the config its node is still running. A node is tombstoned when
+// every service in that config is either gone from desired state or placed on
+// an active node in this cycle. A missing config holds nothing and is safe to
+// tombstone; an unreadable or unparseable one is left untouched, because its
+// contents are unknown.
+func (c *Controller) inactiveNodeTombstones(ctx context.Context, knownNodeIDs []string, nodeConfigs []config.NodeConfig, desired []config.ServiceConfig) []nodeTombstone {
+	placed := make(map[string]struct{}, len(nodeConfigs))
+	placedServices := make(map[string]struct{})
+	for _, nc := range nodeConfigs {
+		placed[nc.Node] = struct{}{}
+		for _, svc := range nc.Services {
+			placedServices[svc.Name] = struct{}{}
+		}
+	}
+	desiredServices := make(map[string]struct{}, len(desired))
+	for _, svc := range desired {
+		desiredServices[svc.Name] = struct{}{}
+	}
+
+	var tombstones []nodeTombstone
+	for _, nodeID := range knownNodeIDs {
+		if _, ok := placed[nodeID]; ok {
+			continue
+		}
+		key := legacyNodeConfigKey(c.cfg.State.Prefix, nodeID)
+		data, token, exists, err := c.store.GetRaw(ctx, key)
+		if err != nil {
+			c.logger.Warn("reading inactive node config failed; leaving it untouched", "node", nodeID, "error", err)
+			continue
+		}
+		if exists {
+			current, err := config.ParseNodeConfig(data)
+			if err != nil {
+				c.logger.Warn("inactive node config is unreadable; leaving it untouched", "node", nodeID, "error", err)
+				continue
+			}
+			if service, stranded := strandedService(current, desiredServices, placedServices); stranded {
+				c.logger.Info("inactive node still holds an unplaced desired service; leaving its config untouched",
+					"node", nodeID, "service", service)
+				continue
+			}
+		}
+		tombstones = append(tombstones, nodeTombstone{
+			config: config.NodeConfig{Node: nodeID, Services: []config.ServiceConfig{}},
+			token:  token,
+			exists: exists,
+		})
+	}
+	return tombstones
+}
+
+// strandedService reports a service in current that is still desired but has
+// no active placement, and so may be running nowhere but on current's node.
+func strandedService(current config.NodeConfig, desired, placed map[string]struct{}) (string, bool) {
+	for _, svc := range current.Services {
+		if _, wanted := desired[svc.Name]; !wanted {
+			continue
+		}
+		if _, elsewhere := placed[svc.Name]; !elsewhere {
+			return svc.Name, true
+		}
+	}
+	return "", false
 }
 
 // appendRetiredNodeConfigs adds an explicit empty config for every active node
@@ -613,8 +746,9 @@ func (c *Controller) publishRendered(ctx context.Context, renderRev string, node
 // revisions can never satisfy the fleet view's observed check.
 //
 // Nodes missing from activeNodes entirely (down, stale, or decommissioned)
-// are deliberately not included: they are not part of this placement at all,
-// and publishRendered's stale-key cleanup still applies to them.
+// are deliberately not included: they are not part of this placement, and the
+// fleet view would otherwise wait forever on nodes that may never return.
+// inactiveNodeTombstones handles their configs outside the placement.
 func appendRetiredNodeConfigs(nodeConfigs []config.NodeConfig, activeNodes []scheduler.Node) []config.NodeConfig {
 	placed := make(map[string]struct{}, len(nodeConfigs))
 	for _, nc := range nodeConfigs {

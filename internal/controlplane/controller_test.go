@@ -172,7 +172,9 @@ func TestAppendRetiredNodeConfigs(t *testing.T) {
 }
 
 // A node absent from activeNodes entirely (down, stale, decommissioned) is not
-// part of this placement and must not be resurrected into it.
+// part of this placement and must not be resurrected into it: the fleet view
+// would then wait on a node that may never return. Its config is retired
+// outside the placement by inactiveNodeTombstones instead.
 func TestAppendRetiredNodeConfigsIgnoresInactiveNodes(t *testing.T) {
 	got := appendRetiredNodeConfigs(
 		[]config.NodeConfig{{Node: "node-b", Services: []config.ServiceConfig{{Name: "web"}}}},
