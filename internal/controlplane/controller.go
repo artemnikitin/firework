@@ -194,7 +194,7 @@ func (c *Controller) runReconcile(ctx context.Context) {
 		return
 	}
 
-	inputSig, err := schedulingInputSignature(desired.Revision, activeNodes, hostIPByNode, volumeRecordsDigest(volumeRecords))
+	inputSig, err := schedulingInputSignature(desired.Revision, activeNodes, hostIPByNode, knownNodeIDs, volumeRecordsDigest(volumeRecords))
 	if err != nil {
 		c.logger.Error("failed to compute scheduling input signature; skipping signature cache optimization", "error", err)
 	}
@@ -321,9 +321,11 @@ func (c *Controller) runReconcile(ctx context.Context) {
 }
 
 // discoverActiveNodes returns the nodes eligible for scheduling, their host
-// IPs, and the ID of every node with a readable registry record in any state.
-// The known set is what inactive-node tombstones are drawn from; a record that
-// cannot be read is in neither, so its node's config is left untouched.
+// IPs, and the sorted ID of every node with a readable registry record in any
+// state. The known set is what inactive-node tombstones are drawn from; a
+// record that cannot be read is in neither, so its node's config is left
+// untouched this cycle. The known set is part of the input signature, so the
+// node is evaluated again once its record reads.
 func (c *Controller) discoverActiveNodes(ctx context.Context) ([]scheduler.Node, map[string]string, []string, error) {
 	keys, err := c.store.ListKeys(ctx, registryNodesPrefix(c.cfg.State.Prefix))
 	if err != nil {
@@ -837,10 +839,18 @@ func applyHostIPAndCrossNodeLinks(nodeConfigs []config.NodeConfig, hostIPByNode 
 	}
 }
 
-func schedulingInputSignature(desiredRevision string, nodes []scheduler.Node, hostIPByNode map[string]string, volumeDigest string) (string, error) {
+func schedulingInputSignature(desiredRevision string, nodes []scheduler.Node, hostIPByNode map[string]string, knownNodeIDs []string, volumeDigest string) (string, error) {
 	// Intentionally excludes runtime "used" resources from node heartbeats.
 	// Current scheduler decisions are based on node total capacity plus desired
 	// assignment bookkeeping, not host-reported instantaneous utilization.
+	//
+	// Known node IDs are included because inactive-node tombstones are drawn
+	// from them. A node whose registry record could not be read is absent from
+	// the set; when the read recovers it reappears, the signature changes, and
+	// the cycle that evaluates its tombstone runs. Without them an inactive
+	// node leaves the active set unchanged, the failed cycle stays cached, and
+	// its tombstone is never retried. A record that stays unreadable keeps the
+	// set stable, so it does not force a new revision every tick.
 	type nodeInput struct {
 		ID                  string `json:"id"`
 		CapacityV           int    `json:"capacity_v"`
@@ -853,10 +863,12 @@ func schedulingInputSignature(desiredRevision string, nodes []scheduler.Node, ho
 	payload := struct {
 		DesiredRevision     string      `json:"desired_revision"`
 		Nodes               []nodeInput `json:"nodes"`
+		KnownNodes          []string    `json:"known_nodes,omitempty"`
 		VolumeRecordsDigest string      `json:"volume_records_digest,omitempty"`
 	}{
 		DesiredRevision:     desiredRevision,
 		Nodes:               make([]nodeInput, 0, len(nodes)),
+		KnownNodes:          knownNodeIDs,
 		VolumeRecordsDigest: volumeDigest,
 	}
 	for _, n := range nodes {

@@ -314,3 +314,79 @@ func TestDeferredTombstoneIsRetriedOnTheNextCycle(t *testing.T) {
 		t.Fatal("a fully applied cycle was not cached")
 	}
 }
+
+// failingRecordStore fails GetJSON for one key a set number of times; a
+// negative count fails it on every read.
+type failingRecordStore struct {
+	StateStore
+	key   string
+	fails int
+}
+
+func (s *failingRecordStore) GetJSON(ctx context.Context, key string, out any) (objectstorage.WriteToken, bool, error) {
+	if key == s.key && s.fails != 0 {
+		if s.fails > 0 {
+			s.fails--
+		}
+		return "", false, errors.New("transient registry read failure")
+	}
+	return s.StateStore.GetJSON(ctx, key, out)
+}
+
+func placementPointer(t *testing.T, store StateStore) string {
+	t.Helper()
+	var ptr RevisionPointer
+	if _, _, err := store.GetJSON(context.Background(), placementCurrentKey(emptyStatePrefix), &ptr); err != nil {
+		t.Fatal(err)
+	}
+	return ptr.Revision
+}
+
+// An inactive node whose registry record cannot be read drops out of
+// discovery without changing the active set. If that cycle were cached under
+// a signature that ignores the known set, recovering the read would leave the
+// signature unchanged, and the node's tombstone would never be evaluated.
+func TestRegistryReadFailureDoesNotStrandRetirement(t *testing.T) {
+	c, store := emptyStateController(t)
+	now := time.Now().UTC()
+	putDesired(t, store, "desired-1", testService("web"))
+	putEmptyStateNode(t, store, "node-a", NodeStateReady, now)
+	putEmptyStateNode(t, store, "node-b", NodeStateDown, now)
+	original := nodeConfigYAML(t, "node-b", "web")
+	putNodeConfig(t, store, "node-b", original)
+	recordKey, err := nodeRecordKey(emptyStatePrefix, "node-b")
+	if err != nil {
+		t.Fatal(err)
+	}
+	c.store = &failingRecordStore{StateStore: store, key: recordKey, fails: 1}
+
+	c.runReconcile(context.Background())
+	if got, _ := readNodeConfig(t, store, "node-b"); !bytes.Equal(got, original) {
+		t.Fatalf("node with an unreadable registry record was rewritten:\n%s", got)
+	}
+
+	c.runReconcile(context.Background())
+	requireExplicitEmpty(t, store, "node-b", currentPlacement(t, store))
+}
+
+// A record that stays unreadable must not defeat the cache: every uncached
+// cycle publishes a new placement and rendered revision.
+func TestPersistentRegistryReadFailureStillCaches(t *testing.T) {
+	c, store := emptyStateController(t)
+	now := time.Now().UTC()
+	putDesired(t, store, "desired-1", testService("web"))
+	putEmptyStateNode(t, store, "node-a", NodeStateReady, now)
+	putEmptyStateNode(t, store, "node-b", NodeStateDown, now)
+	recordKey, err := nodeRecordKey(emptyStatePrefix, "node-b")
+	if err != nil {
+		t.Fatal(err)
+	}
+	c.store = &failingRecordStore{StateStore: store, key: recordKey, fails: -1}
+
+	c.runReconcile(context.Background())
+	first := placementPointer(t, store)
+	c.runReconcile(context.Background())
+	if second := placementPointer(t, store); second != first {
+		t.Fatalf("a persistently unreadable record republished placement: %s then %s", first, second)
+	}
+}
