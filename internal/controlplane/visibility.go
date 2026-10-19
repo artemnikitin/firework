@@ -666,9 +666,9 @@ func (s visibilitySnapshot) statusObservedCurrent(status statusmodel.AgentStatus
 
 // revisionStatus is the fleet view: the node-level derivation plus service
 // counts from the same per-service projection /v1/services serves. A fleet
-// whose nodes all converged is still not converged while a service is
-// unhealthy or its configured health check has not passed yet, because
-// running does not mean serving.
+// whose nodes all converged is still not converged until every desired
+// service is running and healthy or without a health check, because a
+// reported service is not necessarily a serving one.
 func (s visibilitySnapshot) revisionStatus() operatorapi.RevisionStatus {
 	status := s.nodeRevisionStatus()
 	status.UnhealthyServices = []string{}
@@ -704,6 +704,12 @@ func (s visibilitySnapshot) revisionStatus() operatorapi.RevisionStatus {
 	case status.Services.Ready < status.Services.Running:
 		status.Phase = "progressing"
 		status.ReasonCode = "service_health_pending"
+	case status.Services.Ready < status.Services.Desired:
+		// Node-level convergence only proves each service was reported. An
+		// agent keeps its last phase and conditions between ticks, so a VM
+		// that stopped since then still sits under a ready node.
+		status.Phase = "progressing"
+		status.ReasonCode = "service_not_running"
 	case len(s.problems) > 0:
 		// A converged claim needs every record it rests on. A relevant node
 		// whose record could not be read is already unknown above, but with

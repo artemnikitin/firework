@@ -743,18 +743,24 @@ func putNode(t *testing.T, ctx context.Context, store StateStore, cfg Config, re
 // services is not serving: running does not imply healthy.
 func TestRevisionStatusAccountsForServiceHealth(t *testing.T) {
 	tests := []struct {
-		health     string
-		wantPhase  string
-		wantReason string
-		wantReady  int
+		vmState     string
+		health      string
+		wantPhase   string
+		wantReason  string
+		wantRunning int
+		wantReady   int
 	}{
-		{health: "healthy", wantPhase: "converged", wantReady: 1},
-		{health: "not_configured", wantPhase: "converged", wantReady: 1},
-		{health: "unhealthy", wantPhase: "degraded", wantReason: "service_unhealthy"},
-		{health: "unknown", wantPhase: "progressing", wantReason: "service_health_pending"},
+		{vmState: "running", health: "healthy", wantPhase: "converged", wantRunning: 1, wantReady: 1},
+		{vmState: "running", health: "not_configured", wantPhase: "converged", wantRunning: 1, wantReady: 1},
+		{vmState: "running", health: "unhealthy", wantPhase: "degraded", wantReason: "service_unhealthy", wantRunning: 1},
+		{vmState: "running", health: "unknown", wantPhase: "progressing", wantReason: "service_health_pending", wantRunning: 1},
+		// An agent keeps its last phase and conditions between ticks, so a VM
+		// that died since then is reported stopped under a ready node.
+		{vmState: "stopped", health: "not_configured", wantPhase: "progressing", wantReason: "service_not_running"},
+		{vmState: "starting", health: "not_configured", wantPhase: "progressing", wantReason: "service_not_running"},
 	}
 	for _, tt := range tests {
-		t.Run(tt.health, func(t *testing.T) {
+		t.Run(tt.vmState+"/"+tt.health, func(t *testing.T) {
 			ctx := context.Background()
 			store := newBlobStateStore(newMemBlob())
 			cfg := validConfigForRole(RoleAPI)
@@ -764,6 +770,7 @@ func TestRevisionStatusAccountsForServiceHealth(t *testing.T) {
 			placement := PlacementRevision{Revision: "placement-1", DesiredRevision: desired.Revision, NodeConfigs: []config.NodeConfig{{Node: "node-1", Services: desired.Services}}}
 			putCurrentState(t, ctx, store, desired, placement, "rendered-1")
 			agent := currentAgentStatus(statusmodel.PhaseReady, "rendered-1")
+			agent.Services[0].VMState = tt.vmState
 			agent.Services[0].Health = tt.health
 			putNode(t, ctx, store, cfg, NodeRecord{NodeID: "node-1", State: NodeStateReady, LastSeenAt: now, AgentStatus: agent})
 
@@ -774,7 +781,7 @@ func TestRevisionStatusAccountsForServiceHealth(t *testing.T) {
 			if got.Phase != tt.wantPhase || got.ReasonCode != tt.wantReason {
 				t.Fatalf("phase/reason = %s/%s, want %s/%s", got.Phase, got.ReasonCode, tt.wantPhase, tt.wantReason)
 			}
-			if got.Services.Desired != 1 || got.Services.Running != 1 || got.Services.Ready != tt.wantReady {
+			if got.Services.Desired != 1 || got.Services.Running != tt.wantRunning || got.Services.Ready != tt.wantReady {
 				t.Fatalf("service counts = %#v", got.Services)
 			}
 			if wantUnhealthy := tt.health == "unhealthy"; (len(got.UnhealthyServices) == 1) != wantUnhealthy || got.Services.Unhealthy != len(got.UnhealthyServices) {

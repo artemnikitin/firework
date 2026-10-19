@@ -179,10 +179,11 @@ second state machine:
   observed the current rendered revision yet;
 - `progressing`: at least one relevant agent is applying the current revision,
   or every node converged but a running service's configured health check has
-  not passed yet (`service_health_pending`);
+  not passed yet (`service_health_pending`) or a desired service is not
+  running (`service_not_running`);
 - `converged`: every relevant node is fresh and has applied it with no false or
-  unknown blocking condition, and every running service is healthy or has no
-  health check;
+  unknown blocking condition, and every desired service is running and healthy
+  or without a health check;
 - `degraded`: convergence criteria are met, but at least one node reports a
   non-blocking condition false — the peer-route condition
   (`peer_routes_degraded`), or `VolumeSizesApplied`

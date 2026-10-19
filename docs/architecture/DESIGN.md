@@ -81,8 +81,11 @@ never create a record:
 | `409 stale_generation` | The record belongs to another incarnation | One registration attempt; if that also conflicts, the agent is terminally `fenced` |
 
 A fenced agent stops all registry traffic, including its shutdown `down`
-update, and exposes `firework_agent_registry_fenced 1`. It recovers only by
-restarting the intended agent, which proposes a new generation. This is what
+update, and exposes `firework_agent_registry_fenced 1`. Restarting the
+intended agent proposes a new generation and normally recovers. A restart
+cannot recover when the host clock is behind the stored generation, because
+the new proposal is still older; once the old process is confirmed gone,
+delete `cp/v1/registry/nodes/<node>.json` and restart the agent. This is what
 prevents an old process shutting down late from marking its replacement
 `down`. Registry errors share one envelope:
 `{"error":{"code":"<stable code>","message":"<text>"}}`; clients branch on the

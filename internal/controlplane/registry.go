@@ -219,7 +219,11 @@ func (s *RegistryServer) handleRegister(w http.ResponseWriter, r *http.Request) 
 			cur.RegisteredAt = now
 		}
 		if generationChanged {
+			// None of the previous incarnation's telemetry describes the new
+			// process, including why its last status was refused.
 			cur.AgentStatus = nil
+			cur.AgentStatusRejected = ""
+			cur.AgentStatusReceivedAt = time.Time{}
 			cur.Used = Resources{}
 		}
 		cur.NodeID = req.NodeID

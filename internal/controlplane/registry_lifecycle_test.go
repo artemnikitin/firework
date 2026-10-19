@@ -209,3 +209,21 @@ func TestNodeLifecycleStateKeepsExplicitDownPastStaleTTL(t *testing.T) {
 		}
 	}
 }
+
+// A new incarnation must not inherit the previous process's telemetry,
+// including the reason its last status was refused.
+func TestRegistrationOfNewGenerationClearsPreviousTelemetry(t *testing.T) {
+	server, store := newTestRegistry(t)
+	registryCall(t, server, "node-1", "/v1/nodes/register", register("node-1", 1))
+	req := heartbeat("node-1", 1)
+	req.AgentStatus = validTestAgentStatus("node-1")
+	req.AgentStatus.Services[0].VMState = "exploded"
+	if code, _ := registryCall(t, server, "node-1", "/v1/nodes/heartbeat", req); code != http.StatusUnprocessableEntity {
+		t.Fatalf("invalid heartbeat: %d", code)
+	}
+	registryCall(t, server, "node-1", "/v1/nodes/register", register("node-1", 2))
+	record, _ := readNode(t, store, server.cfg, "node-1")
+	if record.AgentStatus != nil || record.AgentStatusRejected != "" || !record.AgentStatusReceivedAt.IsZero() {
+		t.Fatalf("new generation inherited telemetry: %+v", record)
+	}
+}
