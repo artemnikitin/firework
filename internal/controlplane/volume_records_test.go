@@ -69,7 +69,7 @@ func TestCreateAssignedVolumeRecordUsesSchedulerBinding(t *testing.T) {
 func TestAcknowledgeLocalVolumeRequiresMatchingNodeIdentityAndSize(t *testing.T) {
 	ctx := context.Background()
 	store := newBlobStateStore(newMemBlob())
-	controller := NewController(Config{State: StateConfig{Prefix: "cp/v1/"}}, store, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	controller := NewController(Config{State: StateConfig{Prefix: "cp/v1/"}, NodeStaleTTL: time.Minute}, store, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	recordKey := mustVolumeRecordKey("cp/v1/", "db", "data")
 	record := VolumeRecord{
 		LogicalID: "db/data", Type: config.VolumeTypeLocal, BoundNode: "node-1",
@@ -91,7 +91,7 @@ func TestAcknowledgeLocalVolumeRequiresMatchingNodeIdentityAndSize(t *testing.T)
 				AppliedSizeBytes: size, ResizeGeneration: 1, State: state, LastError: lastError,
 			}},
 		}}}}
-		if _, err := store.PutJSON(ctx, key, node); err != nil {
+		if _, err := store.PutJSON(ctx, key, currentAckNode(t, store, node)); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -134,5 +134,85 @@ func TestAcknowledgeLocalVolumeRequiresMatchingNodeIdentityAndSize(t *testing.T)
 	}
 	if got := readRecord(); got.ResizeState != VolumeResizeApplied || got.AppliedSizeBytes != config.GiB || got.LastError != "" {
 		t.Fatalf("matching node did not acknowledge local volume: %#v", got)
+	}
+}
+
+// Every rule an observation must pass before it changes a durable record.
+// The shared volume is the case that motivated placement gating: any node
+// attached to the same backend can report it, but only the node the current
+// placement assigns the service to may acknowledge it.
+func TestAcknowledgeRequiresFreshCurrentPlacementEvidence(t *testing.T) {
+	stale := time.Now().UTC().Add(-time.Hour)
+	tests := []struct {
+		name   string
+		mutate func(*NodeRecord)
+		// placedOn is the node the published placement assigns "db" to.
+		placedOn string
+		wantAck  bool
+	}{
+		{name: "current placement acknowledges", placedOn: "node-1", wantAck: true},
+		{name: "previous placement cannot acknowledge", placedOn: "node-2"},
+		{name: "down node", placedOn: "node-1", mutate: func(n *NodeRecord) { n.State = NodeStateDown }},
+		{name: "stale heartbeat", placedOn: "node-1", mutate: func(n *NodeRecord) { n.LastSeenAt = stale }},
+		{name: "stale status receipt", placedOn: "node-1", mutate: func(n *NodeRecord) { n.AgentStatusReceivedAt = stale }},
+		{name: "unsupported schema", placedOn: "node-1", mutate: func(n *NodeRecord) { n.AgentStatus.SchemaVersion = statusmodel.SchemaVersion + 1 }},
+		{name: "older rendered revision", placedOn: "node-1", mutate: func(n *NodeRecord) { n.AgentStatus.ObservedRevision = "older-rendered" }},
+		{name: "older placement revision", placedOn: "node-1", mutate: func(n *NodeRecord) { n.AgentStatus.PlacementRevision = "older-placement" }},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ctx := context.Background()
+			controller, store := admissionController(t)
+			putRecord(t, store, "db", "data", VolumeRecord{
+				LogicalID: "db/data", Type: config.VolumeTypeShared, SharedBackendID: "efs-1",
+				DesiredSizeBytes: config.GiB, ResizeGeneration: 1, ResizeState: VolumeResizePending,
+			})
+			node := currentAckNode(t, store, NodeRecord{NodeID: "node-1", AgentStatus: &statusmodel.AgentStatus{Services: []statusmodel.ServiceStatus{{
+				Name: "db", Volumes: []statusmodel.VolumeStatus{{
+					LogicalID: "db/data", Type: "shared", SharedBackendID: "efs-1",
+					AppliedSizeBytes: config.GiB, ResizeGeneration: 1, State: "prepared",
+				}},
+			}}}})
+			publishAckPlacement(t, store, config.NodeConfig{Node: tt.placedOn, Services: []config.ServiceConfig{{Name: "db"}}})
+			if tt.mutate != nil {
+				tt.mutate(&node)
+			}
+			putNode(t, ctx, store, controller.cfg, node)
+
+			if err := controller.acknowledgeVolumeRecords(ctx); err != nil {
+				t.Fatal(err)
+			}
+			var got VolumeRecord
+			if _, _, err := store.GetJSON(ctx, mustVolumeRecordKey("cp/v1/", "db", "data"), &got); err != nil {
+				t.Fatal(err)
+			}
+			if acked := got.ResizeState == VolumeResizeApplied; acked != tt.wantAck {
+				t.Fatalf("acknowledged = %v, want %v (record %#v)", acked, tt.wantAck, got)
+			}
+		})
+	}
+}
+
+func TestAcknowledgeWithoutPublishedPlacementChangesNothing(t *testing.T) {
+	ctx := context.Background()
+	controller, store := admissionController(t)
+	putRecord(t, store, "db", "data", VolumeRecord{
+		LogicalID: "db/data", Type: config.VolumeTypeLocal, BoundNode: "node-1",
+		DesiredSizeBytes: config.GiB, ResizeGeneration: 1, ResizeState: VolumeResizePending,
+	})
+	now := time.Now().UTC()
+	putNode(t, ctx, store, controller.cfg, NodeRecord{NodeID: "node-1", State: NodeStateReady, LastSeenAt: now, AgentStatusReceivedAt: now,
+		AgentStatus: &statusmodel.AgentStatus{SchemaVersion: statusmodel.SchemaVersion, Services: []statusmodel.ServiceStatus{{
+			Name: "db", Volumes: []statusmodel.VolumeStatus{{LogicalID: "db/data", Type: "local", BoundNode: "node-1", AppliedSizeBytes: config.GiB, ResizeGeneration: 1, State: "prepared"}},
+		}}}})
+	if err := controller.acknowledgeVolumeRecords(ctx); err != nil {
+		t.Fatal(err)
+	}
+	var got VolumeRecord
+	if _, _, err := store.GetJSON(ctx, mustVolumeRecordKey("cp/v1/", "db", "data"), &got); err != nil {
+		t.Fatal(err)
+	}
+	if got.ResizeState != VolumeResizePending {
+		t.Fatalf("acknowledged without a published placement: %#v", got)
 	}
 }

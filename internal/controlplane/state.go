@@ -47,6 +47,40 @@ type NodeRecord struct {
 	UpdatedAt    time.Time                `json:"updated_at"`
 	AgentStatus  *statusmodel.AgentStatus `json:"agent_status,omitempty"`
 	Storage      StorageResources         `json:"storage,omitempty"`
+	// StateChangedAt is the registry receipt time of the last lifecycle
+	// state transition. DownAt is set when the current generation reported
+	// an explicit shutdown and cleared when a registration revives the node.
+	// Records written before these fields existed leave them zero.
+	StateChangedAt time.Time `json:"state_changed_at,omitzero"`
+	DownAt         time.Time `json:"down_at,omitzero"`
+	// AgentStatusReceivedAt is the registry receipt time of the stored
+	// AgentStatus. Freshness is judged on this clock, not the agent's
+	// observed_at. AgentStatusRejected is the bounded reason the latest
+	// heartbeat's status was refused (AgentStatus is then nil), so the
+	// projection can say why status is absent instead of calling it missing.
+	AgentStatusReceivedAt time.Time `json:"agent_status_received_at,omitzero"`
+	AgentStatusRejected   string    `json:"agent_status_rejected,omitempty"`
+}
+
+// Reasons a heartbeat's agent_status was refused.
+const (
+	agentStatusRejectedInvalid           = "agent_status_invalid"
+	agentStatusRejectedUnsupportedSchema = "agent_status_unsupported_schema"
+)
+
+// setState records a lifecycle transition and its receipt time.
+func (r *NodeRecord) setState(state NodeState, now time.Time) {
+	if r.State != state || r.StateChangedAt.IsZero() {
+		r.StateChangedAt = now
+	}
+	r.State = state
+	if state == NodeStateDown {
+		if r.DownAt.IsZero() {
+			r.DownAt = now
+		}
+	} else {
+		r.DownAt = time.Time{}
+	}
 }
 
 // DesiredRevision stores normalized services from events.
@@ -250,10 +284,6 @@ func renderedCurrentKey(prefix string) string {
 
 func legacyNodeConfigKey(prefix, nodeID string) string {
 	return path.Join(stateRoot(prefix), "nodes", nodeID+".yaml")
-}
-
-func legacyNodesPrefix(prefix string) string {
-	return path.Join(stateRoot(prefix), "nodes") + "/"
 }
 
 func dedupeKey(prefix, eventID string) string {

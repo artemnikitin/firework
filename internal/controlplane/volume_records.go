@@ -454,18 +454,73 @@ func volumeRecordsDigest(set volumeRecordSet) string {
 	return hex.EncodeToString(sum[:])
 }
 
+// volumeAckEvidence is the published state an observation must have been made
+// against before it may change a durable volume record.
+type volumeAckEvidence struct {
+	placementRevision string
+	renderedRevision  string
+	nodeByService     map[string]string
+}
+
+// loadVolumeAckEvidence reads the currently published placement and rendered
+// pointers. ok is false when either is absent, and then nothing is
+// acknowledged: an observation cannot be shown to be current.
+func (c *Controller) loadVolumeAckEvidence(ctx context.Context) (volumeAckEvidence, bool, error) {
+	var rendered RevisionPointer
+	_, exists, err := c.store.GetJSON(ctx, renderedCurrentKey(c.cfg.State.Prefix), &rendered)
+	if err != nil || !exists || rendered.Revision == "" {
+		return volumeAckEvidence{}, false, err
+	}
+	var placement PlacementRevision
+	if err := loadCurrentRevision(ctx, c.store, placementCurrentKey(c.cfg.State.Prefix), func(revision string) (string, any) {
+		return placementRevisionKey(c.cfg.State.Prefix, revision), &placement
+	}); err != nil {
+		return volumeAckEvidence{}, false, err
+	}
+	if placement.Revision == "" {
+		return volumeAckEvidence{}, false, nil
+	}
+	evidence := volumeAckEvidence{placementRevision: placement.Revision, renderedRevision: rendered.Revision, nodeByService: make(map[string]string)}
+	for _, node := range placement.NodeConfigs {
+		for _, service := range node.Services {
+			evidence.nodeByService[service.Name] = node.Node
+		}
+	}
+	return evidence, true, nil
+}
+
+// acknowledgeVolumeRecords folds agent volume observations into durable
+// records. An observation counts only when it is fresh on the registry's
+// clock, from a supported status of a node that is not down, made against the
+// currently published placement and rendered revisions, and reported by the
+// node that placement assigns the service to. The last rule is what stops a
+// previous placement of a shared volume from changing its resize state. The
+// observed revision is used rather than the applied one because a refused or
+// failed resize is exactly the tick that never reaches "applied".
 func (c *Controller) acknowledgeVolumeRecords(ctx context.Context) error {
+	evidence, ok, err := c.loadVolumeAckEvidence(ctx)
+	if err != nil || !ok {
+		return err
+	}
 	keys, err := c.store.ListKeys(ctx, registryNodesPrefix(c.cfg.State.Prefix))
 	if err != nil {
 		return err
 	}
+	now := time.Now().UTC()
 	for _, key := range keys {
 		var node NodeRecord
 		_, exists, err := c.store.GetJSON(ctx, key, &node)
-		if err != nil || !exists || node.AgentStatus == nil {
+		if err != nil || !exists {
 			continue
 		}
-		for _, service := range node.AgentStatus.Services {
+		status, fresh := freshAgentStatus(node, now, c.cfg.NodeStaleTTL)
+		if !fresh || status.PlacementRevision != evidence.placementRevision || status.ObservedRevision != evidence.renderedRevision {
+			continue
+		}
+		for _, service := range status.Services {
+			if evidence.nodeByService[service.Name] != node.NodeID {
+				continue
+			}
 			for _, observed := range service.Volumes {
 				if observed.State != "prepared" && observed.State != "error" && observed.State != "rejected" {
 					continue

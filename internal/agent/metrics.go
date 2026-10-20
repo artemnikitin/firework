@@ -59,6 +59,7 @@ type runtimeMetrics struct {
 	lastAppliedAt              float64
 	lastAppliedRevision        string
 	remoteRouteSyncDegraded    float64
+	registryFenced             float64
 	statusPhase                string
 	statusConditions           map[string]string
 	volumeOperations           map[volumeOperationKey]uint64
@@ -183,6 +184,18 @@ func (m *runtimeMetrics) setRemoteRouteSyncDegraded(degraded bool) {
 		m.remoteRouteSyncDegraded = 1
 	} else {
 		m.remoteRouteSyncDegraded = 0
+	}
+}
+
+// setRegistryFenced flags that the registry rejected this process's
+// generation and the agent stopped sending registry updates.
+func (m *runtimeMetrics) setRegistryFenced(fenced bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if fenced {
+		m.registryFenced = 1
+	} else {
+		m.registryFenced = 0
 	}
 }
 
@@ -352,6 +365,9 @@ func (m *runtimeMetrics) render() string {
 
 	writeHelpType(&b, "firework_agent_remote_route_sync_degraded", "1 when peer node configs cannot be listed and remote Traefik routes run on last-known-good files.", "gauge")
 	fmt.Fprintf(&b, "firework_agent_remote_route_sync_degraded{node=%q} %.0f\n", m.node, m.remoteRouteSyncDegraded)
+
+	writeHelpType(&b, "firework_agent_registry_fenced", "1 when the registry holds a newer incarnation of this node and this agent stopped registry updates; restart the intended agent to recover.", "gauge")
+	fmt.Fprintf(&b, "firework_agent_registry_fenced{node=%q} %.0f\n", m.node, m.registryFenced)
 
 	writeHelpType(&b, "firework_agent_volume_operations_total", "Total persistent-volume operations by type, operation, and outcome.", "counter")
 	operationKeys := sortedVolumeOperationKeys(m.volumeOperations)

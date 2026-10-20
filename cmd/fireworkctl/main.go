@@ -152,8 +152,68 @@ func runStatus(cfg cliConfig, args []string, out io.Writer) error {
 			formatNodeSet(response.DegradedNodes), formatNodeSet(response.ProgressingNodes), formatNodeSet(response.FailedNodes),
 			formatNodeSet(response.StaleNodes), formatNodeSet(response.DownNodes), formatNodeSet(response.UnknownNodes),
 			valueOrDash(response.ReasonCode), valueOrDash(response.Message))
+		services := response.Services
+		fmt.Fprintf(w, "SERVICES\t%d desired, %d running, %d ready, %d pending, %d unhealthy, %d unknown\nUNHEALTHY\t%s\n",
+			services.Desired, services.Running, services.Ready, services.Pending, services.Unhealthy, services.Unknown,
+			formatNodeSet(response.UnhealthyServices))
+		writeProblems(w, response.Problems)
 		return w.Flush()
 	})
+}
+
+// writeProblems lists records the API left out of its projection, so a table
+// never silently omits a node or volume the operator expects to see.
+func writeProblems(w io.Writer, problems []operatorapi.ProjectionProblem) {
+	if len(problems) == 0 {
+		return
+	}
+	fmt.Fprintln(w, "\nSKIPPED RECORD\tKIND\tREASON")
+	for _, problem := range problems {
+		fmt.Fprintf(w, "%s\t%s\t%s\n", problem.ID, problem.Kind, problem.ReasonCode)
+	}
+}
+
+// formatBytes renders a byte count with binary units for tables; JSON
+// output keeps exact bytes.
+func formatBytes(bytes int64) string {
+	const unit = 1024
+	if bytes < unit {
+		return fmt.Sprintf("%d B", max(bytes, 0))
+	}
+	value, exponent := float64(bytes), 0
+	for value >= unit && exponent < 4 {
+		value /= unit
+		exponent++
+	}
+	return fmt.Sprintf("%.1f %s", value, []string{"B", "KiB", "MiB", "GiB", "TiB"}[exponent])
+}
+
+// formatPool renders node storage as allocated/capacity, distinguishing a
+// pool the node does not have from an empty one.
+func formatPool(pool operatorapi.StorageCapacitySummary) string {
+	switch {
+	case !pool.Configured:
+		return "-"
+	case pool.Unbounded:
+		return formatBytes(pool.AllocatedBytes) + " (no limit)"
+	default:
+		return formatBytes(pool.AllocatedBytes) + "/" + formatBytes(pool.CapacityBytes)
+	}
+}
+
+// formatServiceDisk renders a service's reserved local and shared bytes.
+func formatServiceDisk(storage operatorapi.ServiceStorageSummary) string {
+	var parts []string
+	if storage.Local.Count > 0 {
+		parts = append(parts, "local "+formatBytes(storage.Local.AllocatedBytes))
+	}
+	if storage.Shared.Count > 0 {
+		parts = append(parts, "shared "+formatBytes(storage.Shared.AllocatedBytes))
+	}
+	if len(parts) == 0 {
+		return "-"
+	}
+	return strings.Join(parts, ", ")
 }
 
 func formatNodeSet(nodes []string) string {
@@ -194,14 +254,15 @@ func runNodes(cfg cliConfig, args []string, out io.Writer) error {
 			return writeOutputJSON(out, response, *watch > 0)
 		}
 		w := tabwriter.NewWriter(out, 0, 4, 2, ' ', 0)
-		fmt.Fprintln(w, "NODE\tSTATE\tLAST SEEN\tSERVICES\tVCPU\tMEMORY")
+		fmt.Fprintln(w, "NODE\tSTATE\tLAST SEEN\tSERVICES\tVCPU\tMEMORY\tLOCAL DISK\tSHARED DISK\tREASON")
 		for _, node := range response.Items {
 			lastSeen := formatAge(node.StatusAgeSeconds, node.LastSeenAt.IsZero())
 			if lastSeen != "unknown" {
 				lastSeen += " ago"
 			}
-			fmt.Fprintf(w, "%s\t%s\t%s\t%d/%d\t%d/%d\t%d/%d MB\n", node.NodeID, node.State, lastSeen, node.RunningServices, node.DesiredServices, node.Allocated.VCPUs, node.Capacity.VCPUs, node.Allocated.MemoryMB, node.Capacity.MemoryMB)
+			fmt.Fprintf(w, "%s\t%s\t%s\t%d/%d\t%d/%d\t%d/%d MB\t%s\t%s\t%s\n", node.NodeID, node.State, lastSeen, node.RunningServices, node.DesiredServices, node.Allocated.VCPUs, node.Capacity.VCPUs, node.Allocated.MemoryMB, node.Capacity.MemoryMB, formatPool(node.Storage.Local), formatPool(node.Storage.Shared), valueOrDash(node.ReasonCode))
 		}
+		writeProblems(w, response.Problems)
 		return w.Flush()
 	})
 }
@@ -235,6 +296,13 @@ func runNode(cfg cliConfig, args []string, out io.Writer) error {
 		}
 		w := tabwriter.NewWriter(out, 0, 4, 2, ' ', 0)
 		fmt.Fprintf(w, "NODE\t%s\nSTATE\t%s\nRECONCILIATION\t%s\nLAST SEEN\t%s\nSTATUS AGE\t%s\nAGENT\t%s\nHOST IP\t%s\nREVISION\t%s\nSERVICES\t%d/%d running\nVCPU\t%d/%d allocated (%d available)\nMEMORY\t%d/%d MB allocated (%d MB available)\nSTATUS MISSING\t%s\nSTATUS STALE\t%s\nREASON\t%s\nMESSAGE\t%s\n", response.NodeID, response.State, valueOrUnknown(response.Reconciliation), formatTime(response.LastSeenAt), formatAge(response.StatusAgeSeconds, response.LastSeenAt.IsZero()), valueOrUnknown(response.AgentVersion), valueOrDash(response.HostIP), valueOrUnknown(response.AppliedRevision), response.RunningServices, response.DesiredServices, response.Allocated.VCPUs, response.Capacity.VCPUs, response.Available.VCPUs, response.Allocated.MemoryMB, response.Capacity.MemoryMB, response.Available.MemoryMB, formatBool(response.StatusMissing), formatBool(response.StatusStale), valueOrDash(response.ReasonCode), valueOrDash(response.Message))
+		labels := "-"
+		if len(response.Labels) > 0 {
+			labels = strings.Join(response.Labels, ", ")
+		}
+		fmt.Fprintf(w, "LABELS\t%s\nREGISTERED\t%s\nUPDATED\t%s\nLOCAL DISK\t%s\nSHARED DISK\t%s\nSHARED BACKEND\t%s\nDESIRED REVISION\t%s\nPLACEMENT REVISION\t%s\nOBSERVED REVISION\t%s\nAPPLIED REVISION\t%s\n",
+			labels, formatTime(response.RegisteredAt), formatTime(response.UpdatedAt), formatPool(response.Storage.Local), formatPool(response.Storage.Shared), valueOrDash(response.Storage.SharedBackendID),
+			valueOrDash(response.DesiredRevision), valueOrDash(response.PlacementRevision), valueOrDash(response.ObservedRevision), valueOrDash(response.AppliedRevision))
 		if len(response.Services) > 0 {
 			fmt.Fprintln(w, "\nSERVICE\tSTATE\tHEALTH")
 			for _, service := range response.Services {
@@ -288,10 +356,11 @@ func runServices(cfg cliConfig, args []string, out io.Writer) error {
 			return writeOutputJSON(out, response, *watch > 0)
 		}
 		w := tabwriter.NewWriter(out, 0, 4, 2, ' ', 0)
-		fmt.Fprintln(w, "SERVICE\tNODE\tSTATE\tHEALTH\tVCPU\tMEMORY")
+		fmt.Fprintln(w, "SERVICE\tNODE\tSTATE\tHEALTH\tVCPU\tMEMORY\tDISK\tREASON")
 		for _, service := range response.Items {
-			fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%d\t%d MB\n", service.Name, valueOrDash(service.Node), service.State, service.Health, service.VCPUs, service.MemoryMB)
+			fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%d\t%d MB\t%s\t%s\n", service.Name, valueOrDash(service.Node), service.State, service.Health, service.VCPUs, service.MemoryMB, formatServiceDisk(service.Storage), valueOrDash(service.ReasonCode))
 		}
+		writeProblems(w, response.Problems)
 		return w.Flush()
 	})
 }
@@ -324,7 +393,7 @@ func runService(cfg cliConfig, args []string, out io.Writer) error {
 			return writeOutputJSON(out, response, *watch > 0)
 		}
 		w := tabwriter.NewWriter(out, 0, 4, 2, ' ', 0)
-		fmt.Fprintf(w, "SERVICE\t%s\nNODE\t%s\nDESIRED NODE\t%s\nACTUAL NODE\t%s\nSTATE\t%s\nHEALTH\t%s\nVCPU\t%d\nMEMORY\t%d MB\nIMAGE\t%s\nKERNEL\t%s\nPID\t%d\nRESTARTS\t%d\nSERVICE OBSERVED\t%s\nLAST TRANSITION\t%s\nREASON\t%s\nMESSAGE\t%s\nNETWORK ADDRESS\t%s\nROUTING HOSTNAME\t%s\n", response.Name, valueOrDash(response.Node), valueOrDash(response.DesiredNode), valueOrDash(response.ActualNode), response.State, response.Health, response.VCPUs, response.MemoryMB, valueOrDash(response.DesiredImage), valueOrDash(response.DesiredKernel), response.PID, response.RestartCount, formatTime(response.ServiceObservedAt), formatTime(response.LastTransitionAt), valueOrDash(response.ReasonCode), valueOrDash(response.Message), valueOrDash(response.NetworkAddress), valueOrDash(response.RoutingHostname))
+		fmt.Fprintf(w, "SERVICE\t%s\nNODE\t%s\nDESIRED NODE\t%s\nACTUAL NODE\t%s\nSTATE\t%s\nHEALTH\t%s\nVCPU\t%d\nMEMORY\t%d MB\nIMAGE\t%s\nKERNEL\t%s\nPID\t%d\nRESTARTS\t%d\nSERVICE OBSERVED\t%s\nLAST TRANSITION\t%s\nREASON\t%s\nMESSAGE\t%s\nNETWORK ADDRESS\t%s\nROUTING HOSTNAME\t%s\nPUBLIC URL\t%s\nDISK\t%s\n", response.Name, valueOrDash(response.Node), valueOrDash(response.DesiredNode), valueOrDash(response.ActualNode), response.State, response.Health, response.VCPUs, response.MemoryMB, valueOrDash(response.DesiredImage), valueOrDash(response.DesiredKernel), response.PID, response.RestartCount, formatTime(response.ServiceObservedAt), formatTime(response.LastTransitionAt), valueOrDash(response.ReasonCode), valueOrDash(response.Message), valueOrDash(response.NetworkAddress), valueOrDash(response.RoutingHostname), valueOrDash(response.PublicURL), formatServiceDisk(response.Storage))
 		hc := response.HealthCheck
 		fmt.Fprintf(w, "HEALTH CHECK\t%s\nHEALTH CHECK STATE\t%s\nHEALTH CHECKED\t%s\nHEALTH FAILURES\t%d\nHEALTH LAST ERROR\t%s\n", valueOrDash(hc.Type), valueOrUnknown(hc.State), formatTime(hc.LastCheckedAt), hc.Failures, valueOrDash(hc.LastError))
 		fmt.Fprintf(w, "DESIRED REVISION\t%s\nPLACEMENT REVISION\t%s\nRENDERED REVISION\t%s\nAPPLIED REVISION\t%s\n", valueOrDash(response.DesiredRevision), valueOrDash(response.PlacementRevision), valueOrDash(response.RenderedRevision), valueOrDash(response.AppliedRevision))

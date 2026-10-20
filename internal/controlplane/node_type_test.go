@@ -56,7 +56,7 @@ func publishDesired(t *testing.T, store StateStore, revision string, services ..
 	}
 }
 
-func currentPlacement(t *testing.T, store StateStore) PlacementRevision {
+func nodeTypePlacement(t *testing.T, store StateStore) PlacementRevision {
 	t.Helper()
 	ctx := context.Background()
 	var ptr RevisionPointer
@@ -94,7 +94,7 @@ func TestReconcileEnforcesNodeTypeAgainstRegistryLabels(t *testing.T) {
 	)
 
 	controller.runReconcile(context.Background())
-	placement := currentPlacement(t, store)
+	placement := nodeTypePlacement(t, store)
 	if got := placementNodeOf(placement, "db"); got != "node-backend" {
 		t.Fatalf("db placed on %q, want node-backend", got)
 	}
@@ -112,19 +112,19 @@ func TestReconcileEnforcesNodeTypeAgainstRegistryLabels(t *testing.T) {
 	putReadyNode(t, store, "node-backend", "web")
 	putReadyNode(t, store, "node-web", "web", "backend")
 	controller.runReconcile(context.Background())
-	if got := placementNodeOf(currentPlacement(t, store), "db"); got != "node-web" {
+	if got := placementNodeOf(nodeTypePlacement(t, store), "db"); got != "node-web" {
 		t.Fatalf("after label removal db placed on %q, want node-web", got)
 	}
 }
 
 func TestSchedulingInputSignatureTracksLabels(t *testing.T) {
 	base := []scheduler.Node{{InstanceID: "n", CapacityVCPUs: 4, CapacityMemMB: 4096}}
-	unlabeled, err := schedulingInputSignature("rev", base, nil, "")
+	unlabeled, err := schedulingInputSignature("rev", base, nil, nil, "")
 	if err != nil {
 		t.Fatal(err)
 	}
 	labeledNodes := []scheduler.Node{{InstanceID: "n", Labels: []string{"web"}, CapacityVCPUs: 4, CapacityMemMB: 4096}}
-	labeled, err := schedulingInputSignature("rev", labeledNodes, nil, "")
+	labeled, err := schedulingInputSignature("rev", labeledNodes, nil, nil, "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -136,7 +136,7 @@ func TestSchedulingInputSignatureTracksLabels(t *testing.T) {
 func TestDiscoverActiveNodesNormalizesLabels(t *testing.T) {
 	controller, store := nodeTypeController(t)
 	putReadyNode(t, store, "n", "web", "backend", "web")
-	nodes, _, err := controller.discoverActiveNodes(context.Background())
+	nodes, _, _, err := controller.discoverActiveNodes(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}

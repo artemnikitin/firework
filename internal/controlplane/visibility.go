@@ -2,10 +2,13 @@ package controlplane
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"path"
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/artemnikitin/firework/internal/config"
@@ -26,6 +29,10 @@ type visibilitySnapshot struct {
 	nodeByID           map[string]NodeRecord
 	pendingByService   map[string]PendingPlacement
 	volumeByID         map[string]VolumeRecord
+	// problems lists records left out because they could not be read or
+	// interpreted; one bad record degrades the projection instead of failing
+	// every endpoint.
+	problems []operatorapi.ProjectionProblem
 }
 
 type placedService struct {
@@ -33,9 +40,21 @@ type placedService struct {
 	config config.ServiceConfig
 }
 
+// VisibilityService serves the read-only projection. Every endpoint reads one
+// immutable snapshot, rebuilt at most once per api_snapshot_ttl no matter how
+// many requests arrive; concurrent requests during a rebuild wait for it
+// instead of starting their own. Only the API projection uses this cache —
+// the controller always reads authoritative state.
 type VisibilityService struct {
 	cfg   Config
 	store StateStore
+
+	mu       sync.Mutex
+	cached   *visibilitySnapshot
+	cachedAt time.Time
+	building chan struct{}
+	// builds counts snapshot builds, for tests.
+	builds int
 }
 
 func NewVisibilityService(cfg Config, store StateStore) *VisibilityService {
@@ -64,7 +83,7 @@ func (s *VisibilityService) Nodes(ctx context.Context, stateFilter string) (oper
 		}
 		items = append(items, summary)
 	}
-	return operatorapi.ListEnvelope[operatorapi.NodeSummary]{APIVersion: operatorapi.APIVersion, ObservedAt: snapshot.now, Count: len(items), Items: items}, nil
+	return operatorapi.ListEnvelope[operatorapi.NodeSummary]{APIVersion: operatorapi.APIVersion, ObservedAt: snapshot.now, Count: len(items), Items: items, Problems: snapshot.problems}, nil
 }
 
 func (s *VisibilityService) Node(ctx context.Context, nodeID string) (operatorapi.NodeDetail, bool, error) {
@@ -123,7 +142,7 @@ func (s *VisibilityService) Services(ctx context.Context, stateFilter, healthFil
 		}
 		items = append(items, summary)
 	}
-	return operatorapi.ListEnvelope[operatorapi.ServiceSummary]{APIVersion: operatorapi.APIVersion, ObservedAt: snapshot.now, Count: len(items), Items: items}, nil
+	return operatorapi.ListEnvelope[operatorapi.ServiceSummary]{APIVersion: operatorapi.APIVersion, ObservedAt: snapshot.now, Count: len(items), Items: items, Problems: snapshot.problems}, nil
 }
 
 func (s *VisibilityService) Service(ctx context.Context, name string) (operatorapi.ServiceDetail, bool, error) {
@@ -142,7 +161,7 @@ func (s *VisibilityService) Service(ctx context.Context, name string) (operatora
 		return operatorapi.ServiceDetail{}, false, nil
 	}
 	summary := snapshot.serviceSummary(*desired)
-	volumeStatuses := desiredVolumeStatuses(*desired, snapshot.volumeByID)
+	volumeStatuses := snapshot.serviceVolumeStatuses(*desired)
 	detail := operatorapi.ServiceDetail{
 		APIVersion: operatorapi.APIVersion, ObservedAt: snapshot.now, ServiceSummary: summary,
 		ServiceObservedAt: summary.ObservedAt,
@@ -157,7 +176,6 @@ func (s *VisibilityService) Service(ctx context.Context, name string) (operatora
 	detail.RoutingHostname, detail.PublicURL = servicePublicRoute(desired.Name, desired.Metadata, s.cfg.IngressDomain)
 	placed, placedOK := snapshot.placementByService[name]
 	if placedOK {
-		volumeStatuses = desiredVolumeStatuses(placed.config, snapshot.volumeByID)
 		detail.PlacementRevision = snapshot.placement.Revision
 		record, nodeExists := snapshot.nodeByID[placed.node.Node]
 		if nodeExists {
@@ -168,7 +186,6 @@ func (s *VisibilityService) Service(ctx context.Context, name string) (operatora
 					detail.ActualNode = record.NodeID
 					detail.PID = actual.PID
 					detail.RestartCount = actual.RestartCount
-					volumeStatuses = mergeVolumeStatuses(volumeStatuses, actual.Volumes)
 					if actual.NetworkAddress != "" {
 						detail.NetworkAddress = actual.NetworkAddress
 					}
@@ -278,6 +295,30 @@ func (s visibilitySnapshot) refusedVolumes() []string {
 	return refused
 }
 
+// serviceVolumeStatuses is the single merged volume view used by the service
+// list, service detail, and their disk totals: the durable records for the
+// placed (or, when unplaced, desired) config, overlaid with the current
+// node's observation only when that observation is current.
+func (s visibilitySnapshot) serviceVolumeStatuses(desired config.ServiceConfig) []statusmodel.VolumeStatus {
+	placed, ok := s.placementByService[desired.Name]
+	if !ok {
+		return desiredVolumeStatuses(desired, s.volumeByID)
+	}
+	volumes := desiredVolumeStatuses(placed.config, s.volumeByID)
+	record, exists := s.nodeByID[placed.node.Node]
+	if !exists {
+		return volumes
+	}
+	status, current := s.currentStatus(record)
+	if !current {
+		return volumes
+	}
+	if actual, found := findAgentService(status, desired.Name); found {
+		volumes = mergeVolumeStatuses(volumes, actual.Volumes)
+	}
+	return volumes
+}
+
 func mergeVolumeStatuses(base, observed []statusmodel.VolumeStatus) []statusmodel.VolumeStatus {
 	merged := append([]statusmodel.VolumeStatus(nil), base...)
 	indexByID := make(map[string]int, len(merged))
@@ -367,6 +408,48 @@ func summarizeServiceStorage(volumes []statusmodel.VolumeStatus) operatorapi.Ser
 }
 
 func (s *VisibilityService) load(ctx context.Context) (visibilitySnapshot, error) {
+	ttl := s.cfg.APISnapshotTTL
+	if ttl <= 0 {
+		return s.build(ctx)
+	}
+	for {
+		s.mu.Lock()
+		if s.cached != nil && time.Since(s.cachedAt) < ttl {
+			snapshot := *s.cached
+			s.mu.Unlock()
+			return snapshot, nil
+		}
+		if wait := s.building; wait != nil {
+			s.mu.Unlock()
+			select {
+			case <-wait:
+				continue
+			case <-ctx.Done():
+				return visibilitySnapshot{}, ctx.Err()
+			}
+		}
+		done := make(chan struct{})
+		s.building = done
+		s.mu.Unlock()
+
+		snapshot, err := s.build(ctx)
+		s.mu.Lock()
+		// A failed build is not cached: the next request retries rather than
+		// serving an error, or an older snapshot as current, for a full TTL.
+		if err == nil {
+			s.cached, s.cachedAt = &snapshot, time.Now()
+		}
+		s.building = nil
+		close(done)
+		s.mu.Unlock()
+		return snapshot, err
+	}
+}
+
+func (s *VisibilityService) build(ctx context.Context) (visibilitySnapshot, error) {
+	s.mu.Lock()
+	s.builds++
+	s.mu.Unlock()
 	now := time.Now().UTC()
 	snapshot := visibilitySnapshot{now: now, staleTTL: s.cfg.NodeStaleTTL, placementByService: make(map[string]placedService), nodeByID: make(map[string]NodeRecord), pendingByService: make(map[string]PendingPlacement), volumeByID: make(map[string]VolumeRecord)}
 	keys, err := s.store.ListKeys(ctx, registryNodesPrefix(s.cfg.State.Prefix))
@@ -374,15 +457,25 @@ func (s *VisibilityService) load(ctx context.Context) (visibilitySnapshot, error
 		return snapshot, fmt.Errorf("listing nodes: %w", err)
 	}
 	for _, key := range keys {
+		id := projectionID(strings.TrimSuffix(path.Base(key), ".json"))
 		var record NodeRecord
 		_, exists, err := s.store.GetJSON(ctx, key, &record)
 		if err != nil {
-			return snapshot, fmt.Errorf("reading node record: %w", err)
+			if scanInterrupted(ctx, err) {
+				return snapshot, fmt.Errorf("reading node records: %w", err)
+			}
+			snapshot.problems = append(snapshot.problems, operatorapi.ProjectionProblem{Kind: "node", ID: id, ReasonCode: "record_unreadable"})
+			continue
 		}
-		if exists {
-			snapshot.nodes = append(snapshot.nodes, record)
-			snapshot.nodeByID[record.NodeID] = record
+		if !exists {
+			continue
 		}
+		if record.NodeID == "" || projectionID(record.NodeID) != id {
+			snapshot.problems = append(snapshot.problems, operatorapi.ProjectionProblem{Kind: "node", ID: id, ReasonCode: "record_invalid"})
+			continue
+		}
+		snapshot.nodes = append(snapshot.nodes, record)
+		snapshot.nodeByID[record.NodeID] = record
 	}
 	sort.Slice(snapshot.nodes, func(i, j int) bool { return snapshot.nodes[i].NodeID < snapshot.nodes[j].NodeID })
 	if err := loadCurrentRevision(ctx, s.store, desiredCurrentKey(s.cfg.State.Prefix), func(revision string) (string, any) {
@@ -411,14 +504,24 @@ func (s *VisibilityService) load(ctx context.Context) (visibilitySnapshot, error
 		if !strings.HasSuffix(key, ".json") {
 			continue
 		}
+		id := projectionID(strings.TrimSuffix(strings.TrimPrefix(key, volumeRecordsPrefix(s.cfg.State.Prefix)), ".json"))
 		var record VolumeRecord
 		_, exists, err := s.store.GetJSON(ctx, key, &record)
 		if err != nil {
-			return snapshot, fmt.Errorf("reading volume record %s: %w", key, err)
+			if scanInterrupted(ctx, err) {
+				return snapshot, fmt.Errorf("reading volume records: %w", err)
+			}
+			snapshot.problems = append(snapshot.problems, operatorapi.ProjectionProblem{Kind: "volume", ID: id, ReasonCode: "record_unreadable"})
+			continue
 		}
-		if exists && record.LogicalID != "" {
-			snapshot.volumeByID[record.LogicalID] = record
+		if !exists {
+			continue
 		}
+		if record.LogicalID == "" {
+			snapshot.problems = append(snapshot.problems, operatorapi.ProjectionProblem{Kind: "volume", ID: id, ReasonCode: "record_invalid"})
+			continue
+		}
+		snapshot.volumeByID[record.LogicalID] = record
 	}
 	snapshot.placementCurrent = snapshot.desired.Revision != "" && snapshot.placement.DesiredRevision == snapshot.desired.Revision
 	if snapshot.placementCurrent {
@@ -433,6 +536,25 @@ func (s *VisibilityService) load(ctx context.Context) (visibilitySnapshot, error
 	}
 	sort.Slice(snapshot.desired.Services, func(i, j int) bool { return snapshot.desired.Services[i].Name < snapshot.desired.Services[j].Name })
 	return snapshot, nil
+}
+
+// scanInterrupted reports whether a per-record read failed because the
+// request was cancelled or timed out rather than because of the record. That
+// failure describes the scan, not the record: recording it as a problem would
+// turn every remaining record into a false warning and let an incomplete
+// snapshot be cached as a successful one, so the build fails instead.
+func scanInterrupted(ctx context.Context, err error) bool {
+	return ctx.Err() != nil || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)
+}
+
+// projectionID bounds an identifier taken from a storage key before it is
+// echoed in a response.
+func projectionID(id string) string {
+	const maxProjectionIDLen = 256
+	if len(id) > maxProjectionIDLen {
+		id = id[:maxProjectionIDLen]
+	}
+	return strings.ToValidUTF8(id, "")
 }
 
 func loadCurrentRevision(ctx context.Context, store StateStore, pointerKey string, target func(string) (string, any)) error {
@@ -453,12 +575,7 @@ func loadCurrentRevision(ctx context.Context, store StateStore, pointerKey strin
 }
 
 func (s visibilitySnapshot) nodeSummary(record NodeRecord) operatorapi.NodeSummary {
-	state := string(record.State)
-	if record.LastSeenAt.IsZero() || s.now.Sub(record.LastSeenAt) > s.staleTTL {
-		state = "stale"
-	} else if state != "ready" && state != "draining" && state != "down" {
-		state = "unknown"
-	}
+	state := nodeLifecycleState(record, s.now, s.staleTTL)
 	allocated := Resources{}
 	desiredCount := 0
 	for _, placed := range s.placementByService {
@@ -492,10 +609,8 @@ func (s visibilitySnapshot) nodeSummary(record NodeRecord) operatorapi.NodeSumma
 				}
 			}
 		}
-	} else if record.AgentStatus == nil {
-		summary.ReasonCode = "agent_status_missing"
 	} else {
-		summary.ReasonCode = "agent_status_stale"
+		summary.ReasonCode = statusUnavailableReason(record, s.now, s.staleTTL)
 	}
 	return summary
 }
@@ -520,11 +635,15 @@ func (s visibilitySnapshot) nodeStorageSummary(record NodeRecord) operatorapi.No
 			}
 		}
 	}
-	return operatorapi.NodeStorageSummary{
-		Local:           storageCapacitySummary(record.Storage.LocalCapacityBytes, localAllocated),
-		Shared:          storageCapacitySummary(record.Storage.SharedCapacityBytes, sharedAllocated),
-		SharedBackendID: record.Storage.SharedBackendID,
-	}
+	// The agent rejects a configured local pool without a positive capacity,
+	// so zero means none is configured. A shared pool is configured whenever
+	// it has a backend ID; zero capacity then means no aggregate limit.
+	local := storageCapacitySummary(record.Storage.LocalCapacityBytes, localAllocated)
+	local.Configured = record.Storage.LocalCapacityBytes > 0
+	shared := storageCapacitySummary(record.Storage.SharedCapacityBytes, sharedAllocated)
+	shared.Configured = record.Storage.SharedBackendID != ""
+	shared.Unbounded = shared.Configured && record.Storage.SharedCapacityBytes <= 0
+	return operatorapi.NodeStorageSummary{Local: local, Shared: shared, SharedBackendID: record.Storage.SharedBackendID}
 }
 
 func storageCapacitySummary(capacity, allocated int64) operatorapi.StorageCapacitySummary {
@@ -537,19 +656,7 @@ func storageCapacitySummary(capacity, allocated int64) operatorapi.StorageCapaci
 }
 
 func (s visibilitySnapshot) freshStatus(record NodeRecord) (statusmodel.AgentStatus, bool) {
-	if record.AgentStatus == nil || record.AgentStatus.SchemaVersion != statusmodel.SchemaVersion {
-		return statusmodel.AgentStatus{}, false
-	}
-	if record.State == NodeStateDown {
-		return statusmodel.AgentStatus{}, false
-	}
-	if record.LastSeenAt.IsZero() || s.now.Sub(record.LastSeenAt) > s.staleTTL {
-		return statusmodel.AgentStatus{}, false
-	}
-	if record.AgentStatus.ObservedAt.IsZero() || s.now.Sub(record.AgentStatus.ObservedAt) > s.staleTTL {
-		return statusmodel.AgentStatus{}, false
-	}
-	return *record.AgentStatus, true
+	return freshAgentStatus(record, s.now, s.staleTTL)
 }
 
 func (s visibilitySnapshot) currentStatus(record NodeRecord) (statusmodel.AgentStatus, bool) {
@@ -573,7 +680,77 @@ func (s visibilitySnapshot) statusObservedCurrent(status statusmodel.AgentStatus
 		status.ObservedRevision == s.renderedRevision
 }
 
+// revisionStatus is the fleet view: the node-level derivation plus service
+// counts from the same per-service projection /v1/services serves. A fleet
+// whose nodes all converged is still not converged until every desired
+// service is running and healthy or without a health check, because a
+// reported service is not necessarily a serving one.
 func (s visibilitySnapshot) revisionStatus() operatorapi.RevisionStatus {
+	status := s.nodeRevisionStatus()
+	status.UnhealthyServices = []string{}
+	for _, desired := range s.desired.Services {
+		summary := s.serviceSummary(desired)
+		status.Services.Desired++
+		switch summary.State {
+		case "running":
+			status.Services.Running++
+			if summary.Health == "healthy" || summary.Health == "not_configured" {
+				status.Services.Ready++
+			}
+		case "pending":
+			status.Services.Pending++
+		case "unknown":
+			status.Services.Unknown++
+		}
+		if summary.Health == "unhealthy" {
+			status.Services.Unhealthy++
+			status.UnhealthyServices = append(status.UnhealthyServices, desired.Name)
+		}
+	}
+	sort.Strings(status.UnhealthyServices)
+	status.Problems = s.problems
+	if status.Phase != "converged" {
+		return status
+	}
+	switch {
+	case status.Services.Unhealthy > 0:
+		status.Phase = "degraded"
+		status.ReasonCode = "service_unhealthy"
+		status.Message = statusmodel.BoundedMessage("unhealthy: " + strings.Join(status.UnhealthyServices, ", "))
+	case status.Services.Ready < status.Services.Running:
+		status.Phase = "progressing"
+		status.ReasonCode = "service_health_pending"
+	case status.Services.Ready < status.Services.Desired:
+		// Node-level convergence only proves each service was reported. An
+		// agent keeps its last phase and conditions between ticks, so a VM
+		// that stopped since then still sits under a ready node.
+		status.Phase = "progressing"
+		status.ReasonCode = "service_not_running"
+	case len(s.problems) > 0:
+		// A converged claim needs every record it rests on. A relevant node
+		// whose record could not be read is already unknown above, but with
+		// an empty desired revision every node is relevant, so a skipped
+		// node record could be one still running old workloads.
+		status.Phase = "degraded"
+		status.ReasonCode = "projection_incomplete"
+		if len(s.desired.Services) == 0 && s.hasProblem("node") {
+			status.Phase = "unknown"
+			status.ReasonCode = "node_record_unreadable"
+		}
+	}
+	return status
+}
+
+func (s visibilitySnapshot) hasProblem(kind string) bool {
+	for _, problem := range s.problems {
+		if problem.Kind == kind {
+			return true
+		}
+	}
+	return false
+}
+
+func (s visibilitySnapshot) nodeRevisionStatus() operatorapi.RevisionStatus {
 	status := operatorapi.RevisionStatus{
 		APIVersion: operatorapi.APIVersion, ObservedAt: s.now, Phase: "unknown",
 		DesiredRevision: s.desired.Revision, PlacementRevision: s.placement.Revision,
@@ -662,12 +839,12 @@ func (s visibilitySnapshot) revisionStatus() operatorapi.RevisionStatus {
 			status.Message = "non-empty desired revision has no rendered node assignments"
 			return status
 		}
-		// An empty desired revision has no placement to converge, but
-		// publishRendered deletes nodes/<node>.yaml for a node no longer
-		// relevant instead of publishing an explicit empty config. An agent
-		// that fetches a missing file treats it as a fetch failure and keeps
-		// every VM and route it already had running, so an empty placement
-		// proves nothing about what is actually running: reporting converged
+		// An empty desired revision has no placement to converge. Every
+		// active node would have received an explicit empty config, so this
+		// is reached only when no node was active. A node outside the
+		// placement is emptied only when that is provably safe, and even then
+		// its agent may not be polling, so an empty placement proves nothing
+		// about what is actually running: reporting converged
 		// here on the strength of nothing left to place would go green while
 		// old workloads stay up. Require every node this control plane has a
 		// record for to confirm, via a fresh heartbeat that has actually
@@ -862,7 +1039,7 @@ func (s visibilitySnapshot) serviceSummary(desired config.ServiceConfig) operato
 	if !s.placementCurrent {
 		reason = "placement_pending"
 	}
-	summary := operatorapi.ServiceSummary{Name: desired.Name, State: "pending", Health: "unknown", VCPUs: desired.VCPUs, MemoryMB: desired.MemoryMB, Storage: summarizeServiceStorage(desiredVolumeStatuses(desired, s.volumeByID)), ReasonCode: reason}
+	summary := operatorapi.ServiceSummary{Name: desired.Name, State: "pending", Health: "unknown", VCPUs: desired.VCPUs, MemoryMB: desired.MemoryMB, Storage: summarizeServiceStorage(s.serviceVolumeStatuses(desired)), ReasonCode: reason}
 	if pending, ok := s.pendingByService[desired.Name]; ok && s.placementCurrent {
 		summary.ReasonCode = pending.ReasonCode
 		summary.Message = pending.Message
@@ -891,6 +1068,7 @@ func (s visibilitySnapshot) serviceSummary(desired config.ServiceConfig) operato
 		}
 		stale, fresh := s.freshStatus(record)
 		if !fresh {
+			summary.ReasonCode = statusUnavailableReason(record, s.now, s.staleTTL)
 			return summary
 		}
 		// The node has not applied the current revision, which the reason code

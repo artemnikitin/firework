@@ -52,7 +52,7 @@ nav > button:hover, nav > button:focus-visible, nav > button.active {
 
 main { max-width: 1240px; margin: 0 auto; padding: 2.25rem 1.25rem 4rem; }
 .toolbar { display: flex; justify-content: flex-end; gap: .75rem; margin-bottom: 1.25rem; }
-.toolbar[hidden] { display: none; }
+.toolbar[hidden], .toolbar select[hidden] { display: none; }
 
 input, select {
   width: 100%;
@@ -148,6 +148,8 @@ tbody tr:hover { background: #fafcfd; }
 .draining, .stopped { color: #325777; background: #dcecf8; }
 
 #error { margin-bottom: 1rem; padding: 1rem; border: 1px solid #efb9b9; border-radius: .5rem; color: #8b1c1c; background: #ffe7e7; }
+.notice { margin-bottom: 1rem; padding: .85rem 1rem; border: 1px solid #ecd28f; border-radius: .5rem; color: #6b4e00; background: #fff6dc; }
+.notice ul { margin: .4rem 0 0; padding-left: 1.25rem; }
 .empty-state { padding: 2.5rem 1rem; border: 1px dashed #cbd4dc; border-radius: .65rem; color: #627384; background: #fff; text-align: center; }
 .muted { color: #748290; }
 

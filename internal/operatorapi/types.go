@@ -7,10 +7,20 @@ import "time"
 const APIVersion = "v1"
 
 type ListEnvelope[T any] struct {
-	APIVersion string    `json:"api_version"`
-	ObservedAt time.Time `json:"observed_at"`
-	Count      int       `json:"count"`
-	Items      []T       `json:"items"`
+	APIVersion string              `json:"api_version"`
+	ObservedAt time.Time           `json:"observed_at"`
+	Count      int                 `json:"count"`
+	Items      []T                 `json:"items"`
+	Problems   []ProjectionProblem `json:"problems,omitempty"`
+}
+
+// ProjectionProblem is a stored record the projection could not read or
+// interpret and therefore left out of the response. ID is the record's
+// identifier taken from its storage key, never its contents.
+type ProjectionProblem struct {
+	Kind       string `json:"kind"` // node or volume
+	ID         string `json:"id"`
+	ReasonCode string `json:"reason_code"` // record_unreadable or record_invalid
 }
 
 type Resources struct {
@@ -19,8 +29,13 @@ type Resources struct {
 }
 
 // StorageCapacitySummary reports reserved storage capacity. It does not
-// report filesystem or block-device utilization.
+// report filesystem or block-device utilization. Configured is false when the
+// node has no such pool, so zero capacity is never ambiguous; Unbounded marks
+// a configured pool without aggregate capacity (for example, elastic shared
+// storage), whose capacity and available bytes are then not meaningful.
 type StorageCapacitySummary struct {
+	Configured     bool  `json:"configured"`
+	Unbounded      bool  `json:"unbounded,omitempty"`
 	CapacityBytes  int64 `json:"capacity_bytes"`
 	AllocatedBytes int64 `json:"allocated_bytes"`
 	AvailableBytes int64 `json:"available_bytes"`
@@ -92,8 +107,25 @@ type RevisionStatus struct {
 	StaleNodes        []string  `json:"stale_nodes"`
 	DownNodes         []string  `json:"down_nodes"`
 	UnknownNodes      []string  `json:"unknown_nodes"`
-	ReasonCode        string    `json:"reason_code,omitempty"`
-	Message           string    `json:"message,omitempty"`
+	// Services counts desired services by their projected /v1/services
+	// state, so the overview needs no second request to show unhealthy or
+	// pending work. UnhealthyServices names the unhealthy ones.
+	Services          ServiceCounts       `json:"services"`
+	UnhealthyServices []string            `json:"unhealthy_services"`
+	Problems          []ProjectionProblem `json:"problems,omitempty"`
+	ReasonCode        string              `json:"reason_code,omitempty"`
+	Message           string              `json:"message,omitempty"`
+}
+
+// ServiceCounts summarizes desired services. Ready counts running services
+// whose health check passed or that have none.
+type ServiceCounts struct {
+	Desired   int `json:"desired"`
+	Running   int `json:"running"`
+	Ready     int `json:"ready"`
+	Pending   int `json:"pending"`
+	Unhealthy int `json:"unhealthy"`
+	Unknown   int `json:"unknown"`
 }
 
 // VolumeAllocationSummary reserves the larger desired or applied size for
