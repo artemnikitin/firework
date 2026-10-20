@@ -60,8 +60,8 @@ func maximalAgentStatus(nodeID string) *statusmodel.AgentStatus {
 	for i := 0; i < statusmodel.MaxServices; i++ {
 		service := statusmodel.ServiceStatus{
 			Name:            uniqueAtCap(i, statusmodel.MaxServiceNameLen),
-			VMState:         strings.Repeat("s", statusmodel.MaxEnumLen),
-			Health:          strings.Repeat("h", statusmodel.MaxEnumLen),
+			VMState:         longestVMState,
+			Health:          longestHealthState,
 			HealthCheckType: strings.Repeat("k", statusmodel.MaxEnumLen),
 			NetworkAddress:  strings.Repeat("n", statusmodel.MaxNetworkAddressLen),
 			ReasonCode:      reason,
@@ -69,12 +69,12 @@ func maximalAgentStatus(nodeID string) *statusmodel.AgentStatus {
 		}
 		for v := 0; v < config.MaxServiceVolumes; v++ {
 			service.Volumes = append(service.Volumes, statusmodel.VolumeStatus{
-				LogicalID:       strings.Repeat("l", statusmodel.MaxLogicalIDLen),
-				Type:            strings.Repeat("t", statusmodel.MaxEnumLen),
+				LogicalID:       uniqueAtCap(v, statusmodel.MaxLogicalIDLen),
+				Type:            longestVolumeType,
 				MountPath:       strings.Repeat("m", statusmodel.MaxMountPathLen),
 				BoundNode:       strings.Repeat("b", statusmodel.MaxVolumeIDLen),
 				SharedBackendID: strings.Repeat("d", statusmodel.MaxVolumeIDLen),
-				State:           strings.Repeat("e", statusmodel.MaxEnumLen),
+				State:           longestVolumeState,
 				LastError:       wide,
 				// The rejection fields are additive but still per-volume, so
 				// they have to be at their bound here or the measured worst
@@ -91,6 +91,16 @@ func maximalAgentStatus(nodeID string) *statusmodel.AgentStatus {
 	}
 	return status
 }
+
+// Enum-shaped fields are validated against closed vocabularies, so the
+// worst case uses the longest accepted value of each rather than a filler at
+// MaxEnumLen.
+const (
+	longestVMState     = "recovery_pending"
+	longestHealthState = "not_configured"
+	longestVolumeType  = "shared"
+	longestVolumeState = "prepared"
+)
 
 // uniqueAtCap returns a string of exactly maxLen bytes: a repeated fill with
 // a zero-padded numeric suffix distinct per i, so a caller building many
@@ -196,13 +206,13 @@ func TestMaxRegistryRequestBytesThroughAgentStatusPath(t *testing.T) {
 		// way here to reach the same worst case.
 		volumeStatuses := agent.BuildVolumeStatuses(config.ServiceConfig{Name: svcName, Volumes: volumes}, nil)
 		for v := range volumeStatuses {
-			volumeStatuses[v].State = strings.Repeat("e", statusmodel.MaxEnumLen)
+			volumeStatuses[v].State = longestVolumeState
 			volumeStatuses[v].LastError = statusmodel.BoundedMessage(wide)
 		}
 
 		status.Services = append(status.Services, statusmodel.ServiceStatus{
-			Name: svcName, VMState: strings.Repeat("s", statusmodel.MaxEnumLen),
-			Health: strings.Repeat("h", statusmodel.MaxEnumLen), HealthCheckType: strings.Repeat("k", statusmodel.MaxEnumLen),
+			Name: svcName, VMState: longestVMState,
+			Health: longestHealthState, HealthCheckType: strings.Repeat("k", statusmodel.MaxEnumLen),
 			NetworkAddress: strings.Repeat("n", statusmodel.MaxNetworkAddressLen),
 			ReasonCode:     reason, Message: wide, Volumes: volumeStatuses,
 		})

@@ -15,7 +15,48 @@ import (
 func admissionController(t *testing.T) (*Controller, StateStore) {
 	t.Helper()
 	store := newBlobStateStore(newMemBlob())
-	return NewController(Config{State: StateConfig{Prefix: "cp/v1/"}}, store, slog.New(slog.NewTextHandler(io.Discard, nil))), store
+	return NewController(Config{State: StateConfig{Prefix: "cp/v1/"}, NodeStaleTTL: time.Minute}, store, slog.New(slog.NewTextHandler(io.Discard, nil))), store
+}
+
+const (
+	ackPlacementRevision = "ack-placement"
+	ackRenderedRevision  = "ack-rendered"
+)
+
+// currentAckNode turns a fixture into fresh, current evidence for
+// acknowledgeVolumeRecords — ready, just heard from, supported schema, and
+// observing the published revisions — and publishes a placement assigning
+// every service it reports to it. Only freshness and revision fields change,
+// so tests built on it keep exercising the same acknowledgement rules.
+func currentAckNode(t *testing.T, store StateStore, node NodeRecord) NodeRecord {
+	t.Helper()
+	now := time.Now().UTC()
+	node.State = NodeStateReady
+	node.LastSeenAt = now
+	node.AgentStatusReceivedAt = now
+	node.AgentStatus.SchemaVersion = statusmodel.SchemaVersion
+	node.AgentStatus.PlacementRevision = ackPlacementRevision
+	node.AgentStatus.ObservedRevision = ackRenderedRevision
+	nodeConfig := config.NodeConfig{Node: node.NodeID}
+	for _, service := range node.AgentStatus.Services {
+		nodeConfig.Services = append(nodeConfig.Services, config.ServiceConfig{Name: service.Name})
+	}
+	publishAckPlacement(t, store, nodeConfig)
+	return node
+}
+
+func publishAckPlacement(t *testing.T, store StateStore, nodes ...config.NodeConfig) {
+	t.Helper()
+	ctx := context.Background()
+	for key, value := range map[string]any{
+		placementRevisionKey("cp/v1/", ackPlacementRevision): PlacementRevision{Revision: ackPlacementRevision, NodeConfigs: nodes},
+		placementCurrentKey("cp/v1/"):                        RevisionPointer{Revision: ackPlacementRevision},
+		renderedCurrentKey("cp/v1/"):                         RevisionPointer{Revision: ackRenderedRevision},
+	} {
+		if _, err := store.PutJSON(ctx, key, value); err != nil {
+			t.Fatal(err)
+		}
+	}
 }
 
 func putRecord(t *testing.T, store StateStore, service, volume string, record VolumeRecord) {
@@ -290,7 +331,7 @@ func TestRejectedObservationConvergesTheRecordOnTheEffectiveSize(t *testing.T) {
 			RejectedReason: "shrink_below_minimum", LastError: "below the safe minimum",
 		}},
 	}}}}
-	if _, err := store.PutJSON(ctx, nodeKey, node); err != nil {
+	if _, err := store.PutJSON(ctx, nodeKey, currentAckNode(t, store, node)); err != nil {
 		t.Fatal(err)
 	}
 

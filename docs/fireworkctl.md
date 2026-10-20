@@ -86,6 +86,27 @@ fireworkctl services --help
 - Node states: `ready`, `draining`, `down`, `stale`, `unknown`.
 - Service states: `pending`, `running`, `stopped`, `failed`, `unknown`.
 - Service health: `healthy`, `unhealthy`, `unknown`, `not_configured`.
+- A `down` node stays `down` after its lease ages; only `ready` and
+  `draining` nodes become `stale`.
+
+`fireworkctl status` also counts desired services by state and health and
+names the unhealthy ones, so a fleet whose nodes converged but which runs an
+unhealthy service reads as `degraded`.
+
+Table output shows sizes in binary units; `--output json` always carries the
+exact byte values from the API:
+
+- `nodes` adds `LOCAL DISK` and `SHARED DISK` as allocated/capacity (`-` when
+  the node has no such pool, `(no limit)` for shared storage without an
+  aggregate capacity) and the node's `REASON`.
+- `node NODE_ID` adds labels, registration and update times, local and
+  shared disk, the shared backend, and the desired, placement, observed, and
+  applied revisions.
+- `services` adds `DISK` (reserved local and shared bytes) and `REASON`.
+- `service SERVICE_NAME` adds the public URL and the disk summary.
+
+When the API had to skip a node or volume record it could not read, list and
+status tables end with a `SKIPPED RECORD` section naming it and the reason.
 
 `fireworkctl service SERVICE_NAME` also prints a persistent-volume table when
 the service declares volumes. It shows the logical ID, type, guest mount path,

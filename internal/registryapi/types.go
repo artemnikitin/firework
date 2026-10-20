@@ -47,8 +47,12 @@ type HeartbeatRequest struct {
 	Storage     StorageResources         `json:"storage,omitempty"`
 }
 
+// StateRequest changes the lifecycle state of the caller's current
+// incarnation. Generation must equal the registered generation: a process
+// that was replaced by a newer registration cannot change the newer one.
 type StateRequest struct {
-	State NodeState `json:"state"`
+	State      NodeState `json:"state"`
+	Generation int64     `json:"generation"`
 }
 
 type EnrollRequest struct {
@@ -71,4 +75,28 @@ type NodeResponse struct {
 	Generation int64     `json:"generation"`
 	State      NodeState `json:"state"`
 	LastSeenAt time.Time `json:"last_seen_at"`
+}
+
+// Stable registry error codes. Clients branch on these codes and the HTTP
+// status, never on the message text.
+const (
+	ErrorCodeInvalidRequest     = "invalid_request"
+	ErrorCodeUnauthorized       = "unauthorized"
+	ErrorCodeForbidden          = "forbidden"
+	ErrorCodeNodeNotRegistered  = "node_not_registered"
+	ErrorCodeStaleGeneration    = "stale_generation"
+	ErrorCodeRequestTooLarge    = "request_too_large"
+	ErrorCodeInvalidAgentStatus = "invalid_agent_status"
+	ErrorCodeInternal           = "internal_error"
+)
+
+// ErrorResponse is the bounded error envelope returned by every registry
+// endpoint.
+type ErrorResponse struct {
+	Error ErrorBody `json:"error"`
+}
+
+type ErrorBody struct {
+	Code    string `json:"code"`
+	Message string `json:"message"`
 }

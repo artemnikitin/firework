@@ -35,6 +35,9 @@ type Config struct {
 	LeaderRenewInterval time.Duration `yaml:"leader_renew_interval"`
 	NodeStaleTTL        time.Duration `yaml:"node_stale_ttl"`
 	ControllerTick      time.Duration `yaml:"controller_tick"`
+	// APISnapshotTTL bounds how often the read-only API rebuilds its
+	// deployment snapshot from object storage. 0 rebuilds on every request.
+	APISnapshotTTL time.Duration `yaml:"api_snapshot_ttl"`
 
 	TargetBranch string `yaml:"target_branch"`
 	ConfigDir    string `yaml:"config_dir"`
@@ -109,6 +112,7 @@ func DefaultConfig() Config {
 		LeaderRenewInterval: 10 * time.Second,
 		NodeStaleTTL:        45 * time.Second,
 		ControllerTick:      10 * time.Second,
+		APISnapshotTTL:      5 * time.Second,
 		TargetBranch:        "main",
 		Enrollment: EnrollmentConfig{
 			NodeCertTTL: 24 * time.Hour,
@@ -228,6 +232,9 @@ func (c Config) Validate() error {
 	}
 	if c.NodeStaleTTL <= 0 {
 		return fmt.Errorf("node_stale_ttl must be > 0")
+	}
+	if c.APISnapshotTTL < 0 {
+		return fmt.Errorf("api_snapshot_ttl must be >= 0")
 	}
 
 	// Controller-only role does not expose HTTPS endpoints, so server TLS

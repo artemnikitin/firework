@@ -1049,6 +1049,7 @@ func (a *Agent) syncRegistry(ctx context.Context, cap, used capacity.NodeCapacit
 	}
 	status := a.agentStatusSnapshot()
 	a.registryClient.sync(ctx, a.cfg.NodeID, a.cfg.NodeNames, cap, used, &status)
+	a.metrics.setRegistryFenced(a.registryClient.isFenced())
 }
 
 func (a *Agent) syncRegistryAfterTick(ctx context.Context, cap, used capacity.NodeCapacity) {

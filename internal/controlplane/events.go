@@ -67,8 +67,16 @@ type gitHubWebhookPayload struct {
 }
 
 func (s *EventsServer) handleGitHubEvent(w http.ResponseWriter, r *http.Request) {
+	// The cap applies before the body is buffered for signature
+	// verification, so an unauthenticated caller cannot make this read
+	// unbounded.
+	limitBody(w, r, maxGitHubWebhookBytes)
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
+		if isRequestTooLarge(err) {
+			writeJSON(w, http.StatusRequestEntityTooLarge, map[string]string{"error": "request body too large"})
+			return
+		}
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "failed to read body"})
 		return
 	}
