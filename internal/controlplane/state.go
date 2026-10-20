@@ -286,10 +286,6 @@ func legacyNodeConfigKey(prefix, nodeID string) string {
 	return path.Join(stateRoot(prefix), "nodes", nodeID+".yaml")
 }
 
-func legacyNodesPrefix(prefix string) string {
-	return path.Join(stateRoot(prefix), "nodes") + "/"
-}
-
 func dedupeKey(prefix, eventID string) string {
 	return path.Join(stateRoot(prefix), "events", "dedupe", eventID+".json")
 }

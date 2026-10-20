@@ -230,12 +230,12 @@ early. When a node's status cannot be used, its reason code says why:
 zero relevant nodes can converge only when the desired service set is also
 empty, and even then only once every node the control plane has a record for
 confirms it via a fresh heartbeat that has actually observed the empty
-revision. The controller currently deletes a no-longer-relevant node's legacy
-`nodes/<node>.yaml` instead of publishing an explicit empty config, so an
-agent that fetches it sees a missing file, treats that as a fetch failure, and
-keeps every VM and route it already had running; treating every known node as
-relevant here is what stops an empty desired state from reporting converged
-while those workloads are still up.
+revision. Active nodes receive an explicit empty config, but a node outside
+the placement (draining, down, or stale) is emptied only when nothing in its
+current config is still desired and unplaced, and its agent may not be polling
+at all; treating every known node as relevant here is what stops an empty
+desired state from reporting converged while old workloads may still be up.
+See [empty desired state](configs/README.md#empty-and-unknown-desired-state).
 
 ## CLI
 

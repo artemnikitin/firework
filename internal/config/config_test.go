@@ -1,8 +1,11 @@
 package config
 
 import (
+	"errors"
 	"testing"
 	"time"
+
+	"gopkg.in/yaml.v3"
 )
 
 func TestParseNodeConfig(t *testing.T) {
@@ -100,13 +103,75 @@ services:
 	}
 }
 
-func TestParseNodeConfig_Empty(t *testing.T) {
-	nc, err := ParseNodeConfig([]byte(""))
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
+// Only an explicit services list is authoritative. The agent deletes every
+// running service a config omits, so anything that merely fails to mention
+// services — a truncated object, a half-synced file, a typo — must be a parse
+// error that preserves the node, never a decoded empty assignment.
+func TestParseNodeConfig_ExplicitEmptyState(t *testing.T) {
+	tests := []struct {
+		name    string
+		data    string
+		wantErr bool
+	}{
+		{name: "empty list", data: "node: web\nservices: []\n"},
+		{name: "empty list with revisions", data: "node: web\nservices: []\nrendered_revision: rendered-1\n"},
+		{name: "empty body", data: "", wantErr: true},
+		{name: "whitespace only", data: " \n\t\n", wantErr: true},
+		{name: "document marker only", data: "---\n", wantErr: true},
+		{name: "comments only", data: "# nothing here\n", wantErr: true},
+		{name: "omitted services", data: "node: web\n", wantErr: true},
+		{name: "null services", data: "node: web\nservices: null\n", wantErr: true},
+		{name: "tilde services", data: "node: web\nservices: ~\n", wantErr: true},
+		{name: "bare services key", data: "node: web\nservices:\n", wantErr: true},
+		{name: "scalar services", data: "node: web\nservices: web\n", wantErr: true},
+		{name: "mapping services", data: "node: web\nservices: {}\n", wantErr: true},
+		{name: "top-level list", data: "- node: web\n", wantErr: true},
 	}
-	if len(nc.Services) != 0 {
-		t.Errorf("expected 0 services, got %d", len(nc.Services))
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			nc, err := ParseNodeConfig([]byte(tt.data))
+			if tt.wantErr {
+				if err == nil {
+					t.Fatalf("expected a parse error, got %#v", nc)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if nc.Services == nil || len(nc.Services) != 0 {
+				t.Fatalf("expected a non-nil empty service list, got %#v", nc.Services)
+			}
+		})
+	}
+}
+
+func TestParseNodeConfig_MissingServicesIsTyped(t *testing.T) {
+	_, err := ParseNodeConfig([]byte("node: web\n"))
+	if !errors.Is(err, ErrNoServicesList) {
+		t.Fatalf("expected ErrNoServicesList, got %v", err)
+	}
+}
+
+// The control plane renders an empty node from a zero-value NodeConfig whose
+// Services slice is nil. That must marshal to a document the strict parser
+// accepts, or every empty node would read as unknown instead of empty.
+func TestParseNodeConfig_AcceptsMarshaledEmptyConfig(t *testing.T) {
+	for _, nc := range []NodeConfig{
+		{Node: "web"},
+		{Node: "web", Services: []ServiceConfig{}},
+	} {
+		data, err := yaml.Marshal(nc)
+		if err != nil {
+			t.Fatal(err)
+		}
+		parsed, err := ParseNodeConfig(data)
+		if err != nil {
+			t.Fatalf("marshaled empty config %q was rejected: %v", data, err)
+		}
+		if parsed.Node != "web" || parsed.Services == nil || len(parsed.Services) != 0 {
+			t.Fatalf("unexpected round trip of %q: %#v", data, parsed)
+		}
 	}
 }
 

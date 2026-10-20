@@ -839,12 +839,12 @@ func (s visibilitySnapshot) nodeRevisionStatus() operatorapi.RevisionStatus {
 			status.Message = "non-empty desired revision has no rendered node assignments"
 			return status
 		}
-		// An empty desired revision has no placement to converge, but
-		// publishRendered deletes nodes/<node>.yaml for a node no longer
-		// relevant instead of publishing an explicit empty config. An agent
-		// that fetches a missing file treats it as a fetch failure and keeps
-		// every VM and route it already had running, so an empty placement
-		// proves nothing about what is actually running: reporting converged
+		// An empty desired revision has no placement to converge. Every
+		// active node would have received an explicit empty config, so this
+		// is reached only when no node was active. A node outside the
+		// placement is emptied only when that is provably safe, and even then
+		// its agent may not be polling, so an empty placement proves nothing
+		// about what is actually running: reporting converged
 		// here on the strength of nothing left to place would go green while
 		// old workloads stay up. Require every node this control plane has a
 		// record for to confirm, via a fresh heartbeat that has actually
