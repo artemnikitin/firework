@@ -305,6 +305,8 @@ Notes:
   the service — either `metadata.subdomain` or `metadata.host`. Local routes proxy to the
   VM guest IP; remote routes proxy to the peer node's `host_ip` and the first
   `port_forwards[].host_port`.
+- `services` is required. `services: []` declares a node that runs nothing; see
+  [empty and unknown desired state](#empty-and-unknown-desired-state).
 - revision fields are emitted by the controller and let registry-enabled agents
   acknowledge a stable rendered revision. Direct-Git configs may omit them.
 - `size_bytes`, `bound_node`, `shared_backend_id`, and `resize_generation` are
@@ -339,6 +341,40 @@ Notes:
 - Remote Traefik routing is available when the config store can list peer node
   configs, such as the S3- or GCS-backed control-plane flow.
 - `health_check.target` can be set directly, but enriched configs usually use `port`/`path` and let the agent compose the target from guest IP.
+
+### Empty and unknown desired state
+
+An agent distinguishes a node that should run nothing from a node whose desired
+state it cannot read, and only the first stops workloads:
+
+| Config as read by the agent | Meaning | Agent behavior |
+| --- | --- | --- |
+| `services: []` | Explicit empty desired state | Reconcile normally: stop and remove every local VM, its health check, port forwards, and network devices, and sync local Traefik routes to empty |
+| Missing object or file, read failure, or invalid YAML | Unknown | Keep every running service and route; report `config_fetch_failed` or `config_parse_failed` and retry |
+| Empty file, empty document, `services` omitted, or `services: null` | Unknown (not empty) | Same as above, reported as `config_parse_failed` |
+
+With several `node_names`, the agent reconciles only when every label was
+fetched and parsed; one unknown label keeps the whole node at its last applied
+state.
+
+In the control-plane flow, the controller never deletes `cp/v1/nodes/<node>.yaml`:
+
+- an active node with no assignment receives `services: []` for the current
+  revision;
+- a registered node outside the placement (draining, down, or stale) receives
+  `services: []` once every service in its current config has been removed from
+  desired state or placed on an active node. A config that still holds a desired
+  service with no active placement is left as it is, so a fleet-wide registry
+  outage cannot empty every node;
+- a missing or unreadable config, or one with no registry record, is left
+  untouched. Missing is unknown, not empty: an older controller deleted the
+  config of a node that left the placement, and that node may still be running
+  the only copies of its services.
+
+**Direct Git mode:** to stop everything a label runs, commit its file with
+`services: []`. Deleting `nodes/<label>.yaml` does not stop anything — the agent
+reports a fetch failure and keeps the last applied services running. Keep the
+empty file for as long as any agent may still read that label.
 
 ## 5) CI-Only Fields (Not Used By Firework Runtime)
 

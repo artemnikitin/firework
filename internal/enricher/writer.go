@@ -18,7 +18,6 @@ import (
 type s3WriterAPI interface {
 	PutObject(ctx context.Context, params *s3.PutObjectInput, optFns ...func(*s3.Options)) (*s3.PutObjectOutput, error)
 	ListObjectsV2(ctx context.Context, params *s3.ListObjectsV2Input, optFns ...func(*s3.Options)) (*s3.ListObjectsV2Output, error)
-	DeleteObject(ctx context.Context, params *s3.DeleteObjectInput, optFns ...func(*s3.Options)) (*s3.DeleteObjectOutput, error)
 }
 
 // S3Writer writes enriched NodeConfig YAML files to S3.
@@ -74,15 +73,17 @@ func (w *S3Writer) WriteNodeConfig(ctx context.Context, nc config.NodeConfig) er
 	return nil
 }
 
-// WriteAll writes all enriched NodeConfigs to S3.
-// If configs is empty the function is a no-op: it will not delete existing
-// objects, because an empty scheduler response is almost certainly an error
-// rather than a genuine "zero services desired" signal.
+// WriteAll publishes the result of one successful enrichment run as the
+// complete set of node configs. Call it only after enrichment succeeded: its
+// output is treated as authoritative, including when it is empty.
+//
+// A node config that exists but is absent from configs is overwritten with an
+// explicit `services: []`, never deleted. An agent reads a missing config as
+// "desired state unknown" and keeps running what it has, so deleting the
+// config of a node type that lost its last service would leave that service
+// running indefinitely. For the same reason an empty configs list empties
+// every existing node config rather than being skipped.
 func (w *S3Writer) WriteAll(ctx context.Context, configs []config.NodeConfig) error {
-	if len(configs) == 0 {
-		return nil
-	}
-
 	desiredKeys := make(map[string]struct{}, len(configs))
 	for _, nc := range configs {
 		desiredKeys[w.nodeKey(nc.Node)] = struct{}{}
@@ -103,8 +104,9 @@ func (w *S3Writer) WriteAll(ctx context.Context, configs []config.NodeConfig) er
 		if _, keep := desiredKeys[key]; keep {
 			continue
 		}
-		if err := w.deleteNodeConfigKey(ctx, key); err != nil {
-			return fmt.Errorf("deleting stale node config %s: %w", key, err)
+		node := strings.TrimSuffix(strings.TrimPrefix(key, w.nodesPrefix()), ".yaml")
+		if err := w.WriteNodeConfig(ctx, config.NodeConfig{Node: node, Services: []config.ServiceConfig{}}); err != nil {
+			return fmt.Errorf("emptying omitted node config %s: %w", key, err)
 		}
 	}
 	return nil
@@ -150,14 +152,6 @@ func (w *S3Writer) listNodeConfigKeys(ctx context.Context) ([]string, error) {
 	}
 
 	return keys, nil
-}
-
-func (w *S3Writer) deleteNodeConfigKey(ctx context.Context, key string) error {
-	_, err := w.client.DeleteObject(ctx, &s3.DeleteObjectInput{
-		Bucket: aws.String(w.bucket),
-		Key:    aws.String(key),
-	})
-	return err
 }
 
 func objectKey(obj types.Object) string {
