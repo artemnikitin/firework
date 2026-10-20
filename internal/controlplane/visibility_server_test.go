@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"testing"
 
@@ -29,6 +30,71 @@ func TestVisibilityServerAuthentication(t *testing.T) {
 		t.Fatal("valid bearer token was rejected")
 	}
 
+}
+
+func TestVisibilityLoginBodyLimit(t *testing.T) {
+	cfg := validConfigForRole(RoleAPI)
+	server := NewVisibilityServer(cfg, newBlobStateStore(newMemBlob()), slog.New(slog.NewTextHandler(io.Discard, nil)))
+	validForm := url.Values{"token": {cfg.OperatorToken}}.Encode()
+	paddedForm := validForm + "&padding="
+	atLimit := paddedForm + strings.Repeat("a", maxLoginFormBytes-len(paddedForm))
+	tests := []struct {
+		name          string
+		body          string
+		unknownLength bool
+		wantStatus    int
+		wantLocation  string
+		wantSession   bool
+	}{
+		{name: "valid token", body: validForm, wantStatus: http.StatusSeeOther, wantLocation: "/", wantSession: true},
+		{name: "valid token at limit", body: atLimit, wantStatus: http.StatusSeeOther, wantLocation: "/", wantSession: true},
+		{name: "invalid token", body: "token=wrong", wantStatus: http.StatusSeeOther, wantLocation: "/login?error=1"},
+		{name: "malformed form", body: validForm + "&padding=%ZZ", wantStatus: http.StatusSeeOther, wantLocation: "/login?error=1"},
+		{name: "valid token above limit", body: atLimit + "a", wantStatus: http.StatusRequestEntityTooLarge},
+		{name: "invalid token above limit", body: "token=" + strings.Repeat("a", maxLoginFormBytes), wantStatus: http.StatusRequestEntityTooLarge},
+		{name: "unknown length above limit", body: atLimit + "a", unknownLength: true, wantStatus: http.StatusRequestEntityTooLarge},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			request := httptest.NewRequest(http.MethodPost, "/login", strings.NewReader(tt.body))
+			request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+			if tt.unknownLength {
+				request.ContentLength = -1
+			}
+			recorder := httptest.NewRecorder()
+			server.handleLogin(recorder, request)
+			if recorder.Code != tt.wantStatus {
+				t.Fatalf("status = %d, want %d; body: %s", recorder.Code, tt.wantStatus, recorder.Body.String())
+			}
+			if got := recorder.Header().Get("Location"); got != tt.wantLocation {
+				t.Errorf("Location = %q, want %q", got, tt.wantLocation)
+			}
+			cookies := recorder.Result().Cookies()
+			if tt.wantSession {
+				if len(cookies) != 1 {
+					t.Fatalf("cookies = %v, want one session cookie", cookies)
+				}
+				authenticated := httptest.NewRequest(http.MethodGet, "/v1/status", nil)
+				authenticated.AddCookie(cookies[0])
+				if !server.authorized(authenticated) {
+					t.Error("login cookie does not authorize requests")
+				}
+			} else if len(cookies) != 0 {
+				t.Errorf("rejected login set cookies: %v", cookies)
+			}
+			if tt.wantStatus == http.StatusRequestEntityTooLarge {
+				var response struct {
+					Error string `json:"error"`
+				}
+				if err := json.Unmarshal(recorder.Body.Bytes(), &response); err != nil {
+					t.Fatal(err)
+				}
+				if response.Error != "request_too_large" {
+					t.Errorf("error = %q, want request_too_large", response.Error)
+				}
+			}
+		})
+	}
 }
 
 func TestVisibilityAssetsDisableBrowserCaching(t *testing.T) {
