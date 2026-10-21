@@ -114,9 +114,10 @@ local node binding or shared backend, requested/effective/applied bytes, resize
 generation, and preparation state.
 
 Requested is what the repo asked for, effective is what the control plane
-accepted and rendered, and applied is what exists on disk. They differ only
-when a size request was refused, and in that case the state column names the
-refusal reason. See [persistent volumes](persistent-volumes.md).
+accepted and rendered, and applied is what exists on disk. Effective and
+applied sizes can differ while an accepted resize is in progress. When a
+request was refused, requested and effective sizes differ and the state column
+names the refusal reason. See [persistent volumes](persistent-volumes.md).
 
 Storage-related pending and refusal reasons:
 

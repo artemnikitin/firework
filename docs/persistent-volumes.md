@@ -122,8 +122,9 @@ resize is attempted, and the service is neither stopped nor restarted. Status
 therefore carries three sizes rather than two — **requested** (what the repo
 asked for), **effective** (what the control plane accepted and rendered), and
 **applied** (what exists on disk) — and the API, `fireworkctl service <name>`,
-and the UI show requested next to effective. When they differ, the volume is
-also flagged with the reason it was refused.
+and the UI show requested next to effective. A refused request is flagged with
+its refusal reason. Effective and applied sizes can also differ while an
+accepted resize is still waiting to be applied.
 
 To recover, change the requested size to something feasible. That is a new
 request, so it is measured and admitted from scratch. Reverting the request to
@@ -137,7 +138,7 @@ asked for is not converged, even though every workload is healthy. Deleting the
 service ends that: its record is retained, but nothing is asking for the size
 any more.
 
-### Direct-Git node configs must bump `resize_generation`
+### Direct-Git resize generations
 
 In control-plane-managed mode the controller mints a new `resize_generation`
 whenever a volume's requested size changes, so a corrected request is always
@@ -145,13 +146,18 @@ distinguishable from a repeat of a refused one.
 
 Hand-authored node configs (see [docs/configs](configs/README.md)) carry
 `resize_generation` themselves, and Firework cannot mint one for them.
-**Bump `resize_generation` whenever you change a volume's `size_bytes`.** A
-corrected size at an unchanged generation is still re-measured rather than
-clamped, and reverting to the size already running withdraws the request at any
-generation — but leaving the generation at `0` or omitting it means no resize
-is ever recognized at all. `configcheck --node-config <file>` validates the
-config and warns when it declares a volume size with an absent or zero
+**Bump `resize_generation` whenever you change a volume's `size_bytes`** to
+identify each request explicitly. The runtime compares both size and
+generation, so changing the size can trigger growth or shrink even when the
+generation is unchanged, zero, or omitted. A corrected size at an unchanged
+generation is re-measured rather than inheriting a refusal for a different
+size; reverting to the size already running withdraws the request at any
 generation.
+
+`configcheck --node-config <file>` validates the config and warns when it
+declares a volume size with an absent or zero generation. That warning is
+advisory: the checker has no previous revision with which to verify a generation
+bump.
 
 Deleting application YAML never deletes a volume. Permanent deletion is a
 manual operator action: first stop/remove the service placement, back up the
