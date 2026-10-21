@@ -127,6 +127,10 @@ its endpoint's cap receives `413 request_too_large`:
 | `POST /v1/events/github` (before signature verification) | 25 MiB, GitHub's delivery ceiling |
 | `POST /login` | 4 KiB |
 
+An oversized login form returns HTTP 413 with `{"error":"request_too_large"}`
+without a redirect or session cookie. Forms at or below the cap retain the
+usual login success or failure redirects.
+
 Status validation is closed-world: `vm_state`, `health`, and volume `type`
 and `state` must be values from the published vocabularies, condition types,
 service names, and volume IDs within a service must be unique, and sizes must
