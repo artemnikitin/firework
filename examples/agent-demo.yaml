@@ -10,6 +10,11 @@
 node_names:
   - "web"
   - "backend"
+# Advertise both node types to the control-plane scheduler, which places a
+# service only on nodes whose labels include its node_type.
+node_labels:
+  - "web"
+  - "backend"
 node_id: "demo-node-1"
 
 # Config store: S3 bucket where control-plane controller writes nodes/*.yaml

@@ -153,6 +153,11 @@ Host-port claims have their own reasons — `host_port_conflict` and
 `duplicate_host_port_claims` — described in
 [docs/configs](configs/README.md#host-port-claims).
 
+`no_matching_node_type` means no active node advertises the service's
+`node_type`, or its local volumes are bound to a node that does not. Add the
+label to a node's `node_labels` and restart its agent; see
+[docs/configs](configs/README.md#node-types-and-scheduling-labels).
+
 `unknown` is intentional: it means the control plane cannot safely confirm the
 current state. For example, a stale node or an agent that has not converged to
 the current revision is not reported as healthy by inference.

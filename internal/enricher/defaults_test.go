@@ -43,6 +43,9 @@ func TestEnrichService_AllSpecified(t *testing.T) {
 	if svc.Metadata["version"] != "1.0" {
 		t.Errorf("expected version=1.0 in metadata")
 	}
+	if svc.NodeType != "general-purpose" {
+		t.Errorf("expected node_type general-purpose to be preserved, got %q", svc.NodeType)
+	}
 }
 
 func TestEnrichService_FallsBackToDefaults(t *testing.T) {

@@ -370,7 +370,10 @@ func (c *Controller) discoverActiveNodes(ctx context.Context) ([]scheduler.Node,
 			continue
 		}
 		nodes = append(nodes, scheduler.Node{
-			InstanceID:          rec.NodeID,
+			InstanceID: rec.NodeID,
+			// Normalized so the scheduling signature does not churn on label
+			// order. Labels change only when an agent re-registers.
+			Labels:              config.NormalizeNodeLabels(rec.Labels),
 			CapacityVCPUs:       rec.Capacity.VCPUs,
 			CapacityMemMB:       rec.Capacity.MemoryMB,
 			LocalCapacityBytes:  rec.Storage.LocalCapacityBytes,
@@ -500,6 +503,11 @@ func splitHeldServices(services []config.ServiceConfig, admission volumeAdmissio
 	return schedulable, held, pending
 }
 
+// Held services bypass the scheduler, including its node_type check: a hold
+// re-renders the last applied configuration where it already runs and changes
+// nothing until the record is repaired, so a label removed meanwhile takes
+// effect only once the service is schedulable again.
+//
 // heldPlacementUnrecoverable reports whether publishing this cycle could evict
 // a running service.
 //
@@ -861,13 +869,14 @@ func schedulingInputSignature(desiredRevision string, nodes []scheduler.Node, ho
 	// its tombstone is never retried. A record that stays unreadable keeps the
 	// set stable, so it does not force a new revision every tick.
 	type nodeInput struct {
-		ID                  string `json:"id"`
-		CapacityV           int    `json:"capacity_v"`
-		CapacityMB          int    `json:"capacity_mb"`
-		HostIP              string `json:"host_ip,omitempty"`
-		LocalCapacityBytes  int64  `json:"local_capacity_bytes,omitempty"`
-		SharedBackendID     string `json:"shared_backend_id,omitempty"`
-		SharedCapacityBytes int64  `json:"shared_capacity_bytes,omitempty"`
+		ID                  string   `json:"id"`
+		Labels              []string `json:"labels,omitempty"`
+		CapacityV           int      `json:"capacity_v"`
+		CapacityMB          int      `json:"capacity_mb"`
+		HostIP              string   `json:"host_ip,omitempty"`
+		LocalCapacityBytes  int64    `json:"local_capacity_bytes,omitempty"`
+		SharedBackendID     string   `json:"shared_backend_id,omitempty"`
+		SharedCapacityBytes int64    `json:"shared_capacity_bytes,omitempty"`
 	}
 	payload := struct {
 		DesiredRevision     string      `json:"desired_revision"`
@@ -883,6 +892,7 @@ func schedulingInputSignature(desiredRevision string, nodes []scheduler.Node, ho
 	for _, n := range nodes {
 		payload.Nodes = append(payload.Nodes, nodeInput{
 			ID:                  n.InstanceID,
+			Labels:              n.Labels,
 			CapacityV:           n.CapacityVCPUs,
 			CapacityMB:          n.CapacityMemMB,
 			HostIP:              hostIPByNode[n.InstanceID],

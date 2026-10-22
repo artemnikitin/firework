@@ -38,6 +38,7 @@ func EnrichService(spec ServiceSpec, defs Defaults) config.ServiceConfig {
 		Metadata:          spec.Metadata,
 		AntiAffinityGroup: spec.AntiAffinityGroup,
 		NodeHostIPEnv:     spec.NodeHostIPEnv,
+		NodeType:          spec.NodeType,
 	}
 	if len(spec.CrossNodeLinks) > 0 {
 		svc.CrossNodeLinks = make([]config.CrossNodeLink, len(spec.CrossNodeLinks))

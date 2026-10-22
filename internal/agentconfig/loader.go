@@ -62,6 +62,12 @@ func LoadAgentConfig(path string) (AgentConfig, error) {
 	if cfg.NodeID == "" {
 		cfg.NodeID = cfg.NodeName
 	}
+	for _, label := range cfg.NodeLabels {
+		if err := config.ValidateNodeLabel(label); err != nil {
+			return cfg, fmt.Errorf("node_labels: %w", err)
+		}
+	}
+	cfg.NodeLabels = config.NormalizeNodeLabels(cfg.NodeLabels)
 
 	switch cfg.StoreType {
 	case "git":

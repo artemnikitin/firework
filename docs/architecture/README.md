@@ -93,7 +93,7 @@ flowchart LR
 
 Per poll interval, the agent executes roughly this sequence:
 
-1. Fetch desired config(s) for this node label set (`node_names`).
+1. Fetch desired config(s) for this node's config names (`node_names`).
 2. Merge services from all fetched configs (deterministic ordering by service name).
 3. Optionally skip work when revision is unchanged (single-label optimization).
 4. Assign networking data (guest IP/MAC) for networked services.
@@ -112,10 +112,12 @@ Per poll interval, the agent executes roughly this sequence:
 - Existing placements on active nodes are preserved when capacity and
   anti-affinity allow.
 - Unplaced services are bin-packed to nodes with available capacity.
-- `anti_affinity_group` is treated as a preference.
-- `node_type` is retained by the enricher for direct per-label output, but the
-  current control-plane scheduler does not enforce it against registry labels;
-  see [issue #21](https://github.com/artemnikitin/firework/issues/21).
+- `node_type` is a hard requirement: a service is placed only on a node whose
+  registered labels (`node_labels`, defaulting to `node_names`) include it.
+  Existing placements are dropped when their node loses the label, and a
+  service with no matching node is `pending` with `no_matching_node_type`. See
+  [node types and scheduling labels](../configs/README.md#node-types-and-scheduling-labels).
+- `anti_affinity_group` is treated as a preference among eligible nodes.
 - `cross_node_links` and `node_host_ip_env` are resolved from registry host IPs.
   A cross-node link keeps the legacy bare `host_ip:host_port` value unless its
   optional `protocol` is set, in which case the controller injects a full URL.

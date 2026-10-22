@@ -78,6 +78,12 @@ type AgentConfig struct {
 	// NodeNames lists all labels for this node. The agent fetches and merges
 	// configs for each name. Overrides NodeName when non-empty.
 	NodeNames []string `yaml:"node_names,omitempty"`
+	// NodeLabels are the scheduling capabilities reported to the control-plane
+	// registry and matched against workload node_type. They are separate from
+	// NodeNames, which selects the config objects the agent fetches. Validated,
+	// de-duplicated, and sorted by the loader. Changing them takes effect on
+	// the next registration (an agent restart).
+	NodeLabels []string `yaml:"node_labels,omitempty"`
 	// S3ImagesBucket is the S3 bucket containing VM images (rootfs, kernels).
 	// If empty, image sync is disabled (images must be pre-placed on disk).
 	S3ImagesBucket string `yaml:"s3_images_bucket,omitempty"`
@@ -143,4 +149,15 @@ type AgentConfig struct {
 	// Must be shorter than the server-side node_stale_ttl (default 45s).
 	// Default: 15s.
 	RegistryHeartbeatInterval time.Duration `yaml:"registry_heartbeat_interval,omitempty"`
+}
+
+// SchedulingLabels returns the labels the agent reports to the registry.
+// Without explicit node_labels it reports NodeNames, as agents did before the
+// field existed, so a node whose node_names already equal workload node types
+// keeps matching them.
+func (c AgentConfig) SchedulingLabels() []string {
+	if len(c.NodeLabels) > 0 {
+		return c.NodeLabels
+	}
+	return c.NodeNames
 }

@@ -207,6 +207,7 @@ func (a *Agent) Run(ctx context.Context) error {
 	a.logger.Info("agent starting",
 		"node", a.cfg.NodeName,
 		"node_names", a.cfg.NodeNames,
+		"node_labels", a.cfg.SchedulingLabels(),
 		"store", a.cfg.StoreURL,
 		"poll_interval", a.cfg.PollInterval,
 	)
@@ -1048,7 +1049,7 @@ func (a *Agent) syncRegistry(ctx context.Context, cap, used capacity.NodeCapacit
 		return
 	}
 	status := a.agentStatusSnapshot()
-	a.registryClient.sync(ctx, a.cfg.NodeID, a.cfg.NodeNames, cap, used, &status)
+	a.registryClient.sync(ctx, a.cfg.NodeID, a.cfg.SchedulingLabels(), cap, used, &status)
 	a.metrics.setRegistryFenced(a.registryClient.isFenced())
 }
 

@@ -3,10 +3,12 @@
 // available capacity, it returns per-node service assignments.
 //
 // The algorithm:
-//  1. For each service, honour its existing placement if the target node is
-//     still alive and has capacity.
-//  2. For services that cannot be kept, bin-pack them onto the node with the
-//     most remaining capacity (best-fit descending by vCPU).
+//  1. Restrict each service to nodes advertising its node_type label. This is
+//     a hard requirement, unlike anti-affinity, which is a preference.
+//  2. For each service, honour its existing placement if the target node is
+//     still alive, still eligible, and has capacity.
+//  3. For services that cannot be kept, bin-pack them onto the eligible node
+//     with the most remaining capacity (best-fit descending by vCPU).
 package scheduler
 
 import (
@@ -20,6 +22,9 @@ import (
 type Node struct {
 	// InstanceID is the EC2 instance ID (used as the S3 config key).
 	InstanceID string
+	// Labels are the scheduling labels the node registered with. A service
+	// with a node_type is eligible only for nodes carrying that label.
+	Labels []string
 	// CapacityVCPUs is the total number of vCPUs on the node.
 	CapacityVCPUs int
 	// CapacityMemMB is the total memory on the node in MB.
@@ -27,6 +32,31 @@ type Node struct {
 	LocalCapacityBytes  int64
 	SharedBackendID     string
 	SharedCapacityBytes int64
+}
+
+// eligible reports whether the node satisfies the service's hard placement
+// requirements. An empty node_type is unconstrained: desired revisions
+// published before node_type was carried into ServiceConfig decode that way.
+func eligible(n Node, svc config.ServiceConfig) bool {
+	if svc.NodeType == "" {
+		return true
+	}
+	for _, label := range n.Labels {
+		if label == svc.NodeType {
+			return true
+		}
+	}
+	return false
+}
+
+func countEligible(nodes []Node, svc config.ServiceConfig) int {
+	count := 0
+	for _, n := range nodes {
+		if eligible(n, svc) {
+			count++
+		}
+	}
+	return count
 }
 
 // StorageReservations contains retained quota that must remain admitted even
@@ -94,7 +124,21 @@ const (
 	// never evaluated for storage, so a storage reason recorded elsewhere
 	// describes a different node than the one the operator has to fix.
 	ReasonHostPortConflict = "host_port_conflict"
+	// ReasonNoMatchingNodeType means no active node advertises the service's
+	// node_type label, so no capacity or storage check was ever reached. When
+	// matching nodes exist but cannot fit the service, the ordinary capacity,
+	// port, or storage reason is reported instead, evaluated over matching
+	// nodes only.
+	ReasonNoMatchingNodeType = "no_matching_node_type"
 )
+
+func noMatchingNodeType(svc config.ServiceConfig) Pending {
+	return Pending{
+		Service:    svc.Name,
+		ReasonCode: ReasonNoMatchingNodeType,
+		Message:    fmt.Sprintf("no active node advertises node_type %q", svc.NodeType),
+	}
+}
 
 // storageRank orders storage rejection causes from least to most actionable so
 // the dominant one survives across candidate nodes.
@@ -181,7 +225,7 @@ func Schedule(
 		}
 
 		n, alive := nodeByID[existingNode]
-		if !alive {
+		if !alive || !eligible(n, svc) {
 			unplaced = append(unplaced, svc)
 			continue
 		}
@@ -219,6 +263,15 @@ func Schedule(
 	for _, svc := range unplaced {
 		target := bestFit(nodes, svc, usedVCPUs, usedMemMB, nodeGroups)
 		if target == "" {
+			if countEligible(nodes, svc) == 0 {
+				return nil, fmt.Errorf("service %q requires node_type %q, which no active node advertises", svc.Name, svc.NodeType)
+			}
+			if svc.NodeType != "" {
+				return nil, fmt.Errorf(
+					"no node with node_type %q has sufficient capacity for service %q (needs %d vCPU, %d MB)",
+					svc.NodeType, svc.Name, svc.VCPUs, svc.MemoryMB,
+				)
+			}
 			return nil, fmt.Errorf(
 				"no node has sufficient capacity for service %q (needs %d vCPU, %d MB)",
 				svc.Name, svc.VCPUs, svc.MemoryMB,
@@ -235,15 +288,18 @@ func Schedule(
 	return result, nil
 }
 
-// bestFit returns the instance ID of the node with the most remaining vCPU
-// capacity that can still fit the service, preferring nodes that don't already
-// host the same anti-affinity group. Returns "" if no node has capacity.
+// bestFit returns the instance ID of the eligible node with the most remaining
+// vCPU capacity that can still fit the service, preferring nodes that don't
+// already host the same anti-affinity group. Returns "" if no node has capacity.
 func bestFit(nodes []Node, svc config.ServiceConfig, usedVCPUs, usedMemMB map[string]int, nodeGroups map[string]map[string]bool) string {
 	best := ""
 	bestFree := -1
 	bestHasConflict := true
 
 	for _, n := range nodes {
+		if !eligible(n, svc) {
+			continue
+		}
 		freeVCPUs := n.CapacityVCPUs - usedVCPUs[n.InstanceID]
 		freeMemMB := n.CapacityMemMB - usedMemMB[n.InstanceID]
 
@@ -353,10 +409,21 @@ func ScheduleWithStorage(services []config.ServiceConfig, nodes []Node, existing
 		preferred := existing[service.Name]
 		if boundNode != "" {
 			preferred = boundNode
-			if _, active := nodeByID[boundNode]; !active {
+			bound, active := nodeByID[boundNode]
+			if !active {
 				pending = append(pending, Pending{Service: service.Name, ReasonCode: "local_volume_node_unavailable", Message: fmt.Sprintf("bound node %s is unavailable", boundNode)})
 				continue
 			}
+			// The retained data pins the service to this node, so no other
+			// matching node can substitute for it.
+			if !eligible(bound, service) {
+				pending = append(pending, Pending{Service: service.Name, ReasonCode: ReasonNoMatchingNodeType, Message: fmt.Sprintf("local volumes are bound to node %s, which does not advertise node_type %q", boundNode, service.NodeType)})
+				continue
+			}
+		}
+		if countEligible(nodes, service) == 0 {
+			pending = append(pending, noMatchingNodeType(service))
+			continue
 		}
 
 		candidates := append([]Node(nil), nodes...)
@@ -386,6 +453,13 @@ func ScheduleWithStorage(services []config.ServiceConfig, nodes []Node, existing
 		portConflict := ""
 		for _, node := range candidates {
 			if boundNode != "" && node.InstanceID != boundNode {
+				continue
+			}
+			// The hard requirement runs first, so every reason recorded below
+			// describes a node the service was actually allowed to use. An
+			// existing placement is only a sort preference, so a node that
+			// lost the label is not preserved.
+			if !eligible(node, service) {
 				continue
 			}
 			if usedVCPU[node.InstanceID]+service.VCPUs > node.CapacityVCPUs || usedMem[node.InstanceID]+service.MemoryMB > node.CapacityMemMB {
@@ -420,6 +494,9 @@ func ScheduleWithStorage(services []config.ServiceConfig, nodes []Node, existing
 		if chosen == "" {
 			reason := ReasonInsufficientCompute
 			message := "no active node satisfies compute capacity"
+			if service.NodeType != "" {
+				message = fmt.Sprintf("no active node with node_type %q satisfies compute capacity", service.NodeType)
+			}
 			if dominantStorage.Reason != "" {
 				reason = dominantStorage.Reason
 				message = storageReasonMessage(dominantStorage)

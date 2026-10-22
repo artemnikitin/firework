@@ -64,7 +64,8 @@ Missing data fails closed:
 - unplaced desired services are `pending`, carrying the scheduler's reason code
   (for example `insufficient_compute_capacity`, `volume_capacity_unavailable`,
   `node_storage_exhausted`, `storage_capacity_unknown`, `volume_record_invalid`,
-  or `host_port_conflict`, which names the contested port and the service
+  `no_matching_node_type`, which names the required `node_type`, or
+  `host_port_conflict`, which names the contested port and the service
   already holding it). See [fireworkctl](fireworkctl.md) for what each storage
   reason means and how to resolve it;
 - placed services with missing, stale, or unsupported agent status are
