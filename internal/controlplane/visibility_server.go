@@ -146,7 +146,12 @@ func (s *VisibilityServer) handleLoginPage(w http.ResponseWriter, _ *http.Reques
 
 func (s *VisibilityServer) handleLogin(w http.ResponseWriter, r *http.Request) {
 	limitBody(w, r, maxLoginFormBytes)
-	if err := r.ParseForm(); err != nil || subtle.ConstantTimeCompare([]byte(r.FormValue("token")), []byte(s.cfg.OperatorToken)) != 1 {
+	err := r.ParseForm()
+	if isRequestTooLarge(err) {
+		writeJSON(w, http.StatusRequestEntityTooLarge, map[string]string{"error": "request_too_large"})
+		return
+	}
+	if err != nil || subtle.ConstantTimeCompare([]byte(r.FormValue("token")), []byte(s.cfg.OperatorToken)) != 1 {
 		http.Redirect(w, r, "/login?error=1", http.StatusSeeOther)
 		return
 	}
