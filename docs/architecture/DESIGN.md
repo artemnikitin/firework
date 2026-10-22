@@ -14,10 +14,13 @@ Kubernetes with namespaces solves the scheduling and lifecycle problem, but the 
 boundary is the container, not the VM. Firecracker gives you both: the operational
 simplicity of a process + the isolation guarantee of a VM.
 
-The tradeoff is that Firecracker requires `/dev/kvm`. On AWS this means `.metal`
-instance types; on GCP it requires a machine type and image configuration that
-support nested virtualization. That is a meaningful cost and limits workload
-density compared with containers on general-purpose instances.
+The tradeoff is that Firecracker requires `/dev/kvm`. AWS supports this on
+bare-metal instances and on supported Intel virtual instances with
+[nested virtualization enabled](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/amazon-ec2-nested-virtualization.html).
+The deployment example defaults to `c8i.2xlarge` with nested virtualization;
+bare-metal Graviton remains an option for ARM64 hosts. GCP requires a machine
+type and image configuration that support nested virtualization. Host kernels
+and guest images must match the node architecture.
 
 ## Pull-Based Reconciliation
 
@@ -239,9 +242,23 @@ manifests, and a live process with a missing or invalid socket — enter
 `recovery_pending`. Firework does not signal the process, delete its files, or
 launch a duplicate in that state. The condition is exposed in agent status for
 operator investigation. There is no supported interface for clearing it while
-the agent runs: the manual procedure is to stop the agent, remove
-`<state_dir>/vms/<service>/`, and start it again. Persistent volumes live
-outside that directory and are unaffected.
+the agent runs. To resolve it manually:
+
+1. Stop the agent to prevent reconciliation while investigating.
+2. Preserve and inspect `<state_dir>/vms/<service>/instance.json`, the VM logs,
+   and the associated process or transient systemd unit. Stopping the agent
+   does not stop independently supervised Firecracker processes.
+3. Resolve the ownership ambiguity. If the claimant is still alive, identify
+   and stop the correct process or unit explicitly, then confirm it has exited.
+   Do not delete ownership records, sockets, or configuration while a claimant
+   may still be running.
+4. Only after confirming no live claimant remains, remove the stale
+   `<state_dir>/vms/<service>/` directory and start the agent again. A service
+   still present in desired state will be launched again.
+
+Deleting the directory while a VM survives removes its ownership evidence and
+can permit a duplicate VM to use the same persistent volume. Volume data lives
+outside the VM state directory; leave that data and its volume records intact.
 
 A process observed mid-exit is classified as exited, not ambiguous. Linux
 releases a process's address space, and with it its `exe` link and command line,

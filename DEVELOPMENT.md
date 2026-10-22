@@ -20,12 +20,18 @@ without KVM. Testing the actual VM lifecycle requires a Linux host with
 ```
 cmd/
   agent/       firework-agent entry point
-  controlplane/ firework-controlplane entry point (roles: registry/events/controller/all)
+  controlplane/ firework-controlplane entry point (roles: registry/events/controller/api/all)
+  configcheck/ GitOps and resolved node-config validator
+  fireworkctl/ read-only operator CLI
   fc-init/     guest init process (runs as PID 1 inside each VM)
 internal/
   agent/       reconciliation loop, metrics publishing
   controlplane/ control-plane state, APIs, leader election, scheduling runtime
-  config/      config types and YAML loader
+  agentconfig/ agent operational config, defaults, and YAML loader
+  config/      resolved workload config and YAML loader
+  registryapi/ agent-to-registry wire types
+  operatorapi/ read-only operator response types
+  statusmodel/ bounded agent telemetry
   enricher/    enrichment pipeline (spec → node config)
   scheduler/   bin-packing placement algorithm
   reconciler/  plan/apply VM change logic
@@ -53,15 +59,21 @@ make help          # show all targets with descriptions
 |--------|--------|-------------|
 | `make build-agent` | `bin/firework-agent` (native OS) | local testing, smoke test |
 | `make build-controlplane` | `bin/firework-controlplane` (native OS) | local control-plane testing |
-| `make build-linux-amd64` | `bin/firework-agent-linux-amd64` + `bin/firework-controlplane-linux-amd64` + `bin/fc-init-linux-amd64` | producing Linux x86_64 artifacts |
-| `make build-linux-arm64` | `bin/firework-agent-linux-arm64` + `bin/firework-controlplane-linux-arm64` + `bin/fc-init-linux-arm64` (+ `bin/fc-init` alias) | updating ARM64 nodes or Packer AMI builds |
+| `make build-configcheck` | `bin/configcheck` (native OS) | validating GitOps input or resolved node configs |
+| `make build-fireworkctl` | `bin/fireworkctl` (native OS) | local operator CLI testing |
+| `make build-fireworkctl-release` | `bin/fireworkctl-{linux,darwin}-{amd64,arm64}` | producing CLI release binaries |
+| `make install` | `fireworkctl` in `$(go env GOPATH)/bin` | installing the operator CLI |
+| `make build-linux-amd64` | `bin/firework-agent-linux-amd64` + `bin/firework-controlplane-linux-amd64` + `bin/fireworkctl-linux-amd64` + `bin/fc-init-linux-amd64` | producing Linux x86_64 artifacts |
+| `make build-linux-arm64` | `bin/firework-agent-linux-arm64` + `bin/firework-controlplane-linux-arm64` + `bin/fireworkctl-linux-arm64` + `bin/fc-init-linux-arm64` (+ `bin/fc-init` alias) | producing Linux ARM64 artifacts |
 | `make build-fc-init` | `bin/fc-init-linux-arm64` + `bin/fc-init` alias (Linux ARM64, static) | updating the guest init binary in a rootfs image |
 | `make build-all` | native binaries + Linux amd64/arm64 variants for all binaries | full release build |
 | `make clean` | removes `bin/` and test cache | — |
 
 `fc-init` cross-compiled artifacts are static (`CGO_ENABLED=0`). The compatibility
-alias `bin/fc-init` points to the Linux/ARM64 build because the guest runtime
-still uses ARM64 by default.
+alias `bin/fc-init` is a copy of the Linux/ARM64 build for older ARM64 build
+workflows. Choose `bin/fc-init-linux-amd64` or `bin/fc-init-linux-arm64` to
+match the target node architecture; both deployment examples default to
+x86_64 nodes.
 
 Version, commit, and build time are injected at link time via `ldflags` and reported by `firework-agent --version`.
 
@@ -76,8 +88,8 @@ make test-cover    # with coverage report (outputs coverage.out)
 ```
 
 All unit tests run without cloud credentials, KVM, or external network access.
-Cloud-storage interactions use fakes; the scheduler and reconciler are pure
-functions with no external dependencies.
+Cloud-storage interactions use fakes; the scheduler and enricher are pure
+functions, and reconciler tests substitute interfaces for VM and host effects.
 
 ### Smoke test
 
@@ -123,6 +135,7 @@ Role modes:
 - `registry`: node enrollment/register/heartbeat APIs
 - `events`: GitHub webhook ingestion
 - `controller`: leader-elected scheduler/publisher loop
+- `api`: authenticated read-only operator API and embedded web UI
 - `all`: all roles in one process
 
 ## Control-Plane Container (GHCR)
