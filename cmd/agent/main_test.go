@@ -24,8 +24,11 @@ func TestClearRecoveryCommandHelper(t *testing.T) {
 	if service == "" {
 		service = "missing"
 	}
-	os.Args = []string{
-		"firework-agent", "clear-recovery", "--config", os.Getenv("FIREWORK_AGENT_CONFIG"), service,
+	configPath := os.Getenv("FIREWORK_AGENT_CONFIG")
+	if os.Getenv("FIREWORK_CLEAR_RECOVERY_ROOT_FLAGS") == "1" {
+		os.Args = []string{"firework-agent", "--config", configPath, "clear-recovery", service}
+	} else {
+		os.Args = []string{"firework-agent", "clear-recovery", "--config", configPath, service}
 	}
 	main()
 }
@@ -109,6 +112,21 @@ enable_capacity_check: false
 	}
 	if !strings.Contains(string(output), "service missing has no tracked VM") {
 		t.Fatalf("command did not report the live agent's response: %s", output)
+	}
+
+	command = exec.Command(os.Args[0], "-test.run=^TestClearRecoveryCommandHelper$")
+	command.Env = append(os.Environ(),
+		"FIREWORK_CLEAR_RECOVERY_HELPER=1",
+		"FIREWORK_AGENT_CONFIG="+configPath,
+		"FIREWORK_CLEAR_RECOVERY_SERVICE=missing",
+		"FIREWORK_CLEAR_RECOVERY_ROOT_FLAGS=1",
+	)
+	output, err = command.CombinedOutput()
+	if err != nil || !strings.Contains(string(output), "service missing has no tracked VM") {
+		t.Fatalf("root-level config placement failed: err=%v output=%s", err, output)
+	}
+	if err := runCommand([]string{"clear-recovery", "missing"}, configPath); err != nil {
+		t.Fatalf("clear-recovery did not use the provided default config path: %v", err)
 	}
 
 	command = exec.Command(os.Args[0], "-test.run=^TestClearRecoveryCommandHelper$")

@@ -17,38 +17,36 @@ import (
 )
 
 func main() {
-	if len(os.Args) > 1 && os.Args[1] == "clear-recovery" {
-		if err := runClearRecovery(os.Args[2:], "/etc/firework/agent.yaml"); err != nil {
-			fmt.Fprintf(os.Stderr, "error: %v\n", err)
-			os.Exit(1)
-		}
-		return
-	}
-
-	configPath := flag.String("config", "/etc/firework/agent.yaml", "path to agent config file")
-	showVersion := flag.Bool("version", false, "print version and exit")
-	flag.Parse()
-
-	if *showVersion {
-		fmt.Println("firework-agent", version.String())
-		return
-	}
-	if flag.NArg() > 0 {
-		if flag.Arg(0) != "clear-recovery" {
-			fmt.Fprintf(os.Stderr, "error: unexpected argument %q\n", flag.Arg(0))
-			os.Exit(1)
-		}
-		if err := runClearRecovery(flag.Args()[1:], *configPath); err != nil {
-			fmt.Fprintf(os.Stderr, "error: %v\n", err)
-			os.Exit(1)
-		}
-		return
-	}
-
-	if err := run(*configPath); err != nil {
+	if err := runCommand(os.Args[1:], "/etc/firework/agent.yaml"); err != nil {
 		fmt.Fprintf(os.Stderr, "error: %v\n", err)
 		os.Exit(1)
 	}
+}
+
+func runCommand(args []string, defaultConfigPath string) error {
+	if len(args) > 0 && args[0] == "clear-recovery" {
+		return runClearRecovery(args[1:], defaultConfigPath)
+	}
+	commandFlags := flag.NewFlagSet("firework-agent", flag.ContinueOnError)
+	commandFlags.SetOutput(os.Stderr)
+	configPath := commandFlags.String("config", defaultConfigPath, "path to agent config file")
+	showVersion := commandFlags.Bool("version", false, "print version and exit")
+	if err := commandFlags.Parse(args); err != nil {
+		return err
+	}
+
+	if *showVersion {
+		fmt.Println("firework-agent", version.String())
+		return nil
+	}
+	if commandFlags.NArg() > 0 {
+		if commandFlags.Arg(0) != "clear-recovery" {
+			return fmt.Errorf("unexpected argument %q", commandFlags.Arg(0))
+		}
+		return runClearRecovery(commandFlags.Args()[1:], *configPath)
+	}
+
+	return run(*configPath)
 }
 
 func runClearRecovery(args []string, defaultConfigPath string) error {
