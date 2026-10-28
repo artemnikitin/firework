@@ -10,6 +10,7 @@ require (
 	github.com/aws/smithy-go v1.24.0
 	github.com/fsouza/fake-gcs-server v1.52.3
 	github.com/go-git/go-git/v5 v5.16.5
+	golang.org/x/sys v0.38.0
 	google.golang.org/api v0.247.0
 	gopkg.in/yaml.v3 v3.0.1
 )
@@ -89,7 +90,6 @@ require (
 	golang.org/x/net v0.47.0 // indirect
 	golang.org/x/oauth2 v0.30.0 // indirect
 	golang.org/x/sync v0.18.0 // indirect
-	golang.org/x/sys v0.38.0 // indirect
 	golang.org/x/text v0.31.0 // indirect
 	golang.org/x/time v0.12.0 // indirect
 	google.golang.org/genproto v0.0.0-20250603155806-513f23925822 // indirect
