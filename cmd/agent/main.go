@@ -51,8 +51,9 @@ func runClearRecovery(args []string, defaultConfigPath string) error {
 	commandFlags := flag.NewFlagSet("clear-recovery", flag.ContinueOnError)
 	commandFlags.SetOutput(os.Stderr)
 	configPath := commandFlags.String("config", defaultConfigPath, "path to agent config file")
+	forget := commandFlags.Bool("forget", false, "clear unresolved shutdown state only after proving the VM and launcher are absent")
 	commandFlags.Usage = func() {
-		fmt.Fprintln(commandFlags.Output(), "Usage: firework-agent clear-recovery [--config PATH] SERVICE")
+		fmt.Fprintln(commandFlags.Output(), "Usage: firework-agent clear-recovery [--config PATH] [--forget] SERVICE")
 		commandFlags.PrintDefaults()
 	}
 	if err := commandFlags.Parse(args); err != nil {
@@ -66,7 +67,11 @@ func runClearRecovery(args []string, defaultConfigPath string) error {
 	if err != nil {
 		return fmt.Errorf("loading config: %w", err)
 	}
-	result, err := agent.ClearRecovery(context.Background(), cfg.StateDir, commandFlags.Arg(0))
+	resolve := agent.ClearRecovery
+	if *forget {
+		resolve = agent.ForgetRecovery
+	}
+	result, err := resolve(context.Background(), cfg.StateDir, commandFlags.Arg(0))
 	if err != nil {
 		return err
 	}

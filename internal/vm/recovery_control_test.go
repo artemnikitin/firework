@@ -455,6 +455,7 @@ func TestClearRecoveryPendingWriteFailureKeepsQuarantineInMemory(t *testing.T) {
 
 func TestClearRecoveryPendingKeepsStartBlockedWithoutHoldingManagerLock(t *testing.T) {
 	manager, manifest, inspector := recoveryFixture(t)
+	delete(inspector.identities, manifest.PID)
 	blocking := &blockingRecoveryInspector{fakeProcessInspector: inspector, entered: make(chan struct{}), release: make(chan struct{})}
 	manager.inspector = blocking
 	manager.launcher = &recordingLauncher{}

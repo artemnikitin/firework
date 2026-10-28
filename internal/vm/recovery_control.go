@@ -33,10 +33,22 @@ type RecoveryResult struct {
 func (m *Manager) ClearRecoveryPending(service string) (RecoveryResult, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	return m.clearRecoveryPending(ctx, service)
+	return m.resolveRecoveryMode(ctx, service, false)
 }
 
 func (m *Manager) clearRecoveryPending(ctx context.Context, service string) (RecoveryResult, error) {
+	return m.resolveRecoveryMode(ctx, service, false)
+}
+
+// ForgetRecoveryPending permits deletion of unresolved shutdown metadata only
+// after the same complete unit/process absence proof. It never adopts a VM.
+func (m *Manager) ForgetRecoveryPending(service string) (RecoveryResult, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	return m.resolveRecoveryMode(ctx, service, true)
+}
+
+func (m *Manager) resolveRecoveryMode(ctx context.Context, service string, forget bool) (RecoveryResult, error) {
 	result := RecoveryResult{Service: service, Outcome: RecoveryOutcomeNoop}
 	if err := ValidateRecoveryServiceName(service); err != nil {
 		return result, err
@@ -47,6 +59,10 @@ func (m *Manager) clearRecoveryPending(ctx context.Context, service string) (Rec
 	}
 	instance := m.instances[service]
 	if instance == nil {
+		if m.recoveryReservations[service] {
+			m.mu.Unlock()
+			return recoveryAmbiguous(result, "recovery discovery in progress")
+		}
 		m.mu.Unlock()
 		vmDir, path := m.recoveryManifestPath(service)
 		manifest, err := readManifest(path)
@@ -55,16 +71,20 @@ func (m *Manager) clearRecoveryPending(ctx context.Context, service string) (Rec
 				result.Message = "service has no runtime state"
 				return result, nil
 			}
-			return recoveryAmbiguous(result, fmt.Sprintf("untracked durable VM state requires recovery: %v", err))
+			if !errors.Is(err, os.ErrNotExist) {
+				return recoveryAmbiguous(result, fmt.Sprintf("invalid durable runtime state: %v", err))
+			}
+			manifest = &instanceManifest{Service: service, VMDir: vmDir, SocketPath: filepath.Join(vmDir, "firecracker.sock"), ConfigPath: filepath.Join(vmDir, "vm-config.json")}
+
 		}
 		if err := m.lockRecovery(ctx); err != nil {
 			return recoveryAmbiguous(result, err.Error())
 		}
 		if m.instances[service] == nil {
-			m.instances[service] = instanceFromManifest(manifest, StateRecoveryPending, "retrying durable recovery")
+			m.instances[service] = recoveryInstanceForService(service, manifest, "retrying durable recovery")
 		}
 		m.mu.Unlock()
-		return m.clearRecoveryPending(ctx, service)
+		return m.resolveRecoveryMode(ctx, service, forget)
 	}
 	result.State = instance.State
 	if instance.State != StateRecoveryPending {
@@ -84,12 +104,69 @@ func (m *Manager) clearRecoveryPending(ctx context.Context, service string) (Rec
 	instanceID := instance.instanceID
 	instancePID := instance.PID
 	m.mu.Unlock()
-	if instanceID == "" || instanceID != initialManifest.InstanceID || instancePID != initialManifest.PID {
-		return recoveryAmbiguous(result, "in-memory ownership identities do not match")
-	}
 	vmDir, manifestPath := m.recoveryManifestPath(service)
 	if err := verifyRecoveryManifestPaths(service, vmDir, &manifest); err != nil {
 		return recoveryAmbiguous(result, err.Error())
+	}
+	if err := verifyRecoveryDirectories(vmDir); err != nil {
+		return recoveryAmbiguous(result, err.Error())
+	}
+	if initialManifest.InstanceID == "" {
+		if durable, err := readManifest(manifestPath); err == nil {
+			if err := verifyRecoveryManifestPaths(service, vmDir, durable); err != nil {
+				return recoveryAmbiguous(result, err.Error())
+			}
+			if err := verifyRecoveryManifestIntegrity(durable); err != nil {
+				return recoveryAmbiguous(result, err.Error())
+			}
+			if err := m.lockRecovery(ctx); err != nil {
+				return recoveryAmbiguous(result, err.Error())
+			}
+			if m.instances[service] != instance {
+				m.mu.Unlock()
+				return recoveryAmbiguous(result, "ownership changed during manifest repair")
+			}
+			m.instances[service] = instanceFromManifest(durable, StateRecoveryPending, "retrying repaired manifest")
+			m.mu.Unlock()
+			return m.resolveRecoveryMode(ctx, service, forget)
+		}
+	}
+	absenceErr := m.proveRecoveryAbsent(&manifest)
+	if absenceErr == nil {
+		if initialManifest.Lifecycle == lifecycleStopping && !forget {
+			return recoveryAmbiguous(result, "shutdown state is unresolved; use --forget only after verifying the absence and retained data implications")
+		}
+		if err := m.lockRecovery(ctx); err != nil {
+			return recoveryAmbiguous(result, err.Error())
+		}
+		if !m.isCurrentRecoveryInstanceLocked(service, instance, instanceID, &initialManifest) {
+			m.mu.Unlock()
+			return recoveryAmbiguous(result, "service ownership changed while recovery was being checked")
+		}
+		if err := verifyRecoverySnapshot(manifestPath, &initialManifest); err != nil {
+			m.mu.Unlock()
+			return recoveryAmbiguous(result, err.Error())
+		}
+		if err := m.removeProvenRecoveryState(ctx, &manifest); err != nil {
+			m.mu.Unlock()
+			return result, fmt.Errorf("remove stale VM state for %s: %w", service, err)
+		}
+		delete(m.instances, service)
+		m.mu.Unlock()
+		result.Outcome = RecoveryOutcomeCleared
+		result.State = StateStopped
+		result.Message = "proved the old process is gone and removed its VM runtime state"
+		m.logger.Info("cleared stale VM recovery state", "service", service)
+		return result, nil
+	}
+	if forget {
+		return recoveryAmbiguous(result, "cannot forget a VM whose absence is unproved")
+	}
+	if instanceID == "" || instanceID != initialManifest.InstanceID || instancePID != initialManifest.PID {
+		return recoveryAmbiguous(result, "in-memory ownership identities do not match")
+	}
+	if initialManifest.Lifecycle == lifecycleStopping {
+		return recoveryAmbiguous(result, "durable VM shutdown state is unresolved; refusing to clear or re-adopt its runtime state")
 	}
 	if recoveryCandidate != nil && recoveryCandidate.Legacy {
 		if _, err := os.Lstat(manifestPath); errors.Is(err, os.ErrNotExist) {
@@ -105,9 +182,6 @@ func (m *Manager) clearRecoveryPending(ctx context.Context, service string) (Rec
 	if err != nil {
 		return recoveryAmbiguous(result, err.Error())
 	}
-	if initialManifest.Lifecycle == lifecycleStopping {
-		return recoveryAmbiguous(result, "durable VM shutdown state is unresolved; refusing to clear or re-adopt its runtime state")
-	}
 	if recoveryCandidate != nil {
 		if !sameRecoveryCandidateMetadata(&initialManifest, recoveryCandidate) {
 			return recoveryAmbiguous(result, "reconstructed process identity no longer matches its durable ownership record")
@@ -120,7 +194,7 @@ func (m *Manager) clearRecoveryPending(ctx context.Context, service string) (Rec
 		}
 		manifest = *recoveryCandidate
 	}
-	if manifest.PID <= 0 && manifest.Launcher == "systemd" && manifest.Lifecycle == lifecycleStarting {
+	if manifest.PID <= 0 && manifest.Launcher == "systemd" && (manifest.Lifecycle == lifecycleStarting || manifest.Lifecycle == lifecycleFailed) {
 		pid, inactive, err := m.inspectRecoveryUnit(&manifest)
 		if err != nil {
 			return recoveryAmbiguous(result, err.Error())
@@ -148,42 +222,15 @@ func (m *Manager) clearRecoveryPending(ctx context.Context, service string) (Rec
 
 	processErr := validateOwnedProcess(m.inspector, &manifest)
 	switch {
-	case errors.Is(processErr, errProcessNotFound), errors.Is(processErr, errProcessIdentityReused):
-		if err := m.proveRecoveryAbsent(&manifest); err != nil {
-			return recoveryAmbiguous(result, err.Error())
-		}
-		if err := m.lockRecovery(ctx); err != nil {
-			return recoveryAmbiguous(result, err.Error())
-		}
-		if !m.isCurrentRecoveryInstanceLocked(service, instance, instanceID, &initialManifest) {
-			m.mu.Unlock()
-			return recoveryAmbiguous(result, "service ownership changed while recovery was being checked")
-		}
-		if err := verifyRecoveryStateFiles(vmDir, manifestPath); err != nil {
-			m.mu.Unlock()
-			return recoveryAmbiguous(result, err.Error())
-		}
-		if _, err := readAndVerifyRecoveryManifest(manifestPath, &initialManifest); err != nil {
-			m.mu.Unlock()
-			return recoveryAmbiguous(result, err.Error())
-		}
-		if err := m.removeRecoveryStateContext(ctx, &manifest); err != nil {
-			m.mu.Unlock()
-			return result, fmt.Errorf("remove stale VM state for %s: %w", service, err)
-		}
-		delete(m.instances, service)
-		m.mu.Unlock()
-		result.Outcome = RecoveryOutcomeCleared
-		result.State = StateStopped
-		result.Message = "proved the old process is gone and removed its VM runtime state"
-		m.logger.Info("cleared stale VM recovery state", "service", service)
-		return result, nil
+
+	case errors.Is(processErr, errProcessNotFound):
+		return recoveryAmbiguous(result, fmt.Sprintf("process exited but absence remains unproved: %v", absenceErr))
 	case processErr != nil:
 		if errors.Is(processErr, errIdentityNotRecorded) {
 			return recoveryAmbiguous(result, fmt.Sprintf("refusing to reconstruct process ownership identity that was never recorded: %v", processErr))
 		}
 		if !m.repairOwnership(service, &manifest, processErr) {
-			return recoveryAmbiguous(result, fmt.Sprintf("cannot prove surviving process ownership: %v", processErr))
+			return recoveryAmbiguous(result, fmt.Sprintf("cannot prove surviving process ownership: %v; absence proof: %v", processErr, absenceErr))
 		}
 		if err := validateOwnedProcess(m.inspector, &manifest); err != nil {
 			return recoveryAmbiguous(result, fmt.Sprintf("repaired process identity does not validate: %v", err))
@@ -200,22 +247,13 @@ func (m *Manager) clearRecoveryPending(ctx context.Context, service string) (Rec
 		if err := m.persistReconstructedIdentity(service, vmDir, manifestPath, &initialManifest, &manifest); err != nil {
 			instance.recoveryCandidate = cloneInstanceManifest(&manifest)
 			m.mu.Unlock()
-			return recoveryAmbiguous(result, fmt.Sprintf("persist reconstructed identity: %v", err))
+			return result, fmt.Errorf("persist reconstructed identity: %w", err)
 		}
 		instance.manifest = cloneInstanceManifest(&manifest)
 		instance.PID = manifest.PID
 		instance.recoveryCandidate = nil
 		m.mu.Unlock()
-		return m.clearRecoveryPending(ctx, service)
-	}
-	if manifest.Launcher == "systemd" {
-		pid, inactive, err := m.inspectRecoveryUnit(&manifest)
-		if err != nil {
-			return recoveryAmbiguous(result, err.Error())
-		}
-		if inactive || pid != manifest.PID {
-			return recoveryAmbiguous(result, "systemd unit does not own the recorded process")
-		}
+		return m.resolveRecoveryMode(ctx, service, forget)
 	}
 	if err := validateOwnedSocket(m.inspector, &manifest); err != nil {
 		return recoveryAmbiguous(result, fmt.Sprintf("surviving process API socket is not ready: %v", err))
@@ -234,6 +272,12 @@ func (m *Manager) clearRecoveryPending(ctx context.Context, service string) (Rec
 	if _, err := readAndVerifyRecoveryManifest(manifestPath, &initialManifest); err != nil {
 		m.mu.Unlock()
 		return recoveryAmbiguous(result, err.Error())
+	}
+	for name, other := range m.instances {
+		if name != service && other.instanceID == instanceID {
+			m.mu.Unlock()
+			return recoveryAmbiguous(result, "instance ID is also tracked by another service")
+		}
 	}
 	manifest.Lifecycle = lifecycleRunning
 	manifest.LastError = ""
@@ -280,7 +324,7 @@ func recoveryAmbiguous(result RecoveryResult, message string) (RecoveryResult, e
 	result.Outcome = RecoveryOutcomeAmbiguous
 	result.State = StateRecoveryPending
 	result.Message = message
-	return result, fmt.Errorf("service %s remains recovery_pending: %s", result.Service, message)
+	return result, &recoveryPendingError{fmt.Errorf("service %s remains recovery_pending: %s", result.Service, message)}
 }
 
 // ValidateRecoveryServiceName rejects service identifiers that are not one
@@ -308,7 +352,7 @@ func verifyRecoveryManifestPaths(service, vmDir string, manifest *instanceManife
 	return nil
 }
 
-func verifyRecoveryStateFiles(vmDir, manifestPath string) error {
+func verifyRecoveryDirectories(vmDir string) error {
 	for _, path := range []string{filepath.Dir(vmDir), vmDir} {
 		info, err := os.Lstat(path)
 		if err != nil {
@@ -317,6 +361,13 @@ func verifyRecoveryStateFiles(vmDir, manifestPath string) error {
 		if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
 			return fmt.Errorf("VM state path %s is not a directory", path)
 		}
+	}
+	return nil
+}
+
+func verifyRecoveryStateFiles(vmDir, manifestPath string) error {
+	if err := verifyRecoveryDirectories(vmDir); err != nil {
+		return err
 	}
 	info, err := os.Lstat(manifestPath)
 	if err != nil {
@@ -393,4 +444,25 @@ func (m *Manager) lockRecovery(ctx context.Context) error {
 		case <-time.After(time.Millisecond):
 		}
 	}
+}
+
+type recoveryPendingError struct{ error }
+
+func verifyRecoverySnapshot(path string, initial *instanceManifest) error {
+	if err := verifyRecoveryDirectories(initial.VMDir); err != nil {
+		return err
+	}
+	if info, err := os.Lstat(path); err == nil && (!info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0) {
+		return fmt.Errorf("ownership manifest must be a regular file")
+	}
+	if initial.InstanceID == "" || initial.Legacy {
+		if _, err := os.Lstat(path); errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
+		if initial.InstanceID == "" {
+			return fmt.Errorf("manifest appeared during legacy cleanup")
+		}
+	}
+	_, err := readAndVerifyRecoveryManifest(path, initial)
+	return err
 }

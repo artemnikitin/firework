@@ -224,7 +224,7 @@ func (a *Agent) Run(ctx context.Context) error {
 	// empty node while durable VM ownership is still being reconstructed.
 	a.tick(ctx)
 
-	control, err := startRecoveryControlServer(a.cfg.StateDir, a.logger, a.clearRecoveryPending)
+	control, err := startRecoveryControlServer(a.cfg.StateDir, a.logger, a.clearRecoveryPending, a.forgetRecoveryPending)
 	if err != nil {
 		a.logger.Warn("local recovery control is unavailable", "error", err)
 	} else {
@@ -395,7 +395,7 @@ func (a *Agent) tick(ctx context.Context) {
 			a.logger.Error("failed to get store revision", "error", err)
 		}
 		a.setStatusServices(*merged, rev)
-		if rev != "" && rev == a.lastRevision && !a.forceReconcile {
+		if rev != "" && rev == a.lastRevision && !a.forceReconcile && !a.vmManager.HasPendingRecovery() {
 			// A local revision does not describe the peer node configs used for
 			// remote Traefik routes. Refresh routes on every poll even when the
 			// local VM configuration is unchanged, but avoid the expensive image

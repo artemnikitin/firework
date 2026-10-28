@@ -58,6 +58,73 @@ func TestRecoveryControlRoundTripUsesPrivateSocketAndCleansUp(t *testing.T) {
 	}
 }
 
+func TestRecoveryControlDispatchesGuardedForget(t *testing.T) {
+	stateDir := recoveryControlTestStateDir(t)
+	var clearCalls, forgetCalls atomic.Int32
+	server, err := startRecoveryControlServer(stateDir, testLogger(), func(service string) (vm.RecoveryResult, error) {
+		clearCalls.Add(1)
+		return vm.RecoveryResult{Service: service, Outcome: vm.RecoveryOutcomeReadopted}, nil
+	}, func(service string) (vm.RecoveryResult, error) {
+		forgetCalls.Add(1)
+		return vm.RecoveryResult{Service: service, Outcome: vm.RecoveryOutcomeCleared}, nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = server.Close() })
+	result, err := ForgetRecovery(context.Background(), stateDir, "app")
+	if err != nil || result.Outcome != vm.RecoveryOutcomeCleared || result.Service != "app" {
+		t.Fatalf("forget request was not dispatched: result=%#v err=%v", result, err)
+	}
+	result, err = ClearRecovery(context.Background(), stateDir, "app")
+	if err != nil || result.Outcome != vm.RecoveryOutcomeReadopted || result.Service != "app" {
+		t.Fatalf("normal clear request changed behavior: result=%#v err=%v", result, err)
+	}
+	if clearCalls.Load() != 1 || forgetCalls.Load() != 1 {
+		t.Fatalf("incorrect resolver calls: clear=%d forget=%d", clearCalls.Load(), forgetCalls.Load())
+	}
+}
+
+func TestRecoveryControlForgetNeverFallsBackToClear(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		forget    recoveryControlResolver
+		wantError string
+	}{
+		{name: "unavailable", wantError: "guarded recovery forget is unavailable"},
+		{
+			name: "absence unproved",
+			forget: func(service string) (vm.RecoveryResult, error) {
+				return vm.RecoveryResult{Service: service, Outcome: vm.RecoveryOutcomeAmbiguous, State: vm.StateRecoveryPending}, errors.New("cannot forget a VM whose absence is unproved")
+			},
+			wantError: "absence is unproved",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			stateDir := recoveryControlTestStateDir(t)
+			var clearCalls atomic.Int32
+			server, err := startRecoveryControlServer(stateDir, testLogger(), func(service string) (vm.RecoveryResult, error) {
+				clearCalls.Add(1)
+				return vm.RecoveryResult{Service: service, Outcome: vm.RecoveryOutcomeReadopted}, nil
+			}, tc.forget)
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = server.Close() })
+			result, err := ForgetRecovery(context.Background(), stateDir, "app")
+			if err == nil || !strings.Contains(err.Error(), tc.wantError) {
+				t.Fatalf("forget refusal was lost: result=%#v err=%v", result, err)
+			}
+			if tc.forget != nil && (result.Outcome != vm.RecoveryOutcomeAmbiguous || result.State != vm.StateRecoveryPending) {
+				t.Fatalf("forget refusal changed recovery state: %#v", result)
+			}
+			if clearCalls.Load() != 0 {
+				t.Fatal("guarded forget fell back to normal recovery")
+			}
+		})
+	}
+}
+
 func TestRecoveryControlReplacesOnlyAStaleOwnedSocket(t *testing.T) {
 	stateDir := recoveryControlTestStateDir(t)
 	statePath, controlDir, socketPath, _, err := recoveryControlPaths(stateDir)

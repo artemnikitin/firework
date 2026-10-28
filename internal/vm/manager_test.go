@@ -267,8 +267,8 @@ func TestStartAbandonsALaunchWhoseIdentityIsNeverProvable(t *testing.T) {
 
 			manifest, manifestErr := readManifest(manifestPath(filepath.Join(dir, "vms", "app")))
 			if !testCase.wantRetained {
-				if !errors.Is(manifestErr, os.ErrNotExist) {
-					t.Fatalf("state of a killed launch was not removed: %v", manifestErr)
+				if manifestErr != nil || manifest.Lifecycle != lifecycleFailed || manifest.PID != 0 {
+					t.Fatalf("killed launch must remain reclaimable for unlocked proof: %#v %v", manifest, manifestErr)
 				}
 				return
 			}

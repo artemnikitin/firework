@@ -203,11 +203,24 @@ func TestCleanupClaimantScanMatchesEitherVMPathArgument(t *testing.T) {
 
 func TestCleanupRefusesHiddenProcessTable(t *testing.T) {
 	for _, option := range []string{"hidepid=1", "hidepid=2", "hidepid=invisible"} {
-		if verifyProcessTableVisibility("proc /proc proc rw,"+option+" 0 0") == nil {
+		if verifyProcessVisibilityFor("proc /proc proc rw,"+option+" 0 0", 1000, nil) == nil {
 			t.Fatal(option)
 		}
 	}
 	if err := verifyProcessTableVisibility("proc /proc proc rw,hidepid=0 0 0"); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestHidepidExemptions(t *testing.T) {
+	mounts := "proc /proc proc rw,hidepid=invisible,gid=0 0 0"
+	if err := verifyProcessVisibilityFor(mounts, 0, nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := verifyProcessVisibilityFor(mounts, 1000, []int{0}); err != nil {
+		t.Fatal(err)
+	}
+	if err := verifyProcessVisibilityFor(mounts, 1000, []int{1000}); err == nil {
+		t.Fatal("nonexempt viewer accepted")
 	}
 }

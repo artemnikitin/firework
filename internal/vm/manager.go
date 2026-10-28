@@ -126,10 +126,10 @@ type Manager struct {
 	recoveryManifestWriter func(string, *instanceManifest) error
 	recoveryUnitInspector  func(*instanceManifest) (int, bool, error)
 
-	mu           sync.Mutex
-	instances    map[string]*Instance
-	volumeErrors map[string]string
-	recovered    bool
+	mu                   sync.Mutex
+	instances            map[string]*Instance
+	recoveryReservations map[string]bool
+	volumeErrors         map[string]string
 }
 
 // NewManager creates a new VM manager.
@@ -374,6 +374,9 @@ func (m *Manager) beginStart(svc config.ServiceConfig) (startID, vmDir, socketPa
 		}
 	}()
 
+	if m.recoveryReservations[svc.Name] {
+		return "", "", "", fmt.Errorf("service %s recovery discovery in progress: %w", svc.Name, ErrStartInProgress)
+	}
 	if inst, exists := m.instances[svc.Name]; exists {
 		switch inst.State {
 		case StateRecoveryPending:
@@ -664,10 +667,13 @@ func (m *Manager) abandonLaunch(service string, manifest *instanceManifest, laun
 		gone = awaitProcessExit(m.inspector, launched.PID, m.launchExitTimeout(), launchIdentityInterval)
 	}
 	if gone {
-		if err := os.RemoveAll(manifest.VMDir); err != nil {
-			m.logger.Error("could not remove abandoned microVM state",
-				"service", service, "error", err)
-		}
+		// No process is owned by this attempt any more, but leave reclamation
+		// to the next unlocked recovery/start pass. Unit and claimant checks
+		// must not run under the launch's manager lock.
+		manifest.Lifecycle = lifecycleFailed
+		manifest.PID = 0
+		manifest.LastError = cause.Error()
+		_ = m.writeRecoveryManifest(manifestPath(manifest.VMDir), manifest)
 		return false
 	}
 	manifest.Lifecycle = lifecycleFailed
@@ -709,12 +715,18 @@ func awaitProcessExit(inspector processInspector, pid int, timeout, interval tim
 }
 
 // Stop gracefully shuts down a running microVM.
-func (m *Manager) Stop(name string) error {
+func (m *Manager) Stop(name string) error { return m.stopInstance(name, nil) }
+
+func (m *Manager) stopInstance(name string, expected *Instance) error {
 	m.mu.Lock()
 	inst, exists := m.instances[name]
 	if !exists {
 		m.mu.Unlock()
 		return fmt.Errorf("service %s not found", name)
+	}
+	if expected != nil && inst != expected {
+		m.mu.Unlock()
+		return fmt.Errorf("service %s ownership changed before stop: %w", name, ErrStartInProgress)
 	}
 	if inst.State == StateRecoveryPending {
 		err := fmt.Errorf("refusing to stop service %s: process ownership is ambiguous: %s", name, inst.LastError)
@@ -804,48 +816,77 @@ func (m *Manager) Stop(name string) error {
 // Remove stops (if running) and removes all state for a service.
 func (m *Manager) Remove(name string) error {
 	m.mu.Lock()
+	if m.recoveryReservations[name] {
+		m.mu.Unlock()
+		return fmt.Errorf("service %s recovery discovery in progress: %w", name, ErrStartInProgress)
+	}
 	inst, exists := m.instances[name]
 	aborting := exists && (inst.State == StateStarting || inst.State == StateStartAborting)
 	if aborting {
 		inst.State = StateStartAborting
 	}
+	state := StateStopped
+	lastError := ""
+	if exists {
+		state = inst.State
+		lastError = inst.LastError
+	}
 	m.mu.Unlock()
 
-	// Removing the VM state directory while phase 2 runs is safe: volume
-	// preparation writes only under the storage pool, and writeVMConfig — the
-	// only writer of this directory — lives in phase 3, which will abort. The
-	// placeholder is left for phase 3 to clear, so a second Remove before then
-	// takes this same branch and also succeeds.
+	// A starting reservation may still be inspecting old runtime state.
+	// Mark only; preparation creates no VM directory and finishStart will
+	// observe the abort before writing anything. Never delete an old owner's
+	// files just because a new attempt reserved the name.
 	if aborting {
 		m.logger.Info("aborting in-flight start instead of removing", "service", name)
-		if err := os.RemoveAll(filepath.Join(m.stateDir, "vms", name)); err != nil {
-			return fmt.Errorf("removing vm dir: %w", err)
-		}
 		return nil
 	}
 
-	if exists && (inst.State == StateRunning || inst.State == StateStopping) {
-		if err := m.Stop(name); err != nil {
+	if exists && (state == StateRunning || state == StateStopping) {
+		if err := m.stopInstance(name, inst); err != nil {
 			return fmt.Errorf("stopping VM during remove: %w", err)
 		}
 	}
-	if exists && inst.State == StateRecoveryPending {
-		return fmt.Errorf("refusing to remove service %s while recovery is pending: %s", name, inst.LastError)
+	if exists && state == StateRecoveryPending {
+		return fmt.Errorf("refusing to remove service %s while recovery is pending: %s", name, lastError)
 	}
 
 	m.mu.Lock()
-	delete(m.instances, name)
-	m.mu.Unlock()
-
+	defer m.mu.Unlock()
+	current := m.instances[name]
+	if current != inst {
+		if current != nil && (current.State == StateStarting || current.State == StateStartAborting) {
+			current.State = StateStartAborting
+		}
+		return fmt.Errorf("service %s ownership changed while removing: %w", name, ErrStartInProgress)
+	}
 	vmDir := filepath.Join(m.stateDir, "vms", name)
+	if !exists {
+		if _, err := os.Lstat(vmDir); err == nil {
+			return fmt.Errorf("untracked VM state requires recovery before removal")
+		} else if !errors.Is(err, os.ErrNotExist) {
+			return err
+		}
+		return nil
+	}
+	if current.State == StateRecoveryPending || current.State == StateStarting || current.State == StateRunning {
+		return fmt.Errorf("service %s is not stopped", name)
+	}
+	if current.manifest != nil {
+		if err := verifyRecoveryManifestPaths(name, vmDir, current.manifest); err != nil {
+			return err
+		}
+	}
+	if err := verifyRecoveryDirectories(vmDir); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
 	if err := os.RemoveAll(vmDir); err != nil {
 		return fmt.Errorf("removing vm dir: %w", err)
 	}
-
+	delete(m.instances, name)
 	return nil
 }
 
-// IsRunning checks if the process for a service is still alive.
 func (m *Manager) IsRunning(name string) bool {
 	m.mu.Lock()
 	inst, exists := m.instances[name]

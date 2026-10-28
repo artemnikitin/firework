@@ -627,6 +627,14 @@ func (r *Reconciler) applyRolling(ctx context.Context, actions []Action) error {
 	}
 
 	for i, action := range updates {
+		if instance := r.vmManager.List()[action.Service.Name]; instance != nil && instance.State == vm.StateRecoveryPending {
+			// Quarantine requires a separate ownership decision. Keep it out of
+			// volume preflight and VM removal while independent rolling updates
+			// proceed, and retain an error so this revision is not marked applied.
+			errs = append(errs, stageError(FailureStageVM,
+				fmt.Errorf("update %s remains recovery_pending: %s", action.Service.Name, instance.LastError)))
+			continue
+		}
 		r.logger.Info("updating service (stop + start)", "service", action.Service.Name)
 		rejections, err := r.preflight(ctx, action.Service)
 		if err != nil {
@@ -754,6 +762,9 @@ func (r *Reconciler) Reconcile(ctx context.Context, desired config.NodeConfig) e
 			errs = append(errs, stageError(FailureStageVM, fmt.Errorf("recover VMs: %w", err)))
 		}
 	}
+	if err := r.acceptRecoveryTeardowns(); err != nil {
+		errs = append(errs, err)
+	}
 	if err := r.restoreRecovered(ctx, desired); err != nil {
 		errs = append(errs, err)
 	}
@@ -851,6 +862,9 @@ func (r *Reconciler) restoreRecovered(ctx context.Context, desired config.NodeCo
 	for name := range r.pendingRecovery {
 		service, wanted := desiredByName[name]
 		instance := actual[name]
+		if instance == nil && r.healthMon != nil {
+			r.healthMon.Deregister(name)
+		}
 		if !wanted || instance == nil || needsUpdate(instance, service) {
 			delete(r.pendingRecovery, name)
 			continue

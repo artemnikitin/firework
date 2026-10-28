@@ -32,6 +32,7 @@ const (
 type recoveryControlRequest struct {
 	Version int    `json:"version"`
 	Service string `json:"service"`
+	Forget  bool   `json:"forget,omitempty"`
 }
 
 type recoveryControlResponse struct {
@@ -43,7 +44,19 @@ type recoveryControlResponse struct {
 type recoveryControlResolver func(string) (vm.RecoveryResult, error)
 
 func (a *Agent) clearRecoveryPending(service string) (vm.RecoveryResult, error) {
-	result, err := a.vmManager.ClearRecoveryPending(service)
+	return a.resolveRecoveryPending(service, false)
+}
+
+func (a *Agent) forgetRecoveryPending(service string) (vm.RecoveryResult, error) {
+	return a.resolveRecoveryPending(service, true)
+}
+
+func (a *Agent) resolveRecoveryPending(service string, forget bool) (vm.RecoveryResult, error) {
+	resolve := a.vmManager.ClearRecoveryPending
+	if forget {
+		resolve = a.vmManager.ForgetRecoveryPending
+	}
+	result, err := resolve(service)
 	if err != nil {
 		return result, err
 	}
@@ -96,6 +109,7 @@ type recoveryControlServer struct {
 	socketInfo os.FileInfo
 	lock       io.Closer
 	resolve    recoveryControlResolver
+	forget     recoveryControlResolver
 	logger     *slog.Logger
 	done       chan struct{}
 	closing    chan struct{}
@@ -154,7 +168,7 @@ func prepareRecoveryControlDirectory(statePath, controlDir string, create, allow
 	return nil
 }
 
-func startRecoveryControlServer(stateDir string, logger *slog.Logger, resolve recoveryControlResolver) (*recoveryControlServer, error) {
+func startRecoveryControlServer(stateDir string, logger *slog.Logger, resolve recoveryControlResolver, forget ...recoveryControlResolver) (*recoveryControlServer, error) {
 	if logger == nil {
 		logger = slog.Default()
 	}
@@ -213,6 +227,9 @@ func startRecoveryControlServer(stateDir string, logger *slog.Logger, resolve re
 		listener: listener, path: socketPath, socketInfo: socketInfo, lock: lock,
 		resolve: resolve, logger: logger, done: make(chan struct{}), closing: make(chan struct{}),
 		active: make(map[*net.UnixConn]struct{}),
+	}
+	if len(forget) > 0 {
+		server.forget = forget[0]
 	}
 	cleanupLock = false
 	closeListener = false
@@ -315,7 +332,18 @@ func (s *recoveryControlServer) serveConnection(connection *net.UnixConn) {
 		s.writeResponse(connection, recoveryControlResponse{Version: recoveryControlProtocolVersion, Error: err.Error()})
 		return
 	}
-	result, resolveErr := s.resolve(request.Service)
+	resolve := s.resolve
+	if request.Forget {
+		resolve = s.forget
+		if resolve == nil {
+			s.writeResponse(connection, recoveryControlResponse{
+				Version: recoveryControlProtocolVersion,
+				Error:   "guarded recovery forget is unavailable on this agent",
+			})
+			return
+		}
+	}
+	result, resolveErr := resolve(request.Service)
 	response := recoveryControlResponse{Version: recoveryControlProtocolVersion, Result: result}
 	if resolveErr != nil {
 		response.Error = resolveErr.Error()
@@ -359,6 +387,16 @@ func (s *recoveryControlServer) Close() error {
 // ClearRecovery sends one bounded request to the running agent's private local
 // control socket. The caller must run as root or as the agent's Unix user.
 func ClearRecovery(ctx context.Context, stateDir, service string) (vm.RecoveryResult, error) {
+	return requestRecovery(ctx, stateDir, service, false)
+}
+
+// ForgetRecovery asks the running agent to clear quarantined runtime state only
+// after proving that the service's VM process and launcher are absent.
+func ForgetRecovery(ctx context.Context, stateDir, service string) (vm.RecoveryResult, error) {
+	return requestRecovery(ctx, stateDir, service, true)
+}
+
+func requestRecovery(ctx context.Context, stateDir, service string, forget bool) (vm.RecoveryResult, error) {
 	if err := vm.ValidateRecoveryServiceName(service); err != nil {
 		return vm.RecoveryResult{}, err
 	}
@@ -395,7 +433,7 @@ func ClearRecovery(ctx context.Context, stateDir, service string) (vm.RecoveryRe
 	if ok {
 		_ = connection.SetDeadline(deadline)
 	}
-	body, err := json.Marshal(recoveryControlRequest{Version: recoveryControlProtocolVersion, Service: service})
+	body, err := json.Marshal(recoveryControlRequest{Version: recoveryControlProtocolVersion, Service: service, Forget: forget})
 	if err != nil {
 		return vm.RecoveryResult{}, err
 	}

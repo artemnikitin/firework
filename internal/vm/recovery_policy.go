@@ -2,6 +2,7 @@ package vm
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -42,8 +43,14 @@ func (m *Manager) inspectRecoveryUnit(f *instanceManifest) (int, bool, error) {
 }
 
 func (m *Manager) proveRecoveryAbsent(f *instanceManifest) error {
-	if f.Lifecycle == lifecycleStopping {
-		return fmt.Errorf("unresolved shutdown state must be retained")
+	if f.PID > 0 {
+		identity, err := m.inspector.Inspect(f.PID)
+		if err == nil && (f.ProcessStart == 0 || (identity.StartTicks == f.ProcessStart && identity.HostBootID == f.HostBootID)) {
+			return fmt.Errorf("recorded process is still live")
+		}
+		if err != nil && !errors.Is(err, errProcessNotFound) {
+			return err
+		}
 	}
 	if f.Launcher == "systemd" {
 		_, inactive, err := m.inspectRecoveryUnit(f)
@@ -66,11 +73,35 @@ func (m *Manager) removeRecoveryState(f *instanceManifest) error {
 }
 
 func (m *Manager) removeRecoveryStateContext(ctx context.Context, f *instanceManifest) error {
+	if err := verifyRecoveryDirectories(f.VMDir); err != nil {
+		return err
+	}
 	if err := m.proveRecoveryAbsent(f); err != nil {
+		return err
+	}
+	return m.removeProvenRecoveryState(ctx, f)
+}
+
+func (m *Manager) removeProvenRecoveryState(ctx context.Context, f *instanceManifest) error {
+	if err := verifyRecoveryManifestPaths(f.Service, filepath.Join(m.stateDir, "vms", f.Service), f); err != nil {
+		return err
+	}
+	if err := verifyRecoveryDirectories(f.VMDir); err != nil {
 		return err
 	}
 	if err := ctx.Err(); err != nil {
 		return err
 	}
 	return os.RemoveAll(f.VMDir)
+}
+
+func (m *Manager) HasPendingRecovery() bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for _, i := range m.instances {
+		if i.State == StateRecoveryPending {
+			return true
+		}
+	}
+	return false
 }

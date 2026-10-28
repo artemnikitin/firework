@@ -38,8 +38,14 @@ func (f *fakeProcessInspector) FindByArguments(_, _ string) ([]processIdentity, 
 	return append([]processIdentity(nil), f.find...), f.findErr
 }
 
-func (f *fakeProcessInspector) FindByAnyArgument(_, _ string) ([]processIdentity, error) {
-	return append([]processIdentity(nil), f.find...), f.findErr
+func (f *fakeProcessInspector) FindByAnyArgument(socket, config string) ([]processIdentity, error) {
+	matches := append([]processIdentity(nil), f.find...)
+	for _, identity := range f.identities {
+		if hasExactArgument(identity.CommandLine, "--api-sock", socket) || hasExactArgument(identity.CommandLine, "--config-file", config) {
+			matches = append(matches, identity)
+		}
+	}
+	return matches, f.findErr
 }
 
 func (f *fakeProcessInspector) SocketReady(string) error { return f.socketErr }
@@ -170,6 +176,7 @@ func TestRecoverCleansStateAfterAHostReboot(t *testing.T) {
 	// mismatch proves the recorded process cannot have survived.
 	identity := inspector.identities[manifest.PID]
 	identity.HostBootID = "boot-after-reboot"
+	identity.CommandLine = []string{"other-process"}
 	inspector.identities[manifest.PID] = identity
 	manager.inspector = inspector
 
@@ -200,6 +207,7 @@ func TestRecoverCleansStartingSystemdStateWhenMainProcessExited(t *testing.T) {
 	}
 	manager.recoveryUnitInspector = func(*instanceManifest) (int, bool, error) { return 0, true, nil }
 	delete(inspector.identities, 3637)
+	delete(inspector.identities, 42)
 	manager.inspector = inspector
 
 	binDir := t.TempDir()

@@ -250,12 +250,42 @@ func parseProcStartTicks(stat string) (uint64, error) {
 }
 
 func verifyProcessTableVisibility(mounts string) error {
+	groups, err := os.Getgroups()
+	if err != nil {
+		return err
+	}
+	groups = append(groups, os.Getegid())
+	return verifyProcessVisibilityFor(mounts, os.Geteuid(), groups)
+}
+
+func verifyProcessVisibilityFor(mounts string, uid int, groups []int) error {
 	for _, line := range strings.Split(mounts, "\n") {
 		fields := strings.Fields(line)
 		if len(fields) < 4 || fields[1] != "/proc" {
 			continue
 		}
-		for _, option := range strings.Split(fields[3], ",") {
+		if uid == 0 {
+			continue
+		}
+		options := strings.Split(fields[3], ",")
+		exempt := false
+		for _, option := range options {
+			if text, ok := strings.CutPrefix(option, "gid="); ok {
+				gid, err := strconv.Atoi(text)
+				if err != nil {
+					return err
+				}
+				for _, group := range groups {
+					if group == gid {
+						exempt = true
+					}
+				}
+			}
+		}
+		if exempt {
+			continue
+		}
+		for _, option := range options {
 			if strings.HasPrefix(option, "hidepid=") && option != "hidepid=0" && option != "hidepid=off" {
 				return fmt.Errorf("restricted process table cannot prove absence: %s", option)
 			}

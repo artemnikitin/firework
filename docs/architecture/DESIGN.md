@@ -253,33 +253,30 @@ rechecks the named service through the running manager, so memory and the
 ownership manifest change together.
 
 The command re-adopts a VM only when the manifest, config hash, process identity,
-exact Firecracker command line, and API socket all validate. It removes the VM
-runtime directory only after the recorded process is gone and no process uses
-that service's socket or config paths. A PID start-time mismatch is never
-repaired or signalled. Missing identity, a corrupt manifest, a live claimant,
-an invalid socket, any VM whose durable lifecycle is `stopping`, or an I/O error
-leaves the service in `recovery_pending` and returns the reason. A stopping
-manifest remains even after process exit because this command cannot prove
-whether guest writes were quiesced. The command never accepts a force-forget or
-force-adopt request.
+launch arguments, and API socket validate. Recovery retries transient failures
+on later reconciliation ticks, including when desired configuration is unchanged.
+A fully validated live process does not require an additional systemctl query.
 
-If the command refuses, use the manual procedure as a last resort:
+Cleanup first attempts a complete absence proof, independently of whether the
+old PID/identity is populated. Systemd-owned state requires an inactive or absent
+unit with no MainPID, and all cleanup requires no live process referencing either
+VM path. This permits dead PID-0 starts and unused legacy directories to recover
+without hand-editing files. Unknown, unreadable, or live ownership remains pending.
+A missing identity cannot authorize live adoption.
 
-1. Stop the agent to prevent reconciliation while investigating.
-2. Preserve and inspect `<state_dir>/vms/<service>/instance.json`, the VM logs,
-   and the associated process or transient systemd unit. Stopping the agent
-   does not stop independently supervised Firecracker processes.
-3. Resolve the ownership ambiguity. If the claimant is still alive, identify
-   and stop the correct process or unit explicitly, then confirm it has exited.
-   Do not delete ownership records, sockets, or configuration while a claimant
-   may still be running.
-4. Only after confirming no live claimant remains, remove the stale
-   `<state_dir>/vms/<service>/` directory and start the agent again. A service
-   still present in desired state will be launched again.
+An unresolved `stopping` manifest is not adopted automatically. If the VM is
+proved absent, use `firework-agent clear-recovery --forget SERVICE` to discard
+that runtime marker. This flag still requires the full absence proof; it is not
+an assertion that bypasses process checks. It never deletes persistent volumes.
+Losing runtime metadata does not prove filesystem consistency or guest quiesce.
+When integrated with #49, do not use forgetting as proof that a volume resize is
+safe: the offline filesystem/resize validation remains independently required.
 
-Deleting the directory while a VM survives removes its ownership evidence and
-can permit a duplicate VM to use the same persistent volume. Volume data lives
-outside the VM state directory; leave that data and its volume records intact.
+If proof fails, inspect the VM logs, ownership manifest, and recorded systemd
+unit. Stop/fence the actual owner before retrying. For corrupt metadata, preserve
+it for diagnosis and restore a trusted ownership record before retrying; the
+agent must not guess a new owner. Stopping the agent does not stop surviving VMs.
+Do not delete ownership records while a claimant may be alive.
 
 A process observed mid-exit is classified as exited, not ambiguous. Linux
 releases a process's address space, and with it its `exe` link and command line,
@@ -319,25 +316,29 @@ VM.
 
 ### Recovery policy across restart and explicit retry
 
-Startup recovery, explicit retry, and start-time reclamation use the same
-ownership and absence policy. A `stopping` manifest is retained even if its PID
-is dead. Missing recorded identity remains ambiguous; an interrupted systemd
-start is a separate case that requires the recorded unit and matching launch
-arguments before identity can be reconstructed. Systemd cleanup requires an
-inactive or absent unit with no MainPID, plus a complete process claimant scan.
-Either socket or config reference (including `--flag=value`) prevents deletion.
-Unreadable processes prevent a destructive scan from proving absence.
+Restart and the operator command share the same resolver. Start-time reclamation
+uses the same absence proof, bound to the requested service's canonical runtime
+directory. Quarantined status exposes the directory's service name even if a
+malformed manifest names another service. Healthy startup verification does not
+emit an operator-intervention error.
 
-Executable device/inode, boot ID, start time and launch arguments establish
-identity. The display path from `/proc/PID/exe` is diagnostic; the ` (deleted)`
-suffix after binary replacement does not invalidate a surviving VM.
+Process and unit inspections run outside the global manager lock. Final mutation
+revalidates the captured instance and durable record. Restricted process tables
+are accepted for root or the configured exempt group; an unprivileged nonexempt
+viewer cannot prove absence. An unreadable process during a strict scan still
+prevents deletion. The runtime assumes the agent runs in the host PID namespace.
 
-The command is an explicit request to retry verification, not permission to
-forget an unproved owner. It does not relax restart policy or accept a force
-assertion. This change retains the issue-48 operator interface; automatic retry
-scheduling is a separate policy decision. Manager lock acquisition and commit
-checks have a five-second budget, shorter than the transport deadline. A lost
-response still means the outcome is unknown, as with any local RPC; inspect
-status before retrying. No-op success is limited to absence of both tracked
-and durable runtime state. Clearing a dead removed VM also deregisters its
-health probe on the main loop.
+Boot ID, start time, executable inode/device and launch arguments establish
+ownership. A `/proc/PID/exe` display-path ` (deleted)` suffix does not invalidate
+an otherwise proven process, including during legacy migration.
+
+Pending VM updates are isolated from independent rolling updates; ordinary
+rolling update failures still stop subsequent updates. An unresolved service
+keeps node convergence incomplete and the node's applied revision does not
+advance. Reporting a node-wide revision as applied would falsely acknowledge
+work on the blocked service.
+
+Manager lock acquisition and commit checks have a five-second budget, shorter
+than the transport deadline. A lost response means its outcome is unknown;
+inspect status before retrying. Clearing an absent removed VM also deregisters
+its health probe on the main loop.
