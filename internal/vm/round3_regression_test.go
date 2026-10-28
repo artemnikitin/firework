@@ -515,12 +515,18 @@ func TestRound3DirectChildRetainsWaitMonitorThroughRecovery(t *testing.T) {
 			if err := syscall.Kill(pid, syscall.SIGKILL); err != nil {
 				t.Fatal(err)
 			}
+			wantState := StateFailed
+			wantLifecycle := lifecycleFailed
+			if quarantine == "interrupted stop" {
+				wantState = StateRecoveryPending
+				wantLifecycle = lifecycleStopping
+			}
 			deadline := time.Now().Add(3 * time.Second)
 			for time.Now().Before(deadline) {
 				got := m.List()[service.Name]
-				if got.PID == 0 && got.State == StateFailed {
+				if got.PID == 0 && got.State == wantState {
 					durable, err := readManifest(manifestPath(got.manifest.VMDir))
-					if err != nil || durable.PID != 0 || durable.Lifecycle != lifecycleFailed {
+					if err != nil || durable.PID != 0 || durable.Lifecycle != wantLifecycle {
 						t.Fatalf("real Wait monitor did not persist the exit: manifest=%#v err=%v", durable, err)
 					}
 					return

@@ -322,6 +322,12 @@ directory. Quarantined status exposes the directory's service name even if a
 malformed manifest names another service. Healthy startup verification does not
 emit an operator-intervention error.
 
+A quarantined direct child's exit remains eligible for recovery on the next
+tick or explicit retry. Its Wait monitor records the exit without clearing
+`recovery_pending`; the resolver still requires the full absence proof before
+removing runtime state. An interrupted `stopping` marker remains subject to
+guarded `--forget`, including after that child exits.
+
 Process and unit inspections run outside the global manager lock. Final mutation
 revalidates the captured instance and durable record. Restricted process tables
 are accepted for root or the configured exempt group; an unprivileged nonexempt

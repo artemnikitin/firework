@@ -928,6 +928,8 @@ func (m *Manager) monitor(name, instanceID string, launched *launchedProcess) {
 		return
 	}
 
+	wasRecoveryPending := inst.State == StateRecoveryPending
+	previousManifest := cloneInstanceManifest(inst.manifest)
 	if err != nil {
 		// Stop() marks instances as stopped before process exit. In that case
 		// a non-zero Wait result is expected and should not flip state to failed.
@@ -944,16 +946,37 @@ func (m *Manager) monitor(name, instanceID string, launched *launchedProcess) {
 		m.logger.Info("microVM exited cleanly", "service", name)
 		inst.State = StateStopped
 	}
+	terminalState := inst.State
+	if wasRecoveryPending {
+		inst.State = StateRecoveryPending
+		inst.LastError = "quarantined Firecracker process exited; recovery verification pending"
+		inst.recoveryCandidate = nil
+	}
 	inst.PID = 0
 	if inst.manifest != nil {
 		inst.manifest.PID = 0
 		inst.manifest.LastError = inst.LastError
-		if inst.State == StateFailed {
+		if terminalState == StateFailed {
 			inst.manifest.Lifecycle = lifecycleFailed
 		} else {
 			inst.manifest.Lifecycle = lifecycleStopped
 		}
-		_ = m.writeRecoveryManifest(manifestPath(inst.manifest.VMDir), inst.manifest)
+		if wasRecoveryPending && previousManifest.Lifecycle == lifecycleStopping {
+			inst.manifest.Lifecycle = lifecycleStopping
+		}
+		if writeErr := m.writeRecoveryManifest(manifestPath(inst.manifest.VMDir), inst.manifest); writeErr != nil && wasRecoveryPending {
+			// Rename may have succeeded before directory sync failed. Align
+			// memory with whichever trusted snapshot is actually durable.
+			terminalManifest := inst.manifest
+			durable, readErr := readManifest(manifestPath(previousManifest.VMDir))
+			if readErr == nil && (sameRecoveryIdentity(durable, previousManifest) || sameRecoveryIdentity(durable, terminalManifest)) {
+				inst.manifest = durable
+			} else {
+				inst.manifest = previousManifest
+			}
+			inst.PID = inst.manifest.PID
+			inst.LastError = fmt.Sprintf("persist quarantined process exit: %v", writeErr)
+		}
 	}
 }
 
