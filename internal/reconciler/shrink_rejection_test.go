@@ -74,6 +74,9 @@ func TestPreflightRejectionIsTerminalAndLeavesTheVMRunning(t *testing.T) {
 			if len(manager.removeCalls) != 0 {
 				t.Fatalf("the VM was stopped for a refused shrink: %v", manager.removeCalls)
 			}
+			if len(manager.removeForResizeCalls) != 0 {
+				t.Fatalf("a refused shrink reached resize-required removal: %v", manager.removeForResizeCalls)
+			}
 			if len(manager.startCalls) != 0 {
 				t.Fatalf("the VM was restarted for a refused shrink: %v", manager.startCalls)
 			}
@@ -113,6 +116,9 @@ func TestMixedUpdateStillDeploysTheImageWithNoResize(t *testing.T) {
 	}
 	if len(manager.startCalls) != 1 {
 		t.Fatalf("expected the image change to be deployed, got starts %v", manager.startCalls)
+	}
+	if len(manager.removeForResizeCalls) != 0 {
+		t.Fatalf("the clamped refused shrink reached resize-required removal: %v", manager.removeForResizeCalls)
 	}
 	started := manager.instances["app"].Config
 	if started.Image != "/image-v2" {

@@ -48,6 +48,10 @@ type volumePreflighter interface {
 	Preflight(context.Context, config.ServiceConfig) ([]volume.Rejection, error)
 }
 
+type resizeVMRemover interface {
+	RemoveForResize(string) error
+}
+
 type vmRecoverer interface {
 	Recover(context.Context, config.NodeConfig) ([]string, error)
 }
@@ -566,9 +570,15 @@ func (r *Reconciler) applyAllAtOnce(ctx context.Context, actions []Action) error
 			if action.PreviousService != nil {
 				prev = *action.PreviousService
 			}
-			if err := r.deleteService(prev); err != nil {
-				r.logger.Error("failed to stop existing service during update", "service", action.Service.Name, "error", err)
-				errs = append(errs, fmt.Errorf("remove previous %s: %w", action.Service.Name, err))
+			var removeErr error
+			if hasEffectiveVolumeResize(prev, action.Service) {
+				removeErr = r.deleteServiceForResize(prev)
+			} else {
+				removeErr = r.deleteService(prev)
+			}
+			if removeErr != nil {
+				r.logger.Error("failed to stop existing service during update", "service", action.Service.Name, "error", removeErr)
+				errs = append(errs, fmt.Errorf("remove previous %s: %w", action.Service.Name, removeErr))
 				continue
 			}
 			if err := r.createService(ctx, action.Service); err != nil {
@@ -641,9 +651,15 @@ func (r *Reconciler) applyRolling(ctx context.Context, actions []Action) error {
 		if action.PreviousService != nil {
 			prev = *action.PreviousService
 		}
-		if err := r.deleteService(prev); err != nil {
-			r.logger.Error("failed to stop existing service during update", "service", action.Service.Name, "error", err)
-			errs = append(errs, fmt.Errorf("remove previous %s: %w", action.Service.Name, err))
+		var removeErr error
+		if hasEffectiveVolumeResize(prev, action.Service) {
+			removeErr = r.deleteServiceForResize(prev)
+		} else {
+			removeErr = r.deleteService(prev)
+		}
+		if removeErr != nil {
+			r.logger.Error("failed to stop existing service during update", "service", action.Service.Name, "error", removeErr)
+			errs = append(errs, fmt.Errorf("remove previous %s: %w", action.Service.Name, removeErr))
 			break
 		}
 		if err := r.createService(ctx, action.Service); err != nil {
@@ -671,6 +687,19 @@ func (r *Reconciler) preflight(ctx context.Context, svc config.ServiceConfig) ([
 		return manager.Preflight(ctx, svc)
 	}
 	return nil, nil
+}
+
+func hasEffectiveVolumeResize(previous, effective config.ServiceConfig) bool {
+	previousSizes := make(map[string]int64, len(previous.Volumes))
+	for _, volume := range previous.Volumes {
+		previousSizes[volume.Name] = volume.SizeBytes
+	}
+	for _, volume := range effective.Volumes {
+		if oldSize, exists := previousSizes[volume.Name]; exists && oldSize != volume.SizeBytes {
+			return true
+		}
+	}
+	return false
 }
 
 // settleRejections applies a preflight refusal to a planned update and reports
@@ -966,6 +995,17 @@ func (r *Reconciler) createService(ctx context.Context, svc config.ServiceConfig
 // deleteService deregisters health checks, stops the VM, and tears down host
 // networking (port forwards and the network device).
 func (r *Reconciler) deleteService(svc config.ServiceConfig) error {
+	return r.deleteServiceWithQuiesceRequirement(svc, false)
+}
+
+func (r *Reconciler) deleteServiceForResize(svc config.ServiceConfig) error {
+	if _, ok := r.vmManager.(resizeVMRemover); !ok {
+		return fmt.Errorf("VM manager cannot confirm guest quiesce before resizing service %s", svc.Name)
+	}
+	return r.deleteServiceWithQuiesceRequirement(svc, true)
+}
+
+func (r *Reconciler) deleteServiceWithQuiesceRequirement(svc config.ServiceConfig, requireQuiesce bool) error {
 	// Write-ahead: durably record every host resource this delete will have
 	// to clean up *before* the VM goes away. Once Remove succeeds, svc is
 	// absent from both desired and actual state, so Plan will never emit a
@@ -987,7 +1027,13 @@ func (r *Reconciler) deleteService(svc config.ServiceConfig) error {
 
 	// Prove ownership and stop the VM before removing host resources. If the
 	// process identity is ambiguous, keep the service quarantined and intact.
-	if err := r.vmManager.Remove(svc.Name); err != nil {
+	var removeErr error
+	if requireQuiesce {
+		removeErr = r.vmManager.(resizeVMRemover).RemoveForResize(svc.Name)
+	} else {
+		removeErr = r.vmManager.Remove(svc.Name)
+	}
+	if removeErr != nil {
 		// The entries just journalled are deliberately left in place. They
 		// are not leaked: the VM is still running, so the retry paths see
 		// svc.Name in vmManager.List() and find every one of those resources
@@ -995,7 +1041,7 @@ func (r *Reconciler) deleteService(svc config.ServiceConfig) error {
 		// next tick. That self-healing depends on the retry guards comparing
 		// against the running config rather than the desired one — see
 		// retryPendingPortForwards and retryPendingNetworkDevices.
-		return stageError(FailureStageVM, fmt.Errorf("remove VM: %w", err))
+		return stageError(FailureStageVM, fmt.Errorf("remove VM: %w", removeErr))
 	}
 
 	if r.healthMon != nil {
