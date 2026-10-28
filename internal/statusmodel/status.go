@@ -4,6 +4,7 @@
 package statusmodel
 
 import (
+	"encoding/json"
 	"net/url"
 	"strings"
 	"time"
@@ -12,14 +13,16 @@ import (
 )
 
 const (
-	SchemaVersion       = 1
-	MaxMessageLen       = 256
-	MaxConditions       = 16
-	MaxServices         = 256
-	MaxServiceNameLen   = 128
-	MaxConditionTypeLen = 64
-	MaxReasonCodeLen    = 64
-	MaxRevisionLen      = 256
+	LegacySchemaVersion   = 1
+	SchemaVersion         = 2
+	MaxMessageLen         = 256
+	MaxConditions         = 16
+	MaxServices           = 256
+	MaxActualOnlyServices = 256
+	MaxServiceNameLen     = 128
+	MaxConditionTypeLen   = 64
+	MaxReasonCodeLen      = 64
+	MaxRevisionLen        = 256
 
 	// The following bound every remaining AgentStatus/ServiceStatus/
 	// VolumeStatus string field that would otherwise serialize unbounded.
@@ -213,6 +216,40 @@ type AgentStatus struct {
 	Message           string          `json:"message,omitempty"`
 	Conditions        []Condition     `json:"conditions,omitempty"`
 	Services          []ServiceStatus `json:"services,omitempty"`
+	// ActualOnlyServices lists every VM manager record not present in the
+	// current desired node config. An empty, non-truncated v2 list is positive
+	// evidence that no tracked VM remains. V1 agents did not send this field,
+	// so its absence there is never interpreted as an empty inventory.
+	ActualOnlyServices          []ServiceStatus `json:"actual_only_services,omitempty"`
+	ActualOnlyServicesTruncated bool            `json:"actual_only_services_truncated,omitempty"`
+}
+
+// MarshalJSON preserves the v1 wire shape while requiring v2 senders to carry
+// an explicit empty list when no actual-only records remain. The embedded
+// alias keeps the compatibility fields in one declaration; the outer pointer
+// slice distinguishes v2 [] from an omitted v1 field.
+func (status AgentStatus) MarshalJSON() ([]byte, error) {
+	type alias AgentStatus
+	payload := struct {
+		*alias
+		ActualOnlyServices *[]ServiceStatus `json:"actual_only_services,omitempty"`
+	}{alias: (*alias)(&status)}
+	if status.SchemaVersion == SchemaVersion && status.ActualOnlyServices != nil {
+		payload.ActualOnlyServices = &status.ActualOnlyServices
+	}
+	return json.Marshal(payload)
+}
+
+// IsSupportedSchemaVersion reports whether a telemetry version has a
+// validator and a stable interpretation in this binary.
+func IsSupportedSchemaVersion(version int) bool {
+	return version == LegacySchemaVersion || version == SchemaVersion
+}
+
+// HasCompleteActualOnlyInventory reports whether an observation can prove
+// absence of every VM manager record outside the desired config.
+func HasCompleteActualOnlyInventory(status AgentStatus) bool {
+	return status.SchemaVersion == SchemaVersion && status.ActualOnlyServices != nil && !status.ActualOnlyServicesTruncated
 }
 
 func BoundedMessage(message string) string {

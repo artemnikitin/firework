@@ -172,6 +172,77 @@ func TestRegistrationIsTheOnlyGenerationAdvance(t *testing.T) {
 	}
 }
 
+func TestRetirementPendingFencesEveryRegistryMutation(t *testing.T) {
+	tests := []struct {
+		name        string
+		path        string
+		body        any
+		wantStatus  int
+		wantErrCode string
+	}{
+		{name: "older registration", path: "/v1/nodes/register", body: register("node-1", 6), wantStatus: http.StatusConflict, wantErrCode: registryapi.ErrorCodeStaleGeneration},
+		{name: "same generation registration", path: "/v1/nodes/register", body: register("node-1", 7), wantStatus: http.StatusConflict, wantErrCode: registryapi.ErrorCodeNodeRetiring},
+		{name: "higher generation registration", path: "/v1/nodes/register", body: register("node-1", 8), wantStatus: http.StatusOK},
+		{name: "heartbeat", path: "/v1/nodes/heartbeat", body: heartbeat("node-1", 7), wantStatus: http.StatusConflict, wantErrCode: registryapi.ErrorCodeNodeRetiring},
+		{name: "state", path: "/v1/nodes/node-1/state", body: registryapi.StateRequest{State: registryapi.NodeStateDown, Generation: 7}, wantStatus: http.StatusConflict, wantErrCode: registryapi.ErrorCodeNodeRetiring},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			server, store := newTestRegistry(t)
+			if code, _ := registryCall(t, server, "node-1", "/v1/nodes/register", register("node-1", 7)); code != http.StatusOK {
+				t.Fatalf("register: %d", code)
+			}
+			before, _ := readNode(t, store, server.cfg, "node-1")
+			before.RetirementPendingAt = time.Now().UTC()
+			key, err := nodeRecordKey(server.cfg.State.Prefix, "node-1")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := store.PutJSON(context.Background(), key, before); err != nil {
+				t.Fatal(err)
+			}
+			before, _ = readNode(t, store, server.cfg, "node-1")
+			code, errCode := registryCall(t, server, "node-1", tt.path, tt.body)
+			if code != tt.wantStatus || errCode != tt.wantErrCode {
+				t.Fatalf("got %d %q, want %d %q", code, errCode, tt.wantStatus, tt.wantErrCode)
+			}
+			after, _ := readNode(t, store, server.cfg, "node-1")
+			if tt.wantStatus == http.StatusOK {
+				if after.Generation != 8 || !after.RetirementPendingAt.IsZero() {
+					t.Fatalf("newer registration did not replace the pending incarnation: %+v", after)
+				}
+			} else if after.Generation != before.Generation || after.State != before.State || !after.RetirementPendingAt.Equal(before.RetirementPendingAt) {
+				t.Fatalf("rejected request changed the record: %+v -> %+v", before, after)
+			}
+		})
+	}
+}
+
+func TestTombstoneFencesRegistrationAfterActiveRecordRemoval(t *testing.T) {
+	server, store := newTestRegistry(t)
+	tombstoneKey, err := nodeTombstoneKey(server.cfg.State.Prefix, "node-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := store.PutJSONIfAbsent(context.Background(), tombstoneKey, NodeTombstone{
+		NodeID:        "node-1",
+		MaxGeneration: 7,
+		RetiredAt:     time.Now().UTC(),
+		Reason:        "test",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	for _, generation := range []int64{7, 8} {
+		code, errCode := registryCall(t, server, "node-1", "/v1/nodes/register", register("node-1", generation))
+		if code != http.StatusConflict || errCode != registryapi.ErrorCodeNodeRetired {
+			t.Fatalf("register generation %d = %d %q, want 409 %q", generation, code, errCode, registryapi.ErrorCodeNodeRetired)
+		}
+	}
+	if _, exists := readNode(t, store, server.cfg, "node-1"); exists {
+		t.Fatal("tombstoned registration recreated the active node record")
+	}
+}
+
 // A registration revives a down node, so the down timestamp must not survive
 // into the new incarnation's record.
 func TestRegistrationClearsDownTimestamp(t *testing.T) {

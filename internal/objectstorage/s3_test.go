@@ -19,8 +19,9 @@ import (
 // fakeS3API is an in-memory s3API implementation that models ETag generation
 // and the conditional-write semantics the blob store relies on.
 type fakeS3API struct {
-	objects map[string]fakeS3Object
-	counter int
+	objects   map[string]fakeS3Object
+	counter   int
+	deleteErr error
 }
 
 type fakeS3Object struct {
@@ -86,7 +87,17 @@ func (f *fakeS3API) PutObject(_ context.Context, in *s3.PutObjectInput, _ ...fun
 }
 
 func (f *fakeS3API) DeleteObject(_ context.Context, in *s3.DeleteObjectInput, _ ...func(*s3.Options)) (*s3.DeleteObjectOutput, error) {
-	delete(f.objects, aws.ToString(in.Key))
+	if f.deleteErr != nil {
+		return nil, f.deleteErr
+	}
+	key := aws.ToString(in.Key)
+	if in.IfMatch != nil {
+		obj, exists := f.objects[key]
+		if !exists || obj.etag != aws.ToString(in.IfMatch) {
+			return nil, apiErr("PreconditionFailed")
+		}
+	}
+	delete(f.objects, key)
 	return &s3.DeleteObjectOutput{}, nil
 }
 
@@ -171,5 +182,41 @@ func TestS3BlobStoreConditionalWrites(t *testing.T) {
 	data, meta, exists, err := store.GetBytes(ctx, "lock.json")
 	if err != nil || !exists || string(data) != `{"holder":"two"}` || meta.WriteToken != updated.WriteToken {
 		t.Fatalf("GetBytes = data %q, meta %#v, exists %v, err %v", data, meta, exists, err)
+	}
+}
+
+func TestS3BlobStoreConditionalDelete(t *testing.T) {
+	ctx := context.Background()
+	store := newTestS3Store()
+	meta, err := store.Put(ctx, "node.json", strings.NewReader(`{"generation":7}`), PutOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	deleted, err := store.DeleteIfMatch(ctx, "node.json", "wrong-etag")
+	if err != nil || deleted {
+		t.Fatalf("wrong-token delete = %v, %v; want conflict", deleted, err)
+	}
+	if _, exists, err := store.Head(ctx, "node.json"); err != nil || !exists {
+		t.Fatalf("wrong-token delete removed object: exists %v, err %v", exists, err)
+	}
+	deleted, err = store.DeleteIfMatch(ctx, "node.json", meta.WriteToken)
+	if err != nil || !deleted {
+		t.Fatalf("matching delete = %v, %v", deleted, err)
+	}
+	deleted, err = store.DeleteIfMatch(ctx, "node.json", meta.WriteToken)
+	if err != nil || deleted {
+		t.Fatalf("missing-object delete = %v, %v; want conflict", deleted, err)
+	}
+	if _, err := store.DeleteIfMatch(ctx, "node.json", WriteTokenAbsent); err == nil {
+		t.Fatal("empty-token delete unexpectedly accepted")
+	}
+	if _, err := store.DeleteIfMatch(ctx, "node.json", "*"); err == nil {
+		t.Fatal("wildcard-token delete unexpectedly accepted")
+	}
+	api := store.(*s3BlobStore).client.(*fakeS3API)
+	api.deleteErr = apiErr("InternalError")
+	if _, err := store.DeleteIfMatch(ctx, "node.json", "\"etag-anything\""); err == nil {
+		t.Fatal("expected provider error to propagate")
 	}
 }

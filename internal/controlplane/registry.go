@@ -210,6 +210,14 @@ func (s *RegistryServer) handleRegister(w http.ResponseWriter, r *http.Request) 
 	}
 
 	rec, err := s.upsertNodeRecord(r.Context(), req.NodeID, func(cur *NodeRecord) error {
+		if !cur.RetirementPendingAt.IsZero() {
+			switch {
+			case req.Generation < cur.Generation:
+				return errStaleGeneration
+			case req.Generation == cur.Generation:
+				return errNodeRetiring
+			}
+		}
 		if cur.Generation > req.Generation {
 			return errStaleGeneration
 		}
@@ -228,6 +236,7 @@ func (s *RegistryServer) handleRegister(w http.ResponseWriter, r *http.Request) 
 		}
 		cur.NodeID = req.NodeID
 		cur.Generation = req.Generation
+		cur.RetirementPendingAt = time.Time{}
 		cur.setState(NodeState(req.State), now)
 		cur.Labels = req.Labels
 		cur.Capacity = resourcesFromRegistry(req.Capacity)
@@ -290,6 +299,9 @@ func (s *RegistryServer) handleHeartbeat(w http.ResponseWriter, r *http.Request)
 		if cur.Generation != req.Generation {
 			return errStaleGeneration
 		}
+		if !cur.RetirementPendingAt.IsZero() {
+			return errNodeRetiring
+		}
 		now := time.Now().UTC()
 		if cur.State == "" {
 			cur.setState(NodeStateReady, now)
@@ -348,7 +360,7 @@ func applyHeartbeatAgentStatus(cur *NodeRecord, nodeID string, incoming *statusm
 	if incoming.SchemaVersion <= 0 {
 		return fmt.Errorf("agent_status.schema_version is required")
 	}
-	if incoming.SchemaVersion > statusmodel.SchemaVersion {
+	if !statusmodel.IsSupportedSchemaVersion(incoming.SchemaVersion) {
 		return fmt.Errorf("%w: agent_status.schema_version %d is newer than supported version %d", errUnsupportedAgentStatusSchema, incoming.SchemaVersion, statusmodel.SchemaVersion)
 	}
 	if incoming.NodeID != "" && incoming.NodeID != nodeID {
@@ -360,6 +372,9 @@ func applyHeartbeatAgentStatus(cur *NodeRecord, nodeID string, incoming *statusm
 	}
 	status.Conditions = append([]statusmodel.Condition(nil), incoming.Conditions...)
 	status.Services = append([]statusmodel.ServiceStatus(nil), incoming.Services...)
+	if incoming.ActualOnlyServices != nil {
+		status.ActualOnlyServices = append(make([]statusmodel.ServiceStatus, 0, len(incoming.ActualOnlyServices)), incoming.ActualOnlyServices...)
+	}
 	if err := validateAgentStatus(status); err != nil {
 		return err
 	}
@@ -374,19 +389,50 @@ func applyHeartbeatAgentStatus(cur *NodeRecord, nodeID string, incoming *statusm
 			status.Services[i].Volumes[j].LastError = statusmodel.BoundedMessage(status.Services[i].Volumes[j].LastError)
 		}
 	}
+	for i := range status.ActualOnlyServices {
+		status.ActualOnlyServices[i].Message = statusmodel.BoundedMessage(status.ActualOnlyServices[i].Message)
+		status.ActualOnlyServices[i].Volumes = nil
+	}
+	if status.SchemaVersion == statusmodel.LegacySchemaVersion {
+		// V1 fields are accepted for mixed-version decoding but are not trusted
+		// as an actual-only inventory. In particular, omitted v1 data remains
+		// unknown rather than becoming a complete empty list.
+		status.ActualOnlyServices = nil
+		status.ActualOnlyServicesTruncated = false
+	}
 	cur.AgentStatus = &status
 	return nil
 }
 
 func validateAgentStatus(status statusmodel.AgentStatus) error {
-	if status.SchemaVersion <= 0 {
-		return fmt.Errorf("agent_status.schema_version is required")
+	if !statusmodel.IsSupportedSchemaVersion(status.SchemaVersion) {
+		return fmt.Errorf("agent_status.schema_version %d is unsupported", status.SchemaVersion)
 	}
 	if len(status.Conditions) > statusmodel.MaxConditions {
 		return fmt.Errorf("agent_status has %d conditions; maximum is %d", len(status.Conditions), statusmodel.MaxConditions)
 	}
 	if len(status.Services) > statusmodel.MaxServices {
 		return fmt.Errorf("agent_status has %d services; maximum is %d", len(status.Services), statusmodel.MaxServices)
+	}
+	if len(status.ActualOnlyServices) > statusmodel.MaxActualOnlyServices {
+		return fmt.Errorf("agent_status has %d actual-only services; maximum is %d", len(status.ActualOnlyServices), statusmodel.MaxActualOnlyServices)
+	}
+	if status.SchemaVersion == statusmodel.SchemaVersion {
+		if status.ActualOnlyServices == nil {
+			return fmt.Errorf("agent_status v2 actual_only_services is required, use an empty list when none remain")
+		}
+		if status.ServicesTruncated {
+			if len(status.Services) != statusmodel.MaxServices || status.DesiredServices <= len(status.Services) {
+				return fmt.Errorf("agent_status services_truncated is inconsistent")
+			}
+		} else if status.DesiredServices != len(status.Services) {
+			return fmt.Errorf("agent_status desired_services does not match services list")
+		}
+		if status.ActualOnlyServicesTruncated && len(status.ActualOnlyServices) != statusmodel.MaxActualOnlyServices {
+			return fmt.Errorf("agent_status actual_only_services_truncated is inconsistent")
+		}
+	} else if status.ActualOnlyServicesTruncated && len(status.ActualOnlyServices) != statusmodel.MaxActualOnlyServices {
+		return fmt.Errorf("agent_status actual_only_services_truncated is inconsistent")
 	}
 	if status.DesiredServices < 0 || status.ReadyServices < 0 || status.ReadyServices > status.DesiredServices {
 		return fmt.Errorf("agent_status service counts are invalid")
@@ -462,6 +508,9 @@ func validateAgentStatus(status statusmodel.AgentStatus) error {
 		if len(service.Volumes) > config.MaxServiceVolumes {
 			return fmt.Errorf("agent_status service %q has too many volumes", service.Name)
 		}
+		if service.PID < 0 || service.HealthFailures < 0 || service.RestartCount < 0 {
+			return fmt.Errorf("agent_status service %q has negative numeric fields", service.Name)
+		}
 		volumeIDs := make(map[string]struct{}, len(service.Volumes))
 		for _, volume := range service.Volumes {
 			if err := validateVolumeStatus(service.Name, volume); err != nil {
@@ -471,6 +520,31 @@ func validateAgentStatus(status statusmodel.AgentStatus) error {
 				return fmt.Errorf("agent_status service %q volume %q is duplicated", service.Name, volume.LogicalID)
 			}
 			volumeIDs[volume.LogicalID] = struct{}{}
+		}
+	}
+	actualNames := make(map[string]struct{}, len(status.ActualOnlyServices))
+	for _, service := range status.ActualOnlyServices {
+		if service.Name == "" || len(service.Name) > statusmodel.MaxServiceNameLen {
+			return fmt.Errorf("agent_status actual-only service name is invalid")
+		}
+		if _, duplicate := actualNames[service.Name]; duplicate {
+			return fmt.Errorf("agent_status actual-only service %q is duplicated", service.Name)
+		}
+		actualNames[service.Name] = struct{}{}
+		if _, overlap := serviceNames[service.Name]; overlap && status.SchemaVersion == statusmodel.SchemaVersion {
+			return fmt.Errorf("agent_status actual-only service %q also appears in services", service.Name)
+		}
+		if !validReasonCode(service.ReasonCode) || !statusmodel.IsVMState(service.VMState) || !statusmodel.IsHealthState(service.Health) {
+			return fmt.Errorf("agent_status actual-only service %q has invalid status fields", service.Name)
+		}
+		if len(service.HealthCheckType) > statusmodel.MaxEnumLen || len(service.NetworkAddress) > statusmodel.MaxNetworkAddressLen {
+			return fmt.Errorf("agent_status actual-only service %q has oversized status fields", service.Name)
+		}
+		if service.PID < 0 || service.HealthFailures < 0 || service.RestartCount < 0 {
+			return fmt.Errorf("agent_status actual-only service %q has negative numeric fields", service.Name)
+		}
+		if len(service.Volumes) != 0 {
+			return fmt.Errorf("agent_status actual-only service %q must not include volume summaries", service.Name)
 		}
 	}
 	if !validReasonCode(status.ReasonCode) {
@@ -569,6 +643,9 @@ func (s *RegistryServer) handleState(w http.ResponseWriter, r *http.Request) {
 		if cur.Generation != req.Generation {
 			return errStaleGeneration
 		}
+		if !cur.RetirementPendingAt.IsZero() {
+			return errNodeRetiring
+		}
 		now := time.Now().UTC()
 		cur.setState(NodeState(req.State), now)
 		cur.LastSeenAt = now
@@ -600,11 +677,17 @@ func nodeResponse(record *NodeRecord) registryapi.NodeResponse {
 var (
 	errStaleGeneration              = errors.New("stale generation")
 	errNodeNotRegistered            = errors.New("node not registered")
+	errNodeRetiring                 = errors.New("node retirement is in progress")
+	errNodeRetired                  = errors.New("node identity is retired")
 	errUnsupportedAgentStatusSchema = errors.New("unsupported agent status schema")
 )
 
 func (s *RegistryServer) writeMutationError(w http.ResponseWriter, operation, nodeID string, err error) {
 	switch {
+	case errors.Is(err, errNodeRetiring):
+		writeRegistryError(w, http.StatusConflict, registryapi.ErrorCodeNodeRetiring, "node retirement is in progress")
+	case errors.Is(err, errNodeRetired):
+		writeRegistryError(w, http.StatusConflict, registryapi.ErrorCodeNodeRetired, "node identity is retired and requires audited recovery")
 	case errors.Is(err, errStaleGeneration):
 		writeRegistryError(w, http.StatusConflict, registryapi.ErrorCodeStaleGeneration, "node generation is no longer current")
 	case errors.Is(err, errNodeNotRegistered):
@@ -658,6 +741,18 @@ func (s *RegistryServer) mutateNodeRecord(ctx context.Context, nodeID string, cr
 		if !exists {
 			if !create {
 				return nil, errNodeNotRegistered
+			}
+			tombstoneKey, keyErr := nodeTombstoneKey(s.cfg.State.Prefix, nodeID)
+			if keyErr != nil {
+				return nil, keyErr
+			}
+			var tombstone NodeTombstone
+			_, tombstoned, err := s.store.GetJSON(ctx, tombstoneKey, &tombstone)
+			if err != nil {
+				return nil, err
+			}
+			if tombstoned {
+				return nil, errNodeRetired
 			}
 			current = NodeRecord{NodeID: nodeID}
 		}

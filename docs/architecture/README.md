@@ -54,6 +54,7 @@ cmd/controlplane -> internal/controlplane -> internal/registryapi
                                          -> internal/operatorapi
 
 cmd/fireworkctl -> internal/operatorapi
+cmd/nodemaint -> internal/controlplane -> internal/objectstorage
 ```
 
 `internal/architecturetest` checks the exact internal production dependency

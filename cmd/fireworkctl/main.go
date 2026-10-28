@@ -35,9 +35,10 @@ type apiClient struct {
 }
 
 var (
-	nodeStates    = []string{"ready", "draining", "down", "stale", "unknown"}
+	nodeStates    = []string{"ready", "draining", "down", "stale", "unknown", "retired"}
 	serviceStates = []string{"pending", "running", "stopped", "failed", "unknown"}
 	serviceHealth = []string{"healthy", "unhealthy", "unknown", "not_configured"}
+	volumeStates  = []string{"active", "pending", "node_unavailable", "backend_unavailable", "retained", "orphaned", "invalid"}
 )
 
 type httpStatusError struct {
@@ -114,6 +115,10 @@ func run(args []string, out io.Writer) error {
 		return runServices(cfg, commandArgs, out)
 	case "service":
 		return runService(cfg, commandArgs, out)
+	case "volumes":
+		return runVolumes(cfg, commandArgs, out)
+	case "volume":
+		return runVolume(cfg, commandArgs, out)
 	default:
 		return usageError("unknown command " + command)
 	}
@@ -153,9 +158,9 @@ func runStatus(cfg cliConfig, args []string, out io.Writer) error {
 			formatNodeSet(response.StaleNodes), formatNodeSet(response.DownNodes), formatNodeSet(response.UnknownNodes),
 			valueOrDash(response.ReasonCode), valueOrDash(response.Message))
 		services := response.Services
-		fmt.Fprintf(w, "SERVICES\t%d desired, %d running, %d ready, %d pending, %d unhealthy, %d unknown\nUNHEALTHY\t%s\n",
+		fmt.Fprintf(w, "SERVICES\t%d desired, %d running, %d ready, %d pending, %d unhealthy, %d unknown\nUNHEALTHY\t%s\nPREVIOUS NODE UNCONFIRMED\t%s\n",
 			services.Desired, services.Running, services.Ready, services.Pending, services.Unhealthy, services.Unknown,
-			formatNodeSet(response.UnhealthyServices))
+			formatNodeSet(response.UnhealthyServices), formatNodeSet(response.PreviousNodeUnconfirmedServices))
 		writeProblems(w, response.Problems)
 		return w.Flush()
 	})
@@ -303,10 +308,31 @@ func runNode(cfg cliConfig, args []string, out io.Writer) error {
 		fmt.Fprintf(w, "LABELS\t%s\nREGISTERED\t%s\nUPDATED\t%s\nLOCAL DISK\t%s\nSHARED DISK\t%s\nSHARED BACKEND\t%s\nDESIRED REVISION\t%s\nPLACEMENT REVISION\t%s\nOBSERVED REVISION\t%s\nAPPLIED REVISION\t%s\n",
 			labels, formatTime(response.RegisteredAt), formatTime(response.UpdatedAt), formatPool(response.Storage.Local), formatPool(response.Storage.Shared), valueOrDash(response.Storage.SharedBackendID),
 			valueOrDash(response.DesiredRevision), valueOrDash(response.PlacementRevision), valueOrDash(response.ObservedRevision), valueOrDash(response.AppliedRevision))
+		if response.State == "retired" || response.MaxGeneration > 0 {
+			fmt.Fprintf(w, "MAX GENERATION\t%d\nRETIRED AT\t%s\nRETIREMENT REASON\t%s\n", response.MaxGeneration, formatTime(response.RetiredAt), valueOrDash(response.RetirementReason))
+		}
 		if len(response.Services) > 0 {
 			fmt.Fprintln(w, "\nSERVICE\tSTATE\tHEALTH")
 			for _, service := range response.Services {
 				fmt.Fprintf(w, "%s\t%s\t%s\n", service.Name, service.State, service.Health)
+			}
+		}
+		if response.ActualOnlyServicesTruncated {
+			fmt.Fprintln(w, "ACTUAL-ONLY SERVICES TRUNCATED\tyes")
+		}
+		if len(response.ActualOnlyServices) > 0 {
+			fmt.Fprintln(w, "\nACTUAL-ONLY SERVICE\tVM STATE\tPID\tREASON")
+			for _, service := range response.ActualOnlyServices {
+				fmt.Fprintf(w, "%s\t%s\t%d\t%s\n", service.Name, service.VMState, service.PID, valueOrDash(service.ReasonCode))
+			}
+		}
+		if len(response.RevivalHistory) > 0 {
+			fmt.Fprintln(w, "\nREVIVAL GENERATION\tCLEARED AT\tREASON\tFENCE REFERENCE\tPOOL REFERENCE\tOUTCOME")
+			for _, audit := range response.RevivalHistory {
+				fmt.Fprintf(w, "%d\t%s\t%s\t%s\t%s\t%s\n", audit.ClearedGeneration, formatTime(audit.ClearedAt), audit.OperatorReason, audit.ExternalFenceReference, audit.RetainedPoolReference, audit.Outcome)
+			}
+			if response.RevivalHistoryTruncated {
+				fmt.Fprintln(w, "REVIVAL HISTORY TRUNCATED\tyes")
 			}
 		}
 		if len(response.Conditions) > 0 {
@@ -356,9 +382,13 @@ func runServices(cfg cliConfig, args []string, out io.Writer) error {
 			return writeOutputJSON(out, response, *watch > 0)
 		}
 		w := tabwriter.NewWriter(out, 0, 4, 2, ' ', 0)
-		fmt.Fprintln(w, "SERVICE\tNODE\tSTATE\tHEALTH\tVCPU\tMEMORY\tDISK\tREASON")
+		fmt.Fprintln(w, "SERVICE\tNODE\tSTATE\tHEALTH\tVCPU\tMEMORY\tDISK\tPREVIOUS NODE UNCONFIRMED\tREASON")
 		for _, service := range response.Items {
-			fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%d\t%d MB\t%s\t%s\n", service.Name, valueOrDash(service.Node), service.State, service.Health, service.VCPUs, service.MemoryMB, formatServiceDisk(service.Storage), valueOrDash(service.ReasonCode))
+			previous := "no"
+			if service.PreviousNodeUnconfirmed {
+				previous = formatNodeSet(service.PreviousNodes)
+			}
+			fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%d\t%d MB\t%s\t%s\t%s\n", service.Name, valueOrDash(service.Node), service.State, service.Health, service.VCPUs, service.MemoryMB, formatServiceDisk(service.Storage), previous, valueOrDash(service.ReasonCode))
 		}
 		writeProblems(w, response.Problems)
 		return w.Flush()
@@ -393,7 +423,7 @@ func runService(cfg cliConfig, args []string, out io.Writer) error {
 			return writeOutputJSON(out, response, *watch > 0)
 		}
 		w := tabwriter.NewWriter(out, 0, 4, 2, ' ', 0)
-		fmt.Fprintf(w, "SERVICE\t%s\nNODE\t%s\nDESIRED NODE\t%s\nACTUAL NODE\t%s\nSTATE\t%s\nHEALTH\t%s\nVCPU\t%d\nMEMORY\t%d MB\nIMAGE\t%s\nKERNEL\t%s\nPID\t%d\nRESTARTS\t%d\nSERVICE OBSERVED\t%s\nLAST TRANSITION\t%s\nREASON\t%s\nMESSAGE\t%s\nNETWORK ADDRESS\t%s\nROUTING HOSTNAME\t%s\nPUBLIC URL\t%s\nDISK\t%s\n", response.Name, valueOrDash(response.Node), valueOrDash(response.DesiredNode), valueOrDash(response.ActualNode), response.State, response.Health, response.VCPUs, response.MemoryMB, valueOrDash(response.DesiredImage), valueOrDash(response.DesiredKernel), response.PID, response.RestartCount, formatTime(response.ServiceObservedAt), formatTime(response.LastTransitionAt), valueOrDash(response.ReasonCode), valueOrDash(response.Message), valueOrDash(response.NetworkAddress), valueOrDash(response.RoutingHostname), valueOrDash(response.PublicURL), formatServiceDisk(response.Storage))
+		fmt.Fprintf(w, "SERVICE\t%s\nNODE\t%s\nDESIRED NODE\t%s\nACTUAL NODE\t%s\nSTATE\t%s\nHEALTH\t%s\nVCPU\t%d\nMEMORY\t%d MB\nIMAGE\t%s\nKERNEL\t%s\nPID\t%d\nRESTARTS\t%d\nSERVICE OBSERVED\t%s\nLAST TRANSITION\t%s\nREASON\t%s\nMESSAGE\t%s\nPREVIOUS NODE UNCONFIRMED\t%s\nPREVIOUS NODES\t%s\nNETWORK ADDRESS\t%s\nROUTING HOSTNAME\t%s\nPUBLIC URL\t%s\nDISK\t%s\n", response.Name, valueOrDash(response.Node), valueOrDash(response.DesiredNode), valueOrDash(response.ActualNode), response.State, response.Health, response.VCPUs, response.MemoryMB, valueOrDash(response.DesiredImage), valueOrDash(response.DesiredKernel), response.PID, response.RestartCount, formatTime(response.ServiceObservedAt), formatTime(response.LastTransitionAt), valueOrDash(response.ReasonCode), valueOrDash(response.Message), formatBool(response.PreviousNodeUnconfirmed), formatNodeSet(response.PreviousNodes), valueOrDash(response.NetworkAddress), valueOrDash(response.RoutingHostname), valueOrDash(response.PublicURL), formatServiceDisk(response.Storage))
 		hc := response.HealthCheck
 		fmt.Fprintf(w, "HEALTH CHECK\t%s\nHEALTH CHECK STATE\t%s\nHEALTH CHECKED\t%s\nHEALTH FAILURES\t%d\nHEALTH LAST ERROR\t%s\n", valueOrDash(hc.Type), valueOrUnknown(hc.State), formatTime(hc.LastCheckedAt), hc.Failures, valueOrDash(hc.LastError))
 		fmt.Fprintf(w, "DESIRED REVISION\t%s\nPLACEMENT REVISION\t%s\nRENDERED REVISION\t%s\nAPPLIED REVISION\t%s\n", valueOrDash(response.DesiredRevision), valueOrDash(response.PlacementRevision), valueOrDash(response.RenderedRevision), valueOrDash(response.AppliedRevision))
@@ -426,6 +456,88 @@ func runService(cfg cliConfig, args []string, out io.Writer) error {
 					volume.ResizeGeneration, state, valueOrDash(volume.LastError))
 			}
 		}
+		return w.Flush()
+	})
+}
+
+func runVolumes(cfg cliConfig, args []string, out io.Writer) error {
+	flags := flag.NewFlagSet("volumes", flag.ContinueOnError)
+	flags.SetOutput(io.Discard)
+	state := flags.String("state", "", "filter by lifecycle state")
+	limit := flags.Int("limit", 100, "maximum results (1-500)")
+	offset := flags.Int("offset", 0, "result offset")
+	output := flags.String("output", "table", "table or json")
+	watch := flags.Duration("watch", 0, "polling interval")
+	if err := flags.Parse(args); err != nil || flags.NArg() != 0 {
+		return usageError("usage: fireworkctl volumes [--state STATE] [--limit N] [--offset N] [--output table|json] [--watch 5s]")
+	}
+	if err := validateFilter("state", *state, volumeStates); err != nil {
+		return err
+	}
+	if err := validateOutput(*output); err != nil {
+		return err
+	}
+	if err := validateWatch(*watch); err != nil {
+		return err
+	}
+	if *limit < 1 || *limit > 500 || *offset < 0 {
+		return usageError("limit must be between 1 and 500 and offset must not be negative")
+	}
+	client, err := newAPIClient(cfg)
+	if err != nil {
+		return err
+	}
+	return poll(out, *watch, *output == "table", func() error {
+		query := url.Values{"state": []string{*state}, "limit": []string{fmt.Sprint(*limit)}, "offset": []string{fmt.Sprint(*offset)}}
+		var response operatorapi.ListEnvelope[operatorapi.VolumeSummary]
+		if err := client.get(context.Background(), "/v1/volumes?"+query.Encode(), &response); err != nil {
+			return err
+		}
+		if *output == "json" {
+			return writeOutputJSON(out, response, *watch > 0)
+		}
+		w := tabwriter.NewWriter(out, 0, 4, 2, ' ', 0)
+		fmt.Fprintf(w, "VOLUMES\t%d of %d\nMORE\t%s\n", response.Count, response.Total, formatBool(response.HasMore))
+		fmt.Fprintln(w, "VOLUME\tSTATE\tTYPE\tBOUND NODE\tBACKEND\tDESIRED BYTES\tAPPLIED BYTES\tREASON")
+		for _, volume := range response.Items {
+			fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%d\t%d\t%s\n", volume.LogicalID, volume.State, valueOrDash(volume.Type), valueOrDash(volume.BoundNode), valueOrDash(volume.SharedBackendID), volume.DesiredSizeBytes, volume.AppliedSizeBytes, valueOrDash(volume.ReasonCode))
+		}
+		writeProblems(w, response.Problems)
+		return w.Flush()
+	})
+}
+
+func runVolume(cfg cliConfig, args []string, out io.Writer) error {
+	flags := flag.NewFlagSet("volume", flag.ContinueOnError)
+	flags.SetOutput(io.Discard)
+	output := flags.String("output", "table", "table or json")
+	watch := flags.Duration("watch", 0, "polling interval")
+	if err := flags.Parse(reorderDetailArgs(args)); err != nil || flags.NArg() != 2 {
+		return usageError("usage: fireworkctl volume <service> <volume> [--output table|json] [--watch 5s]")
+	}
+	if err := validateOutput(*output); err != nil {
+		return err
+	}
+	if err := validateWatch(*watch); err != nil {
+		return err
+	}
+	client, err := newAPIClient(cfg)
+	if err != nil {
+		return err
+	}
+	service, name := flags.Arg(0), flags.Arg(1)
+	return poll(out, *watch, *output == "table", func() error {
+		path := "/v1/volumes/" + url.PathEscape(service) + "/" + url.PathEscape(name)
+		var response operatorapi.VolumeDetail
+		if err := client.get(context.Background(), path, &response); err != nil {
+			return err
+		}
+		if *output == "json" {
+			return writeOutputJSON(out, response, *watch > 0)
+		}
+		volume := response.VolumeSummary
+		w := tabwriter.NewWriter(out, 0, 4, 2, ' ', 0)
+		fmt.Fprintf(w, "VOLUME\t%s\nSTATE\t%s\nDESIRED\t%s\nTYPE\t%s\nMOUNT PATH\t%s\nBOUND NODE\t%s\nSHARED BACKEND\t%s\nDESIRED BYTES\t%d\nAPPLIED BYTES\t%d\nREQUESTED BYTES\t%d\nRESIZE GENERATION\t%d\nRESIZE STATE\t%s\nOBSERVED STATE\t%s\nREJECTED\t%s\nREASON\t%s\nMESSAGE\t%s\nLAST ERROR\t%s\n", volume.LogicalID, volume.State, formatBool(volume.Desired), valueOrDash(volume.Type), valueOrDash(volume.MountPath), valueOrDash(volume.BoundNode), valueOrDash(volume.SharedBackendID), volume.DesiredSizeBytes, volume.AppliedSizeBytes, volume.RequestedSizeBytes, volume.ResizeGeneration, valueOrUnknown(volume.ResizeState), valueOrUnknown(volume.ObservedState), formatBool(volume.Rejected), valueOrDash(volume.ReasonCode), valueOrDash(volume.Message), valueOrDash(volume.LastError))
 		return w.Flush()
 	})
 }
@@ -634,6 +746,8 @@ Commands:
   node <node-id>        Show node details
   services              List deployment services
   service <name>        Show service details
+  volumes               List desired and retained volumes
+  volume <service> <volume>  Show volume details
 
 Global options:
   --config <path>       Configuration file
@@ -648,10 +762,12 @@ Global options:
 func printCommandUsage(out io.Writer, command string) {
 	usage := map[string]string{
 		"status":   "Usage: fireworkctl status [--output table|json] [--watch 5s]\n",
-		"nodes":    "Usage: fireworkctl nodes [--state ready|draining|down|stale|unknown] [--output table|json] [--watch 5s]\n",
+		"nodes":    "Usage: fireworkctl nodes [--state ready|draining|down|stale|unknown|retired] [--output table|json] [--watch 5s]\n",
 		"node":     "Usage: fireworkctl node <node-id> [--output table|json] [--watch 5s]\n",
 		"services": "Usage: fireworkctl services [--state pending|running|stopped|failed|unknown] [--health healthy|unhealthy|unknown|not_configured] [--node NODE] [--output table|json] [--watch 5s]\n",
 		"service":  "Usage: fireworkctl service <service-name> [--output table|json] [--watch 5s]\n",
+		"volumes":  "Usage: fireworkctl volumes [--state active|pending|node_unavailable|backend_unavailable|retained|orphaned|invalid] [--limit N] [--offset N] [--output table|json] [--watch 5s]\n",
+		"volume":   "Usage: fireworkctl volume <service> <volume> [--output table|json] [--watch 5s]\n",
 	}
 	if text, ok := usage[command]; ok {
 		fmt.Fprint(out, text)
@@ -698,7 +814,7 @@ func subcommandHelp(args []string) (string, bool) {
 
 func isSubcommand(arg string) bool {
 	switch arg {
-	case "status", "nodes", "node", "services", "service":
+	case "status", "nodes", "node", "services", "service", "volumes", "volume":
 		return true
 	default:
 		return false

@@ -23,10 +23,15 @@ type Controller struct {
 	store  StateStore
 	logger *slog.Logger
 
-	id                 string
-	epoch              int64
-	leader             bool
-	lastInputSignature string
+	id                         string
+	epoch                      int64
+	leader                     bool
+	lastInputSignature         string
+	conditionalDeleteProbeDone bool
+	conditionalDeleteProbeErr  error
+	retirementCursor           string
+	quarantineCursor           string
+	lastTombstoneIndexRepairAt time.Time
 }
 
 // NewController creates a controller runtime.
@@ -144,6 +149,7 @@ func (c *Controller) runReconcile(ctx context.Context) {
 	if !c.leader {
 		return
 	}
+	c.runNodeRetirementMaintenance(ctx)
 
 	var desiredPtr RevisionPointer
 	_, exists, err := c.store.GetJSON(ctx, desiredCurrentKey(c.cfg.State.Prefix), &desiredPtr)
@@ -215,11 +221,24 @@ func (c *Controller) runReconcile(ctx context.Context) {
 	// once this cycle completes.
 	c.lastInputSignature = ""
 
-	existingPlacement, placementFound, err := c.readExistingPlacement(ctx)
+	existingPlacementRevision, placementFound, err := c.readExistingPlacementRevision(ctx)
 	if err != nil {
-		c.logger.Warn("reading existing placement failed; will re-place all", "error", err)
-		existingPlacement = nil
+		c.logger.Error("reading existing placement failed; not publishing a replacement", "error", err)
+		return
 	}
+	if !placementFound {
+		var pointer RevisionPointer
+		_, pointerExists, pointerErr := c.store.GetJSON(ctx, placementCurrentKey(c.cfg.State.Prefix), &pointer)
+		if pointerErr != nil {
+			c.logger.Error("reading placement pointer failed; not publishing a replacement", "error", pointerErr)
+			return
+		}
+		if pointerExists {
+			c.logger.Error("placement pointer targets missing state; not publishing a replacement", "revision", pointer.Revision)
+			return
+		}
+	}
+	existingPlacement := placementServices(existingPlacementRevision)
 	// A held service is one already running that must keep running, and the
 	// prior placement is the only source for where. Without it the service
 	// would be classified as never-placed and left pending, which drops it
@@ -257,6 +276,11 @@ func (c *Controller) runReconcile(ctx context.Context) {
 
 	nodeConfigs := scheduler.BuildNodeConfigs(assignments)
 	nodeConfigs = appendRetiredNodeConfigs(nodeConfigs, activeNodes)
+	previousOwners, err := c.buildUnconfirmedPreviousOwners(ctx, existingPlacementRevision, desired.Services, nodeConfigs)
+	if err != nil {
+		c.logger.Error("preserving previous placement ownership failed; not publishing", "error", err)
+		return
+	}
 	if err := c.createAssignedVolumeRecords(ctx, nodeConfigs, volumeRecords); err != nil {
 		c.logger.Warn("creating volume records conflicted; retrying on next tick", "error", err)
 		return
@@ -278,11 +302,12 @@ func (c *Controller) runReconcile(ctx context.Context) {
 		tombstones[i].config.RenderedRevision = renderRev
 	}
 	placementRev := PlacementRevision{
-		Revision:        placementID,
-		DesiredRevision: desired.Revision,
-		LeaderEpoch:     c.epoch,
-		CreatedAt:       time.Now().UTC(),
-		NodeConfigs:     nodeConfigs,
+		Revision:            placementID,
+		DesiredRevision:     desired.Revision,
+		LeaderEpoch:         c.epoch,
+		CreatedAt:           time.Now().UTC(),
+		NodeConfigs:         nodeConfigs,
+		UnconfirmedPrevious: previousOwners,
 	}
 	for _, item := range pending {
 		placementRev.PendingServices = append(placementRev.PendingServices, PendingPlacement{
@@ -327,6 +352,9 @@ func (c *Controller) runReconcile(ctx context.Context) {
 		"inactive_tombstones", len(tombstones),
 		"pending_services", len(pending),
 	)
+	if c.cfg.NodeRetirementDryRun {
+		c.logRetirementDryRun(ctx)
+	}
 }
 
 // discoverActiveNodes returns the nodes eligible for scheduling, their host
@@ -342,12 +370,21 @@ func (c *Controller) discoverActiveNodes(ctx context.Context) ([]scheduler.Node,
 	}
 
 	now := time.Now().UTC()
+	index, indexExists, indexErr := loadNodeTombstoneIndex(ctx, c.store, c.cfg.State.Prefix)
+	if indexErr != nil {
+		c.logger.Warn("node tombstone index is unreadable; retirement eclipse cannot be applied", "error", indexErr)
+	}
+	tombstoneIDs := make(map[string]struct{})
+	if indexErr == nil && indexExists {
+		for _, nodeID := range index.NodeIDs {
+			tombstoneIDs[nodeID] = struct{}{}
+		}
+	}
 	var nodes []scheduler.Node
 	var known []string
 	hostIPByNode := make(map[string]string)
 	for _, key := range keys {
-		var rec NodeRecord
-		_, exists, err := c.store.GetJSON(ctx, key, &rec)
+		raw, token, exists, err := c.store.GetRaw(ctx, key)
 		if err != nil {
 			c.logger.Warn("failed reading node record", "key", key, "error", err)
 			continue
@@ -355,10 +392,32 @@ func (c *Controller) discoverActiveNodes(ctx context.Context) ([]scheduler.Node,
 		if !exists {
 			continue
 		}
-		// Only a record stored under its own node's key identifies that node;
-		// anything else could direct a tombstone at the wrong config.
-		if ownKey, err := nodeRecordKey(c.cfg.State.Prefix, rec.NodeID); err == nil && ownKey == key {
-			known = append(known, rec.NodeID)
+		rec, nodeID, valid := decodeNodeRegistryRecord(c.cfg.State.Prefix, key, raw)
+		if !valid {
+			if nodeID != "" {
+				if quarantineErr := c.writeNodeQuarantine(ctx, nodeID, token); quarantineErr != nil {
+					c.logger.Warn("node quarantine write will retry", "node", nodeID, "error", quarantineErr)
+				}
+			}
+			continue
+		}
+		if err := c.clearStaleNodeQuarantine(ctx, rec.NodeID, token, false); err != nil {
+			c.logger.Warn("stale node quarantine cleanup will retry", "node", rec.NodeID, "error", err)
+		}
+		if _, retired := tombstoneIDs[rec.NodeID]; retired {
+			var tombstone NodeTombstone
+			_, exists, readErr := c.store.GetJSON(ctx, mustNodeTombstoneKey(c.cfg.State.Prefix, rec.NodeID), &tombstone)
+			if readErr != nil || !exists || tombstone.NodeID != rec.NodeID {
+				c.logger.Warn("node tombstone index entry is unreadable", "node", rec.NodeID, "error", readErr)
+				continue
+			}
+			if rec.Generation <= tombstone.MaxGeneration {
+				continue
+			}
+		}
+		known = append(known, rec.NodeID)
+		if !rec.RetirementPendingAt.IsZero() {
+			continue
 		}
 		if rec.State != NodeStateReady {
 			continue
@@ -420,25 +479,45 @@ type renderedPlacement struct {
 // requires a held service — which requires a retained volume record, which a
 // cluster that has never placed anything does not have.
 func (c *Controller) readExistingPlacement(ctx context.Context) (placement map[string]renderedPlacement, found bool, err error) {
-	var ptr RevisionPointer
-	_, exists, err := c.store.GetJSON(ctx, placementCurrentKey(c.cfg.State.Prefix), &ptr)
-	if err != nil || !exists || ptr.Revision == "" {
+	rev, found, err := c.readExistingPlacementRevision(ctx)
+	if err != nil || !found {
 		return nil, false, err
 	}
+	return placementServices(rev), true, nil
+}
 
-	var rev PlacementRevision
-	_, exists, err = c.store.GetJSON(ctx, placementRevisionKey(c.cfg.State.Prefix, ptr.Revision), &rev)
-	if err != nil || !exists {
-		return nil, false, err
-	}
-
-	placement = make(map[string]renderedPlacement)
+func placementServices(rev PlacementRevision) map[string]renderedPlacement {
+	placement := make(map[string]renderedPlacement)
 	for _, nc := range rev.NodeConfigs {
 		for _, svc := range nc.Services {
 			placement[svc.Name] = renderedPlacement{Node: nc.Node, Service: svc}
 		}
 	}
-	return placement, true, nil
+	return placement
+}
+
+func (c *Controller) readExistingPlacementRevision(ctx context.Context) (PlacementRevision, bool, error) {
+	var ptr RevisionPointer
+	_, exists, err := c.store.GetJSON(ctx, placementCurrentKey(c.cfg.State.Prefix), &ptr)
+	if err != nil || !exists {
+		return PlacementRevision{}, false, err
+	}
+	if ptr.Revision == "" {
+		return PlacementRevision{}, false, fmt.Errorf("placement pointer has an empty revision")
+	}
+
+	var rev PlacementRevision
+	_, exists, err = c.store.GetJSON(ctx, placementRevisionKey(c.cfg.State.Prefix, ptr.Revision), &rev)
+	if err != nil {
+		return PlacementRevision{}, false, err
+	}
+	if !exists {
+		return PlacementRevision{}, false, nil
+	}
+	if rev.Revision != ptr.Revision {
+		return PlacementRevision{}, false, fmt.Errorf("placement pointer targets a mismatched revision %q", ptr.Revision)
+	}
+	return rev, true, nil
 }
 
 // splitHeldServices separates the services that can be scheduled from their
@@ -591,7 +670,7 @@ func (c *Controller) publishPlacement(ctx context.Context, placement PlacementRe
 	if _, err := c.store.PutJSON(ctx, revKey, placement); err != nil {
 		return err
 	}
-	return upsertPointer(ctx, c.store, placementCurrentKey(c.cfg.State.Prefix), placement.Revision)
+	return upsertPlacementPointer(ctx, c.store, placementCurrentKey(c.cfg.State.Prefix), placement.Revision)
 }
 
 // publishRendered writes the immutable rendered revision and the current

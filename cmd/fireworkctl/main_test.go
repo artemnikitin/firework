@@ -25,6 +25,8 @@ func TestRunWithoutCommandPrintsUsage(t *testing.T) {
 		"node <node-id>        Show node details",
 		"services              List deployment services",
 		"service <name>        Show service details",
+		"volumes               List desired and retained volumes",
+		"volume <service> <volume>  Show volume details",
 	} {
 		if !strings.Contains(out.String(), want) {
 			t.Errorf("usage output does not contain %q:\n%s", want, out.String())
@@ -47,7 +49,7 @@ func TestRunHelpPrintsUsage(t *testing.T) {
 }
 
 func TestRunSubcommandHelpDoesNotRequireConfiguration(t *testing.T) {
-	for _, command := range []string{"status", "nodes", "node", "services", "service"} {
+	for _, command := range []string{"status", "nodes", "node", "services", "service", "volumes", "volume"} {
 		t.Run(command, func(t *testing.T) {
 			var out bytes.Buffer
 			if err := run([]string{"--endpoint", "https://example.com", command, "--help"}, &out); err != nil {
@@ -86,6 +88,9 @@ func TestCommandValidationRejectsInvalidValuesBeforeClientSetup(t *testing.T) {
 		{name: "service health", args: []string{"services", "--health", "heathy"}, want: "health must be one of"},
 		{name: "output", args: []string{"nodes", "--output", "yaml"}, want: "output must be table or json"},
 		{name: "negative watch", args: []string{"nodes", "--watch", "-1s"}, want: "watch interval must not be negative"},
+		{name: "volume state", args: []string{"volumes", "--state", "deleted"}, want: "state must be one of"},
+		{name: "volume limit", args: []string{"volumes", "--limit", "501"}, want: "limit must be between"},
+		{name: "volume offset", args: []string{"volumes", "--offset", "-1"}, want: "offset must not be negative"},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {

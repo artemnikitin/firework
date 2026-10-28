@@ -85,6 +85,9 @@ func classifyVolumeRecord(prefix, key string, record VolumeRecord, readErr error
 	if logicalID == "" || record.LogicalID != logicalID {
 		return VolumeRecord{}, quarantine("logical_id does not match its key")
 	}
+	if len(logicalID) > statusmodel.MaxLogicalIDLen {
+		return VolumeRecord{}, quarantine("logical_id exceeds the supported length")
+	}
 	if record.Type != config.VolumeTypeLocal && record.Type != config.VolumeTypeShared {
 		return VolumeRecord{}, quarantine(fmt.Sprintf("invalid type %q", record.Type))
 	}

@@ -619,7 +619,7 @@ func TestTick_StatusReportsStableRenderedRevision(t *testing.T) {
 	if status.Phase != "ready" || status.DesiredRevision != "desired-1" || status.PlacementRevision != "placement-1" || status.ObservedRevision != "rendered-1" || status.AppliedRevision != "rendered-1" {
 		t.Fatalf("unexpected convergence status: %#v", status)
 	}
-	if status.SchemaVersion != 1 || status.ObservedAt.IsZero() || status.LastAppliedAt.IsZero() {
+	if status.SchemaVersion != statusmodel.SchemaVersion || status.ObservedAt.IsZero() || status.LastAppliedAt.IsZero() {
 		t.Fatalf("missing version/timestamps: %#v", status)
 	}
 }

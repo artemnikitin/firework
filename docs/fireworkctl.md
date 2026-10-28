@@ -1,8 +1,8 @@
 # `fireworkctl` user guide
 
 `fireworkctl` is the read-only command-line client for the Firework deployment
-status API. It shows revision convergence, lists nodes and services, shows
-details, and can stream changes.
+status API. It shows revision convergence, lists nodes, services, and
+volumes, shows details, and can stream changes.
 
 ## Install and configure
 
@@ -45,6 +45,7 @@ fireworkctl
 fireworkctl status
 fireworkctl nodes
 fireworkctl services
+fireworkctl volumes
 ```
 
 Inspect one item by using the ID or name from a list response:
@@ -52,6 +53,7 @@ Inspect one item by using the ID or name from a list response:
 ```bash
 fireworkctl node NODE_ID
 fireworkctl service SERVICE_NAME
+fireworkctl volume SERVICE_NAME VOLUME_NAME
 ```
 
 List commands support filters and JSON output:
@@ -61,6 +63,9 @@ fireworkctl nodes --state stale
 fireworkctl services --state failed
 fireworkctl services --health unhealthy --node NODE_ID
 fireworkctl services --output json
+fireworkctl nodes --state retired
+fireworkctl volumes --state orphaned
+fireworkctl volumes --state retained --limit 100 --offset 100
 ```
 
 Use `--watch` to poll repeatedly. Table output refreshes the terminal; JSON
@@ -69,6 +74,7 @@ watch output emits one JSON object per line:
 ```bash
 fireworkctl nodes --watch 5s
 fireworkctl services --output json --watch 5s
+fireworkctl volumes --output json --watch 5s
 ```
 
 Every command has focused help:
@@ -76,6 +82,8 @@ Every command has focused help:
 ```bash
 fireworkctl nodes --help
 fireworkctl services --help
+fireworkctl volumes --help
+fireworkctl volume --help
 ```
 
 ## Reading the result
@@ -83,9 +91,12 @@ fireworkctl services --help
 - Revision states from `fireworkctl status`: `published`, `progressing`,
   `converged`, `degraded`, `failed`, `unknown`. The output separates nodes
   which are stale or down from nodes actively reporting a failed apply.
-- Node states: `ready`, `draining`, `down`, `stale`, `unknown`.
+- Node states: `ready`, `draining`, `down`, `stale`, `unknown`, and explicitly
+  requested `retired`.
 - Service states: `pending`, `running`, `stopped`, `failed`, `unknown`.
 - Service health: `healthy`, `unhealthy`, `unknown`, `not_configured`.
+- Volume states: `active`, `pending`, `node_unavailable`,
+  `backend_unavailable`, `retained`, `orphaned`, `invalid`.
 - A `down` node stays `down` after its lease ages; only `ready` and
   `draining` nodes become `stale`.
 
@@ -104,6 +115,14 @@ exact byte values from the API:
   applied revisions.
 - `services` adds `DISK` (reserved local and shared bytes) and `REASON`.
 - `service SERVICE_NAME` adds the public URL and the disk summary.
+- `volumes` lists desired and retained volumes, with a bounded page (`--limit`
+  up to 500 and `--offset`) and optional lifecycle `--state`; JSON includes
+  `total` and `has_more`.
+- `volume SERVICE_NAME VOLUME_NAME` shows the durable resize fields, current
+  observed state, binding/backend, and derived lifecycle reason.
+- `nodes --state retired` lists tombstoned node IDs; `node NODE_ID` shows the
+  retirement floor and any audited revival history when the node is retired
+  or has previously been revived.
 
 When the API had to skip a node or volume record it could not read, list and
 status tables end with a `SKIPPED RECORD` section naming it and the reason.
@@ -118,6 +137,11 @@ accepted and rendered, and applied is what exists on disk. Effective and
 applied sizes can differ while an accepted resize is in progress. When a
 request was refused, requested and effective sizes differ and the state column
 names the refusal reason. See [persistent volumes](persistent-volumes.md).
+
+For tombstone recovery, use the separate `firework-node-maintenance` command
+only after externally fencing the old host, rotating or revoking its
+bootstrap credential, and verifying the retained local pool. The full
+procedure is in [node retirement and recovery](node-lifecycle.md).
 
 Storage-related pending and refusal reasons:
 

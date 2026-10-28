@@ -1,6 +1,8 @@
 package controlplane
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"path"
 	"strings"
@@ -60,6 +62,10 @@ type NodeRecord struct {
 	// projection can say why status is absent instead of calling it missing.
 	AgentStatusReceivedAt time.Time `json:"agent_status_received_at,omitzero"`
 	AgentStatusRejected   string    `json:"agent_status_rejected,omitempty"`
+	// RetirementPendingAt is a leader-written compare-and-swap fence. Once
+	// present, registry heartbeats and state updates reject this incarnation
+	// while the durable tombstone and index are committed.
+	RetirementPendingAt time.Time `json:"retirement_pending_at,omitzero"`
 }
 
 // Reasons a heartbeat's agent_status was refused.
@@ -106,6 +112,16 @@ type PlacementRevision struct {
 	// agent turns that into a delete. But they are not converged either, so
 	// they are reported here rather than being invisible.
 	HeldServices []PendingPlacement `json:"held_services,omitempty"`
+	// UnconfirmedPrevious retains old service owners across subsequent
+	// placements until a fresh v2 observation proves their explicit empty
+	// config was applied and no actual-only VM remains. This bounded set keeps
+	// a second placement change from forgetting the first possible writer.
+	UnconfirmedPrevious []PreviousPlacementOwner `json:"unconfirmed_previous,omitempty"`
+}
+
+type PreviousPlacementOwner struct {
+	Service string `json:"service"`
+	Node    string `json:"node"`
 }
 
 type PendingPlacement struct {
@@ -213,8 +229,9 @@ func (r *VolumeRecord) clearRejection() bool {
 
 // RevisionPointer points to the current immutable revision.
 type RevisionPointer struct {
-	Revision  string    `json:"revision"`
-	UpdatedAt time.Time `json:"updated_at"`
+	Revision         string    `json:"revision"`
+	PreviousRevision string    `json:"previous_revision,omitempty"`
+	UpdatedAt        time.Time `json:"updated_at"`
 }
 
 // LeaderLock stores controller leadership lease.
@@ -223,6 +240,52 @@ type LeaderLock struct {
 	LeaderEpoch    int64     `json:"leader_epoch"`
 	LeaseExpiresAt time.Time `json:"lease_expires_at"`
 	RenewedAt      time.Time `json:"renewed_at"`
+}
+
+// NodeTombstone is the durable generation floor for a retired node identity.
+// It intentionally omits runtime telemetry, network addresses, and volume
+// data; node IDs remain fenced until an audited operator recovery clears it.
+type NodeTombstone struct {
+	NodeID           string    `json:"node_id"`
+	MaxGeneration    int64     `json:"max_generation"`
+	RetiredAt        time.Time `json:"retired_at"`
+	Reason           string    `json:"reason"`
+	LastRegisteredAt time.Time `json:"last_registered_at,omitempty"`
+}
+
+// NodeTombstoneIndex is a compact, monotonically revised list used by
+// controller and visibility paths without scanning the indefinite tombstone
+// prefix on every pass.
+type NodeTombstoneIndex struct {
+	NodeIDs   []string  `json:"node_ids"`
+	Count     int       `json:"count"`
+	Revision  int64     `json:"revision"`
+	UpdatedAt time.Time `json:"updated_at"`
+}
+
+// NodeRevivalAudit records the operator intent and result around clearing an
+// exact tombstone version. The provider token itself is never persisted.
+type NodeRevivalAudit struct {
+	NodeID                 string    `json:"node_id"`
+	ClearedGeneration      int64     `json:"cleared_generation"`
+	IntentAt               time.Time `json:"intent_at"`
+	ClearedAt              time.Time `json:"cleared_at"`
+	OperatorReason         string    `json:"operator_reason"`
+	ExternalFenceReference string    `json:"external_fence_reference,omitempty"`
+	RetainedPoolReference  string    `json:"retained_pool_reference,omitempty"`
+	TombstoneTokenSHA256   string    `json:"tombstone_token_sha256"`
+	Outcome                string    `json:"outcome"`
+}
+
+// NodeQuarantine projects malformed node records without replacing or
+// deleting the source object. The source object's exact provider token lets a
+// later maintenance pass clear stale quarantine metadata after repair.
+type NodeQuarantine struct {
+	NodeID      string    `json:"node_id"`
+	ObjectToken string    `json:"object_token"`
+	DetectedAt  time.Time `json:"detected_at"`
+	ReasonCode  string    `json:"reason_code"`
+	Message     string    `json:"message"`
 }
 
 // EventDedupeMarker marks a processed event.
@@ -245,6 +308,48 @@ func nodeRecordKey(prefix, nodeID string) (string, error) {
 
 func registryNodesPrefix(prefix string) string {
 	return path.Join(stateRoot(prefix), "registry", "nodes") + "/"
+}
+
+func nodeTombstoneKey(prefix, nodeID string) (string, error) {
+	if strings.TrimSpace(nodeID) == "" || len(nodeID) > statusmodel.MaxVolumeIDLen || strings.Contains(nodeID, "/") {
+		return "", fmt.Errorf("invalid node_id %q", nodeID)
+	}
+	return path.Join(stateRoot(prefix), "registry", "node-tombstones", nodeID+".json"), nil
+}
+
+func nodeTombstonesPrefix(prefix string) string {
+	return path.Join(stateRoot(prefix), "registry", "node-tombstones") + "/"
+}
+
+func nodeTombstoneIndexKey(prefix string) string {
+	return path.Join(nodeTombstonesPrefix(prefix), "index.json")
+}
+
+func nodeRevivalAuditKey(prefix, nodeID, timestamp string) (string, error) {
+	if strings.TrimSpace(nodeID) == "" || len(nodeID) > statusmodel.MaxVolumeIDLen || strings.Contains(nodeID, "/") || strings.TrimSpace(timestamp) == "" || strings.Contains(timestamp, "/") {
+		return "", fmt.Errorf("invalid node revival audit key")
+	}
+	return path.Join(stateRoot(prefix), "registry", "node-revivals", nodeID, timestamp+".json"), nil
+}
+
+func nodeRevivalAuditsPrefix(prefix, nodeID string) string {
+	return path.Join(stateRoot(prefix), "registry", "node-revivals", nodeID) + "/"
+}
+
+func nodeQuarantineKey(prefix, nodeID string) (string, error) {
+	if strings.TrimSpace(nodeID) == "" || len(nodeID) > statusmodel.MaxVolumeIDLen || strings.Contains(nodeID, "/") {
+		return "", fmt.Errorf("invalid node_id %q", nodeID)
+	}
+	sourceKey, err := nodeRecordKey(prefix, nodeID)
+	if err != nil {
+		return "", err
+	}
+	digest := sha256.Sum256([]byte(sourceKey))
+	return path.Join(stateRoot(prefix), "quarantine", "nodes", hex.EncodeToString(digest[:])+".json"), nil
+}
+
+func nodeQuarantinesPrefix(prefix string) string {
+	return path.Join(stateRoot(prefix), "quarantine", "nodes") + "/"
 }
 
 func desiredRevisionKey(prefix, rev string) string {

@@ -270,11 +270,12 @@ Tenant expansions rewrite links to tenant-prefixed service names automatically.
 
 ## 3) Control Plane Config (`controlplane.yaml`)
 
-`cmd/controlplane` uses a YAML config file with these important fields:
+`cmd/controlplane` and the operator-only `firework-node-maintenance` command
+use YAML config files with these important fields:
 
 | Field | Required | Description |
 |---|---|---|
-| `role` | no | `registry`, `events`, `controller`, `api`, or `all` (default `all`) |
+| `role` | no | `registry`, `events`, `controller`, `api`, `node-maintenance`, or `all` (default `all`). The maintenance command requires `node-maintenance` |
 | `registry_listen_addr` | registry/all | HTTPS bind address for registry APIs |
 | `events_listen_addr` | events/all | HTTPS bind address for GitHub webhook API |
 | `api_listen_addr` | api/all | HTTPS bind address for the read-only operator API and UI |
@@ -293,6 +294,10 @@ Tenant expansions rewrite links to tenant-prefixed service names automatically.
 | `leader_lease_ttl` | controller/all | Controller leadership lease TTL |
 | `leader_renew_interval` | controller/all | Leadership renewal interval |
 | `node_stale_ttl` | controller/all | Freshness threshold for schedulable nodes |
+| `node_down_retention` | no | How long an explicitly down node stays visible before retirement is eligible (default `24h`; must exceed `node_stale_ttl`) |
+| `node_stale_retention` | no | How long an unexpectedly stale node stays visible before retirement is eligible (default `168h`; must exceed `node_stale_ttl`) |
+| `node_retirement_enabled` | no | Enables registry retirement after explicit-empty read-back and generation fencing (default `false`) |
+| `node_retirement_dry_run` | no | Logs eligible retirement decisions without writing tombstones or deleting records (default `true`) |
 | `controller_tick` | controller/all | Scheduling/publish loop tick |
 | `api_snapshot_ttl` | no | How long the read-only API reuses one deployment snapshot (default `5s`; `0` rebuilds on every request). The controller never uses it |
 | `target_branch` | events/all | Git branch filter (default `main`) |
@@ -310,6 +315,8 @@ Tenant expansions rewrite links to tenant-prefixed service names automatically.
 | `enrollment.bootstrap_tokens` | registry/all | Token list for automated node enrollment |
 
 See [`examples/controlplane.yaml`](../../examples/controlplane.yaml).
+The separate maintenance config can be minimal; see
+[`examples/node-maintenance.yaml`](../../examples/node-maintenance.yaml).
 
 ## 4) Resolved Node Configs (`nodes/<node>.yaml`)
 

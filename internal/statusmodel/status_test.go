@@ -1,6 +1,7 @@
 package statusmodel
 
 import (
+	"encoding/json"
 	"strings"
 	"testing"
 )
@@ -47,5 +48,22 @@ func TestConditionAccessorsReturnCopies(t *testing.T) {
 	first[0] = "mutated"
 	if BlockingConditionTypes()[0] == "mutated" {
 		t.Fatal("BlockingConditionTypes exposed its backing array")
+	}
+}
+
+func TestActualOnlyWireShapeDistinguishesLegacyOmissionFromV2Empty(t *testing.T) {
+	legacy, err := json.Marshal(AgentStatus{SchemaVersion: LegacySchemaVersion})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(legacy), "actual_only_services") {
+		t.Fatalf("legacy v1 wire shape unexpectedly includes v2 inventory: %s", legacy)
+	}
+	v2, err := json.Marshal(AgentStatus{SchemaVersion: SchemaVersion, ActualOnlyServices: []ServiceStatus{}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(v2), `"actual_only_services":[]`) {
+		t.Fatalf("v2 empty inventory was omitted: %s", v2)
 	}
 }
