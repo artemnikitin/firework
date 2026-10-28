@@ -148,6 +148,89 @@ func TestClearRecoveryPendingReadoptsOnlyARevalidatedLiveVM(t *testing.T) {
 	}
 }
 
+func TestRecoverPersistsRepairedIdentityBeforeSocketQuarantine(t *testing.T) {
+	manager, manifest, inspector := recoveryFixture(t)
+	manifest.Executable = "/usr/lib/systemd/systemd"
+	manifest.ExecutableDev = 66306
+	manifest.ExecutableIno = 8581641
+	if err := writeManifest(manifestPath(manifest.VMDir), manifest); err != nil {
+		t.Fatal(err)
+	}
+	inspector.socketErr = os.ErrNotExist
+	manager.inspector = inspector
+
+	if adopted, err := manager.Recover(context.Background(), config.NodeConfig{}); err != nil || len(adopted) != 0 {
+		t.Fatalf("recovery with an unavailable socket = %v, %v", adopted, err)
+	}
+	instance := manager.List()[manifest.Service]
+	if instance == nil || instance.State != StateRecoveryPending {
+		t.Fatalf("survivor was not quarantined while its socket was unavailable: %#v", instance)
+	}
+	durable, err := readManifest(manifestPath(manifest.VMDir))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if durable.Executable != inspector.identities[manifest.PID].Executable || durable.ProcessStart != inspector.identities[manifest.PID].StartTicks {
+		t.Fatalf("reconstructed identity was not persisted before quarantine: %#v", durable)
+	}
+
+	inspector.socketErr = nil
+	result, err := manager.ClearRecoveryPending(manifest.Service)
+	if err != nil || result.Outcome != RecoveryOutcomeReadopted {
+		t.Fatalf("clear after socket recovery = %#v, %v", result, err)
+	}
+}
+
+func TestRecoverIdentityPersistenceFailureKeepsDurableIdentityAndRetries(t *testing.T) {
+	manager, manifest, inspector := recoveryFixture(t)
+	manifest.Executable = "/usr/lib/systemd/systemd"
+	manifest.ExecutableDev = 66306
+	manifest.ExecutableIno = 8581641
+	if err := writeManifest(manifestPath(manifest.VMDir), manifest); err != nil {
+		t.Fatal(err)
+	}
+	manager.inspector = inspector
+	initialExecutable := manifest.Executable
+	writes := 0
+	manager.recoveryManifestWriter = func(path string, candidate *instanceManifest) error {
+		writes++
+		if writes == 1 {
+			return errors.New("injected durable write failure")
+		}
+		return writeManifest(path, candidate)
+	}
+
+	if _, err := manager.Recover(context.Background(), config.NodeConfig{}); err == nil || !strings.Contains(err.Error(), "injected durable write failure") {
+		t.Fatalf("identity persistence failure was not returned: %v", err)
+	}
+	instance := manager.List()[manifest.Service]
+	if instance == nil || instance.State != StateRecoveryPending || instance.recoveryCandidate == nil {
+		t.Fatalf("failed identity persistence did not retain a retryable candidate: %#v", instance)
+	}
+	if instance.manifest.Executable != initialExecutable {
+		t.Fatalf("failed identity persistence changed the published manifest: %#v", instance.manifest)
+	}
+	durable, err := readManifest(manifestPath(manifest.VMDir))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if durable.Executable != initialExecutable || !sameRecoveryIdentity(instance.manifest, durable) {
+		t.Fatalf("failed identity persistence split memory from disk: memory=%#v disk=%#v", instance.manifest, durable)
+	}
+
+	result, err := manager.ClearRecoveryPending(manifest.Service)
+	if err != nil || result.Outcome != RecoveryOutcomeReadopted {
+		t.Fatalf("retry after durable write recovery = %#v, %v", result, err)
+	}
+	if writes != 2 {
+		t.Fatalf("recovery manifest writes = %d, want initial failure and retry", writes)
+	}
+	durable, err = readManifest(manifestPath(manifest.VMDir))
+	if err != nil || validateOwnedProcess(inspector, durable) != nil {
+		t.Fatalf("retry did not persist a valid process identity: manifest=%#v err=%v", durable, err)
+	}
+}
+
 func TestClearRecoveryPendingRefusesLiveAmbiguityWithoutSignalling(t *testing.T) {
 	manager, manifest, inspector := recoveryFixture(t)
 	identity := inspector.identities[manifest.PID]
@@ -243,6 +326,31 @@ func TestClearRecoveryPendingRefusesMissingIdentityAndCorruptManifest(t *testing
 		}
 		if _, err := os.Stat(manifest.VMDir); err != nil {
 			t.Fatalf("missing-identity state was removed: %v", err)
+		}
+	})
+
+	t.Run("unrecorded identity with a live PID", func(t *testing.T) {
+		manager, manifest, inspector := recoveryFixture(t)
+		manifest.HostBootID = ""
+		manifest.ProcessStart = 0
+		manifest.Executable = ""
+		manifest.ExecutableDev = 0
+		manifest.ExecutableIno = 0
+		if err := writeManifest(manifestPath(manifest.VMDir), manifest); err != nil {
+			t.Fatal(err)
+		}
+		manager.inspector = inspector
+		manager.addRecoveryPending(manifest.Service, manifest, "process ownership identity was never recorded")
+
+		result, err := manager.ClearRecoveryPending(manifest.Service)
+		if err == nil || result.Outcome != RecoveryOutcomeAmbiguous || !strings.Contains(err.Error(), "never recorded") {
+			t.Fatalf("unrecorded identity was reconstructed: result=%#v err=%v", result, err)
+		}
+		if instance := manager.List()[manifest.Service]; instance == nil || instance.State != StateRecoveryPending {
+			t.Fatalf("unrecorded identity left quarantine: %#v", instance)
+		}
+		if _, err := os.Stat(manifest.VMDir); err != nil {
+			t.Fatalf("unrecorded-identity state was removed: %v", err)
 		}
 	})
 

@@ -98,6 +98,10 @@ type Instance struct {
 
 	instanceID string
 	manifest   *instanceManifest
+	// recoveryCandidate holds a re-proved process identity if persisting it
+	// failed. The durable and published manifests remain unchanged until a
+	// later ClearRecoveryPending retries the write successfully.
+	recoveryCandidate *instanceManifest
 	// startID identifies one Start attempt. Phase 3 validates against it
 	// rather than against the service name, so a placeholder that was cleared
 	// and replaced by a later attempt is never mistaken for one's own.
@@ -117,6 +121,9 @@ type Manager struct {
 	// They are fields so tests do not have to sleep out the real budgets.
 	identityTimeout    time.Duration
 	exitConfirmTimeout time.Duration
+	// recoveryManifestWriter is normally nil, which uses writeManifest. Tests
+	// can inject a one-shot durable-write failure to cover recovery retries.
+	recoveryManifestWriter func(string, *instanceManifest) error
 
 	mu           sync.Mutex
 	instances    map[string]*Instance

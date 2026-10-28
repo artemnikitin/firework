@@ -55,6 +55,7 @@ func (m *Manager) ClearRecoveryPending(service string) (RecoveryResult, error) {
 	}
 	initialManifest := *instance.manifest
 	manifest := initialManifest
+	recoveryCandidate := cloneInstanceManifest(instance.recoveryCandidate)
 	instanceID := instance.instanceID
 	instancePID := instance.PID
 	m.mu.Unlock()
@@ -75,11 +76,16 @@ func (m *Manager) ClearRecoveryPending(service string) (RecoveryResult, error) {
 	if initialManifest.Lifecycle == lifecycleStopping {
 		return recoveryAmbiguous(result, "durable VM shutdown state is unresolved; refusing to clear or re-adopt its runtime state")
 	}
+	if recoveryCandidate != nil {
+		if !sameRecoveryCandidateMetadata(&initialManifest, recoveryCandidate) {
+			return recoveryAmbiguous(result, "reconstructed process identity no longer matches its durable ownership record")
+		}
+		manifest = *recoveryCandidate
+	}
 	if manifest.PID <= 0 {
 		return recoveryAmbiguous(result, "ownership manifest has no recorded process identity")
 	}
-	if inspector, ok := m.inspector.(osProcessInspector); ok && !processInspectionSupported {
-		_ = inspector
+	if _, ok := m.inspector.(osProcessInspector); ok && !processInspectionSupported {
 		return recoveryAmbiguous(result, "this host cannot inspect process ownership")
 	}
 
@@ -114,6 +120,9 @@ func (m *Manager) ClearRecoveryPending(service string) (RecoveryResult, error) {
 		m.logger.Info("cleared stale VM recovery state", "service", service)
 		return result, nil
 	case processErr != nil:
+		if recoveryCandidate == nil && errors.Is(processErr, errIdentityNotRecorded) {
+			return recoveryAmbiguous(result, fmt.Sprintf("refusing to reconstruct process ownership identity that was never recorded: %v", processErr))
+		}
 		if !m.repairOwnership(service, &manifest, processErr) {
 			return recoveryAmbiguous(result, fmt.Sprintf("cannot prove surviving process ownership: %v", processErr))
 		}
@@ -139,7 +148,7 @@ func (m *Manager) ClearRecoveryPending(service string) (RecoveryResult, error) {
 	}
 	manifest.Lifecycle = lifecycleRunning
 	manifest.LastError = ""
-	if err := writeManifest(manifestPath, &manifest); err != nil {
+	if err := m.writeRecoveryManifest(manifestPath, &manifest); err != nil {
 		m.mu.Unlock()
 		return result, fmt.Errorf("persist recovery adoption for %s: %w", service, err)
 	}
@@ -238,6 +247,21 @@ func sameRecoveryIdentity(memory, disk *instanceManifest) bool {
 		memory.ConfigHash == disk.ConfigHash && memory.VMDir == disk.VMDir && memory.SocketPath == disk.SocketPath &&
 		memory.ConfigPath == disk.ConfigPath && memory.Launcher == disk.Launcher && memory.LauncherUnit == disk.LauncherUnit &&
 		memory.Lifecycle == disk.Lifecycle && memory.Legacy == disk.Legacy
+}
+
+func sameRecoveryCandidateMetadata(original, candidate *instanceManifest) bool {
+	return original.Service == candidate.Service && original.InstanceID == candidate.InstanceID &&
+		original.Lifecycle == candidate.Lifecycle && original.ConfigHash == candidate.ConfigHash &&
+		original.VMDir == candidate.VMDir && original.SocketPath == candidate.SocketPath &&
+		original.ConfigPath == candidate.ConfigPath && original.Launcher == candidate.Launcher &&
+		original.LauncherUnit == candidate.LauncherUnit && original.Legacy == candidate.Legacy
+}
+
+func (m *Manager) writeRecoveryManifest(path string, manifest *instanceManifest) error {
+	if m.recoveryManifestWriter != nil {
+		return m.recoveryManifestWriter(path, manifest)
+	}
+	return writeManifest(path, manifest)
 }
 
 func (m *Manager) noLiveClaimant(manifest *instanceManifest) error {

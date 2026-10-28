@@ -214,6 +214,52 @@ func TestRecoverCleansStartingSystemdStateWhenMainProcessExited(t *testing.T) {
 	}
 }
 
+func TestRecoverPersistsStartingSystemdIdentityBeforeSocketQuarantine(t *testing.T) {
+	manager, manifest, inspector := recoveryFixture(t)
+	manifest.PID = 0
+	manifest.HostBootID = ""
+	manifest.ProcessStart = 0
+	manifest.Executable = ""
+	manifest.ExecutableDev = 0
+	manifest.ExecutableIno = 0
+	manifest.Lifecycle = lifecycleStarting
+	manifest.Launcher = "systemd"
+	manifest.LauncherUnit = "firework-vm-test.service"
+	if err := writeManifest(manifestPath(manifest.VMDir), manifest); err != nil {
+		t.Fatal(err)
+	}
+	inspector.socketErr = os.ErrNotExist
+	manager.inspector = inspector
+
+	binDir := t.TempDir()
+	systemctl := filepath.Join(binDir, "systemctl")
+	if err := os.WriteFile(systemctl, []byte("#!/bin/sh\nprintf '42\\n'\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	if adopted, err := manager.Recover(context.Background(), config.NodeConfig{}); err != nil || len(adopted) != 0 {
+		t.Fatalf("starting systemd recovery = %v, %v", adopted, err)
+	}
+	instance := manager.List()[manifest.Service]
+	if instance == nil || instance.State != StateRecoveryPending {
+		t.Fatalf("starting survivor was not quarantined while its socket was unavailable: %#v", instance)
+	}
+	durable, err := readManifest(manifestPath(manifest.VMDir))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if durable.PID != manifest.PID+42 || durable.HostBootID == "" || durable.ProcessStart == 0 || durable.Executable == "" {
+		t.Fatalf("systemd-starting identity was not reconstructed durably: %#v", durable)
+	}
+
+	inspector.socketErr = nil
+	result, err := manager.ClearRecoveryPending(manifest.Service)
+	if err != nil || result.Outcome != RecoveryOutcomeReadopted {
+		t.Fatalf("clear after systemd socket recovery = %#v, %v", result, err)
+	}
+}
+
 func TestRecoverDistinguishesUnrecordedIdentityFromAMismatch(t *testing.T) {
 	manager, manifest, inspector := recoveryFixture(t)
 	// An inspection that raced the launcher's exec recorded nothing, and the

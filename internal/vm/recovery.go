@@ -100,6 +100,8 @@ func (m *Manager) Recover(_ context.Context, desired config.NodeConfig) ([]strin
 			continue
 		}
 		seenIDs[manifest.InstanceID] = name
+		originalManifest := cloneInstanceManifest(manifest)
+		identityReconstructed := false
 
 		if manifest.PID == 0 && (manifest.Lifecycle == lifecycleStopped || manifest.Lifecycle == lifecycleFailed) {
 			if removeErr := os.RemoveAll(vmDir); removeErr != nil {
@@ -117,18 +119,21 @@ func (m *Manager) Recover(_ context.Context, desired config.NodeConfig) ([]strin
 					if identity, waitErr := awaitLaunchedIdentity(m.inspector, manifest, pid, m.launchIdentityTimeout(), launchIdentityInterval); waitErr == nil {
 						manifest.PID = pid
 						applyProcessIdentity(manifest, identity)
+						identityReconstructed = true
 					} else if errors.Is(waitErr, errProcessNotFound) {
 						if removeErr := os.RemoveAll(vmDir); removeErr != nil {
 							errs = append(errs, fmt.Errorf("clean dead starting VM state for %s: %w", name, removeErr))
 						}
 						continue
 					} else {
-						// MainPID identifies the candidate process even though its
-						// ownership is not proved. Retaining it makes the ambiguity
-						// explicit and prevents PID-free state from hiding a live unit.
-						manifest.PID = pid
+						// Keep the published manifest unchanged until the candidate
+						// identity is fully proved. The durable unit name remains
+						// available for a later operator retry.
 						m.logger.Warn("could not confirm the identity of a starting microVM",
 							"service", name, "pid", pid, "error", waitErr)
+						m.addRecoveryPending(name, originalManifest,
+							fmt.Sprintf("cannot confirm starting systemd process %d: %v", pid, waitErr))
+						continue
 					}
 				}
 			}
@@ -148,6 +153,17 @@ func (m *Manager) Recover(_ context.Context, desired config.NodeConfig) ([]strin
 				m.addRecoveryPending(name, manifest, fmt.Sprintf("cannot prove surviving process ownership: %v", processErr))
 				continue
 			}
+			identityReconstructed = true
+		}
+		if identityReconstructed {
+			candidate := cloneInstanceManifest(manifest)
+			if persistErr := m.persistReconstructedIdentity(name, vmDir, path, originalManifest, candidate); persistErr != nil {
+				reason := fmt.Sprintf("verified process identity could not be persisted: %v", persistErr)
+				m.addRecoveryPendingWithCandidate(name, originalManifest, candidate, reason)
+				errs = append(errs, fmt.Errorf("persist reconstructed identity for %s: %w", name, persistErr))
+				continue
+			}
+			manifest = candidate
 		}
 		if socketErr := validateOwnedSocket(m.inspector, manifest); socketErr != nil {
 			m.addRecoveryPending(name, manifest, fmt.Sprintf("surviving process API socket is not ready: %v", socketErr))
@@ -211,6 +227,15 @@ func applyProcessIdentity(manifest *instanceManifest, identity processIdentity) 
 	manifest.Executable = identity.Executable
 	manifest.ExecutableDev = identity.ExecutableDev
 	manifest.ExecutableIno = identity.ExecutableIno
+}
+
+func cloneInstanceManifest(manifest *instanceManifest) *instanceManifest {
+	if manifest == nil {
+		return nil
+	}
+	clone := *manifest
+	clone.Volumes = append([]volume.PreparedVolume(nil), manifest.Volumes...)
+	return &clone
 }
 
 func (m *Manager) recoverLegacy(name, vmDir string, desired map[string]config.ServiceConfig) (*instanceManifest, bool, error) {
@@ -290,12 +315,55 @@ func instanceFromManifest(manifest *instanceManifest, state State, lastError str
 }
 
 func (m *Manager) addRecoveryPending(name string, manifest *instanceManifest, reason string) {
+	m.addRecoveryPendingWithCandidate(name, manifest, nil, reason)
+}
+
+func (m *Manager) addRecoveryPendingWithCandidate(name string, manifest, candidate *instanceManifest, reason string) {
 	manifest.LastError = reason
 	m.mu.Lock()
-	m.instances[name] = instanceFromManifest(manifest, StateRecoveryPending, reason)
+	instance := instanceFromManifest(manifest, StateRecoveryPending, reason)
+	instance.recoveryCandidate = cloneInstanceManifest(candidate)
+	m.instances[name] = instance
 	m.mu.Unlock()
 	m.logger.Error("VM recovery requires operator intervention",
 		"service", name, "error", reason, "command", "firework-agent clear-recovery <service>")
+}
+
+func (m *Manager) persistReconstructedIdentity(service, vmDir, path string, original, candidate *instanceManifest) error {
+	if err := verifyRecoveryManifestPaths(service, vmDir, original); err != nil {
+		return err
+	}
+	if err := verifyRecoveryManifestPaths(service, vmDir, candidate); err != nil {
+		return err
+	}
+	if err := verifyRecoveryManifestIntegrity(original); err != nil {
+		return err
+	}
+	if err := verifyRecoveryManifestIntegrity(candidate); err != nil {
+		return err
+	}
+	if err := verifyRecoveryStateFiles(vmDir, path); err != nil {
+		return err
+	}
+	durable, err := readManifest(path)
+	if err != nil {
+		return fmt.Errorf("read durable ownership manifest before identity repair: %w", err)
+	}
+	if !sameRecoveryIdentity(original, durable) {
+		return fmt.Errorf("durable ownership identity changed before identity repair")
+	}
+	if m.recoveryManifestWriter != nil {
+		return m.recoveryManifestWriter(path, candidate)
+	}
+	return writeManifest(path, candidate)
+}
+
+func verifyRecoveryManifestIntegrity(manifest *instanceManifest) error {
+	hash, err := serviceConfigHash(manifest.Config)
+	if err != nil || hash != manifest.ConfigHash {
+		return fmt.Errorf("ownership manifest service configuration hash does not match")
+	}
+	return nil
 }
 
 func (m *Manager) markExistingRecoveryPending(name, reason string) {
