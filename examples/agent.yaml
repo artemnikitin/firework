@@ -15,6 +15,10 @@ store_branch: "main"
 # How often the agent pulls from the config store
 poll_interval: "30s"
 
+# Maximum wait for the guest application to exit, sync filesystems, and unmount
+# persistent volumes before Firecracker stops. Defaults to 15s; allowed: 1s-5m.
+guest_quiesce_timeout: "15s"
+
 # Path to the Firecracker binary
 firecracker_bin: "/usr/bin/firecracker"
 

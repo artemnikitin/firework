@@ -12,6 +12,9 @@ This document explains how Firework components work together at runtime.
 - Registers with control plane and sends periodic heartbeat over mTLS.
 - Exposes local HTTP endpoints (`/healthz`, `/health`, `/status`, `/metrics`).
 
+The guest shutdown and resize ordering is described in
+[Guest Lifecycle and Persistent Volumes](guest-lifecycle.md).
+
 ### `firework-controlplane` (single binary, role-based runtime)
 
 Roles:
