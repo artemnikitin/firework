@@ -6,6 +6,24 @@ configs, VM manifests, local volumes, shared data, or snapshots. Registry
 generation fencing prevents old credentials from changing control-plane state;
 it is not proof that an old process stopped.
 
+## Malformed registry records
+
+The controller leader scans registry records in bounded batches, even while
+automatic retirement is disabled. A malformed record or one whose node ID or
+lifecycle state does not match its key is excluded from scheduling and stored
+under a quarantine key derived from the registry object key's SHA-256 hash.
+Quarantine metadata records the exact source token, detection time, a reason
+code, and a fixed safe message. It never replaces or deletes the source record.
+
+The API role only reads quarantine metadata. `fireworkctl nodes` and
+`fireworkctl node NODE_ID` show an `unknown` node with `quarantined: true` only
+when the quarantine's source token still matches the invalid registry object;
+the response does not include the provider token or malformed payload. After
+an operator repairs the source and its token changes, the controller
+conditionally clears the stale quarantine. Retirement also clears quarantine
+before conditionally deleting the registry record; a cleanup failure defers
+that delete.
+
 ## Automatic retirement
 
 The control-plane defaults keep retirement disabled and dry-run enabled:

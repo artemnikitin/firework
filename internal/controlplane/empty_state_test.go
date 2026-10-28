@@ -333,6 +333,16 @@ func (s *failingRecordStore) GetJSON(ctx context.Context, key string, out any) (
 	return s.StateStore.GetJSON(ctx, key, out)
 }
 
+func (s *failingRecordStore) GetRaw(ctx context.Context, key string) ([]byte, objectstorage.WriteToken, bool, error) {
+	if key == s.key && s.fails != 0 {
+		if s.fails > 0 {
+			s.fails--
+		}
+		return nil, "", false, errors.New("transient registry read failure")
+	}
+	return s.StateStore.GetRaw(ctx, key)
+}
+
 func placementPointer(t *testing.T, store StateStore) string {
 	t.Helper()
 	var ptr RevisionPointer
@@ -358,7 +368,9 @@ func TestRegistryReadFailureDoesNotStrandRetirement(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	c.store = &failingRecordStore{StateStore: store, key: recordKey, fails: 1}
+	// The quarantine maintenance scan reads before discovery, so fail both
+	// reads in this cycle; the next cycle then exercises recovery.
+	c.store = &failingRecordStore{StateStore: store, key: recordKey, fails: 2}
 
 	c.runReconcile(context.Background())
 	if got, _ := readNodeConfig(t, store, "node-b"); !bytes.Equal(got, original) {

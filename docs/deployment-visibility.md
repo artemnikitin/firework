@@ -94,10 +94,14 @@ snapshot's build time. A failed rebuild is never cached and an older snapshot
 is never served in its place. The controller does not use this cache.
 
 A node or volume record that cannot be read or decoded, or whose identity
-does not match its key, is left out of the snapshot and listed in `problems`
-(`kind`, the identifier from its key, and `record_unreadable` or
+does not match its key, is left out of the normal snapshot and listed in
+`problems` (`kind`, the identifier from its key, and `record_unreadable` or
 `record_invalid`) on list and status responses, instead of failing every
-endpoint. Such a fleet is never `converged`: it is `degraded` with
+endpoint. For a node, the leader may also maintain separate quarantine
+metadata. If that metadata matches the exact invalid source token, the node
+list and detail include an `unknown` summary with `quarantined: true` and a
+generic message; the source token and payload are never projected. Such a fleet
+is never `converged`: it is `degraded` with
 `projection_incomplete`, or `unknown` with `node_record_unreadable` when the
 desired revision is empty and the unreadable node could still be running old
 workloads. Failing to list records, or to read the desired, placement, or

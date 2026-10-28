@@ -30,6 +30,7 @@ type Controller struct {
 	conditionalDeleteProbeDone bool
 	conditionalDeleteProbeErr  error
 	retirementCursor           string
+	quarantineCursor           string
 	lastTombstoneIndexRepairAt time.Time
 }
 
@@ -383,8 +384,7 @@ func (c *Controller) discoverActiveNodes(ctx context.Context) ([]scheduler.Node,
 	var known []string
 	hostIPByNode := make(map[string]string)
 	for _, key := range keys {
-		var rec NodeRecord
-		_, exists, err := c.store.GetJSON(ctx, key, &rec)
+		raw, token, exists, err := c.store.GetRaw(ctx, key)
 		if err != nil {
 			c.logger.Warn("failed reading node record", "key", key, "error", err)
 			continue
@@ -392,22 +392,30 @@ func (c *Controller) discoverActiveNodes(ctx context.Context) ([]scheduler.Node,
 		if !exists {
 			continue
 		}
-		// Only a record stored under its own node's key identifies that node;
-		// anything else could direct a tombstone at the wrong config.
-		if ownKey, err := nodeRecordKey(c.cfg.State.Prefix, rec.NodeID); err == nil && ownKey == key {
-			if _, retired := tombstoneIDs[rec.NodeID]; retired {
-				var tombstone NodeTombstone
-				_, exists, readErr := c.store.GetJSON(ctx, mustNodeTombstoneKey(c.cfg.State.Prefix, rec.NodeID), &tombstone)
-				if readErr != nil || !exists || tombstone.NodeID != rec.NodeID {
-					c.logger.Warn("node tombstone index entry is unreadable", "node", rec.NodeID, "error", readErr)
-					continue
-				}
-				if rec.Generation <= tombstone.MaxGeneration {
-					continue
+		rec, nodeID, valid := decodeNodeRegistryRecord(c.cfg.State.Prefix, key, raw)
+		if !valid {
+			if nodeID != "" {
+				if quarantineErr := c.writeNodeQuarantine(ctx, nodeID, token); quarantineErr != nil {
+					c.logger.Warn("node quarantine write will retry", "node", nodeID, "error", quarantineErr)
 				}
 			}
-			known = append(known, rec.NodeID)
+			continue
 		}
+		if err := c.clearStaleNodeQuarantine(ctx, rec.NodeID, token, false); err != nil {
+			c.logger.Warn("stale node quarantine cleanup will retry", "node", rec.NodeID, "error", err)
+		}
+		if _, retired := tombstoneIDs[rec.NodeID]; retired {
+			var tombstone NodeTombstone
+			_, exists, readErr := c.store.GetJSON(ctx, mustNodeTombstoneKey(c.cfg.State.Prefix, rec.NodeID), &tombstone)
+			if readErr != nil || !exists || tombstone.NodeID != rec.NodeID {
+				c.logger.Warn("node tombstone index entry is unreadable", "node", rec.NodeID, "error", readErr)
+				continue
+			}
+			if rec.Generation <= tombstone.MaxGeneration {
+				continue
+			}
+		}
+		known = append(known, rec.NodeID)
 		if !rec.RetirementPendingAt.IsZero() {
 			continue
 		}

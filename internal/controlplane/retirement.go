@@ -31,6 +31,7 @@ func (c *Controller) runNodeRetirementMaintenance(ctx context.Context) {
 	if !c.leader {
 		return
 	}
+	c.runNodeQuarantineMaintenance(ctx)
 	if !c.cfg.NodeRetirementEnabled || c.cfg.NodeRetirementDryRun {
 		return
 	}
@@ -65,19 +66,25 @@ func (c *Controller) runNodeRetirementMaintenance(ctx context.Context) {
 			break
 		}
 		c.retirementCursor = key
-		var record NodeRecord
-		token, exists, err := c.store.GetJSON(ctx, key, &record)
+		raw, token, exists, err := c.store.GetRaw(ctx, key)
 		if err != nil {
 			c.logger.Warn("node retirement skipped unreadable registry record", "key", key, "error", err)
 			continue
 		}
-		if !exists || record.NodeID == "" {
+		if !exists {
 			continue
 		}
-		expectedKey, keyErr := nodeRecordKey(c.cfg.State.Prefix, record.NodeID)
-		if keyErr != nil || expectedKey != key {
-			c.logger.Warn("node retirement skipped registry key mismatch", "key", key)
+		record, nodeID, valid := decodeNodeRegistryRecord(c.cfg.State.Prefix, key, raw)
+		if !valid {
+			if nodeID != "" {
+				if quarantineErr := c.writeNodeQuarantine(ctx, nodeID, token); quarantineErr != nil {
+					c.logger.Warn("node retirement quarantine write will retry", "node", nodeID, "error", quarantineErr)
+				}
+			}
 			continue
+		}
+		if quarantineErr := c.clearStaleNodeQuarantine(ctx, record.NodeID, token, false); quarantineErr != nil {
+			c.logger.Warn("node retirement quarantine cleanup will retry", "node", record.NodeID, "error", quarantineErr)
 		}
 		reason, eligible := retirementEligibility(record, time.Now().UTC(), c.cfg)
 		if !eligible && record.RetirementPendingAt.IsZero() {
@@ -302,6 +309,12 @@ func (c *Controller) retireNodeRecord(ctx context.Context, observed NodeRecord, 
 		// A strictly newer registration is allowed to win while pending. Its
 		// generation exceeds the tombstone floor, so readers keep it active.
 		return nil
+	}
+	if err := c.clearStaleNodeQuarantine(ctx, observed.NodeID, token, true); err != nil {
+		return fmt.Errorf("clear node quarantine before deleting registry record: %w", err)
+	}
+	if !c.stillLeader(ctx) {
+		return errors.New("lost leadership before deleting node record")
 	}
 	deleted, err := c.store.DeleteIfMatch(ctx, key, token)
 	if err != nil {
