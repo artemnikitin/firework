@@ -316,3 +316,28 @@ bridge, and the scheduler does not yet enforce tenant-to-node separation. Any
 deployment that requires network-level tenant isolation must provide additional
 controls. Adding workload mTLS would require a sidecar or library inside each
 VM.
+
+### Recovery policy across restart and explicit retry
+
+Startup recovery, explicit retry, and start-time reclamation use the same
+ownership and absence policy. A `stopping` manifest is retained even if its PID
+is dead. Missing recorded identity remains ambiguous; an interrupted systemd
+start is a separate case that requires the recorded unit and matching launch
+arguments before identity can be reconstructed. Systemd cleanup requires an
+inactive or absent unit with no MainPID, plus a complete process claimant scan.
+Either socket or config reference (including `--flag=value`) prevents deletion.
+Unreadable processes prevent a destructive scan from proving absence.
+
+Executable device/inode, boot ID, start time and launch arguments establish
+identity. The display path from `/proc/PID/exe` is diagnostic; the ` (deleted)`
+suffix after binary replacement does not invalidate a surviving VM.
+
+The command is an explicit request to retry verification, not permission to
+forget an unproved owner. It does not relax restart policy or accept a force
+assertion. This change retains the issue-48 operator interface; automatic retry
+scheduling is a separate policy decision. Manager lock acquisition and commit
+checks have a five-second budget, shorter than the transport deadline. A lost
+response still means the outcome is unknown, as with any local RPC; inspect
+status before retrying. No-op success is limited to absence of both tracked
+and durable runtime state. Clearing a dead removed VM also deregisters its
+health probe on the main loop.

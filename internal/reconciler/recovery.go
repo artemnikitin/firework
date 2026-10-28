@@ -7,3 +7,12 @@ func (r *Reconciler) MarkRecovered(service string) {
 		r.pendingRecovery[service] = struct{}{}
 	}
 }
+
+// ForgetRecovered retires health state for a VM whose dead runtime was cleared.
+// Main-loop ownership keeps this serialized with normal reconciliation.
+func (r *Reconciler) ForgetRecovered(service string) {
+	delete(r.pendingRecovery, service)
+	if r.healthMon != nil {
+		r.healthMon.Deregister(service)
+	}
+}

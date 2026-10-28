@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"log/slog"
@@ -17,16 +18,13 @@ import (
 )
 
 func main() {
-	if err := runCommand(os.Args[1:], "/etc/firework/agent.yaml"); err != nil {
+	if err := runCommand(os.Args[1:], "/etc/firework/agent.yaml"); err != nil && !errors.Is(err, flag.ErrHelp) {
 		fmt.Fprintf(os.Stderr, "error: %v\n", err)
 		os.Exit(1)
 	}
 }
 
 func runCommand(args []string, defaultConfigPath string) error {
-	if len(args) > 0 && args[0] == "clear-recovery" {
-		return runClearRecovery(args[1:], defaultConfigPath)
-	}
 	commandFlags := flag.NewFlagSet("firework-agent", flag.ContinueOnError)
 	commandFlags.SetOutput(os.Stderr)
 	configPath := commandFlags.String("config", defaultConfigPath, "path to agent config file")

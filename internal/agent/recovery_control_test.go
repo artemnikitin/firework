@@ -480,3 +480,19 @@ func recoveryControlTestStateDir(t *testing.T) string {
 	t.Cleanup(func() { _ = os.RemoveAll(stateDir) })
 	return stateDir
 }
+
+func TestTerminalAcceptErrorClosesListener(t *testing.T) {
+	path := filepath.Join(recoveryControlTestStateDir(t), "terminal.sock")
+	listener, err := net.ListenUnix("unix", &net.UnixAddr{Name: path, Net: "unix"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	server := &recoveryControlServer{listener: listener, logger: testLogger()}
+	server.serveAccepting(func() (*net.UnixConn, error) { return nil, errors.New("terminal accept error") })
+	connection, err := net.DialTimeout("unix", path, 100*time.Millisecond)
+	if err == nil {
+		connection.Close()
+		t.Fatal("terminal accept failure left listener open")
+	}
+}

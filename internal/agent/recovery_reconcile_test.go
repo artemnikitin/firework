@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"testing"
+	"time"
 
 	"github.com/artemnikitin/firework/internal/config"
 	"github.com/artemnikitin/firework/internal/healthcheck"
@@ -139,3 +140,18 @@ func (m *recoveryTestNetworkManager) SetupPortForward(hostPort int, _ string, _ 
 }
 
 func (*recoveryTestNetworkManager) TeardownPortForward(int, string, int) error { return nil }
+
+func TestClearedRemovedServiceDropsHealthProbe(t *testing.T) {
+	a := New(testAgentConfig(t), &fakeStore{data: map[string][]byte{"web": []byte("node: web\nservices: []\n")}, revision: "empty"}, testLogger())
+	manager := &recoveryTestVMManager{instances: map[string]*vm.Instance{}}
+	health := healthcheck.NewMonitor(testLogger(), func(context.Context, string) error { return nil })
+	defer health.Stop()
+	service := config.ServiceConfig{Name: "old", HealthCheck: &config.HealthCheckConfig{Type: "tcp", Target: "127.0.0.1:1", Interval: time.Hour, Timeout: time.Second}}
+	health.Register(context.Background(), service)
+	a.reconciler = reconciler.NewWithNetworkManager(manager, testLogger(), health, &recoveryTestNetworkManager{}, "", 0)
+	a.queueRecoveryReconcile("old", false)
+	a.applyRecoveryRequests(context.Background())
+	if _, ok := health.GetResult("old"); ok {
+		t.Fatal("cleared service retained its health probe")
+	}
+}

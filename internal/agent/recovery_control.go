@@ -74,6 +74,8 @@ func (a *Agent) applyRecoveryRequests(ctx context.Context) {
 	for service, adopted := range requests {
 		if adopted {
 			a.reconciler.MarkRecovered(service)
+		} else {
+			a.reconciler.ForgetRecovered(service)
 		}
 	}
 	a.forceReconcile = true
@@ -220,10 +222,14 @@ func startRecoveryControlServer(stateDir string, logger *slog.Logger, resolve re
 
 func (s *recoveryControlServer) serve() {
 	defer close(s.done)
+	defer s.listener.Close()
 	s.serveAccepting(s.listener.AcceptUnix)
 }
 
 func (s *recoveryControlServer) serveAccepting(accept func() (*net.UnixConn, error)) {
+	if s.listener != nil {
+		defer s.listener.Close()
+	}
 	delay := recoveryAcceptRetryInitial
 	for {
 		connection, err := accept()
@@ -398,7 +404,7 @@ func ClearRecovery(ctx context.Context, stateDir, service string) (vm.RecoveryRe
 	}
 	responseBody, err := readRecoveryControlFrame(connection)
 	if err != nil {
-		return vm.RecoveryResult{}, fmt.Errorf("read recovery response: %w", err)
+		return vm.RecoveryResult{}, fmt.Errorf("recovery response unavailable; outcome is unknown, inspect service status before retrying: %w", err)
 	}
 	response, err := decodeRecoveryControlResponse(responseBody)
 	if err != nil {
