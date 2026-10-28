@@ -23,11 +23,19 @@ GET /v1/nodes
 GET /v1/nodes/{node_id}
 GET /v1/services
 GET /v1/services/{service_name}
+GET /v1/volumes?state=STATE&limit=N&offset=N
+GET /v1/volumes/{service}/{volume}
 ```
 
 `/healthz` is unauthenticated. List responses contain `api_version`,
 `observed_at`, `count`, and a deterministically sorted `items` array. Supported
 filters are `state` for nodes and `state`, `health`, and `node` for services.
+The retired-node state is available only when requested explicitly with
+`state=retired`; ordinary node lists remain active registry records only.
+Volume list states are `active`, `pending`, `node_unavailable`,
+`backend_unavailable`, `retained`, `orphaned`, and `invalid`. Volume list
+responses accept an optional state filter and bounded `limit` (default 100,
+maximum 500) and `offset`, and return `total` and `has_more` metadata.
 
 Node capacity is requested capacity, not measured utilization. CPU and memory
 `allocated` values are the sum of desired services assigned to the node.
@@ -95,9 +103,25 @@ desired revision is empty and the unreadable node could still be running old
 workloads. Failing to list records, or to read the desired, placement, or
 rendered state, still fails the request.
 
-Lists are not paginated. Each snapshot reads every node and volume record,
-which is intended for deployments of up to a few hundred nodes and a few
-thousand volumes; responses always contain the complete filtered set.
+Node and service lists remain unpaginated. Volume summaries use bounded pages
+after lifecycle filtering; each snapshot still reads every volume record,
+which is intended for deployments of a few thousand retained volumes.
+
+`/v1/volumes` and `/v1/volumes/{service}/{volume}` expose desired and retained
+data from the same merged snapshot as service detail. `active` means a desired
+volume has a usable bound node or advertised shared backend and is prepared or
+durably applied. `pending` means preparation or resize is incomplete.
+`node_unavailable` and `backend_unavailable` preserve the binding while the
+required resource cannot currently be used. `retained` means the volume record
+outlived its desired declaration; `orphaned` means it is attached to a retired
+node or a shared backend no longer advertised by the active fleet. `invalid`
+means the record needs repair; malformed payload contents are not echoed into
+the response. List `problems` identifies unreadable or invalid source keys.
+
+Node retirement is a metadata operation: it leaves the explicit empty node
+config and every volume record in place. It cannot stop a disconnected VM. See
+[node retirement and recovery](node-lifecycle.md) for the disabled-by-default
+retention settings and the externally fenced tombstone recovery procedure.
 
 ## Agent convergence status
 

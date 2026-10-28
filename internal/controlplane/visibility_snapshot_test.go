@@ -199,7 +199,7 @@ func TestCancelledScanFailsAndIsNotCached(t *testing.T) {
 			cfg := validConfigForRole(RoleAPI)
 			putCurrentState(t, context.Background(), base, DesiredRevision{Revision: "desired-1"}, PlacementRevision{Revision: "placement-1", DesiredRevision: "desired-1"}, "rendered-1")
 			putNode(t, context.Background(), base, cfg, NodeRecord{NodeID: "node-1", State: NodeStateReady})
-			putRecord(t, base, "db", "data", VolumeRecord{LogicalID: "db/data", Type: config.VolumeTypeLocal, BoundNode: "node-1", DesiredSizeBytes: config.GiB})
+			putRecord(t, base, "db", "data", VolumeRecord{LogicalID: "db/data", Type: config.VolumeTypeLocal, BoundNode: "node-1", DesiredSizeBytes: config.GiB, AppliedSizeBytes: config.GiB, ResizeGeneration: 1, ResizeState: VolumeResizeApplied})
 
 			ctx, cancel := context.WithCancel(context.Background())
 			defer cancel()

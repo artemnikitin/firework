@@ -1,5 +1,5 @@
 # Firework control-plane configuration.
-# Roles: registry | events | controller | api | all
+# Roles: registry | events | controller | api | node-maintenance | all
 role: "all"
 
 registry_listen_addr: ":9443"

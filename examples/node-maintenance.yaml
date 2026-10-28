@@ -1,0 +1,12 @@
+# Minimal operator-only configuration for firework-node-maintenance.
+# AWS credentials come from the normal SDK credential chain.
+role: "node-maintenance"
+
+state:
+  backend: "s3"
+  prefix: "cp/v1"
+  s3:
+    bucket: "my-firework-controlplane"
+    region: "us-east-1"
+
+# For GCS, set backend: "gcs" and provide state.gcs.bucket/project or ADC.

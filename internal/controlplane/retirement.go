@@ -474,7 +474,7 @@ func validNodeTombstoneIndex(index NodeTombstoneIndex) bool {
 		return false
 	}
 	for i, id := range index.NodeIDs {
-		if strings.TrimSpace(id) == "" || strings.Contains(id, "/") || (i > 0 && index.NodeIDs[i-1] >= id) {
+		if strings.TrimSpace(id) == "" || len(id) > statusmodel.MaxVolumeIDLen || strings.Contains(id, "/") || (i > 0 && index.NodeIDs[i-1] >= id) {
 			return false
 		}
 	}

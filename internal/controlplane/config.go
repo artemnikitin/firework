@@ -11,11 +11,12 @@ import (
 )
 
 const (
-	RoleAll        = "all"
-	RoleRegistry   = "registry"
-	RoleEvents     = "events"
-	RoleController = "controller"
-	RoleAPI        = "api"
+	RoleAll             = "all"
+	RoleRegistry        = "registry"
+	RoleEvents          = "events"
+	RoleController      = "controller"
+	RoleAPI             = "api"
+	RoleNodeMaintenance = "node-maintenance"
 )
 
 // Config configures the control plane runtime.
@@ -205,7 +206,7 @@ func readSecretFile(path string) (string, error) {
 // Validate validates runtime configuration.
 func (c Config) Validate() error {
 	switch c.Role {
-	case RoleAll, RoleRegistry, RoleEvents, RoleController, RoleAPI:
+	case RoleAll, RoleRegistry, RoleEvents, RoleController, RoleAPI, RoleNodeMaintenance:
 	default:
 		return fmt.Errorf("unsupported role %q", c.Role)
 	}

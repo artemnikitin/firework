@@ -31,6 +31,9 @@ type visibilitySnapshot struct {
 	nodeByID                 map[string]NodeRecord
 	pendingByService         map[string]PendingPlacement
 	volumeByID               map[string]VolumeRecord
+	invalidVolumes           map[string]string
+	tombstoneNodeIDs         map[string]struct{}
+	tombstoneIndexKnown      bool
 	emptyNodeConfigs         map[string]config.NodeConfig
 	// problems lists records left out because they could not be read or
 	// interpreted; one bad record degrades the projection instead of failing
@@ -79,6 +82,16 @@ func (s *VisibilityService) Nodes(ctx context.Context, stateFilter string) (oper
 		return operatorapi.ListEnvelope[operatorapi.NodeSummary]{}, err
 	}
 	items := make([]operatorapi.NodeSummary, 0, len(snapshot.nodes))
+	if stateFilter == "retired" {
+		for nodeID := range snapshot.tombstoneNodeIDs {
+			if _, active := snapshot.nodeByID[nodeID]; active {
+				continue
+			}
+			items = append(items, operatorapi.NodeSummary{NodeID: nodeID, State: "retired"})
+		}
+		sort.Slice(items, func(i, j int) bool { return items[i].NodeID < items[j].NodeID })
+		return operatorapi.ListEnvelope[operatorapi.NodeSummary]{APIVersion: operatorapi.APIVersion, ObservedAt: snapshot.now, Count: len(items), Items: items, Problems: snapshot.problems}, nil
+	}
 	for _, record := range snapshot.nodes {
 		summary := snapshot.nodeSummary(record)
 		if stateFilter != "" && summary.State != stateFilter {
@@ -96,7 +109,7 @@ func (s *VisibilityService) Node(ctx context.Context, nodeID string) (operatorap
 	}
 	record, ok := snapshot.nodeByID[nodeID]
 	if !ok {
-		return operatorapi.NodeDetail{}, false, nil
+		return s.retiredNodeDetail(ctx, snapshot, nodeID)
 	}
 	summary := snapshot.nodeSummary(record)
 	status, statusFresh := snapshot.freshStatus(record)
@@ -105,6 +118,10 @@ func (s *VisibilityService) Node(ctx context.Context, nodeID string) (operatorap
 		HostIP: record.HostIP, RegisteredAt: record.RegisteredAt, UpdatedAt: record.UpdatedAt,
 		Reconciliation: "unknown", StatusMissing: record.AgentStatus == nil, StatusStale: record.AgentStatus != nil && !statusFresh,
 		Services: make([]operatorapi.ServiceSummary, 0),
+	}
+	detail.RevivalHistory, detail.RevivalHistoryTruncated, err = s.nodeRevivalHistory(ctx, nodeID)
+	if err != nil {
+		return operatorapi.NodeDetail{}, false, err
 	}
 	if statusFresh {
 		detail.DesiredRevision = status.DesiredRevision
@@ -270,11 +287,11 @@ func desiredVolumeStatuses(service config.ServiceConfig, records map[string]Volu
 			status.AppliedSizeBytes = record.AppliedSizeBytes
 			status.ResizeGeneration = record.ResizeGeneration
 			status.State = string(record.ResizeState)
-			status.LastError = record.LastError
+			status.LastError = statusmodel.BoundedMessage(record.LastError)
 			if record.rejectionStands() {
 				status.RequestedSizeBytes = record.RequestedSizeBytes
 				status.Rejected = true
-				status.RejectedReason = record.RejectedReason
+				status.RejectedReason = statusmodel.BoundedMessage(record.RejectedReason)
 			}
 		}
 		volumes = append(volumes, status)
@@ -469,7 +486,19 @@ func (s *VisibilityService) build(ctx context.Context) (visibilitySnapshot, erro
 	s.builds++
 	s.mu.Unlock()
 	now := time.Now().UTC()
-	snapshot := visibilitySnapshot{now: now, staleTTL: s.cfg.NodeStaleTTL, placementByService: make(map[string]placedService), nodeByID: make(map[string]NodeRecord), pendingByService: make(map[string]PendingPlacement), volumeByID: make(map[string]VolumeRecord), emptyNodeConfigs: make(map[string]config.NodeConfig)}
+	snapshot := visibilitySnapshot{now: now, staleTTL: s.cfg.NodeStaleTTL, placementByService: make(map[string]placedService), nodeByID: make(map[string]NodeRecord), pendingByService: make(map[string]PendingPlacement), volumeByID: make(map[string]VolumeRecord), invalidVolumes: make(map[string]string), tombstoneNodeIDs: make(map[string]struct{}), emptyNodeConfigs: make(map[string]config.NodeConfig)}
+	index, indexExists, indexErr := loadNodeTombstoneIndex(ctx, s.store, s.cfg.State.Prefix)
+	if indexErr != nil {
+		if scanInterrupted(ctx, indexErr) {
+			return snapshot, fmt.Errorf("reading node tombstone index: %w", indexErr)
+		}
+		snapshot.problems = append(snapshot.problems, operatorapi.ProjectionProblem{Kind: "node_tombstone_index", ID: "index", ReasonCode: "record_invalid"})
+	} else if indexExists {
+		snapshot.tombstoneIndexKnown = true
+		for _, id := range index.NodeIDs {
+			snapshot.tombstoneNodeIDs[id] = struct{}{}
+		}
+	}
 	keys, err := s.store.ListKeys(ctx, registryNodesPrefix(s.cfg.State.Prefix))
 	if err != nil {
 		return snapshot, fmt.Errorf("listing nodes: %w", err)
@@ -491,6 +520,20 @@ func (s *VisibilityService) build(ctx context.Context) (visibilitySnapshot, erro
 		if record.NodeID == "" || projectionID(record.NodeID) != id {
 			snapshot.problems = append(snapshot.problems, operatorapi.ProjectionProblem{Kind: "node", ID: id, ReasonCode: "record_invalid"})
 			continue
+		}
+		if _, tombstoned := snapshot.tombstoneNodeIDs[record.NodeID]; tombstoned {
+			var tombstone NodeTombstone
+			_, exists, tombstoneErr := s.store.GetJSON(ctx, mustNodeTombstoneKey(s.cfg.State.Prefix, record.NodeID), &tombstone)
+			if tombstoneErr != nil || !exists || tombstone.NodeID != record.NodeID || tombstone.MaxGeneration < 0 || !validRetirementReason(tombstone.Reason) {
+				if scanInterrupted(ctx, tombstoneErr) {
+					return snapshot, fmt.Errorf("reading node tombstone: %w", tombstoneErr)
+				}
+				snapshot.problems = append(snapshot.problems, operatorapi.ProjectionProblem{Kind: "node", ID: id, ReasonCode: "tombstone_unreadable"})
+				continue
+			}
+			if record.Generation <= tombstone.MaxGeneration {
+				continue
+			}
 		}
 		snapshot.nodes = append(snapshot.nodes, record)
 		snapshot.nodeByID[record.NodeID] = record
@@ -554,16 +597,23 @@ func (s *VisibilityService) build(ctx context.Context) (visibilitySnapshot, erro
 				return snapshot, fmt.Errorf("reading volume records: %w", err)
 			}
 			snapshot.problems = append(snapshot.problems, operatorapi.ProjectionProblem{Kind: "volume", ID: id, ReasonCode: "record_unreadable"})
+			if projectableVolumeID(id) {
+				snapshot.invalidVolumes[id] = "record_unreadable"
+			}
 			continue
 		}
 		if !exists {
 			continue
 		}
-		if record.LogicalID == "" {
+		validated, quarantine := classifyVolumeRecord(s.cfg.State.Prefix, key, record, nil)
+		if quarantine != nil {
 			snapshot.problems = append(snapshot.problems, operatorapi.ProjectionProblem{Kind: "volume", ID: id, ReasonCode: "record_invalid"})
+			if projectableVolumeID(id) {
+				snapshot.invalidVolumes[id] = "record_invalid"
+			}
 			continue
 		}
-		snapshot.volumeByID[record.LogicalID] = record
+		snapshot.volumeByID[validated.LogicalID] = validated
 	}
 	snapshot.placementCurrent = snapshot.desired.Revision != "" && snapshot.placement.DesiredRevision == snapshot.desired.Revision
 	if snapshot.placementCurrent {

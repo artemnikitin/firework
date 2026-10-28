@@ -2,6 +2,7 @@ AGENT_BINARY := firework-agent
 CONTROLPLANE_BINARY := firework-controlplane
 CONFIGCHECK_BINARY := configcheck
 FIREWORKCTL_BINARY := fireworkctl
+NODE_MAINTENANCE_BINARY := firework-node-maintenance
 FC_INIT_BINARY := fc-init
 AGENT_LINUX_AMD64_BINARY := firework-agent-linux-amd64
 AGENT_LINUX_ARM64_BINARY := firework-agent-linux-arm64
@@ -26,11 +27,11 @@ LDFLAGS   := -s -w \
 	-X '$(MODULE)/internal/version.Commit=$(COMMIT)' \
 	-X '$(MODULE)/internal/version.BuildTime=$(BUILD_TIME)'
 
-.PHONY: all build-all build-agent build-controlplane build-configcheck build-fireworkctl build-fireworkctl-release build-fc-init build-linux-amd64 build-linux-arm64 clean test test-verbose test-race lint vet fmt tidy run smoke-local docker-build-controlplane-image docker-push-controlplane-image push-controlplane-image install help
+.PHONY: all build-all build-agent build-controlplane build-configcheck build-fireworkctl build-fireworkctl-release build-node-maintenance build-node-maintenance-release build-fc-init build-linux-amd64 build-linux-arm64 clean test test-verbose test-race lint vet fmt tidy run smoke-local docker-build-controlplane-image docker-push-controlplane-image push-controlplane-image install help
 
 all: build-all ## Alias for build-all
 
-build-all: build-agent build-controlplane build-configcheck build-fireworkctl build-linux-amd64 build-linux-arm64 ## Build all binaries for native + linux amd64/arm64
+build-all: build-agent build-controlplane build-configcheck build-fireworkctl build-node-maintenance build-linux-amd64 build-linux-arm64 ## Build all binaries for native + linux amd64/arm64
 
 build-agent: ## Build the agent binary
 	@mkdir -p $(BUILD_DIR)
@@ -55,10 +56,25 @@ build-fireworkctl: ## Build the operator CLI for the current platform
 build-fireworkctl-release: ## Build CLI releases for Linux/macOS on amd64/arm64
 	@mkdir -p $(BUILD_DIR)
 	GOOS=linux GOARCH=amd64 go build -ldflags "$(LDFLAGS)" -o $(BUILD_DIR)/$(FIREWORKCTL_LINUX_AMD64_BINARY) ./cmd/fireworkctl/
+	GOOS=linux GOARCH=amd64 go build -ldflags "$(LDFLAGS)" -o $(BUILD_DIR)/firework-node-maintenance-linux-amd64 ./cmd/nodemaint/
 	GOOS=linux GOARCH=arm64 go build -ldflags "$(LDFLAGS)" -o $(BUILD_DIR)/$(FIREWORKCTL_LINUX_ARM64_BINARY) ./cmd/fireworkctl/
+	GOOS=linux GOARCH=arm64 go build -ldflags "$(LDFLAGS)" -o $(BUILD_DIR)/firework-node-maintenance-linux-arm64 ./cmd/nodemaint/
 	GOOS=darwin GOARCH=amd64 go build -ldflags "$(LDFLAGS)" -o $(BUILD_DIR)/$(FIREWORKCTL_DARWIN_AMD64_BINARY) ./cmd/fireworkctl/
 	GOOS=darwin GOARCH=arm64 go build -ldflags "$(LDFLAGS)" -o $(BUILD_DIR)/$(FIREWORKCTL_DARWIN_ARM64_BINARY) ./cmd/fireworkctl/
 	@echo "Built fireworkctl releases for Linux and macOS (amd64/arm64)"
+
+build-node-maintenance: ## Build the node tombstone recovery command
+	@mkdir -p $(BUILD_DIR)
+	go build -ldflags "$(LDFLAGS)" -o $(BUILD_DIR)/$(NODE_MAINTENANCE_BINARY) ./cmd/nodemaint/
+	@echo "Built $(BUILD_DIR)/$(NODE_MAINTENANCE_BINARY)"
+
+build-node-maintenance-release: ## Build node maintenance releases for Linux/macOS on amd64/arm64
+	@mkdir -p $(BUILD_DIR)
+	GOOS=linux GOARCH=amd64 go build -ldflags "$(LDFLAGS)" -o $(BUILD_DIR)/firework-node-maintenance-linux-amd64 ./cmd/nodemaint/
+	GOOS=linux GOARCH=arm64 go build -ldflags "$(LDFLAGS)" -o $(BUILD_DIR)/firework-node-maintenance-linux-arm64 ./cmd/nodemaint/
+	GOOS=darwin GOARCH=amd64 go build -ldflags "$(LDFLAGS)" -o $(BUILD_DIR)/firework-node-maintenance-darwin-amd64 ./cmd/nodemaint/
+	GOOS=darwin GOARCH=arm64 go build -ldflags "$(LDFLAGS)" -o $(BUILD_DIR)/firework-node-maintenance-darwin-arm64 ./cmd/nodemaint/
+	@echo "Built firework-node-maintenance releases for Linux and macOS (amd64/arm64)"
 
 build-fc-init: ## Build fc-init guest init binary (linux/arm64, static) + compatibility alias
 	@mkdir -p $(BUILD_DIR)

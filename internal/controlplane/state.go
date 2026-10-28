@@ -264,12 +264,15 @@ type NodeTombstoneIndex struct {
 // NodeRevivalAudit records the operator intent and result around clearing an
 // exact tombstone version. The provider token itself is never persisted.
 type NodeRevivalAudit struct {
-	NodeID               string    `json:"node_id"`
-	ClearedGeneration    int64     `json:"cleared_generation"`
-	ClearedAt            time.Time `json:"cleared_at"`
-	OperatorReason       string    `json:"operator_reason"`
-	TombstoneTokenSHA256 string    `json:"tombstone_token_sha256"`
-	Outcome              string    `json:"outcome"`
+	NodeID                 string    `json:"node_id"`
+	ClearedGeneration      int64     `json:"cleared_generation"`
+	IntentAt               time.Time `json:"intent_at"`
+	ClearedAt              time.Time `json:"cleared_at"`
+	OperatorReason         string    `json:"operator_reason"`
+	ExternalFenceReference string    `json:"external_fence_reference,omitempty"`
+	RetainedPoolReference  string    `json:"retained_pool_reference,omitempty"`
+	TombstoneTokenSHA256   string    `json:"tombstone_token_sha256"`
+	Outcome                string    `json:"outcome"`
 }
 
 // NodeQuarantine projects malformed node records without replacing or
@@ -306,7 +309,7 @@ func registryNodesPrefix(prefix string) string {
 }
 
 func nodeTombstoneKey(prefix, nodeID string) (string, error) {
-	if strings.TrimSpace(nodeID) == "" || strings.Contains(nodeID, "/") {
+	if strings.TrimSpace(nodeID) == "" || len(nodeID) > statusmodel.MaxVolumeIDLen || strings.Contains(nodeID, "/") {
 		return "", fmt.Errorf("invalid node_id %q", nodeID)
 	}
 	return path.Join(stateRoot(prefix), "registry", "node-tombstones", nodeID+".json"), nil
@@ -321,7 +324,7 @@ func nodeTombstoneIndexKey(prefix string) string {
 }
 
 func nodeRevivalAuditKey(prefix, nodeID, timestamp string) (string, error) {
-	if strings.TrimSpace(nodeID) == "" || strings.Contains(nodeID, "/") || strings.TrimSpace(timestamp) == "" || strings.Contains(timestamp, "/") {
+	if strings.TrimSpace(nodeID) == "" || len(nodeID) > statusmodel.MaxVolumeIDLen || strings.Contains(nodeID, "/") || strings.TrimSpace(timestamp) == "" || strings.Contains(timestamp, "/") {
 		return "", fmt.Errorf("invalid node revival audit key")
 	}
 	return path.Join(stateRoot(prefix), "registry", "node-revivals", nodeID, timestamp+".json"), nil
