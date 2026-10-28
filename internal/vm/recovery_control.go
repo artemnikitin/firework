@@ -265,7 +265,13 @@ func (m *Manager) writeRecoveryManifest(path string, manifest *instanceManifest)
 }
 
 func (m *Manager) noLiveClaimant(manifest *instanceManifest) error {
-	matches, err := m.inspector.FindByArguments(manifest.SocketPath, manifest.ConfigPath)
+	scanner, ok := m.inspector.(interface {
+		FindByAnyArgument(string, string) ([]processIdentity, error)
+	})
+	if !ok {
+		return fmt.Errorf("strict process claimant scan is unavailable")
+	}
+	matches, err := scanner.FindByAnyArgument(manifest.SocketPath, manifest.ConfigPath)
 	if err != nil {
 		return fmt.Errorf("cannot scan for a live process using this VM state: %w", err)
 	}

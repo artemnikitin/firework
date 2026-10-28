@@ -38,6 +38,10 @@ func (f *fakeProcessInspector) FindByArguments(_, _ string) ([]processIdentity, 
 	return append([]processIdentity(nil), f.find...), f.findErr
 }
 
+func (f *fakeProcessInspector) FindByAnyArgument(_, _ string) ([]processIdentity, error) {
+	return append([]processIdentity(nil), f.find...), f.findErr
+}
+
 func (f *fakeProcessInspector) SocketReady(string) error { return f.socketErr }
 
 type recordingLauncher struct {

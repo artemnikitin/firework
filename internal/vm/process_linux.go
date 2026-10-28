@@ -86,26 +86,52 @@ func (inspector osProcessInspector) FindByArguments(socketPath, configPath strin
 	if err != nil {
 		return nil, fmt.Errorf("read process table: %w", err)
 	}
+	return findByVMArgumentsWith(entries, "/proc", socketPath, configPath, false, false,
+		readProcessCommandLine, inspector.Inspect)
+}
+
+// FindByAnyArgument performs the strict claimant scan used before deleting VM
+// state. Either exact path reference is enough to retain the files, and an
+// unreadable live process makes the scan incomplete.
+func (inspector osProcessInspector) FindByAnyArgument(socketPath, configPath string) ([]processIdentity, error) {
+	entries, err := os.ReadDir("/proc")
+	if err != nil {
+		return nil, fmt.Errorf("read process table: %w", err)
+	}
+	return findByVMArgumentsWith(entries, "/proc", socketPath, configPath, true, true,
+		readProcessCommandLine, inspector.Inspect)
+}
+
+func findByVMArgumentsWith(
+	entries []os.DirEntry,
+	procRoot, socketPath, configPath string,
+	matchEither, failOnUnreadable bool,
+	readCommandLine func(string) ([]string, error),
+	inspect func(int) (processIdentity, error),
+) ([]processIdentity, error) {
 	var matches []processIdentity
 	for _, entry := range entries {
 		pid, err := strconv.Atoi(entry.Name())
 		if err != nil {
 			continue
 		}
-		procDir := filepath.Join("/proc", entry.Name())
-		args, err := readProcessCommandLine(procDir)
+		procDir := filepath.Join(procRoot, entry.Name())
+		args, err := readCommandLine(procDir)
 		if err != nil {
 			if errors.Is(err, errProcessNotFound) {
 				continue
 			}
-			return nil, fmt.Errorf("inspect process %d command line: %w", pid, err)
-		}
-		if !hasExactArgument(args, "--api-sock", socketPath) || !hasExactArgument(args, "--config-file", configPath) {
+			if failOnUnreadable {
+				return nil, fmt.Errorf("inspect process %d command line: %w", pid, err)
+			}
 			continue
 		}
-		identity, err := inspector.Inspect(pid)
+		if !matchesVMArgumentPaths(args, socketPath, configPath, matchEither) {
+			continue
+		}
+		identity, err := inspect(pid)
 		if err != nil {
-			if errors.Is(err, errProcessNotFound) {
+			if failOnUnreadable && errors.Is(err, errProcessNotFound) {
 				continue
 			}
 			return nil, fmt.Errorf("inspect matching process %d: %w", pid, err)
@@ -113,6 +139,15 @@ func (inspector osProcessInspector) FindByArguments(socketPath, configPath strin
 		matches = append(matches, identity)
 	}
 	return matches, nil
+}
+
+func matchesVMArgumentPaths(args []string, socketPath, configPath string, matchEither bool) bool {
+	socketMatch := hasExactArgument(args, "--api-sock", socketPath)
+	configMatch := hasExactArgument(args, "--config-file", configPath)
+	if matchEither {
+		return socketMatch || configMatch
+	}
+	return socketMatch && configMatch
 }
 
 func readProcessCommandLine(procDir string) ([]string, error) {
