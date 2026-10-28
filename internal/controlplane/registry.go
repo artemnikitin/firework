@@ -210,6 +210,14 @@ func (s *RegistryServer) handleRegister(w http.ResponseWriter, r *http.Request) 
 	}
 
 	rec, err := s.upsertNodeRecord(r.Context(), req.NodeID, func(cur *NodeRecord) error {
+		if !cur.RetirementPendingAt.IsZero() {
+			switch {
+			case req.Generation < cur.Generation:
+				return errStaleGeneration
+			case req.Generation == cur.Generation:
+				return errNodeRetiring
+			}
+		}
 		if cur.Generation > req.Generation {
 			return errStaleGeneration
 		}
@@ -228,6 +236,7 @@ func (s *RegistryServer) handleRegister(w http.ResponseWriter, r *http.Request) 
 		}
 		cur.NodeID = req.NodeID
 		cur.Generation = req.Generation
+		cur.RetirementPendingAt = time.Time{}
 		cur.setState(NodeState(req.State), now)
 		cur.Labels = req.Labels
 		cur.Capacity = resourcesFromRegistry(req.Capacity)
@@ -289,6 +298,9 @@ func (s *RegistryServer) handleHeartbeat(w http.ResponseWriter, r *http.Request)
 	rec, err := s.updateNodeRecord(r.Context(), req.NodeID, func(cur *NodeRecord) error {
 		if cur.Generation != req.Generation {
 			return errStaleGeneration
+		}
+		if !cur.RetirementPendingAt.IsZero() {
+			return errNodeRetiring
 		}
 		now := time.Now().UTC()
 		if cur.State == "" {
@@ -569,6 +581,9 @@ func (s *RegistryServer) handleState(w http.ResponseWriter, r *http.Request) {
 		if cur.Generation != req.Generation {
 			return errStaleGeneration
 		}
+		if !cur.RetirementPendingAt.IsZero() {
+			return errNodeRetiring
+		}
 		now := time.Now().UTC()
 		cur.setState(NodeState(req.State), now)
 		cur.LastSeenAt = now
@@ -600,11 +615,17 @@ func nodeResponse(record *NodeRecord) registryapi.NodeResponse {
 var (
 	errStaleGeneration              = errors.New("stale generation")
 	errNodeNotRegistered            = errors.New("node not registered")
+	errNodeRetiring                 = errors.New("node retirement is in progress")
+	errNodeRetired                  = errors.New("node identity is retired")
 	errUnsupportedAgentStatusSchema = errors.New("unsupported agent status schema")
 )
 
 func (s *RegistryServer) writeMutationError(w http.ResponseWriter, operation, nodeID string, err error) {
 	switch {
+	case errors.Is(err, errNodeRetiring):
+		writeRegistryError(w, http.StatusConflict, registryapi.ErrorCodeNodeRetiring, "node retirement is in progress")
+	case errors.Is(err, errNodeRetired):
+		writeRegistryError(w, http.StatusConflict, registryapi.ErrorCodeNodeRetired, "node identity is retired and requires audited recovery")
 	case errors.Is(err, errStaleGeneration):
 		writeRegistryError(w, http.StatusConflict, registryapi.ErrorCodeStaleGeneration, "node generation is no longer current")
 	case errors.Is(err, errNodeNotRegistered):
@@ -658,6 +679,18 @@ func (s *RegistryServer) mutateNodeRecord(ctx context.Context, nodeID string, cr
 		if !exists {
 			if !create {
 				return nil, errNodeNotRegistered
+			}
+			tombstoneKey, keyErr := nodeTombstoneKey(s.cfg.State.Prefix, nodeID)
+			if keyErr != nil {
+				return nil, keyErr
+			}
+			var tombstone NodeTombstone
+			_, tombstoned, err := s.store.GetJSON(ctx, tombstoneKey, &tombstone)
+			if err != nil {
+				return nil, err
+			}
+			if tombstoned {
+				return nil, errNodeRetired
 			}
 			current = NodeRecord{NodeID: nodeID}
 		}

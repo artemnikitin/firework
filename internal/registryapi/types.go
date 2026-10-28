@@ -85,6 +85,8 @@ const (
 	ErrorCodeForbidden          = "forbidden"
 	ErrorCodeNodeNotRegistered  = "node_not_registered"
 	ErrorCodeStaleGeneration    = "stale_generation"
+	ErrorCodeNodeRetiring       = "node_retiring"
+	ErrorCodeNodeRetired        = "node_retired"
 	ErrorCodeRequestTooLarge    = "request_too_large"
 	ErrorCodeInvalidAgentStatus = "invalid_agent_status"
 	ErrorCodeInternal           = "internal_error"
