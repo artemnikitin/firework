@@ -60,6 +60,10 @@ type NodeRecord struct {
 	// projection can say why status is absent instead of calling it missing.
 	AgentStatusReceivedAt time.Time `json:"agent_status_received_at,omitzero"`
 	AgentStatusRejected   string    `json:"agent_status_rejected,omitempty"`
+	// RetirementPendingAt is a leader-written compare-and-swap fence. Once
+	// present, registry heartbeats and state updates reject this incarnation
+	// while the durable tombstone and index are committed.
+	RetirementPendingAt time.Time `json:"retirement_pending_at,omitzero"`
 }
 
 // Reasons a heartbeat's agent_status was refused.
@@ -225,6 +229,49 @@ type LeaderLock struct {
 	RenewedAt      time.Time `json:"renewed_at"`
 }
 
+// NodeTombstone is the durable generation floor for a retired node identity.
+// It intentionally omits runtime telemetry, network addresses, and volume
+// data; node IDs remain fenced until an audited operator recovery clears it.
+type NodeTombstone struct {
+	NodeID           string    `json:"node_id"`
+	MaxGeneration    int64     `json:"max_generation"`
+	RetiredAt        time.Time `json:"retired_at"`
+	Reason           string    `json:"reason"`
+	LastRegisteredAt time.Time `json:"last_registered_at,omitempty"`
+}
+
+// NodeTombstoneIndex is a compact, monotonically revised list used by
+// controller and visibility paths without scanning the indefinite tombstone
+// prefix on every pass.
+type NodeTombstoneIndex struct {
+	NodeIDs   []string  `json:"node_ids"`
+	Count     int       `json:"count"`
+	Revision  int64     `json:"revision"`
+	UpdatedAt time.Time `json:"updated_at"`
+}
+
+// NodeRevivalAudit records the operator intent and result around clearing an
+// exact tombstone version. The provider token itself is never persisted.
+type NodeRevivalAudit struct {
+	NodeID               string    `json:"node_id"`
+	ClearedGeneration    int64     `json:"cleared_generation"`
+	ClearedAt            time.Time `json:"cleared_at"`
+	OperatorReason       string    `json:"operator_reason"`
+	TombstoneTokenSHA256 string    `json:"tombstone_token_sha256"`
+	Outcome              string    `json:"outcome"`
+}
+
+// NodeQuarantine projects malformed node records without replacing or
+// deleting the source object. The source object's exact provider token lets a
+// later maintenance pass clear stale quarantine metadata after repair.
+type NodeQuarantine struct {
+	NodeID      string    `json:"node_id"`
+	ObjectToken string    `json:"object_token"`
+	DetectedAt  time.Time `json:"detected_at"`
+	ReasonCode  string    `json:"reason_code"`
+	Message     string    `json:"message"`
+}
+
 // EventDedupeMarker marks a processed event.
 type EventDedupeMarker struct {
 	EventID    string    `json:"event_id"`
@@ -245,6 +292,39 @@ func nodeRecordKey(prefix, nodeID string) (string, error) {
 
 func registryNodesPrefix(prefix string) string {
 	return path.Join(stateRoot(prefix), "registry", "nodes") + "/"
+}
+
+func nodeTombstoneKey(prefix, nodeID string) (string, error) {
+	if strings.TrimSpace(nodeID) == "" || strings.Contains(nodeID, "/") {
+		return "", fmt.Errorf("invalid node_id %q", nodeID)
+	}
+	return path.Join(stateRoot(prefix), "registry", "node-tombstones", nodeID+".json"), nil
+}
+
+func nodeTombstonesPrefix(prefix string) string {
+	return path.Join(stateRoot(prefix), "registry", "node-tombstones") + "/"
+}
+
+func nodeTombstoneIndexKey(prefix string) string {
+	return path.Join(nodeTombstonesPrefix(prefix), "index.json")
+}
+
+func nodeRevivalAuditKey(prefix, nodeID, timestamp string) (string, error) {
+	if strings.TrimSpace(nodeID) == "" || strings.Contains(nodeID, "/") || strings.TrimSpace(timestamp) == "" || strings.Contains(timestamp, "/") {
+		return "", fmt.Errorf("invalid node revival audit key")
+	}
+	return path.Join(stateRoot(prefix), "registry", "node-revivals", nodeID, timestamp+".json"), nil
+}
+
+func nodeRevivalAuditsPrefix(prefix, nodeID string) string {
+	return path.Join(stateRoot(prefix), "registry", "node-revivals", nodeID) + "/"
+}
+
+func nodeQuarantineKey(prefix, nodeID string) (string, error) {
+	if strings.TrimSpace(nodeID) == "" || strings.Contains(nodeID, "/") {
+		return "", fmt.Errorf("invalid node_id %q", nodeID)
+	}
+	return path.Join(stateRoot(prefix), "quarantine", "nodes", nodeID+".json"), nil
 }
 
 func desiredRevisionKey(prefix, rev string) string {

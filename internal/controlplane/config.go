@@ -31,10 +31,14 @@ type Config struct {
 
 	State StateConfig `yaml:"state"`
 
-	LeaderLeaseTTL      time.Duration `yaml:"leader_lease_ttl"`
-	LeaderRenewInterval time.Duration `yaml:"leader_renew_interval"`
-	NodeStaleTTL        time.Duration `yaml:"node_stale_ttl"`
-	ControllerTick      time.Duration `yaml:"controller_tick"`
+	LeaderLeaseTTL        time.Duration `yaml:"leader_lease_ttl"`
+	LeaderRenewInterval   time.Duration `yaml:"leader_renew_interval"`
+	NodeStaleTTL          time.Duration `yaml:"node_stale_ttl"`
+	NodeDownRetention     time.Duration `yaml:"node_down_retention"`
+	NodeStaleRetention    time.Duration `yaml:"node_stale_retention"`
+	NodeRetirementEnabled bool          `yaml:"node_retirement_enabled"`
+	NodeRetirementDryRun  bool          `yaml:"node_retirement_dry_run"`
+	ControllerTick        time.Duration `yaml:"controller_tick"`
 	// APISnapshotTTL bounds how often the read-only API rebuilds its
 	// deployment snapshot from object storage. 0 rebuilds on every request.
 	APISnapshotTTL time.Duration `yaml:"api_snapshot_ttl"`
@@ -108,12 +112,15 @@ func DefaultConfig() Config {
 			Backend: "s3",
 			Prefix:  "cp/v1",
 		},
-		LeaderLeaseTTL:      30 * time.Second,
-		LeaderRenewInterval: 10 * time.Second,
-		NodeStaleTTL:        45 * time.Second,
-		ControllerTick:      10 * time.Second,
-		APISnapshotTTL:      5 * time.Second,
-		TargetBranch:        "main",
+		LeaderLeaseTTL:       30 * time.Second,
+		LeaderRenewInterval:  10 * time.Second,
+		NodeStaleTTL:         45 * time.Second,
+		NodeDownRetention:    24 * time.Hour,
+		NodeStaleRetention:   168 * time.Hour,
+		NodeRetirementDryRun: true,
+		ControllerTick:       10 * time.Second,
+		APISnapshotTTL:       5 * time.Second,
+		TargetBranch:         "main",
 		Enrollment: EnrollmentConfig{
 			NodeCertTTL: 24 * time.Hour,
 		},
@@ -232,6 +239,12 @@ func (c Config) Validate() error {
 	}
 	if c.NodeStaleTTL <= 0 {
 		return fmt.Errorf("node_stale_ttl must be > 0")
+	}
+	if c.NodeDownRetention <= c.NodeStaleTTL {
+		return fmt.Errorf("node_down_retention must be greater than node_stale_ttl")
+	}
+	if c.NodeStaleRetention <= c.NodeStaleTTL {
+		return fmt.Errorf("node_stale_retention must be greater than node_stale_ttl")
 	}
 	if c.APISnapshotTTL < 0 {
 		return fmt.Errorf("api_snapshot_ttl must be >= 0")

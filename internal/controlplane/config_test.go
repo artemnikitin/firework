@@ -4,6 +4,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 )
 
 func validConfigForRole(role string) Config {
@@ -76,6 +77,27 @@ func TestConfigValidate_NodeStaleTTL(t *testing.T) {
 	cfg.NodeStaleTTL = 0
 	if err := cfg.Validate(); err == nil {
 		t.Fatalf("expected node_stale_ttl validation error")
+	}
+}
+
+func TestConfig_NodeRetirementDefaultsAndRetentionBounds(t *testing.T) {
+	cfg := DefaultConfig()
+	if cfg.NodeRetirementEnabled || !cfg.NodeRetirementDryRun {
+		t.Fatalf("retirement defaults enabled=%v dry_run=%v; want disabled dry-run", cfg.NodeRetirementEnabled, cfg.NodeRetirementDryRun)
+	}
+	if cfg.NodeDownRetention != 24*time.Hour || cfg.NodeStaleRetention != 168*time.Hour {
+		t.Fatalf("retention defaults down=%s stale=%s", cfg.NodeDownRetention, cfg.NodeStaleRetention)
+	}
+
+	cfg = validConfigForRole(RoleController)
+	cfg.NodeDownRetention = cfg.NodeStaleTTL
+	if err := cfg.Validate(); err == nil {
+		t.Fatal("expected node_down_retention to exceed node_stale_ttl")
+	}
+	cfg = validConfigForRole(RoleController)
+	cfg.NodeStaleRetention = cfg.NodeStaleTTL
+	if err := cfg.Validate(); err == nil {
+		t.Fatal("expected node_stale_retention to exceed node_stale_ttl")
 	}
 }
 
