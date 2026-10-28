@@ -222,8 +222,8 @@ func TestRecoverIdentityPersistenceFailureKeepsDurableIdentityAndRetries(t *test
 	if err != nil || result.Outcome != RecoveryOutcomeReadopted {
 		t.Fatalf("retry after durable write recovery = %#v, %v", result, err)
 	}
-	if writes != 2 {
-		t.Fatalf("recovery manifest writes = %d, want initial failure and retry", writes)
+	if writes != 3 {
+		t.Fatalf("recovery manifest writes = %d, want failed repair, repaired identity, and adoption", writes)
 	}
 	durable, err = readManifest(manifestPath(manifest.VMDir))
 	if err != nil || validateOwnedProcess(inspector, durable) != nil {
@@ -312,9 +312,7 @@ func TestClearRecoveryPendingClearsPIDReuseAfterProvingNoLiveClaimant(t *testing
 	manager.inspector = inspector
 	launcher := &recordingLauncher{}
 	manager.launcher = launcher
-	if _, err := manager.Recover(context.Background(), config.NodeConfig{}); err != nil {
-		t.Fatal(err)
-	}
+	manager.addRecoveryPending(manifest.Service, manifest, "PID reuse")
 
 	result, err := manager.ClearRecoveryPending(manifest.Service)
 	if err != nil || result.Outcome != RecoveryOutcomeCleared {

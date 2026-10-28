@@ -124,6 +124,7 @@ type Manager struct {
 	// recoveryManifestWriter is normally nil, which uses writeManifest. Tests
 	// can inject a one-shot durable-write failure to cover recovery retries.
 	recoveryManifestWriter func(string, *instanceManifest) error
+	recoveryUnitInspector  func(*instanceManifest) (int, bool, error)
 
 	mu           sync.Mutex
 	instances    map[string]*Instance
@@ -483,7 +484,7 @@ func (m *Manager) finishStart(ctx context.Context, svc config.ServiceConfig, sta
 		Launcher: launcherKind, LauncherUnit: launcherUnit,
 		StartedAt: time.Now().UTC(), Volumes: append([]volume.PreparedVolume(nil), prepared...),
 	}
-	if err := writeManifest(manifestPath(vmDir), manifest); err != nil {
+	if err := m.writeRecoveryManifest(manifestPath(vmDir), manifest); err != nil {
 		delete(m.instances, svc.Name)
 		return err
 	}
@@ -494,7 +495,7 @@ func (m *Manager) finishStart(ctx context.Context, svc config.ServiceConfig, sta
 	if err != nil {
 		manifest.Lifecycle = lifecycleFailed
 		manifest.LastError = err.Error()
-		_ = writeManifest(manifestPath(vmDir), manifest)
+		_ = m.writeRecoveryManifest(manifestPath(vmDir), manifest)
 		delete(m.instances, svc.Name)
 		return fmt.Errorf("starting firecracker: %w", err)
 	}
@@ -510,7 +511,7 @@ func (m *Manager) finishStart(ctx context.Context, svc config.ServiceConfig, sta
 		return fmt.Errorf("confirming launched process identity: %w", identityErr)
 	}
 	manifest.Lifecycle = lifecycleRunning
-	if err := writeManifest(manifestPath(vmDir), manifest); err != nil {
+	if err := m.writeRecoveryManifest(manifestPath(vmDir), manifest); err != nil {
 		_ = m.launcher.Stop(manifest, syscall.SIGKILL)
 		delete(m.instances, svc.Name)
 		return err
@@ -559,7 +560,7 @@ func (m *Manager) reclaimUnownedState(service, vmDir string) error {
 	if err == nil && manifest.PID == 0 &&
 		(manifest.Lifecycle == lifecycleStopped ||
 			(manifest.Lifecycle == lifecycleFailed && manifest.Launcher == "direct")) {
-		if removeErr := os.RemoveAll(vmDir); removeErr != nil {
+		if removeErr := m.removeRecoveryState(manifest); removeErr != nil {
 			return fmt.Errorf("removing exited VM state for %s: %w", service, removeErr)
 		}
 		return nil
@@ -654,7 +655,7 @@ func (m *Manager) abandonLaunch(service string, manifest *instanceManifest, laun
 	}
 	manifest.Lifecycle = lifecycleFailed
 	manifest.LastError = fmt.Sprintf("launch identity is unprovable and the process did not exit: %v", cause)
-	_ = writeManifest(manifestPath(manifest.VMDir), manifest)
+	_ = m.writeRecoveryManifest(manifestPath(manifest.VMDir), manifest)
 	m.logger.Error("abandoned microVM launch did not exit; its state is retained for recovery",
 		"service", service, "pid", launched.PID, "command", recoveryInterventionCommand)
 	return true
@@ -724,7 +725,7 @@ func (m *Manager) Stop(name string) error {
 	socketPath := manifest.SocketPath
 	inst.State = StateStopping
 	manifest.Lifecycle = lifecycleStopping
-	if err := writeManifest(manifestPath(manifest.VMDir), manifest); err != nil {
+	if err := m.writeRecoveryManifest(manifestPath(manifest.VMDir), manifest); err != nil {
 		inst.State = StateRunning
 		m.mu.Unlock()
 		return err
@@ -773,7 +774,7 @@ func (m *Manager) Stop(name string) error {
 	inst.PID = 0
 	manifest.Lifecycle = lifecycleStopped
 	manifest.PID = 0
-	_ = writeManifest(manifestPath(manifest.VMDir), manifest)
+	_ = m.writeRecoveryManifest(manifestPath(manifest.VMDir), manifest)
 	m.mu.Unlock()
 
 	// Clean up socket.
@@ -882,7 +883,7 @@ func (m *Manager) monitor(name, instanceID string, launched *launchedProcess) {
 		} else {
 			inst.manifest.Lifecycle = lifecycleStopped
 		}
-		_ = writeManifest(manifestPath(inst.manifest.VMDir), inst.manifest)
+		_ = m.writeRecoveryManifest(manifestPath(inst.manifest.VMDir), inst.manifest)
 	}
 }
 
@@ -911,7 +912,7 @@ func newInstanceID() (string, error) {
 func (m *Manager) quarantine(name string, manifest *instanceManifest, err error) {
 	m.mu.Lock()
 	manifest.LastError = err.Error()
-	_ = writeManifest(manifestPath(manifest.VMDir), manifest)
+	_ = m.writeRecoveryManifest(manifestPath(manifest.VMDir), manifest)
 	if inst := m.instances[name]; inst != nil {
 		inst.State = StateRecoveryPending
 		inst.LastError = err.Error()

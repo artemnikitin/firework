@@ -85,12 +85,6 @@ func validateOwnedProcess(inspector processInspector, manifest *instanceManifest
 	if identity.ExecutableDev != manifest.ExecutableDev || identity.ExecutableIno != manifest.ExecutableIno {
 		return fmt.Errorf("process executable identity does not match")
 	}
-	if manifest.Executable == "" {
-		return fmt.Errorf("process executable path: %w", errIdentityNotRecorded)
-	}
-	if identity.Executable != manifest.Executable {
-		return fmt.Errorf("process executable path does not match")
-	}
 	if !matchesOwnedArguments(identity, manifest) {
 		if !manifest.Legacy && !hasExactArgument(identity.CommandLine, "--id", manifest.InstanceID) {
 			return fmt.Errorf("process command line does not contain its instance ID")
@@ -129,8 +123,11 @@ func validateOwnedSocket(inspector processInspector, manifest *instanceManifest)
 }
 
 func hasExactArgument(args []string, name, value string) bool {
-	for i := 0; i+1 < len(args); i++ {
-		if args[i] == name && args[i+1] == value {
+	for i := 0; i < len(args); i++ {
+		if args[i] == name+"="+value {
+			return true
+		}
+		if i+1 < len(args) && args[i] == name && args[i+1] == value {
 			return true
 		}
 	}

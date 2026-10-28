@@ -200,3 +200,14 @@ func TestCleanupClaimantScanMatchesEitherVMPathArgument(t *testing.T) {
 		t.Fatalf("cleanup scan matches = %#v, want the socket-only and config-only processes", matches)
 	}
 }
+
+func TestCleanupRefusesHiddenProcessTable(t *testing.T) {
+	for _, option := range []string{"hidepid=1", "hidepid=2", "hidepid=invisible"} {
+		if verifyProcessTableVisibility("proc /proc proc rw,"+option+" 0 0") == nil {
+			t.Fatal(option)
+		}
+	}
+	if err := verifyProcessTableVisibility("proc /proc proc rw,hidepid=0 0 0"); err != nil {
+		t.Fatal(err)
+	}
+}

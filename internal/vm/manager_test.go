@@ -418,3 +418,7 @@ func TestPreflightRetainsVisibleVolumeError(t *testing.T) {
 		t.Fatalf("unexpected retained volume error %q", got)
 	}
 }
+
+func (i *execRacingInspector) FindByAnyArgument(a, b string) ([]processIdentity, error) {
+	return i.FindByArguments(a, b)
+}

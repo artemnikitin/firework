@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"time"
 
 	"github.com/artemnikitin/firework/internal/config"
@@ -85,6 +86,13 @@ func (m *Manager) Recover(_ context.Context, desired config.NodeConfig) ([]strin
 				continue
 			}
 		}
+		if errors.Is(readErr, os.ErrNotExist) {
+			if err := m.writeRecoveryManifest(path, manifest); err != nil {
+				m.addRecoveryPendingWithCandidate(name, manifest, manifest, "legacy migration persistence failed")
+				errs = append(errs, err)
+				continue
+			}
+		}
 		if err := verifyRecoveryManifestPaths(name, vmDir, manifest); err != nil {
 			m.addRecoveryPending(name, manifest, "ownership manifest paths do not match its state directory")
 			continue
@@ -99,88 +107,25 @@ func (m *Manager) Recover(_ context.Context, desired config.NodeConfig) ([]strin
 			continue
 		}
 		seenIDs[manifest.InstanceID] = name
-		originalManifest := cloneInstanceManifest(manifest)
-		identityReconstructed := false
-
-		if manifest.PID == 0 && (manifest.Lifecycle == lifecycleStopped || manifest.Lifecycle == lifecycleFailed) {
-			if removeErr := os.RemoveAll(vmDir); removeErr != nil {
-				errs = append(errs, fmt.Errorf("clean stale state for %s: %w", name, removeErr))
+		// Publish quarantine first. Restart and explicit retry then use exactly
+		// the same ownership, absence, persistence and shutdown policy.
+		m.addRecoveryPending(name, manifest, "recovery verification pending")
+		result, resolveErr := m.ClearRecoveryPending(name)
+		if resolveErr != nil {
+			m.mu.Lock()
+			if current := m.instances[name]; current != nil {
+				current.LastError = resolveErr.Error()
 			}
+			m.mu.Unlock()
+			if strings.Contains(resolveErr.Error(), "persist") {
+				errs = append(errs, resolveErr)
+			}
+			m.logger.Warn("VM recovery remains pending", "service", name, "error", resolveErr)
 			continue
 		}
-		if manifest.PID <= 0 {
-			if manifest.Lifecycle == lifecycleStarting && manifest.Launcher == "systemd" && manifest.LauncherUnit != "" {
-				if pid, lookupErr := systemdMainPID("systemctl", manifest.LauncherUnit); lookupErr == nil {
-					// systemd reports MainPID at fork, so the identity is only
-					// recorded once that PID is running the launched command
-					// line. Recording it earlier is what produced manifests
-					// describing systemd itself.
-					if identity, waitErr := awaitLaunchedIdentity(m.inspector, manifest, pid, m.launchIdentityTimeout(), launchIdentityInterval); waitErr == nil {
-						manifest.PID = pid
-						applyProcessIdentity(manifest, identity)
-						identityReconstructed = true
-					} else if errors.Is(waitErr, errProcessNotFound) {
-						if removeErr := os.RemoveAll(vmDir); removeErr != nil {
-							errs = append(errs, fmt.Errorf("clean dead starting VM state for %s: %w", name, removeErr))
-						}
-						continue
-					} else {
-						// Keep the published manifest unchanged until the candidate
-						// identity is fully proved. The durable unit name remains
-						// available for a later operator retry.
-						m.logger.Warn("could not confirm the identity of a starting microVM",
-							"service", name, "pid", pid, "error", waitErr)
-						m.addRecoveryPending(name, originalManifest,
-							fmt.Sprintf("cannot confirm starting systemd process %d: %v", pid, waitErr))
-						continue
-					}
-				}
-			}
+		if result.Outcome == RecoveryOutcomeReadopted {
+			adopted = append(adopted, name)
 		}
-		if manifest.PID <= 0 {
-			m.addRecoveryPending(name, manifest, fmt.Sprintf("manifest is %s but has no process identity", manifest.Lifecycle))
-			continue
-		}
-		if processErr := validateOwnedProcess(m.inspector, manifest); processErr != nil {
-			if errors.Is(processErr, errProcessNotFound) {
-				if removeErr := os.RemoveAll(vmDir); removeErr != nil {
-					errs = append(errs, fmt.Errorf("clean dead VM state for %s: %w", name, removeErr))
-				}
-				continue
-			}
-			if !m.repairOwnership(name, manifest, processErr) {
-				m.addRecoveryPending(name, manifest, fmt.Sprintf("cannot prove surviving process ownership: %v", processErr))
-				continue
-			}
-			identityReconstructed = true
-		}
-		if identityReconstructed {
-			candidate := cloneInstanceManifest(manifest)
-			if persistErr := m.persistReconstructedIdentity(name, vmDir, path, originalManifest, candidate); persistErr != nil {
-				reason := fmt.Sprintf("verified process identity could not be persisted: %v", persistErr)
-				m.addRecoveryPendingWithCandidate(name, originalManifest, candidate, reason)
-				errs = append(errs, fmt.Errorf("persist reconstructed identity for %s: %w", name, persistErr))
-				continue
-			}
-			manifest = candidate
-		}
-		if socketErr := validateOwnedSocket(m.inspector, manifest); socketErr != nil {
-			m.addRecoveryPending(name, manifest, fmt.Sprintf("surviving process API socket is not ready: %v", socketErr))
-			continue
-		}
-
-		manifest.Lifecycle = lifecycleRunning
-		manifest.LastError = ""
-		if writeErr := writeManifest(path, manifest); writeErr != nil {
-			errs = append(errs, fmt.Errorf("persist adoption for %s: %w", name, writeErr))
-			continue
-		}
-		m.mu.Lock()
-		m.instances[name] = instanceFromManifest(manifest, StateRunning, "")
-		m.mu.Unlock()
-		adopted = append(adopted, name)
-		go m.monitorAdopted(name, manifest.InstanceID)
-		m.logger.Info("adopted surviving microVM", "service", name, "pid", manifest.PID, "launcher", manifest.Launcher)
 	}
 	if len(errs) > 0 {
 		return adopted, fmt.Errorf("VM recovery had %d error(s): %v", len(errs), errs)
@@ -272,7 +217,7 @@ func (m *Manager) recoverLegacy(name, vmDir string, desired map[string]config.Se
 			m.addRecoveryPending(name, partial, "legacy process arguments match but its executable is not the configured Firecracker binary")
 			return nil, true, nil
 		}
-		if err := os.RemoveAll(vmDir); err != nil {
+		if err := m.removeRecoveryState(partial); err != nil {
 			return nil, true, fmt.Errorf("clean stale legacy state for %s: %w", name, err)
 		}
 		return nil, true, nil
@@ -358,7 +303,7 @@ func (m *Manager) persistReconstructedIdentity(service, vmDir, path string, orig
 	if m.recoveryManifestWriter != nil {
 		return m.recoveryManifestWriter(path, candidate)
 	}
-	return writeManifest(path, candidate)
+	return m.writeRecoveryManifest(path, candidate)
 }
 
 func verifyRecoveryManifestIntegrity(manifest *instanceManifest) error {
@@ -378,7 +323,7 @@ func (m *Manager) markExistingRecoveryPending(name, reason string) {
 		instance.LastError = reason
 		if instance.manifest != nil {
 			instance.manifest.LastError = reason
-			_ = writeManifest(manifestPath(instance.manifest.VMDir), instance.manifest)
+			_ = m.writeRecoveryManifest(manifestPath(instance.manifest.VMDir), instance.manifest)
 		}
 	}
 	m.mu.Unlock()
@@ -426,7 +371,7 @@ func (m *Manager) monitorAdopted(name, instanceID string) {
 			current.manifest.PID = 0
 			current.manifest.Lifecycle = lifecycleFailed
 			current.manifest.LastError = current.LastError
-			if err := writeManifest(manifestPath(current.manifest.VMDir), current.manifest); err != nil {
+			if err := m.writeRecoveryManifest(manifestPath(current.manifest.VMDir), current.manifest); err != nil {
 				m.logger.Error("failed to persist exited adopted VM state", "service", name, "error", err)
 			}
 		}
@@ -444,7 +389,7 @@ func (m *Manager) quarantineIfCurrent(name string, expected *Instance, instanceI
 	}
 	if instance.manifest != nil {
 		instance.manifest.LastError = reason.Error()
-		if err := writeManifest(manifestPath(instance.manifest.VMDir), instance.manifest); err != nil {
+		if err := m.writeRecoveryManifest(manifestPath(instance.manifest.VMDir), instance.manifest); err != nil {
 			reason = fmt.Errorf("%w; persisting quarantine state: %v", reason, err)
 		}
 	}

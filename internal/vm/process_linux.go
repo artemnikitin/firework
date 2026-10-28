@@ -94,6 +94,14 @@ func (inspector osProcessInspector) FindByArguments(socketPath, configPath strin
 // state. Either exact path reference is enough to retain the files, and an
 // unreadable live process makes the scan incomplete.
 func (inspector osProcessInspector) FindByAnyArgument(socketPath, configPath string) ([]processIdentity, error) {
+	mounts, err := os.ReadFile("/proc/mounts")
+	if err != nil {
+		return nil, fmt.Errorf("cannot verify process table visibility: %w", err)
+	}
+	if err := verifyProcessTableVisibility(string(mounts)); err != nil {
+		return nil, err
+	}
+
 	entries, err := os.ReadDir("/proc")
 	if err != nil {
 		return nil, fmt.Errorf("read process table: %w", err)
@@ -239,4 +247,19 @@ func parseProcStartTicks(stat string) (uint64, error) {
 		return 0, fmt.Errorf("parse process start time: %w", err)
 	}
 	return startTicks, nil
+}
+
+func verifyProcessTableVisibility(mounts string) error {
+	for _, line := range strings.Split(mounts, "\n") {
+		fields := strings.Fields(line)
+		if len(fields) < 4 || fields[1] != "/proc" {
+			continue
+		}
+		for _, option := range strings.Split(fields[3], ",") {
+			if strings.HasPrefix(option, "hidepid=") && option != "hidepid=0" && option != "hidepid=off" {
+				return fmt.Errorf("restricted process table cannot prove absence: %s", option)
+			}
+		}
+	}
+	return nil
 }
