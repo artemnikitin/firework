@@ -23,6 +23,8 @@ import (
 
 const maxKernelCommandLineBytes = 2047
 
+const defaultGuestQuiesceTimeout = 15 * time.Second
+
 const (
 	// launchIdentityTimeout bounds how long a launch waits for its process to
 	// exec into Firecracker before the start is abandoned. Warm launches are
@@ -115,13 +117,17 @@ type Manager struct {
 	// identityTimeout bounds waiting for a launched process to exec, and
 	// exitConfirmTimeout bounds waiting for an abandoned launch to go away.
 	// They are fields so tests do not have to sleep out the real budgets.
-	identityTimeout    time.Duration
-	exitConfirmTimeout time.Duration
+	identityTimeout     time.Duration
+	exitConfirmTimeout  time.Duration
+	guestQuiesceTimeout time.Duration
+	quiescer            guestQuiescer
 
-	mu           sync.Mutex
-	instances    map[string]*Instance
-	volumeErrors map[string]string
-	recovered    bool
+	mu             sync.Mutex
+	operationMu    sync.Mutex
+	operationLocks map[string]*serviceOperationLock
+	instances      map[string]*Instance
+	volumeErrors   map[string]string
+	recovered      bool
 }
 
 // NewManager creates a new VM manager.
@@ -131,6 +137,15 @@ func NewManager(firecrackerBin, stateDir string, logger *slog.Logger) *Manager {
 
 // NewManagerWithVolumes creates a VM manager with persistent-volume support.
 func NewManagerWithVolumes(firecrackerBin, stateDir string, logger *slog.Logger, volumeManager *volume.Manager) *Manager {
+	return NewManagerWithVolumesAndGuestQuiesceTimeout(firecrackerBin, stateDir, logger, volumeManager, defaultGuestQuiesceTimeout)
+}
+
+// NewManagerWithVolumesAndGuestQuiesceTimeout configures the maximum time
+// ordinary stop and resize preparation spend waiting for guest quiesce.
+func NewManagerWithVolumesAndGuestQuiesceTimeout(firecrackerBin, stateDir string, logger *slog.Logger, volumeManager *volume.Manager, timeout time.Duration) *Manager {
+	if timeout < time.Second || timeout > 5*time.Minute {
+		timeout = defaultGuestQuiesceTimeout
+	}
 	return &Manager{
 		firecrackerBin: firecrackerBin,
 		stateDir:       stateDir,
@@ -138,12 +153,15 @@ func NewManagerWithVolumes(firecrackerBin, stateDir string, logger *slog.Logger,
 		volumeManager:  volumeManager,
 		launcher:       chooseLauncher(firecrackerBin),
 		inspector:      osProcessInspector{},
+		quiescer:       firecrackerGuestQuiescer{},
 
 		identityTimeout:    launchIdentityTimeout,
 		exitConfirmTimeout: launchExitConfirmTimeout,
 
-		instances:    make(map[string]*Instance),
-		volumeErrors: make(map[string]string),
+		guestQuiesceTimeout: timeout,
+		operationLocks:      make(map[string]*serviceOperationLock),
+		instances:           make(map[string]*Instance),
+		volumeErrors:        make(map[string]string),
 	}
 }
 
@@ -337,7 +355,9 @@ func (m *Manager) List() map[string]*Instance {
 // Phase 3 confirms ownership before any side effect: no manifest is written
 // and nothing is launched unless the placeholder is still this attempt's own.
 func (m *Manager) Start(ctx context.Context, svc config.ServiceConfig) error {
+	unlock := m.lockService(svc.Name)
 	startID, vmDir, socketPath, err := m.beginStart(svc)
+	unlock()
 	if err != nil {
 		return err
 	}
@@ -348,10 +368,14 @@ func (m *Manager) Start(ctx context.Context, svc config.ServiceConfig) error {
 	// start reuses them.
 	prepared, err := m.prepareVolumes(ctx, svc)
 	if err != nil {
+		unlock = m.lockService(svc.Name)
 		m.discardStart(svc.Name, startID)
+		unlock()
 		return err
 	}
 
+	unlock = m.lockService(svc.Name)
+	defer unlock()
 	return m.finishStart(ctx, svc, startID, vmDir, socketPath, prepared)
 }
 
@@ -387,6 +411,7 @@ func (m *Manager) beginStart(svc config.ServiceConfig) (startID, vmDir, socketPa
 	socketPath = filepath.Join(vmDir, "firecracker.sock")
 	// Remove stale socket if it exists.
 	_ = os.Remove(socketPath)
+	_ = os.Remove(filepath.Join(vmDir, "guest.vsock"))
 
 	startID, err = newInstanceID()
 	if err != nil {
@@ -472,7 +497,8 @@ func (m *Manager) finishStart(ctx context.Context, svc config.ServiceConfig, sta
 	manifest := &instanceManifest{
 		SchemaVersion: manifestSchemaVersion, Service: svc.Name, InstanceID: instanceID,
 		Lifecycle: lifecycleStarting, Config: svc, ConfigHash: configHash,
-		SocketPath: socketPath, ConfigPath: configPath, VMDir: vmDir,
+		SocketPath: socketPath, GuestVsockPath: filepath.Join(vmDir, "guest.vsock"),
+		ConfigPath: configPath, VMDir: vmDir,
 		Launcher: launcherKind, LauncherUnit: launcherUnit,
 		StartedAt: time.Now().UTC(), Volumes: append([]volume.PreparedVolume(nil), prepared...),
 	}
@@ -683,143 +709,6 @@ func awaitProcessExit(inspector processInspector, pid int, timeout, interval tim
 	}
 }
 
-// Stop gracefully shuts down a running microVM.
-func (m *Manager) Stop(name string) error {
-	m.mu.Lock()
-	inst, exists := m.instances[name]
-	if !exists {
-		m.mu.Unlock()
-		return fmt.Errorf("service %s not found", name)
-	}
-	if inst.State == StateRecoveryPending {
-		err := fmt.Errorf("refusing to stop service %s: process ownership is ambiguous: %s", name, inst.LastError)
-		m.mu.Unlock()
-		return err
-	}
-	// A start that is still preparing volumes has launched nothing, so there
-	// is no process to signal. Mark the attempt aborted and return
-	// immediately rather than waiting for a possibly multi-minute mkfs — not
-	// stalling shutdown behind volume work is the point of the barrier.
-	// Marking is idempotent so shutdown and the agent API can both issue a
-	// stop without the loser seeing an error for work the winner already did.
-	if inst.State == StateStarting || inst.State == StateStartAborting {
-		inst.State = StateStartAborting
-		m.mu.Unlock()
-		m.logger.Info("aborting in-flight start instead of stopping", "service", name)
-		return nil
-	}
-	manifest := inst.manifest
-	if manifest == nil {
-		m.mu.Unlock()
-		return fmt.Errorf("service %s has no ownership manifest", name)
-	}
-	pid := manifest.PID
-	socketPath := manifest.SocketPath
-	inst.State = StateStopping
-	manifest.Lifecycle = lifecycleStopping
-	if err := writeManifest(manifestPath(manifest.VMDir), manifest); err != nil {
-		inst.State = StateRunning
-		m.mu.Unlock()
-		return err
-	}
-	// Process monitoring may clear the live manifest as soon as Wait reaps the
-	// child. Keep an immutable identity snapshot for every validation and
-	// signal in this stop operation; PID 0 must never reach os.FindProcess.
-	ownedManifest := *manifest
-	m.mu.Unlock()
-
-	m.logger.Info("stopping microVM", "service", name, "pid", pid)
-
-	if err := validateOwnedProcess(m.inspector, &ownedManifest); err != nil {
-		if !errors.Is(err, errProcessNotFound) {
-			m.quarantine(name, manifest, fmt.Errorf("ownership validation failed before stop: %w", err))
-			return fmt.Errorf("refusing to signal pid %d: %w", pid, err)
-		}
-	} else {
-		launcher := launcherForManifest(m.firecrackerBin, &ownedManifest)
-		if err := launcher.Stop(&ownedManifest, syscall.SIGTERM); err != nil {
-			m.logger.Warn("SIGTERM failed, sending SIGKILL", "service", name, "error", err)
-			_ = launcher.Stop(&ownedManifest, syscall.SIGKILL)
-		}
-
-		exited, waitErr := waitForOwnedProcessExit(m.inspector, &ownedManifest, 5*time.Second)
-		if waitErr != nil {
-			m.quarantine(name, manifest, fmt.Errorf("process identity changed while stopping: %w", waitErr))
-			return fmt.Errorf("refusing to signal pid %d again: %w", pid, waitErr)
-		}
-		if !exited {
-			m.logger.Warn("microVM did not exit after SIGTERM, sending SIGKILL", "service", name, "pid", pid)
-			_ = launcher.Stop(&ownedManifest, syscall.SIGKILL)
-			exited, waitErr = waitForOwnedProcessExit(m.inspector, &ownedManifest, 2*time.Second)
-			if waitErr != nil {
-				m.quarantine(name, manifest, fmt.Errorf("process identity changed after SIGKILL: %w", waitErr))
-				return fmt.Errorf("process identity changed after SIGKILL: %w", waitErr)
-			}
-			if !exited {
-				return fmt.Errorf("process %d did not exit after SIGKILL", pid)
-			}
-		}
-	}
-
-	m.mu.Lock()
-	inst.State = StateStopped
-	inst.PID = 0
-	manifest.Lifecycle = lifecycleStopped
-	manifest.PID = 0
-	_ = writeManifest(manifestPath(manifest.VMDir), manifest)
-	m.mu.Unlock()
-
-	// Clean up socket.
-	_ = os.Remove(socketPath)
-
-	m.logger.Info("microVM stopped", "service", name)
-	return nil
-}
-
-// Remove stops (if running) and removes all state for a service.
-func (m *Manager) Remove(name string) error {
-	m.mu.Lock()
-	inst, exists := m.instances[name]
-	aborting := exists && (inst.State == StateStarting || inst.State == StateStartAborting)
-	if aborting {
-		inst.State = StateStartAborting
-	}
-	m.mu.Unlock()
-
-	// Removing the VM state directory while phase 2 runs is safe: volume
-	// preparation writes only under the storage pool, and writeVMConfig — the
-	// only writer of this directory — lives in phase 3, which will abort. The
-	// placeholder is left for phase 3 to clear, so a second Remove before then
-	// takes this same branch and also succeeds.
-	if aborting {
-		m.logger.Info("aborting in-flight start instead of removing", "service", name)
-		if err := os.RemoveAll(filepath.Join(m.stateDir, "vms", name)); err != nil {
-			return fmt.Errorf("removing vm dir: %w", err)
-		}
-		return nil
-	}
-
-	if exists && (inst.State == StateRunning || inst.State == StateStopping) {
-		if err := m.Stop(name); err != nil {
-			return fmt.Errorf("stopping VM during remove: %w", err)
-		}
-	}
-	if exists && inst.State == StateRecoveryPending {
-		return fmt.Errorf("refusing to remove service %s while recovery is pending: %s", name, inst.LastError)
-	}
-
-	m.mu.Lock()
-	delete(m.instances, name)
-	m.mu.Unlock()
-
-	vmDir := filepath.Join(m.stateDir, "vms", name)
-	if err := os.RemoveAll(vmDir); err != nil {
-		return fmt.Errorf("removing vm dir: %w", err)
-	}
-
-	return nil
-}
-
 // IsRunning checks if the process for a service is still alive.
 func (m *Manager) IsRunning(name string) bool {
 	m.mu.Lock()
@@ -841,6 +730,8 @@ func (m *Manager) monitor(name, instanceID string, launched *launchedProcess) {
 	defer launched.LogFile.Close()
 
 	err := launched.Cmd.Wait()
+	unlock := m.lockService(name)
+	defer unlock()
 
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -901,19 +792,9 @@ func newInstanceID() (string, error) {
 	return hex.EncodeToString(data), nil
 }
 
-func (m *Manager) quarantine(name string, manifest *instanceManifest, err error) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	manifest.LastError = err.Error()
-	_ = writeManifest(manifestPath(manifest.VMDir), manifest)
-	if inst := m.instances[name]; inst != nil {
-		inst.State = StateRecoveryPending
-		inst.LastError = err.Error()
-	}
-}
-
 // writeVMConfig writes a Firecracker JSON config file for the given service.
 func (m *Manager) writeVMConfig(vmDir string, svc config.ServiceConfig, prepared []volume.PreparedVolume) (string, error) {
+	guestVsockPath := filepath.Join(vmDir, "guest.vsock")
 	sort.Slice(prepared, func(i, j int) bool { return prepared[i].LogicalID < prepared[j].LogicalID })
 	drives := []firecrackerDrive{{DriveID: "rootfs", PathOnHost: svc.Image, IsRootDevice: true, IsReadOnly: false}}
 	guestVolumes := make([]guestVolume, 0, len(prepared))
@@ -952,6 +833,7 @@ func (m *Manager) writeVMConfig(vmDir string, svc config.ServiceConfig, prepared
 		Drives:            drives,
 		MachineConfig:     firecrackerMachineConfig{VCPUCount: svc.VCPUs, MemSizeMiB: svc.MemoryMB},
 		NetworkInterfaces: networkInterfaces,
+		Vsock:             firecrackerVsock{GuestCID: 3, UDSPath: guestVsockPath},
 	}
 	configJSON, err := json.MarshalIndent(vmConfig, "", "  ")
 	if err != nil {
@@ -970,6 +852,12 @@ type firecrackerConfig struct {
 	Drives            []firecrackerDrive            `json:"drives"`
 	MachineConfig     firecrackerMachineConfig      `json:"machine-config"`
 	NetworkInterfaces []firecrackerNetworkInterface `json:"network-interfaces,omitempty"`
+	Vsock             firecrackerVsock              `json:"vsock"`
+}
+
+type firecrackerVsock struct {
+	GuestCID int    `json:"guest_cid"`
+	UDSPath  string `json:"uds_path"`
 }
 
 type firecrackerBootSource struct {

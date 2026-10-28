@@ -19,6 +19,7 @@ func DefaultAgentConfig() AgentConfig {
 		StoreType:                 "git",
 		StoreBranch:               "main",
 		PollInterval:              30 * time.Second,
+		GuestQuiesceTimeout:       15 * time.Second,
 		FirecrackerBin:            "/usr/bin/firecracker",
 		StateDir:                  "/var/lib/firework",
 		LogLevel:                  "info",
@@ -43,6 +44,9 @@ func LoadAgentConfig(path string) (AgentConfig, error) {
 
 	if err := yaml.Unmarshal(data, &cfg); err != nil {
 		return cfg, fmt.Errorf("parsing agent config %s: %w", path, err)
+	}
+	if cfg.GuestQuiesceTimeout < time.Second || cfg.GuestQuiesceTimeout > 5*time.Minute {
+		return cfg, fmt.Errorf("guest_quiesce_timeout must be between 1s and 5m")
 	}
 
 	if cfg.NodeName == "" && len(cfg.NodeNames) == 0 {

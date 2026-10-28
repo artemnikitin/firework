@@ -101,6 +101,18 @@ func (m *Manager) Recover(_ context.Context, desired config.NodeConfig) ([]strin
 		}
 		seenIDs[manifest.InstanceID] = name
 
+		if manifest.PID == 0 && manifest.Lifecycle == lifecycleStopping {
+			if manifest.GuestQuiesced {
+				if removeErr := os.RemoveAll(vmDir); removeErr != nil {
+					errs = append(errs, fmt.Errorf("clean stopped VM state for %s: %w", name, removeErr))
+				}
+				continue
+			}
+			if retainErr := m.retainStoppedWithoutGuestQuiesce(name, manifest); retainErr != nil {
+				errs = append(errs, retainErr)
+			}
+			continue
+		}
 		if manifest.PID == 0 && (manifest.Lifecycle == lifecycleStopped || manifest.Lifecycle == lifecycleFailed) {
 			if removeErr := os.RemoveAll(vmDir); removeErr != nil {
 				errs = append(errs, fmt.Errorf("clean stale state for %s: %w", name, removeErr))
@@ -139,6 +151,12 @@ func (m *Manager) Recover(_ context.Context, desired config.NodeConfig) ([]strin
 		}
 		if processErr := validateOwnedProcess(m.inspector, manifest); processErr != nil {
 			if errors.Is(processErr, errProcessNotFound) {
+				if manifest.Lifecycle == lifecycleStopping && !manifest.GuestQuiesced {
+					if retainErr := m.retainStoppedWithoutGuestQuiesce(name, manifest); retainErr != nil {
+						errs = append(errs, retainErr)
+					}
+					continue
+				}
 				if removeErr := os.RemoveAll(vmDir); removeErr != nil {
 					errs = append(errs, fmt.Errorf("clean dead VM state for %s: %w", name, removeErr))
 				}
@@ -151,6 +169,14 @@ func (m *Manager) Recover(_ context.Context, desired config.NodeConfig) ([]strin
 		}
 		if socketErr := validateOwnedSocket(m.inspector, manifest); socketErr != nil {
 			m.addRecoveryPending(name, manifest, fmt.Sprintf("surviving process API socket is not ready: %v", socketErr))
+			continue
+		}
+		if manifest.Lifecycle == lifecycleStopping {
+			reason := "VM was stopping when the agent restarted; refusing to re-adopt uncertain guest lifecycle state"
+			if manifest.GuestQuiesced {
+				reason = "guest quiesce completed before the agent restarted; refusing to re-adopt the stopped workload"
+			}
+			m.addRecoveryPending(name, manifest, reason)
 			continue
 		}
 
@@ -171,6 +197,25 @@ func (m *Manager) Recover(_ context.Context, desired config.NodeConfig) ([]strin
 		return adopted, fmt.Errorf("VM recovery had %d error(s): %v", len(errs), errs)
 	}
 	return adopted, nil
+}
+
+// retainStoppedWithoutGuestQuiesce keeps resize preparation blocked when the
+// VMM exited during a stop that had no durable guest quiesce confirmation.
+// Process absence alone does not prove guest filesystem sync or unmount.
+func (m *Manager) retainStoppedWithoutGuestQuiesce(name string, manifest *instanceManifest) error {
+	const reason = "Firecracker exited before guest quiesce was confirmed; volume resize is unsafe"
+	manifest.PID = 0
+	manifest.LastError = reason
+	writeErr := writeManifest(manifestPath(manifest.VMDir), manifest)
+	instance := instanceFromManifest(manifest, StateFailed, reason)
+	m.mu.Lock()
+	m.instances[name] = instance
+	m.mu.Unlock()
+	m.logger.Error("retaining stopped VM state because guest quiesce was not confirmed", "service", name)
+	if writeErr != nil {
+		return fmt.Errorf("persist unquiesced stopped VM state for %s: %w", name, writeErr)
+	}
+	return nil
 }
 
 // repairOwnership re-proves ownership of a VM whose recorded identity cannot be
@@ -317,49 +362,55 @@ func (m *Manager) monitorAdopted(name, instanceID string) {
 	ticker := time.NewTicker(500 * time.Millisecond)
 	defer ticker.Stop()
 	for range ticker.C {
-		m.mu.Lock()
-		instance := m.instances[name]
-		if instance == nil || instance.instanceID != instanceID || instance.State != StateRunning {
-			m.mu.Unlock()
+		unlock := m.lockService(name)
+		done := m.monitorAdoptedOnce(name, instanceID)
+		unlock()
+		if done {
 			return
 		}
-		manifest := *instance.manifest
-		m.mu.Unlock()
-
-		err := validateOwnedProcess(m.inspector, &manifest)
-		if err == nil {
-			continue
-		}
-		m.mu.Lock()
-		current := m.instances[name]
-		active := current != nil && current.instanceID == instanceID && current.State == StateRunning
-		var currentManifest *instanceManifest
-		if active {
-			currentManifest = current.manifest
-		}
-		m.mu.Unlock()
-		if !active {
-			return
-		}
-		if !errors.Is(err, errProcessNotFound) {
-			m.quarantine(name, currentManifest, fmt.Errorf("process identity changed while monitoring: %w", err))
-			return
-		}
-
-		m.mu.Lock()
-		instance = m.instances[name]
-		if instance == nil || instance.instanceID != instanceID || instance.State != StateRunning {
-			m.mu.Unlock()
-			return
-		}
-		instance.State = StateFailed
-		instance.PID = 0
-		instance.LastError = "adopted Firecracker process exited"
-		instance.manifest.PID = 0
-		instance.manifest.Lifecycle = lifecycleFailed
-		instance.manifest.LastError = instance.LastError
-		_ = writeManifest(manifestPath(instance.manifest.VMDir), instance.manifest)
-		m.mu.Unlock()
-		return
 	}
+}
+
+func (m *Manager) monitorAdoptedOnce(name, instanceID string) bool {
+	m.mu.Lock()
+	instance := m.instances[name]
+	if instance == nil || instance.instanceID != instanceID || instance.State != StateRunning {
+		m.mu.Unlock()
+		return true
+	}
+	captured := instance
+	manifest := *instance.manifest
+	m.mu.Unlock()
+
+	err := validateOwnedProcess(m.inspector, &manifest)
+	if err == nil {
+		return false
+	}
+	m.mu.Lock()
+	current := m.instances[name]
+	active := current == captured && current.instanceID == instanceID && current.State == StateRunning
+	m.mu.Unlock()
+	if !active {
+		return true
+	}
+	if !errors.Is(err, errProcessNotFound) {
+		m.quarantineIfCurrent(name, captured, instanceID, fmt.Errorf("process identity changed while monitoring: %w", err))
+		return true
+	}
+
+	m.mu.Lock()
+	instance = m.instances[name]
+	if instance != captured || instance.instanceID != instanceID || instance.State != StateRunning {
+		m.mu.Unlock()
+		return true
+	}
+	instance.State = StateFailed
+	instance.PID = 0
+	instance.LastError = "adopted Firecracker process exited"
+	instance.manifest.PID = 0
+	instance.manifest.Lifecycle = lifecycleFailed
+	instance.manifest.LastError = instance.LastError
+	_ = writeManifest(manifestPath(instance.manifest.VMDir), instance.manifest)
+	m.mu.Unlock()
+	return true
 }

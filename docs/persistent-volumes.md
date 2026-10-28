@@ -97,15 +97,44 @@ The two numbers are a contract: `destructiveCommandTimeout` in
 `internal/volume` bounds the command, and `TimeoutStopSec` must stay above it.
 Raising one without the other reopens the gap.
 
-### Guest data is not flushed before a microVM is stopped
+### Guest quiesce before stopping a microVM
 
-Stopping a microVM — including every service update and every volume resize,
-which are implemented as stop-then-start — terminates the Firecracker process
-without a guest-side shutdown. The ext4 journal keeps the filesystem
-consistent, but application data still in the guest page cache is lost.
-Workloads with persistent volumes should be configured to fsync data they
-cannot afford to lose. A guest quiesce channel is tracked in
-[#49](https://github.com/artemnikitin/firework/issues/49).
+The guest `fc-init` remains root as PID 1 and starts the application as a child
+with the configured user, primary group, supplementary groups, argv, and
+environment. It forwards signals, reaps application descendants, and listens
+for a versioned lifecycle request over Firecracker vsock. The host gives the
+guest up to `guest_quiesce_timeout` to terminate the application, sync guest
+filesystems, and unmount persistent volumes in reverse mount order. Each
+unmount result is checked before the host treats quiesce as successful.
+
+The timeout defaults to `15s` and accepts `1s` through `5m`. It bounds the
+guest application wait plus protocol and filesystem cleanup. Existing agent
+config files inherit the default; deployments that set a custom value must add
+it to the deployed agent config as well.
+
+For an ordinary stop or service update, a failed or unavailable guest request
+is reported and the host continues with the existing ownership-validated
+Firecracker termination fallback. That fallback can still lose dirty guest
+data. For an accepted volume resize, Firework requires confirmed guest
+quiesce before removing the old VM or changing its volume image. If quiesce
+fails while the VM remains live, the old VM and image stay in place and the
+replacement is not started. A rejected shrink and a no-op effective size do
+not enter this resize-required path.
+
+Older guest images without the lifecycle listener remain stoppable through
+the ordinary fallback but cannot pass the resize-required quiesce check. Ship
+the new guest `fc-init` in the guest image before relying on resize safety.
+Firework's `firework-gitops-example` builds a bundled `scripts/fc-init/main.go`
+by default, so that copy must be updated or the build must select a new core
+release. Updating the core agent alone does not update an already published
+guest rootfs.
+
+Quiesce terminates the workload and stops the VM; it is not a reversible,
+process-preserving snapshot. Applications still need to handle termination
+signals and keep their own transaction guarantees for abrupt host failure,
+kernel failure, timeouts, or old guest images. The guest kernel must enable
+`CONFIG_VIRTIO_VSOCKETS=y`, and the host must support Firecracker's vsock
+device.
 
 ### Refused size requests
 

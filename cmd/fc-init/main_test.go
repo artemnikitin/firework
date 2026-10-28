@@ -12,15 +12,18 @@ import (
 )
 
 func TestResolveUserSpec_NumericUIDDefaultsGID(t *testing.T) {
-	uid, gid, username, home, err := resolveUserSpec("1001")
+	identity, err := resolveUserSpec("1001")
 	if err != nil {
 		t.Fatalf("resolveUserSpec returned error: %v", err)
 	}
-	if uid != 1001 || gid != 1001 {
-		t.Fatalf("expected uid/gid 1001/1001, got %d/%d", uid, gid)
+	if identity.uid != 1001 || identity.gid != 1001 {
+		t.Fatalf("expected uid/gid 1001/1001, got %d/%d", identity.uid, identity.gid)
 	}
-	if username != "" || home != "" {
-		t.Fatalf("expected empty username/home for numeric uid, got %q/%q", username, home)
+	if identity.username != "" || identity.home != "" {
+		t.Fatalf("expected empty username/home for numeric uid, got %q/%q", identity.username, identity.home)
+	}
+	if len(identity.groups) != 1 || identity.groups[0] != 1001 {
+		t.Fatalf("expected the requested gid as the only supplementary group, got %v", identity.groups)
 	}
 }
 
@@ -48,17 +51,20 @@ func TestParseVolumePayloadRejectsUnsafePath(t *testing.T) {
 }
 
 func TestResolveUserSpec_NumericUIDAndGID(t *testing.T) {
-	uid, gid, _, _, err := resolveUserSpec("1001:2002")
+	identity, err := resolveUserSpec("1001:2002")
 	if err != nil {
 		t.Fatalf("resolveUserSpec returned error: %v", err)
 	}
-	if uid != 1001 || gid != 2002 {
-		t.Fatalf("expected uid/gid 1001/2002, got %d/%d", uid, gid)
+	if identity.uid != 1001 || identity.gid != 2002 {
+		t.Fatalf("expected uid/gid 1001/2002, got %d/%d", identity.uid, identity.gid)
+	}
+	if len(identity.groups) != 1 || identity.groups[0] != 2002 {
+		t.Fatalf("expected the explicit gid as the only supplementary group, got %v", identity.groups)
 	}
 }
 
 func TestResolveUserSpec_InvalidSpec(t *testing.T) {
-	if _, _, _, _, err := resolveUserSpec(":1000"); err == nil {
+	if _, err := resolveUserSpec(":1000"); err == nil {
 		t.Fatal("expected error for invalid user spec")
 	}
 }

@@ -32,27 +32,29 @@ const (
 // process. The process identity fields prevent a recycled PID from being
 // mistaken for a VM owned by Firework.
 type instanceManifest struct {
-	SchemaVersion int                     `json:"schema_version"`
-	Service       string                  `json:"service"`
-	InstanceID    string                  `json:"instance_id"`
-	Lifecycle     manifestLifecycle       `json:"lifecycle"`
-	Config        config.ServiceConfig    `json:"config"`
-	ConfigHash    string                  `json:"config_hash"`
-	PID           int                     `json:"pid,omitempty"`
-	HostBootID    string                  `json:"host_boot_id,omitempty"`
-	ProcessStart  uint64                  `json:"process_start_ticks,omitempty"`
-	Executable    string                  `json:"executable,omitempty"`
-	ExecutableDev uint64                  `json:"executable_device,omitempty"`
-	ExecutableIno uint64                  `json:"executable_inode,omitempty"`
-	SocketPath    string                  `json:"socket_path"`
-	ConfigPath    string                  `json:"config_path"`
-	VMDir         string                  `json:"vm_dir"`
-	Launcher      string                  `json:"launcher"`
-	LauncherUnit  string                  `json:"launcher_unit,omitempty"`
-	Legacy        bool                    `json:"legacy_process,omitempty"`
-	StartedAt     time.Time               `json:"started_at"`
-	Volumes       []volume.PreparedVolume `json:"volumes,omitempty"`
-	LastError     string                  `json:"last_error,omitempty"`
+	SchemaVersion  int                     `json:"schema_version"`
+	Service        string                  `json:"service"`
+	InstanceID     string                  `json:"instance_id"`
+	Lifecycle      manifestLifecycle       `json:"lifecycle"`
+	Config         config.ServiceConfig    `json:"config"`
+	ConfigHash     string                  `json:"config_hash"`
+	PID            int                     `json:"pid,omitempty"`
+	HostBootID     string                  `json:"host_boot_id,omitempty"`
+	ProcessStart   uint64                  `json:"process_start_ticks,omitempty"`
+	Executable     string                  `json:"executable,omitempty"`
+	ExecutableDev  uint64                  `json:"executable_device,omitempty"`
+	ExecutableIno  uint64                  `json:"executable_inode,omitempty"`
+	SocketPath     string                  `json:"socket_path"`
+	GuestVsockPath string                  `json:"guest_vsock_path,omitempty"`
+	ConfigPath     string                  `json:"config_path"`
+	VMDir          string                  `json:"vm_dir"`
+	Launcher       string                  `json:"launcher"`
+	LauncherUnit   string                  `json:"launcher_unit,omitempty"`
+	Legacy         bool                    `json:"legacy_process,omitempty"`
+	StartedAt      time.Time               `json:"started_at"`
+	Volumes        []volume.PreparedVolume `json:"volumes,omitempty"`
+	GuestQuiesced  bool                    `json:"guest_quiesced,omitempty"`
+	LastError      string                  `json:"last_error,omitempty"`
 }
 
 func serviceConfigHash(svc config.ServiceConfig) (string, error) {

@@ -14,12 +14,14 @@ import (
 
 // fakeVMManager implements VMManager for testing.
 type fakeVMManager struct {
-	instances          map[string]*vm.Instance
-	startCalls         []string
-	removeCalls        []string
-	removeErr          error
-	startErr           error
-	retainOnStartError bool
+	instances            map[string]*vm.Instance
+	startCalls           []string
+	removeCalls          []string
+	removeForResizeCalls []string
+	removeErr            error
+	removeForResizeErr   error
+	startErr             error
+	retainOnStartError   bool
 }
 
 func newFakeVMManager() *fakeVMManager {
@@ -50,6 +52,15 @@ func (f *fakeVMManager) Remove(name string) error {
 	f.removeCalls = append(f.removeCalls, name)
 	if f.removeErr != nil {
 		return f.removeErr
+	}
+	delete(f.instances, name)
+	return nil
+}
+
+func (f *fakeVMManager) RemoveForResize(name string) error {
+	f.removeForResizeCalls = append(f.removeForResizeCalls, name)
+	if f.removeForResizeErr != nil {
+		return f.removeForResizeErr
 	}
 	delete(f.instances, name)
 	return nil

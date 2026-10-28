@@ -1,13 +1,14 @@
 //go:build linux
 
-// fc-init is a minimal init process for Firecracker microVMs.
+// fc-init is the resident init and application supervisor for Firecracker guests.
 //
 // It runs as PID 1 (init=/sbin/fc-init) inside the guest and:
 //  1. Mounts /proc, /sys, /dev/pts
 //  2. Reads /proc/cmdline and exports firework.env.KEY=VALUE and encoded
-//     firework.env64.KEY=VALUE pairs as environment variables for the child process.
-//  3. Execs the remainder of argv (os.Args[1:]), or falls back to
-//     /sbin/init if no arguments are given.
+//     firework.env64.KEY=VALUE pairs as environment variables for the application.
+//  3. Starts os.Args[1:] as a child, while remaining root to reap it and serve
+//     bounded host lifecycle requests.
+//  4. Execs /sbin/init in place when no application arguments are given.
 //
 // Usage in kernel args:
 //
@@ -22,6 +23,7 @@ import (
 	"fmt"
 	"io/fs"
 	"os"
+	"os/signal"
 	"os/user"
 	"path/filepath"
 	"sort"
@@ -58,18 +60,22 @@ type runtimeMetadata struct {
 }
 
 func main() {
+	os.Exit(run())
+}
+
+func run() int {
 	mountAll()
 	volumes, err := mountPersistentVolumes()
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "fc-init: mount persistent volumes: %v\n", err)
-		os.Exit(1)
+		return 1
 	}
 	applyKernelSettings()
 	setHostname()
 	meta := loadRuntimeMetadata()
 	applyImageEnv(meta.Env)
 	exportFireworkEnv()
-	execService(meta, volumes)
+	return execService(meta, volumes)
 }
 
 func mountPersistentVolumes() ([]guestVolume, error) {
@@ -291,11 +297,13 @@ func parseFireworkEnvArg(arg string) (key, val string, ok bool, err error) {
 	return key, val, true, nil
 }
 
-// execService execs argv[1:] if provided, otherwise /sbin/init.
-func execService(meta runtimeMetadata, volumes []guestVolume) {
+// execService starts the application as a child and remains available to reap
+// it and handle host lifecycle requests.
+func execService(meta runtimeMetadata, volumes []guestVolume) int {
 	argv := os.Args[1:]
 	if len(argv) == 0 {
 		argv = []string{"/sbin/init"}
+		return execInitFallback(meta, volumes, argv)
 	}
 
 	if meta.Workdir != "" {
@@ -304,20 +312,89 @@ func execService(meta runtimeMetadata, volumes []guestVolume) {
 		}
 	}
 
+	var credential *syscall.Credential
 	if spec := strings.TrimSpace(meta.User); spec != "" {
-		if err := applyUserSpec(spec, meta.WritablePaths, volumes); err != nil {
+		var err error
+		credential, err = prepareUserSpec(spec, meta.WritablePaths, volumes)
+		if err != nil {
 			fmt.Fprintf(os.Stderr, "fc-init: apply user %q: %v\n", spec, err)
-			os.Exit(1)
+			return 1
 		}
 	}
 
 	// Resolve PATH for the binary if it's not absolute.
 	bin := resolveBinary(argv[0])
+	if err := prepareChildSupervisor(); err != nil {
+		fmt.Fprintf(os.Stderr, "fc-init: prepare child supervisor: %v\n", err)
+		return 1
+	}
 
+	calls, closeServer, err := startLifecycleServer()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "fc-init: start vsock lifecycle server: %v\n", err)
+		calls = nil
+	} else {
+		defer closeServer()
+	}
+
+	signals := make(chan os.Signal, 32)
+	signal.Notify(signals,
+		syscall.SIGCHLD, syscall.SIGTERM, syscall.SIGINT, syscall.SIGHUP,
+		syscall.SIGQUIT, syscall.SIGUSR1, syscall.SIGUSR2,
+	)
+	defer signal.Stop(signals)
+	pid, err := startApplicationChild(bin, argv, os.Environ(),
+		[]uintptr{os.Stdin.Fd(), os.Stdout.Fd(), os.Stderr.Fd()}, credential)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "fc-init: exec %s: %v\n", bin, err)
+		return 1
+	}
+	return superviseChild(pid, calls, signals, volumes, osGuestFilesystem{})
+}
+
+func startApplicationChild(bin string, argv, environment []string, files []uintptr, credential *syscall.Credential) (int, error) {
+	return syscall.ForkExec(bin, argv, &syscall.ProcAttr{
+		Env:   environment,
+		Files: files,
+		Sys:   &syscall.SysProcAttr{Setpgid: true, Credential: credential},
+	})
+}
+
+func execInitFallback(meta runtimeMetadata, volumes []guestVolume, argv []string) int {
+	if meta.Workdir != "" {
+		if err := os.Chdir(meta.Workdir); err != nil {
+			fmt.Fprintf(os.Stderr, "fc-init: chdir %s: %v\n", meta.Workdir, err)
+		}
+	}
+	if spec := strings.TrimSpace(meta.User); spec != "" {
+		credential, err := prepareUserSpec(spec, meta.WritablePaths, volumes)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "fc-init: apply user %q: %v\n", spec, err)
+			return 1
+		}
+		groups := make([]int, len(credential.Groups))
+		for i, group := range credential.Groups {
+			groups[i] = int(group)
+		}
+		if err := syscall.Setgroups(groups); err != nil {
+			fmt.Fprintf(os.Stderr, "fc-init: setgroups: %v\n", err)
+			return 1
+		}
+		if err := syscall.Setgid(int(credential.Gid)); err != nil {
+			fmt.Fprintf(os.Stderr, "fc-init: setgid(%d): %v\n", credential.Gid, err)
+			return 1
+		}
+		if err := syscall.Setuid(int(credential.Uid)); err != nil {
+			fmt.Fprintf(os.Stderr, "fc-init: setuid(%d): %v\n", credential.Uid, err)
+			return 1
+		}
+	}
+	bin := resolveBinary(argv[0])
 	if err := syscall.Exec(bin, argv, os.Environ()); err != nil {
 		fmt.Fprintf(os.Stderr, "fc-init: exec %s: %v\n", bin, err)
-		os.Exit(1)
+		return 1
 	}
+	return 0
 }
 
 func resolveBinary(bin string) string {
@@ -334,42 +411,32 @@ func resolveBinary(bin string) string {
 	return bin
 }
 
-func applyUserSpec(spec string, writablePaths []string, volumes []guestVolume) error {
-	uid, gid, username, home, err := resolveUserSpec(spec)
+func prepareUserSpec(spec string, writablePaths []string, volumes []guestVolume) (*syscall.Credential, error) {
+	identity, err := resolveUserSpec(spec)
 	if err != nil {
-		return err
+		return nil, err
 	}
 
 	volumePaths := make([]string, 0, len(volumes))
 	for _, volume := range volumes {
 		volumePaths = append(volumePaths, volume.MountPath)
 	}
-	if err := ensureWritablePaths(writablePaths, volumePaths, uid, gid); err != nil {
-		return err
+	if err := ensureWritablePaths(writablePaths, volumePaths, int(identity.uid), int(identity.gid)); err != nil {
+		return nil, err
 	}
 	for _, path := range volumePaths {
-		if err := os.Chown(path, uid, gid); err != nil {
-			return fmt.Errorf("chown volume root %s: %w", path, err)
+		if err := os.Chown(path, int(identity.uid), int(identity.gid)); err != nil {
+			return nil, fmt.Errorf("chown volume root %s: %w", path, err)
 		}
 	}
 
-	if home != "" {
-		_ = os.Setenv("HOME", home)
+	if identity.home != "" {
+		_ = os.Setenv("HOME", identity.home)
 	}
-	if username != "" {
-		_ = os.Setenv("USER", username)
+	if identity.username != "" {
+		_ = os.Setenv("USER", identity.username)
 	}
-
-	if err := syscall.Setgroups([]int{gid}); err != nil {
-		return fmt.Errorf("setgroups: %w", err)
-	}
-	if err := syscall.Setgid(gid); err != nil {
-		return fmt.Errorf("setgid(%d): %w", gid, err)
-	}
-	if err := syscall.Setuid(uid); err != nil {
-		return fmt.Errorf("setuid(%d): %w", uid, err)
-	}
-	return nil
+	return &syscall.Credential{Uid: identity.uid, Gid: identity.gid, Groups: identity.groups}, nil
 }
 
 // ensureWritablePaths recursively changes ownership for paths that apps need
@@ -466,61 +533,112 @@ func normalizeWritablePaths(paths []string) []string {
 //   - uid:gid
 //
 // If only numeric uid is provided, gid defaults to uid.
-func resolveUserSpec(spec string) (uid, gid int, username, home string, err error) {
+type childUserIdentity struct {
+	uid      uint32
+	gid      uint32
+	groups   []uint32
+	username string
+	home     string
+}
+
+func resolveUserSpec(spec string) (childUserIdentity, error) {
 	spec = strings.TrimSpace(spec)
 	if spec == "" {
-		return 0, 0, "", "", fmt.Errorf("empty user spec")
+		return childUserIdentity{}, fmt.Errorf("empty user spec")
 	}
 
 	userPart, groupPart, hasGroup := strings.Cut(spec, ":")
 	if userPart == "" {
-		return 0, 0, "", "", fmt.Errorf("invalid user spec %q", spec)
+		return childUserIdentity{}, fmt.Errorf("invalid user spec %q", spec)
 	}
 
 	parsedUID, uidIsNumeric, err := parseNumericID(userPart)
 	if err != nil {
-		return 0, 0, "", "", err
+		return childUserIdentity{}, err
 	}
+	var identity childUserIdentity
+	var primaryGroup int
+	var supplementary []int
 	if uidIsNumeric {
-		uid = parsedUID
-		gid = parsedUID
+		if parsedUID < 0 || uint64(parsedUID) > uint64(^uint32(0)) {
+			return childUserIdentity{}, fmt.Errorf("uid %d is outside the supported range", parsedUID)
+		}
+		primaryGroup = parsedUID
+		supplementary = []int{parsedUID}
+		identity.uid = uint32(parsedUID)
 	} else {
 		u, lookupErr := user.Lookup(userPart)
 		if lookupErr != nil {
-			return 0, 0, "", "", fmt.Errorf("lookup user %q: %w", userPart, lookupErr)
+			return childUserIdentity{}, fmt.Errorf("lookup user %q: %w", userPart, lookupErr)
 		}
-		uid, err = parseRequiredID(u.Uid)
+		uid, err := parseRequiredID(u.Uid)
 		if err != nil {
-			return 0, 0, "", "", fmt.Errorf("invalid uid for %q: %w", userPart, err)
+			return childUserIdentity{}, fmt.Errorf("invalid uid for %q: %w", userPart, err)
 		}
-		gid, err = parseRequiredID(u.Gid)
+		if uid < 0 || uint64(uid) > uint64(^uint32(0)) {
+			return childUserIdentity{}, fmt.Errorf("uid %d is outside the supported range", uid)
+		}
+		primaryGroup, err = parseRequiredID(u.Gid)
 		if err != nil {
-			return 0, 0, "", "", fmt.Errorf("invalid gid for %q: %w", userPart, err)
+			return childUserIdentity{}, fmt.Errorf("invalid gid for %q: %w", userPart, err)
 		}
-		username = u.Username
-		home = u.HomeDir
+		identity.uid = uint32(uid)
+		identity.username = u.Username
+		identity.home = u.HomeDir
+		groupIDs, groupErr := u.GroupIds()
+		if groupErr != nil {
+			return childUserIdentity{}, fmt.Errorf("list groups for %q: %w", userPart, groupErr)
+		}
+		for _, groupID := range groupIDs {
+			id, parseErr := parseRequiredID(groupID)
+			if parseErr != nil {
+				return childUserIdentity{}, fmt.Errorf("invalid supplementary group for %q: %w", userPart, parseErr)
+			}
+			supplementary = append(supplementary, id)
+		}
 	}
 
 	if hasGroup && groupPart != "" {
 		parsedGID, gidIsNumeric, err := parseNumericID(groupPart)
 		if err != nil {
-			return 0, 0, "", "", err
+			return childUserIdentity{}, err
 		}
 		if gidIsNumeric {
-			gid = parsedGID
+			primaryGroup = parsedGID
 		} else {
 			g, lookupErr := user.LookupGroup(groupPart)
 			if lookupErr != nil {
-				return 0, 0, "", "", fmt.Errorf("lookup group %q: %w", groupPart, lookupErr)
+				return childUserIdentity{}, fmt.Errorf("lookup group %q: %w", groupPart, lookupErr)
 			}
-			gid, err = parseRequiredID(g.Gid)
+			primaryGroup, err = parseRequiredID(g.Gid)
 			if err != nil {
-				return 0, 0, "", "", fmt.Errorf("invalid gid for group %q: %w", groupPart, err)
+				return childUserIdentity{}, fmt.Errorf("invalid gid for group %q: %w", groupPart, err)
 			}
 		}
+		// An explicit group overrides the account's supplementary group list,
+		// matching the previous setgroups behavior.
+		supplementary = []int{primaryGroup}
 	}
 
-	return uid, gid, username, home, nil
+	if primaryGroup < 0 || uint64(primaryGroup) > uint64(^uint32(0)) {
+		return childUserIdentity{}, fmt.Errorf("gid %d is outside the supported range", primaryGroup)
+	}
+	identity.gid = uint32(primaryGroup)
+	supplementary = append(supplementary, primaryGroup)
+	seen := make(map[uint32]struct{}, len(supplementary))
+	for _, groupID := range supplementary {
+		if groupID < 0 || uint64(groupID) > uint64(^uint32(0)) {
+			return childUserIdentity{}, fmt.Errorf("supplementary group %d is outside the supported range", groupID)
+		}
+		group := uint32(groupID)
+		if _, duplicate := seen[group]; duplicate {
+			continue
+		}
+		seen[group] = struct{}{}
+		identity.groups = append(identity.groups, group)
+	}
+	sort.Slice(identity.groups, func(i, j int) bool { return identity.groups[i] < identity.groups[j] })
+	return identity, nil
 }
 
 func parseNumericID(s string) (int, bool, error) {

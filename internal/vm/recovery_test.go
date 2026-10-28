@@ -75,6 +75,76 @@ func TestRecoverAdoptsMatchingSurvivorOnce(t *testing.T) {
 	}
 }
 
+func TestRecoverDoesNotReadoptGuestQuiescedLiveVM(t *testing.T) {
+	manager, manifest, inspector := recoveryFixture(t)
+	manifest.Lifecycle = lifecycleStopping
+	manifest.GuestQuiesced = true
+	if err := writeManifest(manifestPath(manifest.VMDir), manifest); err != nil {
+		t.Fatal(err)
+	}
+	manager.inspector = inspector
+
+	adopted, err := manager.Recover(context.Background(), config.NodeConfig{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(adopted) != 0 {
+		t.Fatalf("guest-quiesced VM was re-adopted: %v", adopted)
+	}
+	instance := manager.List()[manifest.Service]
+	if instance == nil || instance.State != StateRecoveryPending || instance.PID != manifest.PID {
+		t.Fatalf("guest-quiesced live VM was not retained for recovery: %#v", instance)
+	}
+	if !strings.Contains(instance.LastError, "guest quiesce completed") {
+		t.Fatalf("recovery reason does not explain the quiesced workload: %q", instance.LastError)
+	}
+	if _, err := inspector.Inspect(manifest.PID); err != nil {
+		t.Fatalf("test process identity unexpectedly disappeared: %v", err)
+	}
+	persisted, err := readManifest(manifestPath(manifest.VMDir))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if persisted.Lifecycle != lifecycleStopping || !persisted.GuestQuiesced {
+		t.Fatalf("recovery changed the durable stop proof: %#v", persisted)
+	}
+}
+
+func TestRecoverRetainsStoppedVMWithoutGuestQuiesceProof(t *testing.T) {
+	manager, manifest, inspector := recoveryFixture(t)
+	manifest.Lifecycle = lifecycleStopping
+	if err := writeManifest(manifestPath(manifest.VMDir), manifest); err != nil {
+		t.Fatal(err)
+	}
+	delete(inspector.identities, manifest.PID)
+	manager.inspector = inspector
+
+	adopted, err := manager.Recover(context.Background(), config.NodeConfig{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(adopted) != 0 {
+		t.Fatalf("stopped unquiesced VM was adopted: %v", adopted)
+	}
+	instance := manager.List()[manifest.Service]
+	if instance == nil || instance.State != StateFailed || instance.PID != 0 {
+		t.Fatalf("stopped VM without guest quiesce proof was not retained accurately: %#v", instance)
+	}
+	if err := manager.RemoveForResize(manifest.Service); err == nil || !strings.Contains(err.Error(), "no successful guest quiesce") {
+		t.Fatalf("unquiesced stopped VM did not block resize: %v", err)
+	}
+	if _, err := os.Stat(manifestPath(manifest.VMDir)); err != nil {
+		t.Fatalf("unquiesced ownership manifest was removed: %v", err)
+	}
+	persisted, err := readManifest(manifestPath(manifest.VMDir))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if persisted.PID != 0 || persisted.Lifecycle != lifecycleStopping || persisted.GuestQuiesced {
+		t.Fatalf("recovery did not persist the resize guard: %#v", persisted)
+	}
+}
+
 func TestRecoverQuarantinesPIDReuseAndNeverSignalsIt(t *testing.T) {
 	manager, manifest, inspector := recoveryFixture(t)
 	identity := inspector.identities[manifest.PID]
