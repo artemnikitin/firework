@@ -66,6 +66,13 @@ func TestCommandRuntimeBoundaries(t *testing.T) {
 			internalDependencies: []string{"operatorapi", "version"},
 		},
 		{
+			command: "nodemaint", targets: allReleaseTargets,
+			internalDependencies: []string{
+				"config", "controlplane", "enricher", "ingress", "objectstorage",
+				"operatorapi", "registryapi", "scheduler", "statusmodel",
+			},
+		},
+		{
 			command: "configcheck", targets: linuxReleaseTargets,
 			internalDependencies: []string{
 				"agentconfig", "config", "enricher", "ingress", "statusmodel", "volume",

@@ -270,11 +270,12 @@ Tenant expansions rewrite links to tenant-prefixed service names automatically.
 
 ## 3) Control Plane Config (`controlplane.yaml`)
 
-`cmd/controlplane` uses a YAML config file with these important fields:
+`cmd/controlplane` and the operator-only `firework-node-maintenance` command
+use YAML config files with these important fields:
 
 | Field | Required | Description |
 |---|---|---|
-| `role` | no | `registry`, `events`, `controller`, `api`, or `all` (default `all`) |
+| `role` | no | `registry`, `events`, `controller`, `api`, `node-maintenance`, or `all` (default `all`). The maintenance command requires `node-maintenance` |
 | `registry_listen_addr` | registry/all | HTTPS bind address for registry APIs |
 | `events_listen_addr` | events/all | HTTPS bind address for GitHub webhook API |
 | `api_listen_addr` | api/all | HTTPS bind address for the read-only operator API and UI |
@@ -314,6 +315,8 @@ Tenant expansions rewrite links to tenant-prefixed service names automatically.
 | `enrollment.bootstrap_tokens` | registry/all | Token list for automated node enrollment |
 
 See [`examples/controlplane.yaml`](../../examples/controlplane.yaml).
+The separate maintenance config can be minimal; see
+[`examples/node-maintenance.yaml`](../../examples/node-maintenance.yaml).
 
 ## 4) Resolved Node Configs (`nodes/<node>.yaml`)
 

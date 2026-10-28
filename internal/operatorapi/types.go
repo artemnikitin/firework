@@ -12,6 +12,10 @@ type ListEnvelope[T any] struct {
 	Count      int                 `json:"count"`
 	Items      []T                 `json:"items"`
 	Problems   []ProjectionProblem `json:"problems,omitempty"`
+	Limit      int                 `json:"limit,omitempty"`
+	Offset     int                 `json:"offset,omitempty"`
+	Total      int                 `json:"total,omitempty"`
+	HasMore    bool                `json:"has_more,omitempty"`
 }
 
 // ProjectionProblem is a stored record the projection could not read or
@@ -90,6 +94,11 @@ type NodeDetail struct {
 	Services                    []ServiceSummary    `json:"services"`
 	ActualOnlyServices          []ActualOnlyService `json:"actual_only_services,omitempty"`
 	ActualOnlyServicesTruncated bool                `json:"actual_only_services_truncated,omitempty"`
+	MaxGeneration               int64               `json:"max_generation,omitempty"`
+	RetiredAt                   time.Time           `json:"retired_at,omitempty"`
+	RetirementReason            string              `json:"retirement_reason,omitempty"`
+	RevivalHistory              []NodeRevivalAudit  `json:"revival_history,omitempty"`
+	RevivalHistoryTruncated     bool                `json:"revival_history_truncated,omitempty"`
 }
 
 type ActualOnlyService struct {
@@ -98,6 +107,15 @@ type ActualOnlyService struct {
 	PID        int    `json:"pid,omitempty"`
 	ReasonCode string `json:"reason_code,omitempty"`
 	Message    string `json:"message,omitempty"`
+}
+
+type NodeRevivalAudit struct {
+	ClearedGeneration      int64     `json:"cleared_generation"`
+	ClearedAt              time.Time `json:"cleared_at"`
+	OperatorReason         string    `json:"operator_reason"`
+	ExternalFenceReference string    `json:"external_fence_reference,omitempty"`
+	RetainedPoolReference  string    `json:"retained_pool_reference,omitempty"`
+	Outcome                string    `json:"outcome"`
 }
 
 // RevisionStatus is derived from current desired, placement, rendered, and
@@ -151,6 +169,38 @@ type VolumeAllocationSummary struct {
 type ServiceStorageSummary struct {
 	Local  VolumeAllocationSummary `json:"local"`
 	Shared VolumeAllocationSummary `json:"shared"`
+}
+
+// VolumeSummary combines the durable resize record with the desired config
+// and the current node/backend availability. State is a derived lifecycle
+// value; ResizeState preserves the underlying durable resize protocol state.
+type VolumeSummary struct {
+	LogicalID          string `json:"logical_id"`
+	Service            string `json:"service"`
+	Name               string `json:"name"`
+	Type               string `json:"type,omitempty"`
+	MountPath          string `json:"mount_path,omitempty"`
+	BoundNode          string `json:"bound_node,omitempty"`
+	SharedBackendID    string `json:"shared_backend_id,omitempty"`
+	Desired            bool   `json:"desired"`
+	State              string `json:"state"`
+	ReasonCode         string `json:"reason_code,omitempty"`
+	Message            string `json:"message,omitempty"`
+	DesiredSizeBytes   int64  `json:"desired_size_bytes,omitempty"`
+	AppliedSizeBytes   int64  `json:"applied_size_bytes,omitempty"`
+	RequestedSizeBytes int64  `json:"requested_size_bytes,omitempty"`
+	ResizeGeneration   int64  `json:"resize_generation,omitempty"`
+	ResizeState        string `json:"resize_state,omitempty"`
+	Rejected           bool   `json:"rejected,omitempty"`
+	RejectedReason     string `json:"rejected_reason,omitempty"`
+	LastError          string `json:"last_error,omitempty"`
+	ObservedState      string `json:"observed_state,omitempty"`
+}
+
+type VolumeDetail struct {
+	APIVersion string    `json:"api_version"`
+	ObservedAt time.Time `json:"observed_at"`
+	VolumeSummary
 }
 
 type ServiceSummary struct {
