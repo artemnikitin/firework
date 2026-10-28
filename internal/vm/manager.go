@@ -555,7 +555,10 @@ func (m *Manager) reclaimUnownedState(service, vmDir string) error {
 	}
 	manifest, err := readManifest(manifestPath(vmDir))
 	if errors.Is(err, os.ErrNotExist) {
-		return nil
+		if _, statErr := os.Lstat(vmDir); errors.Is(statErr, os.ErrNotExist) {
+			return nil
+		}
+		return fmt.Errorf("service %s has runtime state without a manifest; recovery must prove absence before start", service)
 	}
 	if err == nil && manifest.PID == 0 &&
 		(manifest.Lifecycle == lifecycleStopped ||

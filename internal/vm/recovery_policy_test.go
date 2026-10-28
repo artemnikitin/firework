@@ -126,3 +126,13 @@ func TestDeletedExecutableAndEqualsArgumentsPreserveIdentity(t *testing.T) {
 		t.Fatal("fixture")
 	}
 }
+
+func TestStartCannotBypassLegacyQuarantine(t *testing.T) {
+	m, f, _ := recoveryFixture(t)
+	if err := os.Remove(manifestPath(f.VMDir)); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.reclaimUnownedState(f.Service, f.VMDir); err == nil {
+		t.Fatal("missing manifest silently authorized Start")
+	}
+}

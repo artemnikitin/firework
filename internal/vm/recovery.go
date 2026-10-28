@@ -144,7 +144,7 @@ func (m *Manager) Recover(_ context.Context, desired config.NodeConfig) ([]strin
 // reused, so a process presenting it with this instance's socket and config
 // paths is the process this manifest was written for.
 func (m *Manager) repairOwnership(name string, manifest *instanceManifest, cause error) bool {
-	if manifest.Legacy || manifest.InstanceID == "" {
+	if errors.Is(cause, errIdentityNotRecorded) || manifest.Legacy || manifest.InstanceID == "" {
 		return false
 	}
 	identity, err := m.inspector.Inspect(manifest.PID)

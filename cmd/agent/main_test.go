@@ -20,6 +20,11 @@ func TestClearRecoveryCommandHelper(t *testing.T) {
 	if os.Getenv("FIREWORK_CLEAR_RECOVERY_HELPER") != "1" {
 		return
 	}
+	if os.Getenv("FIREWORK_AGENT_HELP_TEST") == "1" {
+		os.Args = []string{"firework-agent", "-h"}
+		main()
+		return
+	}
 	service := os.Getenv("FIREWORK_CLEAR_RECOVERY_SERVICE")
 	if service == "" {
 		service = "missing"
@@ -150,3 +155,15 @@ func (*commandTestStore) Fetch(context.Context, string) ([]byte, error) {
 func (*commandTestStore) Revision(context.Context) (string, error) { return "rev-1", nil }
 
 func (*commandTestStore) Close() error { return nil }
+
+func TestAgentHelpExitsSuccessfully(t *testing.T) {
+	cmd := exec.Command(os.Args[0], "-test.run=^TestClearRecoveryCommandHelper$")
+	cmd.Env = append(os.Environ(), "FIREWORK_CLEAR_RECOVERY_HELPER=1", "FIREWORK_AGENT_HELP_TEST=1")
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("help failed: %v %s", err, out)
+	}
+	if !strings.Contains(string(out), "Usage of firework-agent") {
+		t.Fatalf("missing help: %s", out)
+	}
+}
