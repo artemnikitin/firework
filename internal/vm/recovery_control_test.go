@@ -231,6 +231,24 @@ func TestRecoverIdentityPersistenceFailureKeepsDurableIdentityAndRetries(t *test
 	}
 }
 
+func TestClearRecoveryPendingKeepsCurrentDirectChildWaitMonitor(t *testing.T) {
+	manager, manifest, inspector := recoveryFixture(t)
+	manager.inspector = inspector
+	manager.addRecoveryPending(manifest.Service, manifest, "temporary recovery verification")
+	manager.mu.Lock()
+	manager.instances[manifest.Service].startID = "current-direct-start"
+	manager.mu.Unlock()
+
+	result, err := manager.ClearRecoveryPending(manifest.Service)
+	if err != nil || result.Outcome != RecoveryOutcomeReadopted {
+		t.Fatalf("clear for a current direct child = %#v, %v", result, err)
+	}
+	instance := manager.List()[manifest.Service]
+	if instance == nil || instance.State != StateRunning || instance.startID != "current-direct-start" {
+		t.Fatalf("clear lost the current direct child's Wait monitor identity: %#v", instance)
+	}
+}
+
 func TestClearRecoveryPendingRefusesLiveAmbiguityWithoutSignalling(t *testing.T) {
 	manager, manifest, inspector := recoveryFixture(t)
 	identity := inspector.identities[manifest.PID]
