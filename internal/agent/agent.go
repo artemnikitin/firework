@@ -44,20 +44,25 @@ type routeSyncer interface {
 // the desired state from the config store and reconciles it with the actual
 // state of running Firecracker microVMs.
 type Agent struct {
-	cfg            agentconfig.AgentConfig
-	store          store.Store
-	vmManager      *vm.Manager
-	volumeManager  *volume.Manager
-	reconciler     *reconciler.Reconciler
-	healthMon      *healthcheck.Monitor
-	networkMgr     *network.Manager
-	imageSyncer    *imagesync.Syncer
-	apiServer      *api.Server
-	logger         *slog.Logger
-	metrics        *runtimeMetrics
-	capacityReader capacity.Reader
-	traefikMgr     routeSyncer
-	registryClient *registryClient
+	cfg             agentconfig.AgentConfig
+	store           store.Store
+	vmManager       *vm.Manager
+	volumeManager   *volume.Manager
+	reconciler      *reconciler.Reconciler
+	healthMon       *healthcheck.Monitor
+	networkMgr      *network.Manager
+	imageSyncer     *imagesync.Syncer
+	apiServer       *api.Server
+	logger          *slog.Logger
+	metrics         *runtimeMetrics
+	capacityReader  capacity.Reader
+	traefikMgr      routeSyncer
+	registryClient  *registryClient
+	recoveryControl *recoveryControlServer
+	recoveryWake    chan struct{}
+	recoveryMu      sync.Mutex
+	recoveryQueue   map[string]bool
+	forceReconcile  bool
 
 	lastRevision         string
 	lastKnownCapacity    capacity.NodeCapacity
@@ -177,6 +182,8 @@ func New(cfg agentconfig.AgentConfig, s store.Store, logger *slog.Logger) *Agent
 		capacityReader: capReader,
 		traefikMgr:     traefikMgr,
 		restartCounts:  make(map[string]int),
+		recoveryWake:   make(chan struct{}, 1),
+		recoveryQueue:  make(map[string]bool),
 		currentStatus: statusmodel.AgentStatus{
 			SchemaVersion: statusmodel.SchemaVersion,
 			NodeID:        cfg.NodeID,
@@ -217,8 +224,16 @@ func (a *Agent) Run(ctx context.Context) error {
 	// empty node while durable VM ownership is still being reconstructed.
 	a.tick(ctx)
 
+	control, err := startRecoveryControlServer(a.cfg.StateDir, a.logger, a.clearRecoveryPending)
+	if err != nil {
+		return fmt.Errorf("starting local recovery control: %w", err)
+	}
+	a.recoveryControl = control
+
 	if a.apiServer != nil {
 		if err := a.apiServer.Start(); err != nil {
+			_ = a.recoveryControl.Close()
+			a.recoveryControl = nil
 			return err
 		}
 	}
@@ -236,6 +251,8 @@ func (a *Agent) Run(ctx context.Context) error {
 			a.logger.Info("agent shutting down")
 			a.shutdown()
 			return ctx.Err()
+		case <-a.recoveryWake:
+			a.applyRecoveryRequests(ctx)
 		case <-ticker.C:
 			a.tick(ctx)
 		}
@@ -286,6 +303,12 @@ func (a *Agent) getHeartbeatResources() (cap capacity.NodeCapacity, used capacit
 
 // shutdown cleans up all resources.
 func (a *Agent) shutdown() {
+	if a.recoveryControl != nil {
+		if err := a.recoveryControl.Close(); err != nil {
+			a.logger.Warn("failed to close recovery control socket", "error", err)
+		}
+		a.recoveryControl = nil
+	}
 	if a.imageSyncer != nil {
 		_ = a.imageSyncer.Close()
 	}
@@ -369,7 +392,7 @@ func (a *Agent) tick(ctx context.Context) {
 			a.logger.Error("failed to get store revision", "error", err)
 		}
 		a.setStatusServices(*merged, rev)
-		if rev != "" && rev == a.lastRevision {
+		if rev != "" && rev == a.lastRevision && !a.forceReconcile {
 			// A local revision does not describe the peer node configs used for
 			// remote Traefik routes. Refresh routes on every poll even when the
 			// local VM configuration is unchanged, but avoid the expensive image
@@ -497,6 +520,9 @@ func (a *Agent) tick(ctx context.Context) {
 	reconcileStart := time.Now()
 	err := a.reconciler.Reconcile(ctx, *merged)
 	a.metrics.observeReconcile(time.Since(reconcileStart), err != nil)
+	if err == nil {
+		a.forceReconcile = false
+	}
 	if err != nil && reconciler.IsIncomplete(err) {
 		// Every collected error was a benign start race: a stop or remove
 		// arrived while a start was preparing volumes, or two starts

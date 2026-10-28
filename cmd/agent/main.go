@@ -13,9 +13,18 @@ import (
 	"github.com/artemnikitin/firework/internal/agentconfig"
 	"github.com/artemnikitin/firework/internal/store"
 	"github.com/artemnikitin/firework/internal/version"
+	"github.com/artemnikitin/firework/internal/vm"
 )
 
 func main() {
+	if len(os.Args) > 1 && os.Args[1] == "clear-recovery" {
+		if err := runClearRecovery(os.Args[2:], "/etc/firework/agent.yaml"); err != nil {
+			fmt.Fprintf(os.Stderr, "error: %v\n", err)
+			os.Exit(1)
+		}
+		return
+	}
+
 	configPath := flag.String("config", "/etc/firework/agent.yaml", "path to agent config file")
 	showVersion := flag.Bool("version", false, "print version and exit")
 	flag.Parse()
@@ -24,11 +33,62 @@ func main() {
 		fmt.Println("firework-agent", version.String())
 		return
 	}
+	if flag.NArg() > 0 {
+		if flag.Arg(0) != "clear-recovery" {
+			fmt.Fprintf(os.Stderr, "error: unexpected argument %q\n", flag.Arg(0))
+			os.Exit(1)
+		}
+		if err := runClearRecovery(flag.Args()[1:], *configPath); err != nil {
+			fmt.Fprintf(os.Stderr, "error: %v\n", err)
+			os.Exit(1)
+		}
+		return
+	}
 
 	if err := run(*configPath); err != nil {
 		fmt.Fprintf(os.Stderr, "error: %v\n", err)
 		os.Exit(1)
 	}
+}
+
+func runClearRecovery(args []string, defaultConfigPath string) error {
+	commandFlags := flag.NewFlagSet("clear-recovery", flag.ContinueOnError)
+	commandFlags.SetOutput(os.Stderr)
+	configPath := commandFlags.String("config", defaultConfigPath, "path to agent config file")
+	commandFlags.Usage = func() {
+		fmt.Fprintln(commandFlags.Output(), "Usage: firework-agent clear-recovery [--config PATH] SERVICE")
+		commandFlags.PrintDefaults()
+	}
+	if err := commandFlags.Parse(args); err != nil {
+		return err
+	}
+	if commandFlags.NArg() != 1 {
+		commandFlags.Usage()
+		return fmt.Errorf("clear-recovery requires one service name")
+	}
+	cfg, err := agentconfig.LoadAgentConfig(*configPath)
+	if err != nil {
+		return fmt.Errorf("loading config: %w", err)
+	}
+	result, err := agent.ClearRecovery(context.Background(), cfg.StateDir, commandFlags.Arg(0))
+	if err != nil {
+		return err
+	}
+	switch result.Outcome {
+	case vm.RecoveryOutcomeNoop:
+		if result.State == "" {
+			fmt.Fprintf(os.Stdout, "service %s has no tracked VM\n", result.Service)
+		} else {
+			fmt.Fprintf(os.Stdout, "service %s is not recovery_pending (state %s)\n", result.Service, result.State)
+		}
+	case vm.RecoveryOutcomeCleared:
+		fmt.Fprintf(os.Stdout, "cleared stale VM state for service %s\n", result.Service)
+	case vm.RecoveryOutcomeReadopted:
+		fmt.Fprintf(os.Stdout, "re-adopted the live VM for service %s; reconciliation was queued\n", result.Service)
+	default:
+		return fmt.Errorf("unexpected recovery outcome %q for service %s", result.Outcome, result.Service)
+	}
+	return nil
 }
 
 func run(configPath string) error {

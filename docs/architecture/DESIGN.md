@@ -242,9 +242,26 @@ still be alive.
 Ambiguous cases — including PID reuse, mismatched command lines, corrupt
 manifests, and a live process with a missing or invalid socket — enter
 `recovery_pending`. Firework does not signal the process, delete its files, or
-launch a duplicate in that state. The condition is exposed in agent status for
-operator investigation. There is no supported interface for clearing it while
-the agent runs. To resolve it manually:
+launch a duplicate in that state. Agent status exposes the condition and the
+recovery log names the supported command.
+
+Run `firework-agent clear-recovery SERVICE` on the node as root or as the agent's
+Unix user. Pass `--config PATH` when the agent uses a nondefault config file.
+The command connects to `<state_dir>/control/recovery.sock`, which the agent
+creates with a private directory and owner-only socket permissions. The command
+rechecks the named service through the running manager, so memory and the
+ownership manifest change together.
+
+The command re-adopts a VM only when the manifest, config hash, process identity,
+exact Firecracker command line, and API socket all validate. It removes the VM
+runtime directory only after the recorded process is gone and no process uses
+that service's socket or config paths. A PID start-time mismatch is never
+repaired or signalled. Missing identity, a corrupt manifest, a live claimant,
+an invalid socket, a live VM whose durable lifecycle is `stopping`, or an I/O
+error leaves the service in `recovery_pending` and returns the reason. The
+command never accepts a force-forget or force-adopt request.
+
+If the command refuses, use the manual procedure as a last resort:
 
 1. Stop the agent to prevent reconciliation while investigating.
 2. Preserve and inspect `<state_dir>/vms/<service>/instance.json`, the VM logs,
