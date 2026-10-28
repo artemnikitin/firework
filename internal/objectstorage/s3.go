@@ -148,6 +148,22 @@ func (s *s3BlobStore) Delete(ctx context.Context, key string) error {
 	return nil
 }
 
+func (s *s3BlobStore) DeleteIfMatch(ctx context.Context, key string, expected WriteToken) (bool, error) {
+	if expected == WriteTokenAbsent || expected == WriteToken("*") {
+		return false, fmt.Errorf("conditional delete requires an exact write token")
+	}
+	_, err := s.client.DeleteObject(ctx, &s3.DeleteObjectInput{
+		Bucket: aws.String(s.bucket), Key: aws.String(key), IfMatch: aws.String(string(expected)),
+	})
+	if err != nil {
+		if s3PreconditionFailure(err) || s3NotFound(err) {
+			return false, nil
+		}
+		return false, fmt.Errorf("conditional delete s3://%s/%s: %w", s.bucket, key, err)
+	}
+	return true, nil
+}
+
 func (s *s3BlobStore) ListKeys(ctx context.Context, prefix string) ([]string, error) {
 	var keys []string
 	var token *string
