@@ -199,11 +199,41 @@ store_url: "https://github.com/example/configs.git"
 	if cfg.PollInterval != 30*time.Second {
 		t.Errorf("expected default 30s poll interval, got %v", cfg.PollInterval)
 	}
+	if cfg.GuestQuiesceTimeout != 15*time.Second {
+		t.Errorf("expected default 15s guest quiesce timeout, got %v", cfg.GuestQuiesceTimeout)
+	}
 	if cfg.FirecrackerBin != "/usr/bin/firecracker" {
 		t.Errorf("expected default firecracker bin, got %s", cfg.FirecrackerBin)
 	}
 	if cfg.LogLevel != "info" {
 		t.Errorf("expected default log level info, got %s", cfg.LogLevel)
+	}
+}
+
+func TestLoadAgentConfig_GuestQuiesceTimeoutRange(t *testing.T) {
+	tests := []struct {
+		name    string
+		value   string
+		wantErr bool
+	}{
+		{name: "minimum", value: "1s"},
+		{name: "maximum", value: "5m"},
+		{name: "below minimum", value: "999ms", wantErr: true},
+		{name: "zero", value: "0s", wantErr: true},
+		{name: "above maximum", value: "5m1s", wantErr: true},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			data := "store_url: https://example.com/config.git\nguest_quiesce_timeout: \"" + test.value + "\"\n"
+			path := filepath.Join(t.TempDir(), "agent.yaml")
+			if err := os.WriteFile(path, []byte(data), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			_, err := LoadAgentConfig(path)
+			if (err != nil) != test.wantErr {
+				t.Fatalf("LoadAgentConfig guest_quiesce_timeout=%s err=%v wantErr=%v", test.value, err, test.wantErr)
+			}
+		})
 	}
 }
 

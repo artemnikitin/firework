@@ -5,6 +5,7 @@ import (
 	"context"
 	"fmt"
 	"net"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -78,7 +79,7 @@ func readVsockHandshake(reader *bufio.Reader) error {
 	line, err := reader.ReadSlice('\n')
 	if err != nil {
 		if err == bufio.ErrBufferFull {
-			return fmt.Errorf("Firecracker vsock handshake exceeds %d bytes", maxVsockHandshakeBytes)
+			return fmt.Errorf("firecracker vsock handshake exceeds %d bytes", maxVsockHandshakeBytes)
 		}
 		return fmt.Errorf("read Firecracker vsock handshake: %w", err)
 	}
@@ -89,6 +90,66 @@ func readVsockHandshake(reader *bufio.Reader) error {
 	port, err := strconv.ParseUint(portText, 10, 32)
 	if err != nil || port == 0 || strconv.FormatUint(port, 10) != portText {
 		return fmt.Errorf("invalid Firecracker vsock host port %q", portText)
+	}
+	return nil
+}
+
+func guestVsockPath(manifest *instanceManifest) (string, error) {
+	if manifest == nil || manifest.GuestVsockPath == "" {
+		return "", fmt.Errorf("guest lifecycle socket is not configured by this VM image")
+	}
+	vmDir, err := filepath.Abs(manifest.VMDir)
+	if err != nil {
+		return "", fmt.Errorf("resolve VM state directory: %w", err)
+	}
+	path, err := filepath.Abs(manifest.GuestVsockPath)
+	if err != nil {
+		return "", fmt.Errorf("resolve guest lifecycle socket path: %w", err)
+	}
+	if path != filepath.Join(vmDir, "guest.vsock") {
+		return "", fmt.Errorf("guest lifecycle socket path does not match the VM state directory")
+	}
+	return path, nil
+}
+
+func validateGuestQuiesceResponse(response guestlifecycle.Response, manifest *instanceManifest) error {
+	if err := response.Validate(); err != nil {
+		return fmt.Errorf("invalid guest quiesce response: %w", err)
+	}
+	if response.ErrorCode != "" {
+		return fmt.Errorf("guest quiesce failed: %s", response.ErrorCode)
+	}
+	if !response.AppExited {
+		return fmt.Errorf("guest quiesce did not confirm application exit")
+	}
+	if !response.SyncDone {
+		return fmt.Errorf("guest quiesce did not confirm filesystem sync")
+	}
+	expected := make(map[string]string, len(manifest.Volumes))
+	for _, prepared := range manifest.Volumes {
+		name := filepath.Base(prepared.LogicalID)
+		if _, duplicate := expected[name]; duplicate {
+			return fmt.Errorf("ownership manifest repeats persistent volume %q", name)
+		}
+		expected[name] = prepared.MountPath
+	}
+	for _, result := range response.Mounts {
+		path, ok := expected[result.Name]
+		if !ok {
+			return fmt.Errorf("guest quiesce reported unexpected volume %q", result.Name)
+		}
+		if path != result.Path {
+			return fmt.Errorf("guest quiesce reported volume %q at unexpected path %q", result.Name, result.Path)
+		}
+		delete(expected, result.Name)
+		if !result.Unmounted {
+			return fmt.Errorf("guest did not unmount volume %q at %s: %s", result.Name, result.Path, result.Error)
+		}
+	}
+	if len(expected) > 0 {
+		for name, path := range expected {
+			return fmt.Errorf("guest quiesce did not report volume %q at %s", name, path)
+		}
 	}
 	return nil
 }

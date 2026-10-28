@@ -84,7 +84,7 @@ type Agent struct {
 func New(cfg agentconfig.AgentConfig, s store.Store, logger *slog.Logger) *Agent {
 	metrics := newRuntimeMetrics(cfg.NodeName)
 	volumeMgr := volume.NewManagerWithObserver(cfg.NodeID, cfg.Storage, metrics)
-	vmMgr := vm.NewManagerWithVolumes(cfg.FirecrackerBin, cfg.StateDir, logger, volumeMgr)
+	vmMgr := vm.NewManagerWithVolumesAndGuestQuiesceTimeout(cfg.FirecrackerBin, cfg.StateDir, logger, volumeMgr, cfg.GuestQuiesceTimeout)
 	var agentRef *Agent
 
 	// Set up optional health check monitor.

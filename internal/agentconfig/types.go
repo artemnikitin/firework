@@ -62,6 +62,10 @@ type AgentConfig struct {
 	GCSProject string `yaml:"gcs_project,omitempty"`
 	// PollInterval is how often the agent polls the config store.
 	PollInterval time.Duration `yaml:"poll_interval"`
+	// GuestQuiesceTimeout bounds graceful application shutdown before the
+	// ownership-validated Firecracker stop. Defaults to 15s; allowed range is
+	// 1s through 5m.
+	GuestQuiesceTimeout time.Duration `yaml:"guest_quiesce_timeout,omitempty"`
 	// FirecrackerBin is the path to the firecracker binary.
 	FirecrackerBin string `yaml:"firecracker_bin"`
 	// StateDir is where the agent stores runtime state.
