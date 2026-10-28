@@ -656,7 +656,7 @@ func (m *Manager) abandonLaunch(service string, manifest *instanceManifest, laun
 	manifest.LastError = fmt.Sprintf("launch identity is unprovable and the process did not exit: %v", cause)
 	_ = writeManifest(manifestPath(manifest.VMDir), manifest)
 	m.logger.Error("abandoned microVM launch did not exit; its state is retained for recovery",
-		"service", service, "pid", launched.PID, "command", "firework-agent clear-recovery <service>")
+		"service", service, "pid", launched.PID, "command", recoveryInterventionCommand)
 	return true
 }
 
@@ -917,8 +917,7 @@ func (m *Manager) quarantine(name string, manifest *instanceManifest, err error)
 		inst.LastError = err.Error()
 	}
 	m.mu.Unlock()
-	m.logger.Error("VM recovery requires operator intervention",
-		"service", name, "error", err, "command", "firework-agent clear-recovery <service>")
+	m.logRecoveryIntervention(name, err)
 }
 
 // writeVMConfig writes a Firecracker JSON config file for the given service.

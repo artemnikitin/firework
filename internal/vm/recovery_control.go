@@ -80,6 +80,12 @@ func (m *Manager) ClearRecoveryPending(service string) (RecoveryResult, error) {
 		if !sameRecoveryCandidateMetadata(&initialManifest, recoveryCandidate) {
 			return recoveryAmbiguous(result, "reconstructed process identity no longer matches its durable ownership record")
 		}
+		if err := verifyRecoveryManifestPaths(service, vmDir, recoveryCandidate); err != nil {
+			return recoveryAmbiguous(result, err.Error())
+		}
+		if err := verifyRecoveryManifestIntegrity(recoveryCandidate); err != nil {
+			return recoveryAmbiguous(result, err.Error())
+		}
 		manifest = *recoveryCandidate
 	}
 	if manifest.PID <= 0 {
@@ -120,7 +126,7 @@ func (m *Manager) ClearRecoveryPending(service string) (RecoveryResult, error) {
 		m.logger.Info("cleared stale VM recovery state", "service", service)
 		return result, nil
 	case processErr != nil:
-		if recoveryCandidate == nil && errors.Is(processErr, errIdentityNotRecorded) {
+		if errors.Is(processErr, errIdentityNotRecorded) {
 			return recoveryAmbiguous(result, fmt.Sprintf("refusing to reconstruct process ownership identity that was never recorded: %v", processErr))
 		}
 		if !m.repairOwnership(service, &manifest, processErr) {
@@ -180,9 +186,8 @@ func readAndVerifyRecoveryManifest(path string, expected *instanceManifest) (*in
 		return nil, fmt.Errorf("ownership manifest service configuration does not match its service")
 	}
 	for _, manifest := range []*instanceManifest{expected, durable} {
-		hash, err := serviceConfigHash(manifest.Config)
-		if err != nil || hash != manifest.ConfigHash {
-			return nil, fmt.Errorf("ownership manifest service configuration hash does not match")
+		if err := verifyRecoveryManifestIntegrity(manifest); err != nil {
+			return nil, err
 		}
 	}
 	return durable, nil
@@ -205,10 +210,10 @@ func ValidateRecoveryServiceName(service string) error {
 	return nil
 }
 
-func (m *Manager) recoveryManifestPath(service string) (vmDir, manifestPath string) {
+func (m *Manager) recoveryManifestPath(service string) (vmDir, path string) {
 	vmDir = filepath.Join(m.stateDir, "vms", service)
-	manifestPath = filepath.Join(vmDir, manifestFileName)
-	return vmDir, manifestPath
+	path = manifestPath(vmDir)
+	return vmDir, path
 }
 
 func verifyRecoveryManifestPaths(service, vmDir string, manifest *instanceManifest) error {

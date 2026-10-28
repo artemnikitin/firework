@@ -13,6 +13,8 @@ import (
 	"github.com/artemnikitin/firework/internal/volume"
 )
 
+const recoveryInterventionCommand = "firework-agent clear-recovery <service>"
+
 // Recover discovers Firecracker processes that survived an agent restart.
 // It returns the names of safely adopted services so the reconciler can
 // recreate idempotent host networking and health-monitor state.
@@ -83,14 +85,11 @@ func (m *Manager) Recover(_ context.Context, desired config.NodeConfig) ([]strin
 				continue
 			}
 		}
-		if manifest.Service != name || manifest.VMDir != vmDir ||
-			manifest.SocketPath != filepath.Join(vmDir, "firecracker.sock") ||
-			manifest.ConfigPath != filepath.Join(vmDir, "vm-config.json") {
+		if err := verifyRecoveryManifestPaths(name, vmDir, manifest); err != nil {
 			m.addRecoveryPending(name, manifest, "ownership manifest paths do not match its state directory")
 			continue
 		}
-		hash, hashErr := serviceConfigHash(manifest.Config)
-		if hashErr != nil || hash != manifest.ConfigHash {
+		if err := verifyRecoveryManifestIntegrity(manifest); err != nil {
 			m.addRecoveryPending(name, manifest, "ownership manifest service configuration hash does not match")
 			continue
 		}
@@ -325,8 +324,12 @@ func (m *Manager) addRecoveryPendingWithCandidate(name string, manifest, candida
 	instance.recoveryCandidate = cloneInstanceManifest(candidate)
 	m.instances[name] = instance
 	m.mu.Unlock()
+	m.logRecoveryIntervention(name, reason)
+}
+
+func (m *Manager) logRecoveryIntervention(service string, reason any) {
 	m.logger.Error("VM recovery requires operator intervention",
-		"service", name, "error", reason, "command", "firework-agent clear-recovery <service>")
+		"service", service, "error", reason, "command", recoveryInterventionCommand)
 }
 
 func (m *Manager) persistReconstructedIdentity(service, vmDir, path string, original, candidate *instanceManifest) error {
@@ -380,8 +383,7 @@ func (m *Manager) markExistingRecoveryPending(name, reason string) {
 	}
 	m.mu.Unlock()
 	if found {
-		m.logger.Error("VM recovery requires operator intervention",
-			"service", name, "error", reason, "command", "firework-agent clear-recovery <service>")
+		m.logRecoveryIntervention(name, reason)
 	}
 }
 
@@ -449,7 +451,6 @@ func (m *Manager) quarantineIfCurrent(name string, expected *Instance, instanceI
 	instance.State = StateRecoveryPending
 	instance.LastError = reason.Error()
 	m.mu.Unlock()
-	m.logger.Error("VM recovery requires operator intervention",
-		"service", name, "error", reason, "command", "firework-agent clear-recovery <service>")
+	m.logRecoveryIntervention(name, reason)
 	return true
 }
