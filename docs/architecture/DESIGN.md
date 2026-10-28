@@ -257,9 +257,11 @@ exact Firecracker command line, and API socket all validate. It removes the VM
 runtime directory only after the recorded process is gone and no process uses
 that service's socket or config paths. A PID start-time mismatch is never
 repaired or signalled. Missing identity, a corrupt manifest, a live claimant,
-an invalid socket, a live VM whose durable lifecycle is `stopping`, or an I/O
-error leaves the service in `recovery_pending` and returns the reason. The
-command never accepts a force-forget or force-adopt request.
+an invalid socket, any VM whose durable lifecycle is `stopping`, or an I/O error
+leaves the service in `recovery_pending` and returns the reason. A stopping
+manifest remains even after process exit because this command cannot prove
+whether guest writes were quiesced. The command never accepts a force-forget or
+force-adopt request.
 
 If the command refuses, use the manual procedure as a last resort:
 

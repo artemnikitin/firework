@@ -72,6 +72,9 @@ func (m *Manager) ClearRecoveryPending(service string) (RecoveryResult, error) {
 	if err != nil {
 		return recoveryAmbiguous(result, err.Error())
 	}
+	if initialManifest.Lifecycle == lifecycleStopping {
+		return recoveryAmbiguous(result, "durable VM shutdown state is unresolved; refusing to clear or re-adopt its runtime state")
+	}
 	if manifest.PID <= 0 {
 		return recoveryAmbiguous(result, "ownership manifest has no recorded process identity")
 	}
@@ -117,9 +120,6 @@ func (m *Manager) ClearRecoveryPending(service string) (RecoveryResult, error) {
 		if err := validateOwnedProcess(m.inspector, &manifest); err != nil {
 			return recoveryAmbiguous(result, fmt.Sprintf("repaired process identity does not validate: %v", err))
 		}
-	}
-	if manifest.Lifecycle == lifecycleStopping {
-		return recoveryAmbiguous(result, "VM shutdown was in progress; refusing to re-adopt a live VM")
 	}
 	if err := validateOwnedSocket(m.inspector, &manifest); err != nil {
 		return recoveryAmbiguous(result, fmt.Sprintf("surviving process API socket is not ready: %v", err))

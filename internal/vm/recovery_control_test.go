@@ -22,13 +22,6 @@ func TestClearRecoveryPendingRemovesStateOnlyAfterProcessIsProvenGone(t *testing
 	if _, err := manager.Recover(context.Background(), config.NodeConfig{}); err != nil {
 		t.Fatal(err)
 	}
-	manager.mu.Lock()
-	manager.instances[manifest.Service].manifest.Lifecycle = lifecycleStopping
-	if err := writeManifest(manifestPath(manifest.VMDir), manager.instances[manifest.Service].manifest); err != nil {
-		manager.mu.Unlock()
-		t.Fatal(err)
-	}
-	manager.mu.Unlock()
 	delete(inspector.errors, manifest.PID)
 	delete(inspector.identities, manifest.PID)
 
@@ -62,7 +55,7 @@ func TestClearRecoveryPendingDoesNotReadoptLiveStoppingVM(t *testing.T) {
 	manager.launcher = launcher
 
 	result, err := manager.ClearRecoveryPending(manifest.Service)
-	if err == nil || result.Outcome != RecoveryOutcomeAmbiguous || !strings.Contains(err.Error(), "shutdown was in progress") {
+	if err == nil || result.Outcome != RecoveryOutcomeAmbiguous || !strings.Contains(err.Error(), "shutdown state is unresolved") {
 		t.Fatalf("live stopping VM was re-adopted: result=%#v err=%v", result, err)
 	}
 	if instance := manager.List()[manifest.Service]; instance == nil || instance.State != StateRecoveryPending {
@@ -70,6 +63,43 @@ func TestClearRecoveryPendingDoesNotReadoptLiveStoppingVM(t *testing.T) {
 	}
 	if launcher.stops != 0 {
 		t.Fatalf("clear operation signalled a live stopping VM %d times", launcher.stops)
+	}
+}
+
+func TestClearRecoveryPendingPreservesDeadStoppingManifest(t *testing.T) {
+	manager, manifest, inspector := recoveryFixture(t)
+	manifest.Lifecycle = lifecycleStopping
+	if err := writeManifest(manifestPath(manifest.VMDir), manifest); err != nil {
+		t.Fatal(err)
+	}
+	manager.inspector = inspector
+	manager.addRecoveryPending(manifest.Service, manifest, "shutdown acknowledgement was interrupted")
+	delete(inspector.identities, manifest.PID)
+	launcher := &recordingLauncher{}
+	manager.launcher = launcher
+
+	result, err := manager.ClearRecoveryPending(manifest.Service)
+	if err == nil || result.Outcome != RecoveryOutcomeAmbiguous || !strings.Contains(err.Error(), "shutdown state is unresolved") {
+		t.Fatalf("dead stopping VM state was cleared: result=%#v err=%v", result, err)
+	}
+	if instance := manager.List()[manifest.Service]; instance == nil || instance.State != StateRecoveryPending {
+		t.Fatalf("dead stopping VM left recovery_pending: %#v", instance)
+	}
+	durable, err := readManifest(manifestPath(manifest.VMDir))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if durable.Lifecycle != lifecycleStopping {
+		t.Fatalf("dead stopping marker was changed: %#v", durable)
+	}
+	if _, err := os.Stat(manifest.VMDir); err != nil {
+		t.Fatalf("dead stopping VM runtime state was removed: %v", err)
+	}
+	if err := manager.Start(context.Background(), manifest.Config); err == nil || !strings.Contains(err.Error(), "ambiguous surviving state") {
+		t.Fatalf("start was not blocked by the retained stopping marker: %v", err)
+	}
+	if launcher.stops != 0 {
+		t.Fatalf("clear operation signalled a stopped VM %d times", launcher.stops)
 	}
 }
 
