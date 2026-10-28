@@ -90,6 +90,15 @@ func (m *memBlob) Delete(_ context.Context, key string) error {
 	return nil
 }
 
+func (m *memBlob) DeleteIfMatch(_ context.Context, key string, expected objectstorage.WriteToken) (bool, error) {
+	if m.tokens[key] != expected {
+		return false, nil
+	}
+	delete(m.objects, key)
+	delete(m.tokens, key)
+	return true, nil
+}
+
 func (m *memBlob) ListKeys(_ context.Context, prefix string) ([]string, error) {
 	var keys []string
 	for key := range m.objects {
@@ -147,6 +156,27 @@ func TestBlobStateStoreConditionalJSON(t *testing.T) {
 	ok, _, err = s.PutJSONIfMatch(ctx, "lease.json", initial, lease{Holder: "stale"})
 	if err != nil || ok {
 		t.Fatalf("stale PutJSONIfMatch = ok %v, err %v", ok, err)
+	}
+}
+
+func TestBlobStateStoreConditionalDelete(t *testing.T) {
+	ctx := context.Background()
+	s := newBlobStateStore(newMemBlob())
+	token, err := s.PutJSON(ctx, "node.json", lease{Holder: "one"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	deleted, err := s.DeleteIfMatch(ctx, "node.json", "stale-token")
+	if err != nil || deleted {
+		t.Fatalf("wrong-token delete = %v, %v; want conflict", deleted, err)
+	}
+	var got lease
+	if _, exists, err := s.GetJSON(ctx, "node.json", &got); err != nil || !exists || got.Holder != "one" {
+		t.Fatalf("wrong-token delete changed object: %#v, exists %v, err %v", got, exists, err)
+	}
+	deleted, err = s.DeleteIfMatch(ctx, "node.json", token)
+	if err != nil || !deleted {
+		t.Fatalf("matching delete = %v, %v", deleted, err)
 	}
 }
 
