@@ -5,6 +5,8 @@ package main
 import (
 	"fmt"
 	"os"
+	"strconv"
+	"strings"
 	"syscall"
 	"time"
 
@@ -115,28 +117,23 @@ func (c *childSupervisor) forwardSignal(sig os.Signal) error {
 		if !c.children {
 			return syscall.ESRCH
 		}
-		return syscall.Kill(-c.pgid, signal)
+		return c.signalApplicationChildren(signal)
 	}
-	if err := syscall.Kill(-c.pgid, signal); err == nil {
-		return nil
-	} else if err != syscall.ESRCH {
-		return err
-	}
-	return syscall.Kill(c.pid, signal)
+	return c.signalApplicationChildren(signal)
 }
 
 func (c *childSupervisor) reapOrphans(signals <-chan os.Signal) {
 	if !c.children {
 		return
 	}
-	if err := syscall.Kill(-c.pgid, syscall.SIGTERM); err != nil && err != syscall.ESRCH {
+	if err := c.signalApplicationChildren(syscall.SIGTERM); err != nil && err != syscall.ESRCH {
 		fmt.Fprintf(os.Stderr, "fc-init: stop orphaned application children: %v\n", err)
 	}
 	if c.waitForNoChildren(signals, time.Second) {
 		return
 	}
 	for c.children {
-		if err := syscall.Kill(-c.pgid, syscall.SIGKILL); err != nil && err != syscall.ESRCH {
+		if err := c.signalApplicationChildren(syscall.SIGKILL); err != nil && err != syscall.ESRCH {
 			fmt.Fprintf(os.Stderr, "fc-init: kill orphaned application children: %v\n", err)
 		}
 		if c.waitForNoChildren(signals, 2*time.Second) {
@@ -144,6 +141,55 @@ func (c *childSupervisor) reapOrphans(signals <-chan os.Signal) {
 		}
 		fmt.Fprintln(os.Stderr, "fc-init: orphaned application children did not exit after SIGKILL; continuing to reap")
 	}
+}
+
+func (c *childSupervisor) signalApplicationChildren(sig syscall.Signal) error {
+	var firstErr error
+	if !c.exited {
+		if err := syscall.Kill(-c.pgid, sig); err != nil && err != syscall.ESRCH {
+			firstErr = err
+		}
+	}
+	for _, pid := range directChildPIDs(os.Getpid()) {
+		if pid == c.pid && c.exited {
+			continue
+		}
+		if err := syscall.Kill(pid, sig); err != nil && err != syscall.ESRCH && firstErr == nil {
+			firstErr = err
+		}
+	}
+	return firstErr
+}
+
+func directChildPIDs(parentPID int) []int {
+	entries, err := os.ReadDir("/proc")
+	if err != nil {
+		return nil
+	}
+	children := make([]int, 0)
+	for _, entry := range entries {
+		pid, err := strconv.Atoi(entry.Name())
+		if err != nil || pid <= 0 || pid == os.Getpid() || !entry.IsDir() {
+			continue
+		}
+		data, err := os.ReadFile("/proc/" + entry.Name() + "/stat")
+		if err != nil {
+			continue
+		}
+		closeParen := strings.LastIndexByte(string(data), ')')
+		if closeParen < 0 {
+			continue
+		}
+		fields := strings.Fields(string(data[closeParen+1:]))
+		if len(fields) < 2 {
+			continue
+		}
+		ppid, err := strconv.Atoi(fields[1])
+		if err == nil && ppid == parentPID {
+			children = append(children, pid)
+		}
+	}
+	return children
 }
 
 func (c *childSupervisor) waitForNoChildren(signals <-chan os.Signal, timeout time.Duration) bool {

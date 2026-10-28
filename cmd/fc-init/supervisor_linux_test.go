@@ -46,8 +46,9 @@ func TestSupervisorChildHelper(t *testing.T) {
 	if os.Getenv("FC_INIT_SUPERVISOR_TEST_HELPER") != "orphan" {
 		return
 	}
-	_, err := syscall.ForkExec("/bin/sh", []string{"sh", "-c", "sleep 0.2"}, &syscall.ProcAttr{
+	_, err := syscall.ForkExec("/bin/sleep", []string{"sleep", "10"}, &syscall.ProcAttr{
 		Env: os.Environ(), Files: []uintptr{os.Stdin.Fd(), os.Stdout.Fd(), os.Stderr.Fd()},
+		Sys: &syscall.SysProcAttr{Setsid: true},
 	})
 	if err != nil {
 		os.Exit(98)
@@ -91,8 +92,15 @@ func TestSupervisorReapsOrphanedApplicationChildren(t *testing.T) {
 	}
 	environment := append(os.Environ(), "FC_INIT_SUPERVISOR_TEST_HELPER=orphan")
 	started := startTestChild(t, bin, []string{bin, "-test.run=^TestSupervisorChildHelper$"}, environment, nil, nil)
-	if code := superviseChild(started.pid, nil, signals, nil, &fakeGuestFilesystem{}); code != 23 {
-		t.Fatalf("application exit code = %d, want 23", code)
+	result := make(chan int, 1)
+	go func() { result <- superviseChild(started.pid, nil, signals, nil, &fakeGuestFilesystem{}) }()
+	select {
+	case code := <-result:
+		if code != 23 {
+			t.Fatalf("application exit code = %d, want 23", code)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("supervisor did not terminate and reap an escaped orphan")
 	}
 	if _, err := syscall.Wait4(-1, nil, syscall.WNOHANG, nil); !errors.Is(err, syscall.ECHILD) {
 		t.Fatalf("orphan children remain unreaped: wait4 error = %v", err)
