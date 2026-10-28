@@ -29,7 +29,8 @@ type Request struct {
 	TimeoutMS uint32 `json:"timeout_ms"`
 }
 
-// MountResult records one persistent mount's outcome in original mount order.
+// MountResult records one persistent mount's outcome in guest unmount order,
+// which is the reverse of the mount order.
 type MountResult struct {
 	Name      string `json:"name"`
 	Path      string `json:"path"`
