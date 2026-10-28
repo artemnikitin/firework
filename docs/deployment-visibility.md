@@ -106,6 +106,28 @@ agent-local `/status` endpoint. It reports agent version, observation time,
 desired/placement/rendered/applied revisions, reconciliation phase, typed
 conditions, and fixed-shape service summaries.
 
+The control plane accepts status schema v1 and v2. V2 adds a separately
+bounded `actual_only_services` list containing every VM manager record that is
+not in the node's desired config. Each entry reports the service name, VM
+state, running PID, and a bounded VM or volume error; actual-only entries do
+not include volume summaries. V2 always sends an explicit list, including
+`[]` when there are no tracked actual-only records. The registry preserves the
+old v1 wire shape and treats its omitted inventory as unknown.
+
+The list is capped at 256 entries. `actual_only_services_truncated: true`
+means the snapshot cannot prove absence. Any listed entry blocks an absence
+claim, including an entry in `failed`, `stopped`, or `recovery_pending`; a
+failure state by itself does not prove that execution has ended. Node detail
+returns the fresh v2 inventory in `actual_only_services` and reports its
+truncation flag.
+
+When a service moves, service detail and `/v1/status` report
+`previous_node_unconfirmed` until the former node freshly reports that it
+observed and applied its explicit empty config and has no actual-only VM
+records. A v1 heartbeat, a truncated v2 inventory, a stale/down node, or a
+retired registry record cannot clear this condition. Registry retirement
+fences later control-plane writes; it does not stop a disconnected VM.
+
 The wire payload accepts at most 16 unique conditions, 256 service summaries,
 and 25 volumes per service. Messages are sanitized and capped at 256
 characters; revisions, names, condition types, reason codes, agent version,

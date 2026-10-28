@@ -32,7 +32,7 @@ func nodeLifecycleState(record NodeRecord, now time.Time, staleTTL time.Duration
 // received within ttl on the registry's own clock. The agent's observed_at is
 // an ordering hint from another machine's clock and does not gate freshness.
 func freshAgentStatus(record NodeRecord, now time.Time, ttl time.Duration) (statusmodel.AgentStatus, bool) {
-	if record.AgentStatus == nil || record.AgentStatus.SchemaVersion != statusmodel.SchemaVersion {
+	if record.AgentStatus == nil || !statusmodel.IsSupportedSchemaVersion(record.AgentStatus.SchemaVersion) {
 		return statusmodel.AgentStatus{}, false
 	}
 	if record.State == NodeStateDown {
@@ -66,7 +66,7 @@ func statusUnavailableReason(record NodeRecord, now time.Time, ttl time.Duration
 		return record.AgentStatusRejected
 	case record.AgentStatus == nil:
 		return "agent_status_missing"
-	case record.AgentStatus.SchemaVersion != statusmodel.SchemaVersion:
+	case !statusmodel.IsSupportedSchemaVersion(record.AgentStatus.SchemaVersion):
 		return agentStatusRejectedUnsupportedSchema
 	default:
 		return "agent_status_stale"

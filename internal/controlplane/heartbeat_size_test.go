@@ -36,17 +36,19 @@ func maximalAgentStatus(nodeID string) *statusmodel.AgentStatus {
 	reason := strings.Repeat("c", statusmodel.MaxReasonCodeLen)
 
 	status := &statusmodel.AgentStatus{
-		SchemaVersion:     statusmodel.SchemaVersion,
-		NodeID:            nodeID,
-		AgentVersion:      strings.Repeat("v", statusmodel.MaxAgentVersionLen),
-		ObservedAt:        time.Now().UTC(),
-		Phase:             statusmodel.PhaseReady,
-		DesiredRevision:   revision,
-		PlacementRevision: revision,
-		ObservedRevision:  revision,
-		AppliedRevision:   revision,
-		ReasonCode:        reason,
-		Message:           wide,
+		SchemaVersion:      statusmodel.SchemaVersion,
+		NodeID:             nodeID,
+		AgentVersion:       strings.Repeat("v", statusmodel.MaxAgentVersionLen),
+		ObservedAt:         time.Now().UTC(),
+		Phase:              statusmodel.PhaseReady,
+		DesiredRevision:    revision,
+		PlacementRevision:  revision,
+		ObservedRevision:   revision,
+		AppliedRevision:    revision,
+		DesiredServices:    statusmodel.MaxServices,
+		ReasonCode:         reason,
+		Message:            wide,
+		ActualOnlyServices: make([]statusmodel.ServiceStatus, 0, statusmodel.MaxActualOnlyServices),
 	}
 	for i := 0; i < statusmodel.MaxConditions; i++ {
 		status.Conditions = append(status.Conditions, statusmodel.Condition{
@@ -88,6 +90,16 @@ func maximalAgentStatus(nodeID string) *statusmodel.AgentStatus {
 			})
 		}
 		status.Services = append(status.Services, service)
+	}
+	for i := 0; i < statusmodel.MaxActualOnlyServices; i++ {
+		status.ActualOnlyServices = append(status.ActualOnlyServices, statusmodel.ServiceStatus{
+			Name:    uniqueAtCap(i, statusmodel.MaxServiceNameLen-1) + "a",
+			VMState: longestVMState, Health: longestHealthState,
+			HealthCheckType: strings.Repeat("k", statusmodel.MaxEnumLen),
+			NetworkAddress:  strings.Repeat("n", statusmodel.MaxNetworkAddressLen),
+			PID:             int(^uint(0) >> 1), RestartCount: int(^uint(0) >> 1), HealthFailures: int(^uint(0) >> 1),
+			ReasonCode: reason, Message: wide,
+		})
 	}
 	return status
 }
@@ -175,13 +187,15 @@ func TestMaxRegistryRequestBytesThroughAgentStatusPath(t *testing.T) {
 	maxMountPath := "/" + strings.Repeat("m", statusmodel.MaxMountPathLen-1)
 
 	status := &statusmodel.AgentStatus{
-		SchemaVersion: statusmodel.SchemaVersion,
-		NodeID:        nodeID,
-		AgentVersion:  strings.Repeat("v", statusmodel.MaxAgentVersionLen),
-		ObservedAt:    time.Now().UTC(),
-		Phase:         statusmodel.PhaseReady,
-		ReasonCode:    reason,
-		Message:       wide,
+		SchemaVersion:      statusmodel.SchemaVersion,
+		NodeID:             nodeID,
+		AgentVersion:       strings.Repeat("v", statusmodel.MaxAgentVersionLen),
+		ObservedAt:         time.Now().UTC(),
+		Phase:              statusmodel.PhaseReady,
+		DesiredServices:    statusmodel.MaxServices,
+		ReasonCode:         reason,
+		Message:            wide,
+		ActualOnlyServices: []statusmodel.ServiceStatus{},
 	}
 	for i := 0; i < statusmodel.MaxConditions; i++ {
 		status.Conditions = append(status.Conditions, statusmodel.Condition{

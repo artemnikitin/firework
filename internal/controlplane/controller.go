@@ -220,11 +220,24 @@ func (c *Controller) runReconcile(ctx context.Context) {
 	// once this cycle completes.
 	c.lastInputSignature = ""
 
-	existingPlacement, placementFound, err := c.readExistingPlacement(ctx)
+	existingPlacementRevision, placementFound, err := c.readExistingPlacementRevision(ctx)
 	if err != nil {
-		c.logger.Warn("reading existing placement failed; will re-place all", "error", err)
-		existingPlacement = nil
+		c.logger.Error("reading existing placement failed; not publishing a replacement", "error", err)
+		return
 	}
+	if !placementFound {
+		var pointer RevisionPointer
+		_, pointerExists, pointerErr := c.store.GetJSON(ctx, placementCurrentKey(c.cfg.State.Prefix), &pointer)
+		if pointerErr != nil {
+			c.logger.Error("reading placement pointer failed; not publishing a replacement", "error", pointerErr)
+			return
+		}
+		if pointerExists {
+			c.logger.Error("placement pointer targets missing state; not publishing a replacement", "revision", pointer.Revision)
+			return
+		}
+	}
+	existingPlacement := placementServices(existingPlacementRevision)
 	// A held service is one already running that must keep running, and the
 	// prior placement is the only source for where. Without it the service
 	// would be classified as never-placed and left pending, which drops it
@@ -262,6 +275,11 @@ func (c *Controller) runReconcile(ctx context.Context) {
 
 	nodeConfigs := scheduler.BuildNodeConfigs(assignments)
 	nodeConfigs = appendRetiredNodeConfigs(nodeConfigs, activeNodes)
+	previousOwners, err := c.buildUnconfirmedPreviousOwners(ctx, existingPlacementRevision, desired.Services, nodeConfigs)
+	if err != nil {
+		c.logger.Error("preserving previous placement ownership failed; not publishing", "error", err)
+		return
+	}
 	if err := c.createAssignedVolumeRecords(ctx, nodeConfigs, volumeRecords); err != nil {
 		c.logger.Warn("creating volume records conflicted; retrying on next tick", "error", err)
 		return
@@ -283,11 +301,12 @@ func (c *Controller) runReconcile(ctx context.Context) {
 		tombstones[i].config.RenderedRevision = renderRev
 	}
 	placementRev := PlacementRevision{
-		Revision:        placementID,
-		DesiredRevision: desired.Revision,
-		LeaderEpoch:     c.epoch,
-		CreatedAt:       time.Now().UTC(),
-		NodeConfigs:     nodeConfigs,
+		Revision:            placementID,
+		DesiredRevision:     desired.Revision,
+		LeaderEpoch:         c.epoch,
+		CreatedAt:           time.Now().UTC(),
+		NodeConfigs:         nodeConfigs,
+		UnconfirmedPrevious: previousOwners,
 	}
 	for _, item := range pending {
 		placementRev.PendingServices = append(placementRev.PendingServices, PendingPlacement{
@@ -452,25 +471,45 @@ type renderedPlacement struct {
 // requires a held service — which requires a retained volume record, which a
 // cluster that has never placed anything does not have.
 func (c *Controller) readExistingPlacement(ctx context.Context) (placement map[string]renderedPlacement, found bool, err error) {
-	var ptr RevisionPointer
-	_, exists, err := c.store.GetJSON(ctx, placementCurrentKey(c.cfg.State.Prefix), &ptr)
-	if err != nil || !exists || ptr.Revision == "" {
+	rev, found, err := c.readExistingPlacementRevision(ctx)
+	if err != nil || !found {
 		return nil, false, err
 	}
+	return placementServices(rev), true, nil
+}
 
-	var rev PlacementRevision
-	_, exists, err = c.store.GetJSON(ctx, placementRevisionKey(c.cfg.State.Prefix, ptr.Revision), &rev)
-	if err != nil || !exists {
-		return nil, false, err
-	}
-
-	placement = make(map[string]renderedPlacement)
+func placementServices(rev PlacementRevision) map[string]renderedPlacement {
+	placement := make(map[string]renderedPlacement)
 	for _, nc := range rev.NodeConfigs {
 		for _, svc := range nc.Services {
 			placement[svc.Name] = renderedPlacement{Node: nc.Node, Service: svc}
 		}
 	}
-	return placement, true, nil
+	return placement
+}
+
+func (c *Controller) readExistingPlacementRevision(ctx context.Context) (PlacementRevision, bool, error) {
+	var ptr RevisionPointer
+	_, exists, err := c.store.GetJSON(ctx, placementCurrentKey(c.cfg.State.Prefix), &ptr)
+	if err != nil || !exists {
+		return PlacementRevision{}, false, err
+	}
+	if ptr.Revision == "" {
+		return PlacementRevision{}, false, fmt.Errorf("placement pointer has an empty revision")
+	}
+
+	var rev PlacementRevision
+	_, exists, err = c.store.GetJSON(ctx, placementRevisionKey(c.cfg.State.Prefix, ptr.Revision), &rev)
+	if err != nil {
+		return PlacementRevision{}, false, err
+	}
+	if !exists {
+		return PlacementRevision{}, false, nil
+	}
+	if rev.Revision != ptr.Revision {
+		return PlacementRevision{}, false, fmt.Errorf("placement pointer targets a mismatched revision %q", ptr.Revision)
+	}
+	return rev, true, nil
 }
 
 // splitHeldServices separates the services that can be scheduled from their
@@ -623,7 +662,7 @@ func (c *Controller) publishPlacement(ctx context.Context, placement PlacementRe
 	if _, err := c.store.PutJSON(ctx, revKey, placement); err != nil {
 		return err
 	}
-	return upsertPointer(ctx, c.store, placementCurrentKey(c.cfg.State.Prefix), placement.Revision)
+	return upsertPlacementPointer(ctx, c.store, placementCurrentKey(c.cfg.State.Prefix), placement.Revision)
 }
 
 // publishRendered writes the immutable rendered revision and the current

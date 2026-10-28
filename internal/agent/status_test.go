@@ -1,6 +1,7 @@
 package agent
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 
@@ -120,6 +121,44 @@ func TestFailedVMNamesFrom(t *testing.T) {
 	})
 	if len(got) != 2 || got[0] != "batch" || got[1] != "web" {
 		t.Fatalf("expected the failed VMs in sorted order, got %#v", got)
+	}
+}
+
+func TestBuildActualOnlyServiceStatusesIncludesEveryTrackedNonDesiredVM(t *testing.T) {
+	instances := map[string]*vm.Instance{
+		"api":   {Name: "api", State: vm.StateRunning, PID: 1234},
+		"batch": {Name: "batch", State: vm.StateFailed, LastError: "child exited"},
+		"db":    {Name: "db", State: vm.StateRunning, PID: 5678},
+		"nil":   nil,
+	}
+	got, truncated := buildActualOnlyServiceStatuses(instances, map[string]struct{}{"db": {}}, map[string]string{
+		"api": strings.Repeat("volume failed ", 40),
+	})
+	if truncated || len(got) != 2 || got[0].Name != "api" || got[1].Name != "batch" {
+		t.Fatalf("actual-only inventory = %#v, truncated=%v", got, truncated)
+	}
+	if got[0].VMState != string(vm.StateRunning) || got[0].PID != 1234 || got[0].ReasonCode != "volume_failed" || len(got[0].Message) > statusmodel.MaxMessageLen {
+		t.Fatalf("running actual-only entry lost bounded volume error or identity: %+v", got[0])
+	}
+	if got[1].VMState != string(vm.StateFailed) || got[1].ReasonCode != "vm_failed" || got[1].Message != "child exited" {
+		t.Fatalf("failed actual-only entry lost execution state: %+v", got[1])
+	}
+}
+
+func TestBuildActualOnlyServiceStatusesMarksTruncationIncomplete(t *testing.T) {
+	instances := make(map[string]*vm.Instance, statusmodel.MaxActualOnlyServices+1)
+	for i := 0; i < statusmodel.MaxActualOnlyServices+1; i++ {
+		name := fmt.Sprintf("service-%04d", i)
+		instances[name] = &vm.Instance{Name: name, State: vm.StateStopped}
+	}
+	got, truncated := buildActualOnlyServiceStatuses(instances, nil, nil)
+	if !truncated || len(got) != statusmodel.MaxActualOnlyServices {
+		t.Fatalf("actual-only inventory count=%d truncated=%v", len(got), truncated)
+	}
+	if statusmodel.HasCompleteActualOnlyInventory(statusmodel.AgentStatus{
+		SchemaVersion: statusmodel.SchemaVersion, ActualOnlyServices: got, ActualOnlyServicesTruncated: truncated,
+	}) {
+		t.Fatal("truncated actual-only inventory was treated as proof of absence")
 	}
 }
 

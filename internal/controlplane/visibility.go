@@ -18,17 +18,20 @@ import (
 )
 
 type visibilitySnapshot struct {
-	now                time.Time
-	staleTTL           time.Duration
-	nodes              []NodeRecord
-	desired            DesiredRevision
-	placement          PlacementRevision
-	renderedRevision   string
-	placementCurrent   bool
-	placementByService map[string]placedService
-	nodeByID           map[string]NodeRecord
-	pendingByService   map[string]PendingPlacement
-	volumeByID         map[string]VolumeRecord
+	now                      time.Time
+	staleTTL                 time.Duration
+	nodes                    []NodeRecord
+	desired                  DesiredRevision
+	placement                PlacementRevision
+	previousPlacement        PlacementRevision
+	previousPlacementUnknown bool
+	renderedRevision         string
+	placementCurrent         bool
+	placementByService       map[string]placedService
+	nodeByID                 map[string]NodeRecord
+	pendingByService         map[string]PendingPlacement
+	volumeByID               map[string]VolumeRecord
+	emptyNodeConfigs         map[string]config.NodeConfig
 	// problems lists records left out because they could not be read or
 	// interpreted; one bad record degrades the projection instead of failing
 	// every endpoint.
@@ -111,6 +114,10 @@ func (s *VisibilityService) Node(ctx context.Context, nodeID string) (operatorap
 		detail.Reconciliation = string(status.Phase)
 		detail.Message = status.Message
 		detail.Conditions = toOperatorConditions(status.Conditions)
+		if status.SchemaVersion == statusmodel.SchemaVersion {
+			detail.ActualOnlyServices = toOperatorActualOnlyServices(status.ActualOnlyServices)
+			detail.ActualOnlyServicesTruncated = status.ActualOnlyServicesTruncated
+		}
 	}
 	for _, desired := range snapshot.desired.Services {
 		placed, exists := snapshot.placementByService[desired.Name]
@@ -121,6 +128,17 @@ func (s *VisibilityService) Node(ctx context.Context, nodeID string) (operatorap
 	}
 	sort.Slice(detail.Services, func(i, j int) bool { return detail.Services[i].Name < detail.Services[j].Name })
 	return detail, true, nil
+}
+
+func toOperatorActualOnlyServices(services []statusmodel.ServiceStatus) []operatorapi.ActualOnlyService {
+	out := make([]operatorapi.ActualOnlyService, len(services))
+	for i, service := range services {
+		out[i] = operatorapi.ActualOnlyService{
+			Name: service.Name, VMState: service.VMState, PID: service.PID,
+			ReasonCode: service.ReasonCode, Message: service.Message,
+		}
+	}
+	return out
 }
 
 func (s *VisibilityService) Services(ctx context.Context, stateFilter, healthFilter, nodeFilter string) (operatorapi.ListEnvelope[operatorapi.ServiceSummary], error) {
@@ -451,7 +469,7 @@ func (s *VisibilityService) build(ctx context.Context) (visibilitySnapshot, erro
 	s.builds++
 	s.mu.Unlock()
 	now := time.Now().UTC()
-	snapshot := visibilitySnapshot{now: now, staleTTL: s.cfg.NodeStaleTTL, placementByService: make(map[string]placedService), nodeByID: make(map[string]NodeRecord), pendingByService: make(map[string]PendingPlacement), volumeByID: make(map[string]VolumeRecord)}
+	snapshot := visibilitySnapshot{now: now, staleTTL: s.cfg.NodeStaleTTL, placementByService: make(map[string]placedService), nodeByID: make(map[string]NodeRecord), pendingByService: make(map[string]PendingPlacement), volumeByID: make(map[string]VolumeRecord), emptyNodeConfigs: make(map[string]config.NodeConfig)}
 	keys, err := s.store.ListKeys(ctx, registryNodesPrefix(s.cfg.State.Prefix))
 	if err != nil {
 		return snapshot, fmt.Errorf("listing nodes: %w", err)
@@ -483,10 +501,34 @@ func (s *VisibilityService) build(ctx context.Context) (visibilitySnapshot, erro
 	}); err != nil {
 		return snapshot, fmt.Errorf("reading desired state: %w", err)
 	}
-	if err := loadCurrentRevision(ctx, s.store, placementCurrentKey(s.cfg.State.Prefix), func(revision string) (string, any) {
-		return placementRevisionKey(s.cfg.State.Prefix, revision), &snapshot.placement
-	}); err != nil {
-		return snapshot, fmt.Errorf("reading placement state: %w", err)
+	var placementPointer RevisionPointer
+	_, placementPointerExists, err := s.store.GetJSON(ctx, placementCurrentKey(s.cfg.State.Prefix), &placementPointer)
+	if err != nil {
+		return snapshot, fmt.Errorf("reading placement pointer: %w", err)
+	}
+	if placementPointerExists {
+		if placementPointer.Revision == "" {
+			return snapshot, fmt.Errorf("placement pointer has an empty revision")
+		}
+		_, exists, err := s.store.GetJSON(ctx, placementRevisionKey(s.cfg.State.Prefix, placementPointer.Revision), &snapshot.placement)
+		if err != nil {
+			return snapshot, fmt.Errorf("reading placement revision: %w", err)
+		}
+		if !exists || snapshot.placement.Revision != placementPointer.Revision {
+			return snapshot, fmt.Errorf("placement pointer targets a missing or mismatched revision %q", placementPointer.Revision)
+		}
+		if placementPointer.PreviousRevision != "" && placementPointer.PreviousRevision != placementPointer.Revision {
+			_, exists, err = s.store.GetJSON(ctx, placementRevisionKey(s.cfg.State.Prefix, placementPointer.PreviousRevision), &snapshot.previousPlacement)
+			if err != nil || !exists || snapshot.previousPlacement.Revision != placementPointer.PreviousRevision {
+				if scanInterrupted(ctx, err) {
+					return snapshot, fmt.Errorf("reading previous placement revision: %w", err)
+				}
+				snapshot.previousPlacementUnknown = true
+				snapshot.problems = append(snapshot.problems, operatorapi.ProjectionProblem{
+					Kind: "placement_history", ID: projectionID(placementPointer.PreviousRevision), ReasonCode: "record_unreadable",
+				})
+			}
+		}
 	}
 	var rendered RevisionPointer
 	_, exists, err := s.store.GetJSON(ctx, renderedCurrentKey(s.cfg.State.Prefix), &rendered)
@@ -532,6 +574,20 @@ func (s *VisibilityService) build(ctx context.Context) (visibilitySnapshot, erro
 			for _, service := range node.Services {
 				snapshot.placementByService[service.Name] = placedService{node: node, config: service}
 			}
+		}
+	}
+	previousNodes := make(map[string]struct{})
+	for _, node := range snapshot.previousPlacement.NodeConfigs {
+		if len(node.Services) > 0 {
+			previousNodes[node.Node] = struct{}{}
+		}
+	}
+	for _, owner := range snapshot.placement.UnconfirmedPrevious {
+		previousNodes[owner.Node] = struct{}{}
+	}
+	for nodeID := range previousNodes {
+		if nodeConfig, ok := readExplicitEmptyNodeConfig(ctx, s.store, s.cfg.State.Prefix, nodeID); ok {
+			snapshot.emptyNodeConfigs[nodeID] = nodeConfig
 		}
 	}
 	sort.Slice(snapshot.desired.Services, func(i, j int) bool { return snapshot.desired.Services[i].Name < snapshot.desired.Services[j].Name })
@@ -688,8 +744,12 @@ func (s visibilitySnapshot) statusObservedCurrent(status statusmodel.AgentStatus
 func (s visibilitySnapshot) revisionStatus() operatorapi.RevisionStatus {
 	status := s.nodeRevisionStatus()
 	status.UnhealthyServices = []string{}
+	status.PreviousNodeUnconfirmedServices = []string{}
 	for _, desired := range s.desired.Services {
 		summary := s.serviceSummary(desired)
+		if summary.PreviousNodeUnconfirmed {
+			status.PreviousNodeUnconfirmedServices = append(status.PreviousNodeUnconfirmedServices, desired.Name)
+		}
 		status.Services.Desired++
 		switch summary.State {
 		case "running":
@@ -708,11 +768,16 @@ func (s visibilitySnapshot) revisionStatus() operatorapi.RevisionStatus {
 		}
 	}
 	sort.Strings(status.UnhealthyServices)
+	sort.Strings(status.PreviousNodeUnconfirmedServices)
 	status.Problems = s.problems
 	if status.Phase != "converged" {
 		return status
 	}
 	switch {
+	case len(status.PreviousNodeUnconfirmedServices) > 0:
+		status.Phase = "degraded"
+		status.ReasonCode = "previous_node_unconfirmed"
+		status.Message = statusmodel.BoundedMessage("possible old executions remain for: " + strings.Join(status.PreviousNodeUnconfirmedServices, ", "))
 	case status.Services.Unhealthy > 0:
 		status.Phase = "degraded"
 		status.ReasonCode = "service_unhealthy"
@@ -880,7 +945,8 @@ func (s visibilitySnapshot) nodeRevisionStatus() operatorapi.RevisionStatus {
 			continue
 		}
 		agentStatus, fresh := s.freshStatus(record)
-		if !fresh || agentStatus.ServicesTruncated {
+		if !fresh || agentStatus.ServicesTruncated ||
+			(agentStatus.SchemaVersion == statusmodel.SchemaVersion && !statusmodel.HasCompleteActualOnlyInventory(agentStatus)) {
 			status.UnknownNodes = append(status.UnknownNodes, nodeID)
 			continue
 		}
@@ -1040,13 +1106,41 @@ func (s visibilitySnapshot) serviceSummary(desired config.ServiceConfig) operato
 		reason = "placement_pending"
 	}
 	summary := operatorapi.ServiceSummary{Name: desired.Name, State: "pending", Health: "unknown", VCPUs: desired.VCPUs, MemoryMB: desired.MemoryMB, Storage: summarizeServiceStorage(s.serviceVolumeStatuses(desired)), ReasonCode: reason}
+	placed, hasCurrentPlacement := s.placementByService[desired.Name]
+	currentNode := ""
+	if hasCurrentPlacement {
+		currentNode = placed.node.Node
+	}
+	previousNodes := s.unconfirmedPreviousNodes(desired.Name, currentNode)
+	finish := func() operatorapi.ServiceSummary {
+		if len(previousNodes) > 0 || s.previousPlacementUnknown {
+			summary.PreviousNodeUnconfirmed = true
+			summary.PreviousNodes = previousNodes
+			if summary.ReasonCode == "" || summary.State == "running" || summary.State == "pending" ||
+				summary.ReasonCode == "agent_status_missing" || summary.ReasonCode == "service_status_missing" ||
+				summary.ReasonCode == "agent_status_revision_mismatch" {
+				summary.ReasonCode = "previous_node_unconfirmed"
+			}
+			message := "previous node execution has not been confirmed absent"
+			if len(previousNodes) > 0 {
+				message += ": " + strings.Join(previousNodes, ", ")
+			}
+			if s.previousPlacementUnknown && len(previousNodes) == 0 {
+				message = "previous placement could not be read, so prior execution cannot be ruled out"
+			}
+			if summary.Message != "" && summary.Message != message {
+				message = summary.Message + "; " + message
+			}
+			summary.Message = statusmodel.BoundedMessage(message)
+		}
+		return summary
+	}
 	if pending, ok := s.pendingByService[desired.Name]; ok && s.placementCurrent {
 		summary.ReasonCode = pending.ReasonCode
 		summary.Message = pending.Message
 	}
-	placed, ok := s.placementByService[desired.Name]
-	if !ok {
-		return summary
+	if !hasCurrentPlacement {
+		return finish()
 	}
 	summary.Node = placed.node.Node
 	summary.State = "unknown"
@@ -1054,22 +1148,22 @@ func (s visibilitySnapshot) serviceSummary(desired config.ServiceConfig) operato
 	record, exists := s.nodeByID[placed.node.Node]
 	if !exists {
 		summary.ReasonCode = "node_missing"
-		return summary
+		return finish()
 	}
 	if record.State == NodeStateDown {
 		summary.ReasonCode = "node_down"
-		return summary
+		return finish()
 	}
 	status, current := s.currentStatus(record)
 	if !current {
 		if record.LastSeenAt.IsZero() || s.now.Sub(record.LastSeenAt) > s.staleTTL {
 			summary.ReasonCode = "node_stale"
-			return summary
+			return finish()
 		}
 		stale, fresh := s.freshStatus(record)
 		if !fresh {
 			summary.ReasonCode = statusUnavailableReason(record, s.now, s.staleTTL)
-			return summary
+			return finish()
 		}
 		// The node has not applied the current revision, which the reason code
 		// keeps saying. Its per-service observations are still fresh and
@@ -1077,14 +1171,14 @@ func (s visibilitySnapshot) serviceSummary(desired config.ServiceConfig) operato
 		// every service on the node because one of them cannot converge.
 		summary.ReasonCode = "agent_status_revision_mismatch"
 		if !s.statusObservedCurrent(stale) {
-			return summary
+			return finish()
 		}
 		if actual, exists := findAgentService(stale, desired.Name); exists {
 			summary.ObservedAt = stale.ObservedAt
 			applyAgentServiceState(&summary, actual)
 			summary.Message = actual.Message
 		}
-		return summary
+		return finish()
 	}
 	summary.ObservedAt = status.ObservedAt
 	actual, exists := findAgentService(status, desired.Name)
@@ -1095,7 +1189,53 @@ func (s visibilitySnapshot) serviceSummary(desired config.ServiceConfig) operato
 	applyAgentServiceState(&summary, actual)
 	summary.ReasonCode = actual.ReasonCode
 	summary.Message = actual.Message
-	return summary
+	return finish()
+}
+
+func (s visibilitySnapshot) unconfirmedPreviousNodes(service, currentNode string) []string {
+	nodes := make(map[string]struct{})
+	if !s.previousPlacementUnknown {
+		for _, node := range s.previousPlacement.NodeConfigs {
+			for _, placed := range node.Services {
+				if placed.Name == service && node.Node != currentNode {
+					nodes[node.Node] = struct{}{}
+				}
+			}
+		}
+	}
+	for _, owner := range s.placement.UnconfirmedPrevious {
+		if owner.Service == service && owner.Node != currentNode {
+			nodes[owner.Node] = struct{}{}
+		}
+	}
+	for nodeID := range nodes {
+		if s.previousNodeConfirmedEmpty(nodeID) {
+			delete(nodes, nodeID)
+		}
+	}
+	out := make([]string, 0, len(nodes))
+	for nodeID := range nodes {
+		out = append(out, nodeID)
+	}
+	sort.Strings(out)
+	return out
+}
+
+func (s visibilitySnapshot) previousNodeConfirmedEmpty(nodeID string) bool {
+	record, exists := s.nodeByID[nodeID]
+	if !exists {
+		return false
+	}
+	status, fresh := s.freshStatus(record)
+	nodeConfig, configExists := s.emptyNodeConfigs[nodeID]
+	return fresh && configExists && statusmodel.HasCompleteActualOnlyInventory(status) &&
+		status.NodeID == nodeID &&
+		!status.ServicesTruncated && status.DesiredServices == 0 && status.ReadyServices == 0 &&
+		len(status.Services) == 0 && len(status.ActualOnlyServices) == 0 &&
+		status.DesiredRevision == nodeConfig.DesiredRevision &&
+		status.PlacementRevision == nodeConfig.PlacementRevision &&
+		status.ObservedRevision == nodeConfig.RenderedRevision &&
+		status.AppliedRevision == nodeConfig.RenderedRevision
 }
 
 // applyAgentServiceState copies an agent's per-service observation into a

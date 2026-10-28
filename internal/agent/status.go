@@ -274,7 +274,9 @@ func (a *Agent) refreshAgentStatus(phase statusmodel.Phase, code, message string
 
 	services := make([]statusmodel.ServiceStatus, 0, len(a.statusServices))
 	ready := 0
+	desiredNames := make(map[string]struct{}, len(a.statusServices))
 	for _, desired := range a.statusServices {
+		desiredNames[desired.Name] = struct{}{}
 		service := statusmodel.ServiceStatus{Name: desired.Name, VMState: "unknown", Health: "unknown"}
 		if desired.Network != nil {
 			service.NetworkAddress = desired.Network.GuestIP
@@ -349,6 +351,13 @@ func (a *Agent) refreshAgentStatus(phase statusmodel.Phase, code, message string
 	if servicesTruncated {
 		services = services[:statusmodel.MaxServices]
 	}
+	volumeErrors := make(map[string]string)
+	for name := range instances {
+		if volumeError := a.vmManager.VolumeError(name); volumeError != "" {
+			volumeErrors[name] = volumeError
+		}
+	}
+	actualOnly, actualOnlyTruncated := buildActualOnlyServiceStatuses(instances, desiredNames, volumeErrors)
 
 	a.currentStatus.SchemaVersion = statusmodel.SchemaVersion
 	a.currentStatus.AgentVersion = version.Version
@@ -361,6 +370,43 @@ func (a *Agent) refreshAgentStatus(phase statusmodel.Phase, code, message string
 	a.currentStatus.ReasonCode = code
 	a.currentStatus.Message = statusmodel.BoundedMessage(message)
 	a.currentStatus.Services = services
+	a.currentStatus.ActualOnlyServices = actualOnly
+	a.currentStatus.ActualOnlyServicesTruncated = actualOnlyTruncated
+}
+
+func buildActualOnlyServiceStatuses(instances map[string]*vm.Instance, desiredNames map[string]struct{}, volumeErrors map[string]string) ([]statusmodel.ServiceStatus, bool) {
+	actualOnly := make([]statusmodel.ServiceStatus, 0, len(instances))
+	for name, instance := range instances {
+		if instance == nil {
+			continue
+		}
+		if _, desired := desiredNames[name]; desired {
+			continue
+		}
+		service := statusmodel.ServiceStatus{Name: name, VMState: string(instance.State), Health: "unknown"}
+		if instance.State == vm.StateRunning {
+			service.PID = instance.PID
+		}
+		switch instance.State {
+		case vm.StateFailed:
+			service.ReasonCode = "vm_failed"
+			service.Message = statusmodel.BoundedMessage(instance.LastError)
+		case vm.StateRecoveryPending:
+			service.ReasonCode = "vm_recovery_pending"
+			service.Message = statusmodel.BoundedMessage(instance.LastError)
+		}
+		if volumeError := volumeErrors[name]; volumeError != "" {
+			service.ReasonCode = "volume_failed"
+			service.Message = statusmodel.BoundedMessage(volumeError)
+		}
+		actualOnly = append(actualOnly, service)
+	}
+	sort.Slice(actualOnly, func(i, j int) bool { return actualOnly[i].Name < actualOnly[j].Name })
+	truncated := len(actualOnly) > statusmodel.MaxActualOnlyServices
+	if truncated {
+		actualOnly = actualOnly[:statusmodel.MaxActualOnlyServices]
+	}
+	return actualOnly, truncated
 }
 
 // BuildVolumeStatuses builds the reported volume statuses for a service from
@@ -430,6 +476,7 @@ func (a *Agent) agentStatusSnapshot() statusmodel.AgentStatus {
 	out := a.currentStatus
 	out.Conditions = append([]statusmodel.Condition(nil), a.currentStatus.Conditions...)
 	out.Services = append([]statusmodel.ServiceStatus(nil), a.currentStatus.Services...)
+	out.ActualOnlyServices = append(make([]statusmodel.ServiceStatus, 0, len(a.currentStatus.ActualOnlyServices)), a.currentStatus.ActualOnlyServices...)
 	return out
 }
 
