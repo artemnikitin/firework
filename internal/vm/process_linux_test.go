@@ -109,3 +109,29 @@ func TestInspectReportsZombieProcessAsNotFound(t *testing.T) {
 		t.Fatalf("Inspect(zombie pid %d) = %v, want errProcessNotFound", pid, err)
 	}
 }
+
+func TestReadProcessCommandLineFailsClosedForUnreadableLiveEntry(t *testing.T) {
+	info, err := os.Stat(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = readProcessCommandLineWith("/proc/123", func(string) ([]byte, error) {
+		return nil, os.ErrPermission
+	}, func(string) (os.FileInfo, error) {
+		return info, nil
+	})
+	if !errors.Is(err, os.ErrPermission) {
+		t.Fatalf("unreadable live process command line error = %v, want permission error", err)
+	}
+}
+
+func TestReadProcessCommandLineSkipsOnlyVanishedEntry(t *testing.T) {
+	_, err := readProcessCommandLineWith("/proc/123", func(string) ([]byte, error) {
+		return nil, os.ErrNotExist
+	}, func(string) (os.FileInfo, error) {
+		return nil, os.ErrNotExist
+	})
+	if !errors.Is(err, errProcessNotFound) {
+		t.Fatalf("vanished process error = %v, want errProcessNotFound", err)
+	}
+}

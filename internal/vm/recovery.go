@@ -294,19 +294,26 @@ func (m *Manager) addRecoveryPending(name string, manifest *instanceManifest, re
 	m.mu.Lock()
 	m.instances[name] = instanceFromManifest(manifest, StateRecoveryPending, reason)
 	m.mu.Unlock()
-	m.logger.Error("VM recovery requires operator intervention", "service", name, "error", reason)
+	m.logger.Error("VM recovery requires operator intervention",
+		"service", name, "error", reason, "command", "firework-agent clear-recovery <service>")
 }
 
 func (m *Manager) markExistingRecoveryPending(name, reason string) {
 	m.mu.Lock()
-	defer m.mu.Unlock()
+	found := false
 	if instance := m.instances[name]; instance != nil {
+		found = true
 		instance.State = StateRecoveryPending
 		instance.LastError = reason
 		if instance.manifest != nil {
 			instance.manifest.LastError = reason
 			_ = writeManifest(manifestPath(instance.manifest.VMDir), instance.manifest)
 		}
+	}
+	m.mu.Unlock()
+	if found {
+		m.logger.Error("VM recovery requires operator intervention",
+			"service", name, "error", reason, "command", "firework-agent clear-recovery <service>")
 	}
 }
 
@@ -330,36 +337,51 @@ func (m *Manager) monitorAdopted(name, instanceID string) {
 		if err == nil {
 			continue
 		}
-		m.mu.Lock()
-		current := m.instances[name]
-		active := current != nil && current.instanceID == instanceID && current.State == StateRunning
-		var currentManifest *instanceManifest
-		if active {
-			currentManifest = current.manifest
-		}
-		m.mu.Unlock()
-		if !active {
-			return
-		}
 		if !errors.Is(err, errProcessNotFound) {
-			m.quarantine(name, currentManifest, fmt.Errorf("process identity changed while monitoring: %w", err))
+			m.quarantineIfCurrent(name, instance, instanceID,
+				fmt.Errorf("process identity changed while monitoring: %w", err))
 			return
 		}
 
 		m.mu.Lock()
-		instance = m.instances[name]
-		if instance == nil || instance.instanceID != instanceID || instance.State != StateRunning {
+		current := m.instances[name]
+		if current != instance || current == nil || current.instanceID != instanceID || current.State != StateRunning {
 			m.mu.Unlock()
 			return
 		}
-		instance.State = StateFailed
-		instance.PID = 0
-		instance.LastError = "adopted Firecracker process exited"
-		instance.manifest.PID = 0
-		instance.manifest.Lifecycle = lifecycleFailed
-		instance.manifest.LastError = instance.LastError
-		_ = writeManifest(manifestPath(instance.manifest.VMDir), instance.manifest)
+		current.State = StateFailed
+		current.PID = 0
+		current.LastError = "adopted Firecracker process exited"
+		if current.manifest != nil {
+			current.manifest.PID = 0
+			current.manifest.Lifecycle = lifecycleFailed
+			current.manifest.LastError = current.LastError
+			if err := writeManifest(manifestPath(current.manifest.VMDir), current.manifest); err != nil {
+				m.logger.Error("failed to persist exited adopted VM state", "service", name, "error", err)
+			}
+		}
 		m.mu.Unlock()
 		return
 	}
+}
+
+func (m *Manager) quarantineIfCurrent(name string, expected *Instance, instanceID string, reason error) bool {
+	m.mu.Lock()
+	instance := m.instances[name]
+	if instance != expected || instance == nil || instance.instanceID != instanceID || instance.State != StateRunning {
+		m.mu.Unlock()
+		return false
+	}
+	if instance.manifest != nil {
+		instance.manifest.LastError = reason.Error()
+		if err := writeManifest(manifestPath(instance.manifest.VMDir), instance.manifest); err != nil {
+			reason = fmt.Errorf("%w; persisting quarantine state: %v", reason, err)
+		}
+	}
+	instance.State = StateRecoveryPending
+	instance.LastError = reason.Error()
+	m.mu.Unlock()
+	m.logger.Error("VM recovery requires operator intervention",
+		"service", name, "error", reason, "command", "firework-agent clear-recovery <service>")
+	return true
 }

@@ -92,21 +92,44 @@ func (inspector osProcessInspector) FindByArguments(socketPath, configPath strin
 		if err != nil {
 			continue
 		}
-		cmdline, err := os.ReadFile(filepath.Join("/proc", entry.Name(), "cmdline"))
+		procDir := filepath.Join("/proc", entry.Name())
+		args, err := readProcessCommandLine(procDir)
 		if err != nil {
-			continue
+			if errors.Is(err, errProcessNotFound) {
+				continue
+			}
+			return nil, fmt.Errorf("inspect process %d command line: %w", pid, err)
 		}
-		args := strings.Split(strings.TrimSuffix(string(cmdline), "\x00"), "\x00")
 		if !hasExactArgument(args, "--api-sock", socketPath) || !hasExactArgument(args, "--config-file", configPath) {
 			continue
 		}
 		identity, err := inspector.Inspect(pid)
 		if err != nil {
+			if errors.Is(err, errProcessNotFound) {
+				continue
+			}
 			return nil, fmt.Errorf("inspect matching process %d: %w", pid, err)
 		}
 		matches = append(matches, identity)
 	}
 	return matches, nil
+}
+
+func readProcessCommandLine(procDir string) ([]string, error) {
+	return readProcessCommandLineWith(procDir, os.ReadFile, os.Stat)
+}
+
+func readProcessCommandLineWith(procDir string, readFile func(string) ([]byte, error), stat func(string) (os.FileInfo, error)) ([]string, error) {
+	cmdline, err := readFile(filepath.Join(procDir, "cmdline"))
+	if err != nil {
+		if _, statErr := stat(procDir); errors.Is(statErr, os.ErrNotExist) {
+			return nil, errProcessNotFound
+		} else if statErr != nil {
+			return nil, fmt.Errorf("inspect process directory: %w", statErr)
+		}
+		return nil, fmt.Errorf("read process command line: %w", err)
+	}
+	return strings.Split(strings.TrimSuffix(string(cmdline), "\x00"), "\x00"), nil
 }
 
 // procExitConfirmTimeout bounds how long a partially readable /proc entry is

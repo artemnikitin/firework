@@ -18,6 +18,11 @@ var errProcessNotFound = errors.New("process not found")
 // instead of having its state cleaned while the process may still be alive.
 var errIdentityNotRecorded = errors.New("process ownership identity was never recorded")
 
+// errProcessIdentityReused marks a PID whose current start time differs from
+// the durable owner. The recorded process is gone, but recovery still checks
+// whether another live process is using the same VM paths before removing them.
+var errProcessIdentityReused = errors.New("process PID was reused")
+
 type processIdentity struct {
 	PID           int
 	HostBootID    string
@@ -72,7 +77,7 @@ func validateOwnedProcess(inspector processInspector, manifest *instanceManifest
 		return fmt.Errorf("process start time: %w", errIdentityNotRecorded)
 	}
 	if identity.StartTicks != manifest.ProcessStart {
-		return fmt.Errorf("process start time does not match")
+		return fmt.Errorf("process start time does not match: %w", errProcessIdentityReused)
 	}
 	if manifest.ExecutableDev == 0 || manifest.ExecutableIno == 0 {
 		return fmt.Errorf("process executable device and inode: %w", errIdentityNotRecorded)
