@@ -395,7 +395,10 @@ func (a *Agent) tick(ctx context.Context) {
 			a.logger.Error("failed to get store revision", "error", err)
 		}
 		a.setStatusServices(*merged, rev)
-		if rev != "" && rev == a.lastRevision && !a.forceReconcile && !a.vmManager.HasPendingRecovery() {
+		if a.vmManager.HasPendingRecovery() {
+			a.forceReconcile = true
+		}
+		if rev != "" && rev == a.lastRevision && !a.forceReconcile {
 			// A local revision does not describe the peer node configs used for
 			// remote Traefik routes. Refresh routes on every poll even when the
 			// local VM configuration is unchanged, but avoid the expensive image

@@ -342,3 +342,20 @@ Manager lock acquisition and commit checks have a five-second budget, shorter
 than the transport deadline. A lost response means its outcome is unknown;
 inspect status before retrying. Clearing an absent removed VM also deregisters
 its health probe on the main loop.
+
+
+Recovery discovery reserves a service name before inspecting old files. Start
+and Remove cannot overtake that inspection. Start preparation does not create a
+VM directory; prelaunch failures discard only files belonging to that attempt.
+An abort during preparation marks the attempt and leaves any old runtime state
+intact. Final removal checks the same instance that was originally selected.
+
+Before recovery deletes VM state it atomically stores a validated full manifest
+under `<state_dir>/recovery-teardowns/`. The reconciler first copies its old
+network resources into the existing durable teardown journal, then acknowledges
+the outbox event. Physical cleanup uses the usual running-config claimant guards
+so resources reused by a new VM are preserved. Events remain pending during
+unresolved/starting/aborting VM state or journal failures. If removal only partly
+succeeds and removes `instance.json`, the retained snapshot permits a fresh
+absence proof and retry after restart. Multiple incompatible snapshots remain
+ambiguous rather than guessing which identity owns the directory.

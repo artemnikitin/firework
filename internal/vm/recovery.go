@@ -79,6 +79,15 @@ func (m *Manager) Recover(ctx context.Context, desired config.NodeConfig) ([]str
 			vmDir := filepath.Join(root, name)
 			path := manifestPath(vmDir)
 			manifest, readErr := readManifest(path)
+			if errors.Is(readErr, os.ErrNotExist) {
+				if saved, lookupErr := m.recoveryTeardownManifest(name); lookupErr != nil {
+					errs = append(errs, lookupErr)
+					return
+				} else if saved != nil {
+					manifest = saved
+					readErr = nil
+				}
+			}
 			if readErr != nil {
 				if errors.Is(readErr, os.ErrNotExist) {
 					var handled bool
@@ -319,9 +328,6 @@ func (m *Manager) persistReconstructedIdentity(service, vmDir, path string, orig
 	}
 	if !sameRecoveryIdentity(original, durable) {
 		return fmt.Errorf("durable ownership identity changed before identity repair")
-	}
-	if m.recoveryManifestWriter != nil {
-		return m.recoveryManifestWriter(path, candidate)
 	}
 	return m.writeRecoveryManifest(path, candidate)
 }

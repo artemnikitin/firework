@@ -66,6 +66,18 @@ func (m *Manager) resolveRecoveryMode(ctx context.Context, service string, forge
 		m.mu.Unlock()
 		vmDir, path := m.recoveryManifestPath(service)
 		manifest, err := readManifest(path)
+		if errors.Is(err, os.ErrNotExist) {
+			if _, statErr := os.Lstat(vmDir); errors.Is(statErr, os.ErrNotExist) {
+				result.Message = "service has no runtime state"
+				return result, nil
+			}
+			if saved, lookupErr := m.recoveryTeardownManifest(service); lookupErr != nil {
+				return recoveryAmbiguous(result, lookupErr.Error())
+			} else if saved != nil {
+				manifest = saved
+				err = nil
+			}
+		}
 		if err != nil {
 			if _, statErr := os.Lstat(vmDir); errors.Is(statErr, os.ErrNotExist) {
 				result.Message = "service has no runtime state"
@@ -143,7 +155,7 @@ func (m *Manager) resolveRecoveryMode(ctx context.Context, service string, forge
 			m.mu.Unlock()
 			return recoveryAmbiguous(result, "service ownership changed while recovery was being checked")
 		}
-		if err := verifyRecoverySnapshot(manifestPath, &initialManifest); err != nil {
+		if err := m.verifyRecoverySnapshot(manifestPath, &initialManifest); err != nil {
 			m.mu.Unlock()
 			return recoveryAmbiguous(result, err.Error())
 		}
@@ -161,6 +173,13 @@ func (m *Manager) resolveRecoveryMode(ctx context.Context, service string, forge
 	}
 	if forget {
 		return recoveryAmbiguous(result, "cannot forget a VM whose absence is unproved")
+	}
+	if _, err := os.Lstat(manifestPath); errors.Is(err, os.ErrNotExist) {
+		if saved, lookupErr := m.hasRecoveryTeardown(&initialManifest); lookupErr != nil {
+			return recoveryAmbiguous(result, lookupErr.Error())
+		} else if saved {
+			return recoveryAmbiguous(result, "interrupted deletion awaits complete absence proof")
+		}
 	}
 	if instanceID == "" || instanceID != initialManifest.InstanceID || instancePID != initialManifest.PID {
 		return recoveryAmbiguous(result, "in-memory ownership identities do not match")
@@ -448,12 +467,19 @@ func (m *Manager) lockRecovery(ctx context.Context) error {
 
 type recoveryPendingError struct{ error }
 
-func verifyRecoverySnapshot(path string, initial *instanceManifest) error {
+func (m *Manager) verifyRecoverySnapshot(path string, initial *instanceManifest) error {
 	if err := verifyRecoveryDirectories(initial.VMDir); err != nil {
 		return err
 	}
 	if info, err := os.Lstat(path); err == nil && (!info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0) {
 		return fmt.Errorf("ownership manifest must be a regular file")
+	}
+	if _, err := os.Lstat(path); errors.Is(err, os.ErrNotExist) {
+		if saved, lookupErr := m.hasRecoveryTeardown(initial); lookupErr != nil {
+			return lookupErr
+		} else if saved {
+			return nil
+		}
 	}
 	if initial.InstanceID == "" || initial.Legacy {
 		if _, err := os.Lstat(path); errors.Is(err, os.ErrNotExist) {

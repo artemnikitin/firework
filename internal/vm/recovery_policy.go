@@ -92,6 +92,9 @@ func (m *Manager) removeProvenRecoveryState(ctx context.Context, f *instanceMani
 	if err := ctx.Err(); err != nil {
 		return err
 	}
+	if err := m.persistRecoveryTeardown(f); err != nil {
+		return fmt.Errorf("persist recovery cleanup intent: %w", err)
+	}
 	return os.RemoveAll(f.VMDir)
 }
 

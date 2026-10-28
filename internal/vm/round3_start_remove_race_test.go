@@ -2,6 +2,8 @@ package vm
 
 import (
 	"context"
+	"errors"
+	"github.com/artemnikitin/firework/internal/config"
 	"os"
 	"sync"
 	"testing"
@@ -75,5 +77,28 @@ func TestRound3RemoveDuringOldStateReclaimPreservesUnprovedRuntime(t *testing.T)
 	assertOldFiles()
 	if launcher.count() != 0 {
 		t.Fatal("aborted start launched another VM")
+	}
+}
+
+func TestRound3DiscoveryReservationBlocksConcurrentMutation(t *testing.T) {
+	m, f, inspector := recoveryFixture(t)
+	blocker := &blockingRecoveryInspector{fakeProcessInspector: inspector, entered: make(chan struct{}), release: make(chan struct{})}
+	m.inspector = blocker
+	done := make(chan error, 1)
+	go func() { _, err := m.Recover(context.Background(), config.NodeConfig{}); done <- err }()
+	select {
+	case <-blocker.entered:
+	case <-time.After(time.Second):
+		t.Fatal("discovery did not inspect")
+	}
+	if err := m.Start(context.Background(), f.Config); !errors.Is(err, ErrStartInProgress) {
+		t.Fatalf("start passed discovery reservation: %v", err)
+	}
+	if err := m.Remove(f.Service); !errors.Is(err, ErrStartInProgress) {
+		t.Fatalf("remove passed discovery reservation: %v", err)
+	}
+	close(blocker.release)
+	if err := <-done; err != nil {
+		t.Fatal(err)
 	}
 }

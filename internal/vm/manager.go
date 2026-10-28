@@ -366,6 +366,9 @@ func (m *Manager) Start(ctx context.Context, svc config.ServiceConfig) error {
 // beginStart is phase 1: it takes the entry checks and publishes the starting
 // placeholder under the manager lock.
 func (m *Manager) beginStart(svc config.ServiceConfig) (startID, vmDir, socketPath string, err error) {
+	if err := ValidateRecoveryServiceName(svc.Name); err != nil {
+		return "", "", "", err
+	}
 	m.mu.Lock()
 	locked := true
 	defer func() {
@@ -769,7 +772,7 @@ func (m *Manager) stopInstance(name string, expected *Instance) error {
 
 	if err := validateOwnedProcess(m.inspector, &ownedManifest); err != nil {
 		if !errors.Is(err, errProcessNotFound) {
-			m.quarantine(name, manifest, fmt.Errorf("ownership validation failed before stop: %w", err))
+			m.quarantineStopIfCurrent(name, inst, ownedManifest.InstanceID, fmt.Errorf("ownership validation failed before stop: %w", err))
 			return fmt.Errorf("refusing to signal pid %d: %w", pid, err)
 		}
 	} else {
@@ -781,7 +784,7 @@ func (m *Manager) stopInstance(name string, expected *Instance) error {
 
 		exited, waitErr := waitForOwnedProcessExit(m.inspector, &ownedManifest, 5*time.Second)
 		if waitErr != nil {
-			m.quarantine(name, manifest, fmt.Errorf("process identity changed while stopping: %w", waitErr))
+			m.quarantineStopIfCurrent(name, inst, ownedManifest.InstanceID, fmt.Errorf("process identity changed while stopping: %w", waitErr))
 			return fmt.Errorf("refusing to signal pid %d again: %w", pid, waitErr)
 		}
 		if !exited {
@@ -789,7 +792,7 @@ func (m *Manager) stopInstance(name string, expected *Instance) error {
 			_ = launcher.Stop(&ownedManifest, syscall.SIGKILL)
 			exited, waitErr = waitForOwnedProcessExit(m.inspector, &ownedManifest, 2*time.Second)
 			if waitErr != nil {
-				m.quarantine(name, manifest, fmt.Errorf("process identity changed after SIGKILL: %w", waitErr))
+				m.quarantineStopIfCurrent(name, inst, ownedManifest.InstanceID, fmt.Errorf("process identity changed after SIGKILL: %w", waitErr))
 				return fmt.Errorf("process identity changed after SIGKILL: %w", waitErr)
 			}
 			if !exited {
@@ -799,15 +802,20 @@ func (m *Manager) stopInstance(name string, expected *Instance) error {
 	}
 
 	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.instances[name] != inst || inst.instanceID != ownedManifest.InstanceID {
+		return fmt.Errorf("service %s ownership changed before stop completion: %w", name, ErrStartInProgress)
+	}
 	inst.State = StateStopped
 	inst.PID = 0
 	manifest.Lifecycle = lifecycleStopped
 	manifest.PID = 0
-	_ = m.writeRecoveryManifest(manifestPath(manifest.VMDir), manifest)
-	m.mu.Unlock()
-
-	// Clean up socket.
+	writeErr := m.writeRecoveryManifest(manifestPath(manifest.VMDir), manifest)
+	// Keep unlink serialized with replacement starts, just like manifest commit.
 	_ = os.Remove(socketPath)
+	if writeErr != nil {
+		return fmt.Errorf("persist stopped VM state: %w", writeErr)
+	}
 
 	m.logger.Info("microVM stopped", "service", name)
 	return nil
@@ -815,6 +823,9 @@ func (m *Manager) stopInstance(name string, expected *Instance) error {
 
 // Remove stops (if running) and removes all state for a service.
 func (m *Manager) Remove(name string) error {
+	if err := ValidateRecoveryServiceName(name); err != nil {
+		return err
+	}
 	m.mu.Lock()
 	if m.recoveryReservations[name] {
 		m.mu.Unlock()
@@ -872,6 +883,10 @@ func (m *Manager) Remove(name string) error {
 	if current.State == StateRecoveryPending || current.State == StateStarting || current.State == StateRunning {
 		return fmt.Errorf("service %s is not stopped", name)
 	}
+	if current.PID > 0 || (current.manifest != nil && current.manifest.PID > 0) {
+		current.State = StateRecoveryPending
+		return fmt.Errorf("service %s requires process absence verification before removal", name)
+	}
 	if current.manifest != nil {
 		if err := verifyRecoveryManifestPaths(name, vmDir, current.manifest); err != nil {
 			return err
@@ -889,16 +904,13 @@ func (m *Manager) Remove(name string) error {
 
 func (m *Manager) IsRunning(name string) bool {
 	m.mu.Lock()
-	inst, exists := m.instances[name]
-	m.mu.Unlock()
-
-	if !exists || inst.State != StateRunning {
-		return false
-	}
-	if inst.manifest == nil {
+	inst := m.instances[name]
+	if inst == nil || inst.State != StateRunning || inst.manifest == nil {
+		m.mu.Unlock()
 		return false
 	}
 	manifest := *inst.manifest
+	m.mu.Unlock()
 	return validateOwnedProcess(m.inspector, &manifest) == nil
 }
 
@@ -1095,4 +1107,20 @@ func insertBeforeApplicationSeparator(args, value string) string {
 		return value
 	}
 	return args + " " + value
+}
+
+func (m *Manager) quarantineStopIfCurrent(name string, expected *Instance, id string, cause error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	current := m.instances[name]
+	if current != expected || current.instanceID != id || current.State != StateStopping {
+		return
+	}
+	current.State = StateRecoveryPending
+	current.LastError = cause.Error()
+	if current.manifest != nil {
+		current.manifest.LastError = cause.Error()
+		_ = m.writeRecoveryManifest(manifestPath(current.manifest.VMDir), current.manifest)
+	}
+	m.logRecoveryIntervention(name, cause)
 }
