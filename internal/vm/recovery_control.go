@@ -93,6 +93,25 @@ func (m *Manager) resolveRecoveryMode(ctx context.Context, service string, forge
 			return recoveryAmbiguous(result, err.Error())
 		}
 		if m.instances[service] == nil {
+			// The disk read happened unlocked. Another resolver may have
+			// completed clearance or discovery may now own this name.
+			if m.recoveryReservations[service] {
+				m.mu.Unlock()
+				return recoveryAmbiguous(result, "recovery discovery in progress")
+			}
+			if _, err := os.Lstat(vmDir); errors.Is(err, os.ErrNotExist) {
+				m.mu.Unlock()
+				result.Message = "service has no runtime state"
+				return result, nil
+			}
+			if err := m.verifyRecoverySnapshot(path, manifest); err != nil {
+				m.mu.Unlock()
+				return recoveryAmbiguous(result, err.Error())
+			}
+			if err := ctx.Err(); err != nil {
+				m.mu.Unlock()
+				return recoveryAmbiguous(result, err.Error())
+			}
 			m.instances[service] = recoveryInstanceForService(service, manifest, "retrying durable recovery")
 		}
 		m.mu.Unlock()
