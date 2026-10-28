@@ -367,7 +367,12 @@ func (m *Manager) Start(ctx context.Context, svc config.ServiceConfig) error {
 // placeholder under the manager lock.
 func (m *Manager) beginStart(svc config.ServiceConfig) (startID, vmDir, socketPath string, err error) {
 	m.mu.Lock()
-	defer m.mu.Unlock()
+	locked := true
+	defer func() {
+		if locked {
+			m.mu.Unlock()
+		}
+	}()
 
 	if inst, exists := m.instances[svc.Name]; exists {
 		switch inst.State {
@@ -385,17 +390,7 @@ func (m *Manager) beginStart(svc config.ServiceConfig) (startID, vmDir, socketPa
 	m.logger.Info("starting microVM", "service", svc.Name, "vcpus", svc.VCPUs, "memory_mb", svc.MemoryMB)
 
 	vmDir = filepath.Join(m.stateDir, "vms", svc.Name)
-	if err := m.reclaimUnownedState(svc.Name, vmDir); err != nil {
-		return "", "", "", err
-	}
-	if err := os.MkdirAll(vmDir, 0o755); err != nil {
-		return "", "", "", fmt.Errorf("creating vm dir: %w", err)
-	}
-
 	socketPath = filepath.Join(vmDir, "firecracker.sock")
-	// Remove stale socket if it exists.
-	_ = os.Remove(socketPath)
-
 	startID, err = newInstanceID()
 	if err != nil {
 		return "", "", "", err
@@ -403,6 +398,12 @@ func (m *Manager) beginStart(svc config.ServiceConfig) (startID, vmDir, socketPa
 	m.instances[svc.Name] = &Instance{
 		Name: svc.Name, Config: svc, State: StateStarting,
 		SocketPath: socketPath, startID: startID,
+	}
+	m.mu.Unlock()
+	locked = false
+	if err := m.reclaimUnownedState(svc.Name, vmDir); err != nil {
+		m.discardStart(svc.Name, startID)
+		return "", "", "", err
 	}
 	return startID, vmDir, socketPath, nil
 }
@@ -460,6 +461,16 @@ func (m *Manager) finishStart(ctx context.Context, svc config.ServiceConfig, sta
 	// later.
 	svc = clampToPrepared(svc, prepared)
 
+	if err := os.MkdirAll(vmDir, 0755); err != nil {
+		delete(m.instances, svc.Name)
+		return err
+	}
+	launchAttempted := false
+	defer func() {
+		if !launchAttempted {
+			_ = os.RemoveAll(vmDir)
+		}
+	}()
 	configPath, err := m.writeVMConfig(vmDir, svc, prepared)
 	if err != nil {
 		delete(m.instances, svc.Name)
@@ -488,6 +499,7 @@ func (m *Manager) finishStart(ctx context.Context, svc config.ServiceConfig, sta
 		delete(m.instances, svc.Name)
 		return err
 	}
+	launchAttempted = true
 	launched, err := m.launcher.Launch(ctx, launchSpec{
 		InstanceID: instanceID, SocketPath: socketPath, ConfigPath: configPath,
 		LogPath: filepath.Join(vmDir, "firecracker.log"),
@@ -550,15 +562,17 @@ func (m *Manager) finishStart(ctx context.Context, svc config.ServiceConfig, sta
 // create a unit and then fail while Firework is waiting for MainPID, so a
 // missing recorded PID does not prove that no process exists.
 func (m *Manager) reclaimUnownedState(service, vmDir string) error {
-	if _, loaded := m.instances[service]; loaded {
-		return nil
-	}
 	manifest, err := readManifest(manifestPath(vmDir))
 	if errors.Is(err, os.ErrNotExist) {
 		if _, statErr := os.Lstat(vmDir); errors.Is(statErr, os.ErrNotExist) {
 			return nil
 		}
 		return fmt.Errorf("service %s has runtime state without a manifest; recovery must prove absence before start", service)
+	}
+	if err == nil {
+		if err := verifyRecoveryManifestPaths(service, vmDir, manifest); err != nil {
+			return err
+		}
 	}
 	if err == nil && manifest.PID == 0 &&
 		(manifest.Lifecycle == lifecycleStopped ||

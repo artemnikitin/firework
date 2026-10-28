@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -58,7 +59,7 @@ func (m *Manager) proveRecoveryAbsent(f *instanceManifest) error {
 
 // All recovery deletion paths use the same unit and process-claimant proof.
 func (m *Manager) removeRecoveryState(f *instanceManifest) error {
-	if err := verifyRecoveryManifestPaths(f.Service, f.VMDir, f); err != nil {
+	if err := verifyRecoveryManifestPaths(f.Service, filepath.Join(m.stateDir, "vms", f.Service), f); err != nil {
 		return err
 	}
 	return m.removeRecoveryStateContext(context.Background(), f)

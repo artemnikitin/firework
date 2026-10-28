@@ -5,6 +5,7 @@ import (
 	"errors"
 	"github.com/artemnikitin/firework/internal/config"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -134,5 +135,48 @@ func TestStartCannotBypassLegacyQuarantine(t *testing.T) {
 	}
 	if err := m.reclaimUnownedState(f.Service, f.VMDir); err == nil {
 		t.Fatal("missing manifest silently authorized Start")
+	}
+}
+
+func TestFailedPreparationAndConfigCanRetryWithoutRestart(t *testing.T) {
+	m, f, _ := recoveryFixture(t)
+	os.RemoveAll(f.VMDir)
+	f.Config.KernelArgs = strings.Repeat("x", 4096)
+	if err := m.Start(context.Background(), f.Config); err == nil {
+		t.Fatal("expected config failure")
+	}
+	id, dir, _, err := m.beginStart(f.Config)
+	if err != nil {
+		t.Fatal("retry wedged", err)
+	}
+	m.discardStart(f.Service, id)
+	if _, err := os.Stat(dir); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("preparation created orphan directory: %v", err)
+	}
+	f.Config.Volumes = []config.VolumeConfig{{Name: "data"}}
+	if err := m.Start(context.Background(), f.Config); err == nil {
+		t.Fatal("expected volume failure")
+	}
+	id, _, _, err = m.beginStart(f.Config)
+	if err != nil {
+		t.Fatal("prepare retry wedged", err)
+	}
+	m.discardStart(f.Service, id)
+}
+
+func TestReclaimCannotDeleteOtherService(t *testing.T) {
+	m, f, _ := recoveryFixture(t)
+	f.Lifecycle = lifecycleStopped
+	f.PID = 0
+	other := filepath.Join(m.stateDir, "vms", "other")
+	os.MkdirAll(other, 0755)
+	if err := writeManifest(manifestPath(other), f); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.reclaimUnownedState("other", other); err == nil {
+		t.Fatal("accepted other service manifest")
+	}
+	if _, err := os.Stat(f.VMDir); err != nil {
+		t.Fatal("deleted victim", err)
 	}
 }
