@@ -24,6 +24,9 @@ const (
 	recoveryControlMaxFrameBytes   = 4096
 	recoveryControlDeadline        = 10 * time.Second
 	recoveryControlSocketName      = "recovery.sock"
+	recoveryControlMaxHandlers     = 16
+	recoveryAcceptRetryInitial     = 10 * time.Millisecond
+	recoveryAcceptRetryMaximum     = time.Second
 )
 
 type recoveryControlRequest struct {
@@ -93,6 +96,11 @@ type recoveryControlServer struct {
 	resolve    recoveryControlResolver
 	logger     *slog.Logger
 	done       chan struct{}
+	closing    chan struct{}
+	mu         sync.Mutex
+	active     map[*net.UnixConn]struct{}
+	handlers   sync.WaitGroup
+	closed     bool
 	closeOnce  sync.Once
 	closeErr   error
 }
@@ -201,7 +209,8 @@ func startRecoveryControlServer(stateDir string, logger *slog.Logger, resolve re
 	}
 	server := &recoveryControlServer{
 		listener: listener, path: socketPath, socketInfo: socketInfo, lock: lock,
-		resolve: resolve, logger: logger, done: make(chan struct{}),
+		resolve: resolve, logger: logger, done: make(chan struct{}), closing: make(chan struct{}),
+		active: make(map[*net.UnixConn]struct{}),
 	}
 	cleanupLock = false
 	closeListener = false
@@ -211,21 +220,80 @@ func startRecoveryControlServer(stateDir string, logger *slog.Logger, resolve re
 
 func (s *recoveryControlServer) serve() {
 	defer close(s.done)
+	s.serveAccepting(s.listener.AcceptUnix)
+}
+
+func (s *recoveryControlServer) serveAccepting(accept func() (*net.UnixConn, error)) {
+	delay := recoveryAcceptRetryInitial
 	for {
-		connection, err := s.listener.AcceptUnix()
+		connection, err := accept()
 		if err != nil {
 			if errors.Is(err, net.ErrClosed) {
 				return
 			}
-			if errors.Is(err, syscall.EINTR) {
+			if isRetryableRecoveryAcceptError(err) {
 				s.logger.Warn("temporary recovery control accept failure", "error", err)
+				timer := time.NewTimer(delay)
+				select {
+				case <-s.closing:
+					if !timer.Stop() {
+						<-timer.C
+					}
+					return
+				case <-timer.C:
+				}
+				if delay < recoveryAcceptRetryMaximum {
+					delay *= 2
+					if delay > recoveryAcceptRetryMaximum {
+						delay = recoveryAcceptRetryMaximum
+					}
+				}
 				continue
 			}
 			s.logger.Error("recovery control socket stopped", "error", err)
 			return
 		}
-		s.serveConnection(connection)
+		delay = recoveryAcceptRetryInitial
+		s.startConnection(connection)
 	}
+}
+
+func isRetryableRecoveryAcceptError(err error) bool {
+	return errors.Is(err, syscall.EINTR) || errors.Is(err, syscall.EAGAIN) ||
+		errors.Is(err, syscall.EWOULDBLOCK) || errors.Is(err, syscall.ECONNABORTED) ||
+		errors.Is(err, syscall.EMFILE) || errors.Is(err, syscall.ENFILE) ||
+		errors.Is(err, syscall.ENOBUFS) || errors.Is(err, syscall.ENOMEM)
+}
+
+func (s *recoveryControlServer) startConnection(connection *net.UnixConn) {
+	s.mu.Lock()
+	if s.closed {
+		s.mu.Unlock()
+		_ = connection.Close()
+		return
+	}
+	if len(s.active) >= recoveryControlMaxHandlers {
+		s.mu.Unlock()
+		_ = connection.SetWriteDeadline(time.Now().Add(250 * time.Millisecond))
+		s.writeResponse(connection, recoveryControlResponse{
+			Version: recoveryControlProtocolVersion,
+			Error:   "recovery control server is handling its maximum number of requests",
+		})
+		_ = connection.Close()
+		return
+	}
+	s.active[connection] = struct{}{}
+	s.handlers.Add(1)
+	s.mu.Unlock()
+	go func() {
+		defer s.handlers.Done()
+		defer func() {
+			s.mu.Lock()
+			delete(s.active, connection)
+			s.mu.Unlock()
+		}()
+		s.serveConnection(connection)
+	}()
 }
 
 func (s *recoveryControlServer) serveConnection(connection *net.UnixConn) {
@@ -264,8 +332,16 @@ func (s *recoveryControlServer) writeResponse(connection io.Writer, response rec
 
 func (s *recoveryControlServer) Close() error {
 	s.closeOnce.Do(func() {
+		s.mu.Lock()
+		s.closed = true
+		close(s.closing)
 		_ = s.listener.Close()
+		for connection := range s.active {
+			_ = connection.Close()
+		}
+		s.mu.Unlock()
 		<-s.done
+		s.handlers.Wait()
 		s.closeErr = removeRecoveryControlSocket(s.path, s.socketInfo)
 		if err := s.lock.Close(); s.closeErr == nil && err != nil {
 			s.closeErr = err

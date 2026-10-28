@@ -226,14 +226,17 @@ func (a *Agent) Run(ctx context.Context) error {
 
 	control, err := startRecoveryControlServer(a.cfg.StateDir, a.logger, a.clearRecoveryPending)
 	if err != nil {
-		return fmt.Errorf("starting local recovery control: %w", err)
+		a.logger.Warn("local recovery control is unavailable", "error", err)
+	} else {
+		a.recoveryControl = control
 	}
-	a.recoveryControl = control
 
 	if a.apiServer != nil {
 		if err := a.apiServer.Start(); err != nil {
-			_ = a.recoveryControl.Close()
-			a.recoveryControl = nil
+			if a.recoveryControl != nil {
+				_ = a.recoveryControl.Close()
+				a.recoveryControl = nil
+			}
 			return err
 		}
 	}

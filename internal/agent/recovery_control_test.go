@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
@@ -239,6 +240,166 @@ func TestRecoveryControlClientHonorsTimeout(t *testing.T) {
 	close(release)
 	if err := server.Close(); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestRecoveryControlIdleClientDoesNotBlockRequestsOrShutdown(t *testing.T) {
+	stateDir := recoveryControlTestStateDir(t)
+	server := startTestRecoveryControlServer(t, stateDir, func(service string) (vm.RecoveryResult, error) {
+		return vm.RecoveryResult{Service: service, Outcome: vm.RecoveryOutcomeNoop}, nil
+	})
+	idle, err := net.Dial("unix", server.path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer idle.Close()
+	deadline := time.Now().Add(time.Second)
+	for {
+		server.mu.Lock()
+		active := len(server.active)
+		server.mu.Unlock()
+		if active != 0 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("idle client was not accepted")
+		}
+		time.Sleep(time.Millisecond)
+	}
+
+	result, err := ClearRecovery(context.Background(), stateDir, "app")
+	if err != nil || result.Service != "app" {
+		t.Fatalf("idle client blocked a second request: result=%#v err=%v", result, err)
+	}
+
+	closed := make(chan error, 1)
+	go func() { closed <- server.Close() }()
+	select {
+	case err := <-closed:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("shutdown waited for an idle client")
+	}
+	_ = idle.SetReadDeadline(time.Now().Add(time.Second))
+	if _, err := idle.Read(make([]byte, 1)); err == nil {
+		t.Fatal("shutdown left the idle client connection open")
+	}
+}
+
+func TestRecoveryControlBoundsConcurrentRequests(t *testing.T) {
+	stateDir := recoveryControlTestStateDir(t)
+	server := startTestRecoveryControlServer(t, stateDir, func(service string) (vm.RecoveryResult, error) {
+		return vm.RecoveryResult{Service: service, Outcome: vm.RecoveryOutcomeNoop}, nil
+	})
+	connections := make([]net.Conn, 0, recoveryControlMaxHandlers)
+	defer func() {
+		for _, connection := range connections {
+			_ = connection.Close()
+		}
+	}()
+	for range recoveryControlMaxHandlers {
+		connection, err := net.Dial("unix", server.path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		connections = append(connections, connection)
+	}
+	deadline := time.Now().Add(time.Second)
+	for {
+		server.mu.Lock()
+		active := len(server.active)
+		server.mu.Unlock()
+		if active == recoveryControlMaxHandlers {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("accepted %d concurrent requests; want %d", active, recoveryControlMaxHandlers)
+		}
+		time.Sleep(time.Millisecond)
+	}
+
+	_, err := ClearRecovery(context.Background(), stateDir, "overflow")
+	if err == nil || !strings.Contains(err.Error(), "maximum number of requests") {
+		t.Fatalf("server did not reject an excess request: %v", err)
+	}
+	if err := server.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestRecoveryControlRetriesTransientAcceptFailuresWithCancellableBackoff(t *testing.T) {
+	server := &recoveryControlServer{
+		logger: testLogger(), closing: make(chan struct{}), done: make(chan struct{}),
+	}
+	accepted := make(chan time.Time, 4)
+	go func() {
+		defer close(server.done)
+		server.serveAccepting(func() (*net.UnixConn, error) {
+			select {
+			case accepted <- time.Now():
+			default:
+			}
+			return nil, syscall.EMFILE
+		})
+	}()
+	var first, second time.Time
+	select {
+	case first = <-accepted:
+	case <-time.After(time.Second):
+		t.Fatal("accept loop did not make its initial attempt")
+	}
+	select {
+	case second = <-accepted:
+	case <-time.After(time.Second):
+		t.Fatal("accept loop did not retry a transient resource failure")
+	}
+	if second.Sub(first) < recoveryAcceptRetryInitial {
+		t.Fatalf("accept retry did not back off: first=%v second=%v", first, second)
+	}
+	close(server.closing)
+	select {
+	case <-server.done:
+	case <-time.After(time.Second):
+		t.Fatal("accept retry backoff did not stop after shutdown")
+	}
+}
+
+func TestAgentContinuesWhenRecoveryControlSetupIsUnavailable(t *testing.T) {
+	target := t.TempDir()
+	linkParent := t.TempDir()
+	stateDir := filepath.Join(linkParent, "state")
+	if err := os.Symlink(target, stateDir); err != nil {
+		t.Fatal(err)
+	}
+	cfg := testAgentConfig(t)
+	cfg.StateDir = stateDir
+	store := &fakeStore{
+		data:     map[string][]byte{"web": []byte("node: web\nservices: []\n")},
+		revision: "rev-1",
+	}
+	a := New(cfg, store, testLogger())
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- a.Run(ctx) }()
+	select {
+	case err := <-done:
+		cancel()
+		t.Fatalf("agent stopped when optional recovery control setup failed: %v", err)
+	case <-time.After(100 * time.Millisecond):
+	}
+	cancel()
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("agent did not complete normal shutdown: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("agent did not shut down after context cancellation")
+	}
+	if store.fetchCount == 0 {
+		t.Fatal("agent did not run normal reconciliation after control setup failed")
 	}
 }
 
