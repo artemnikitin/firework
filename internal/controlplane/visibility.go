@@ -2,6 +2,7 @@ package controlplane
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"path"
@@ -32,6 +33,9 @@ type visibilitySnapshot struct {
 	pendingByService         map[string]PendingPlacement
 	volumeByID               map[string]VolumeRecord
 	invalidVolumes           map[string]string
+	nodeSourceTokens         map[string]string
+	invalidNodeTokens        map[string]string
+	nodeQuarantines          map[string]NodeQuarantine
 	tombstoneNodeIDs         map[string]struct{}
 	tombstoneIndexKnown      bool
 	emptyNodeConfigs         map[string]config.NodeConfig
@@ -99,6 +103,17 @@ func (s *VisibilityService) Nodes(ctx context.Context, stateFilter string) (oper
 		}
 		items = append(items, summary)
 	}
+	if stateFilter == "" || stateFilter == "unknown" {
+		for nodeID := range snapshot.invalidNodeTokens {
+			if _, active := snapshot.nodeByID[nodeID]; active {
+				continue
+			}
+			if summary, ok := snapshot.quarantinedNodeSummary(nodeID); ok {
+				items = append(items, summary)
+			}
+		}
+		sort.Slice(items, func(i, j int) bool { return items[i].NodeID < items[j].NodeID })
+	}
 	return operatorapi.ListEnvelope[operatorapi.NodeSummary]{APIVersion: operatorapi.APIVersion, ObservedAt: snapshot.now, Count: len(items), Items: items, Problems: snapshot.problems}, nil
 }
 
@@ -109,6 +124,12 @@ func (s *VisibilityService) Node(ctx context.Context, nodeID string) (operatorap
 	}
 	record, ok := snapshot.nodeByID[nodeID]
 	if !ok {
+		if summary, quarantined := snapshot.quarantinedNodeSummary(nodeID); quarantined {
+			return operatorapi.NodeDetail{
+				APIVersion: operatorapi.APIVersion, ObservedAt: snapshot.now, NodeSummary: summary,
+				Reconciliation: "unknown", StatusMissing: true, Services: []operatorapi.ServiceSummary{},
+			}, true, nil
+		}
 		return s.retiredNodeDetail(ctx, snapshot, nodeID)
 	}
 	summary := snapshot.nodeSummary(record)
@@ -486,7 +507,7 @@ func (s *VisibilityService) build(ctx context.Context) (visibilitySnapshot, erro
 	s.builds++
 	s.mu.Unlock()
 	now := time.Now().UTC()
-	snapshot := visibilitySnapshot{now: now, staleTTL: s.cfg.NodeStaleTTL, placementByService: make(map[string]placedService), nodeByID: make(map[string]NodeRecord), pendingByService: make(map[string]PendingPlacement), volumeByID: make(map[string]VolumeRecord), invalidVolumes: make(map[string]string), tombstoneNodeIDs: make(map[string]struct{}), emptyNodeConfigs: make(map[string]config.NodeConfig)}
+	snapshot := visibilitySnapshot{now: now, staleTTL: s.cfg.NodeStaleTTL, placementByService: make(map[string]placedService), nodeByID: make(map[string]NodeRecord), pendingByService: make(map[string]PendingPlacement), volumeByID: make(map[string]VolumeRecord), invalidVolumes: make(map[string]string), nodeSourceTokens: make(map[string]string), invalidNodeTokens: make(map[string]string), nodeQuarantines: make(map[string]NodeQuarantine), tombstoneNodeIDs: make(map[string]struct{}), emptyNodeConfigs: make(map[string]config.NodeConfig)}
 	index, indexExists, indexErr := loadNodeTombstoneIndex(ctx, s.store, s.cfg.State.Prefix)
 	if indexErr != nil {
 		if scanInterrupted(ctx, indexErr) {
@@ -504,9 +525,10 @@ func (s *VisibilityService) build(ctx context.Context) (visibilitySnapshot, erro
 		return snapshot, fmt.Errorf("listing nodes: %w", err)
 	}
 	for _, key := range keys {
+		keyNodeID, keyValid := nodeIDFromRegistryKey(s.cfg.State.Prefix, key)
 		id := projectionID(strings.TrimSuffix(path.Base(key), ".json"))
 		var record NodeRecord
-		_, exists, err := s.store.GetJSON(ctx, key, &record)
+		raw, sourceToken, exists, err := s.store.GetRaw(ctx, key)
 		if err != nil {
 			if scanInterrupted(ctx, err) {
 				return snapshot, fmt.Errorf("reading node records: %w", err)
@@ -517,7 +539,20 @@ func (s *VisibilityService) build(ctx context.Context) (visibilitySnapshot, erro
 		if !exists {
 			continue
 		}
-		if record.NodeID == "" || projectionID(record.NodeID) != id {
+		if keyValid {
+			snapshot.nodeSourceTokens[keyNodeID] = string(sourceToken)
+		}
+		if err := json.Unmarshal(raw, &record); err != nil {
+			if keyValid {
+				snapshot.invalidNodeTokens[keyNodeID] = string(sourceToken)
+			}
+			snapshot.problems = append(snapshot.problems, operatorapi.ProjectionProblem{Kind: "node", ID: id, ReasonCode: "record_unreadable"})
+			continue
+		}
+		if !keyValid || !validNodeRegistryRecord(s.cfg.State.Prefix, key, record) {
+			if keyValid {
+				snapshot.invalidNodeTokens[keyNodeID] = string(sourceToken)
+			}
 			snapshot.problems = append(snapshot.problems, operatorapi.ProjectionProblem{Kind: "node", ID: id, ReasonCode: "record_invalid"})
 			continue
 		}
@@ -537,6 +572,29 @@ func (s *VisibilityService) build(ctx context.Context) (visibilitySnapshot, erro
 		}
 		snapshot.nodes = append(snapshot.nodes, record)
 		snapshot.nodeByID[record.NodeID] = record
+	}
+	quarantineKeys, err := s.store.ListKeys(ctx, nodeQuarantinesPrefix(s.cfg.State.Prefix))
+	if err != nil {
+		return snapshot, fmt.Errorf("listing node quarantines: %w", err)
+	}
+	for _, key := range quarantineKeys {
+		raw, _, exists, err := s.store.GetRaw(ctx, key)
+		if err != nil {
+			if scanInterrupted(ctx, err) {
+				return snapshot, fmt.Errorf("reading node quarantines: %w", err)
+			}
+			snapshot.problems = append(snapshot.problems, operatorapi.ProjectionProblem{Kind: "node_quarantine", ID: projectionID(strings.TrimSuffix(path.Base(key), ".json")), ReasonCode: "record_unreadable"})
+			continue
+		}
+		if !exists {
+			continue
+		}
+		var quarantine NodeQuarantine
+		if err := json.Unmarshal(raw, &quarantine); err != nil || !validNodeQuarantine(quarantine.NodeID, quarantine) || !nodeQuarantineKeyMatches(s.cfg.State.Prefix, key, quarantine.NodeID) {
+			snapshot.problems = append(snapshot.problems, operatorapi.ProjectionProblem{Kind: "node_quarantine", ID: projectionID(strings.TrimSuffix(path.Base(key), ".json")), ReasonCode: "record_invalid"})
+			continue
+		}
+		snapshot.nodeQuarantines[quarantine.NodeID] = quarantine
 	}
 	sort.Slice(snapshot.nodes, func(i, j int) bool { return snapshot.nodes[i].NodeID < snapshot.nodes[j].NodeID })
 	if err := loadCurrentRevision(ctx, s.store, desiredCurrentKey(s.cfg.State.Prefix), func(revision string) (string, any) {
@@ -718,7 +776,24 @@ func (s visibilitySnapshot) nodeSummary(record NodeRecord) operatorapi.NodeSumma
 	} else {
 		summary.ReasonCode = statusUnavailableReason(record, s.now, s.staleTTL)
 	}
+	if quarantine, ok := s.nodeQuarantines[record.NodeID]; ok && quarantine.ObjectToken == s.nodeSourceTokens[record.NodeID] {
+		summary.Quarantined = true
+		summary.QuarantineReason = quarantine.ReasonCode
+		summary.QuarantineMessage = nodeQuarantineMessage
+	}
 	return summary
+}
+
+func (s visibilitySnapshot) quarantinedNodeSummary(nodeID string) (operatorapi.NodeSummary, bool) {
+	quarantine, ok := s.nodeQuarantines[nodeID]
+	if !ok || s.invalidNodeTokens[nodeID] == "" || quarantine.ObjectToken != s.invalidNodeTokens[nodeID] {
+		return operatorapi.NodeSummary{}, false
+	}
+	return operatorapi.NodeSummary{
+		NodeID: nodeID, State: "unknown", ReasonCode: "node_quarantined",
+		Quarantined: true, QuarantineReason: quarantine.ReasonCode,
+		QuarantineMessage: nodeQuarantineMessage,
+	}, true
 }
 
 func toOperatorResources(resources Resources) operatorapi.Resources {

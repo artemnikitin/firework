@@ -1,6 +1,8 @@
 package controlplane
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"path"
 	"strings"
@@ -335,10 +337,19 @@ func nodeRevivalAuditsPrefix(prefix, nodeID string) string {
 }
 
 func nodeQuarantineKey(prefix, nodeID string) (string, error) {
-	if strings.TrimSpace(nodeID) == "" || strings.Contains(nodeID, "/") {
+	if strings.TrimSpace(nodeID) == "" || len(nodeID) > statusmodel.MaxVolumeIDLen || strings.Contains(nodeID, "/") {
 		return "", fmt.Errorf("invalid node_id %q", nodeID)
 	}
-	return path.Join(stateRoot(prefix), "quarantine", "nodes", nodeID+".json"), nil
+	sourceKey, err := nodeRecordKey(prefix, nodeID)
+	if err != nil {
+		return "", err
+	}
+	digest := sha256.Sum256([]byte(sourceKey))
+	return path.Join(stateRoot(prefix), "quarantine", "nodes", hex.EncodeToString(digest[:])+".json"), nil
+}
+
+func nodeQuarantinesPrefix(prefix string) string {
+	return path.Join(stateRoot(prefix), "quarantine", "nodes") + "/"
 }
 
 func desiredRevisionKey(prefix, rev string) string {

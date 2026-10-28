@@ -52,19 +52,22 @@ type NodeStorageSummary struct {
 }
 
 type NodeSummary struct {
-	NodeID           string             `json:"node_id"`
-	Labels           []string           `json:"labels,omitempty"`
-	State            string             `json:"state"`
-	LastSeenAt       time.Time          `json:"last_seen_at,omitempty"`
-	StatusAgeSeconds int64              `json:"status_age_seconds,omitempty"`
-	AgentVersion     string             `json:"agent_version,omitempty"`
-	Capacity         Resources          `json:"capacity"`
-	Allocated        Resources          `json:"allocated"`
-	Available        Resources          `json:"available"`
-	Storage          NodeStorageSummary `json:"storage"`
-	DesiredServices  int                `json:"desired_services"`
-	RunningServices  int                `json:"running_services"`
-	ReasonCode       string             `json:"reason_code,omitempty"`
+	NodeID            string             `json:"node_id"`
+	Labels            []string           `json:"labels,omitempty"`
+	State             string             `json:"state"`
+	LastSeenAt        time.Time          `json:"last_seen_at,omitempty"`
+	StatusAgeSeconds  int64              `json:"status_age_seconds,omitempty"`
+	AgentVersion      string             `json:"agent_version,omitempty"`
+	Capacity          Resources          `json:"capacity"`
+	Allocated         Resources          `json:"allocated"`
+	Available         Resources          `json:"available"`
+	Storage           NodeStorageSummary `json:"storage"`
+	DesiredServices   int                `json:"desired_services"`
+	RunningServices   int                `json:"running_services"`
+	ReasonCode        string             `json:"reason_code,omitempty"`
+	Quarantined       bool               `json:"quarantined,omitempty"`
+	QuarantineReason  string             `json:"quarantine_reason,omitempty"`
+	QuarantineMessage string             `json:"quarantine_message,omitempty"`
 }
 
 type Condition struct {

@@ -189,6 +189,14 @@ func (s *cancellingStore) GetJSON(ctx context.Context, key string, out any) (obj
 	return s.StateStore.GetJSON(ctx, key, out)
 }
 
+func (s *cancellingStore) GetRaw(ctx context.Context, key string) ([]byte, objectstorage.WriteToken, bool, error) {
+	if strings.HasPrefix(key, s.prefix) {
+		s.cancel()
+		return nil, "", false, ctx.Err()
+	}
+	return s.StateStore.GetRaw(ctx, key)
+}
+
 // A scan interrupted by the caller's cancellation is not a set of unreadable
 // records: it must fail, not be cached, and leave no false problems for the
 // next operator.
