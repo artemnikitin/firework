@@ -13,6 +13,7 @@ import (
 
 	"github.com/artemnikitin/firework/internal/config"
 	"github.com/artemnikitin/firework/internal/objectstorage"
+	"github.com/artemnikitin/firework/internal/statusmodel"
 )
 
 const (
@@ -194,23 +195,66 @@ func (c *Controller) readBackExplicitEmptyNodeConfig(ctx context.Context, nodeID
 	if err != nil || !exists || rendered.Revision == "" {
 		return false
 	}
-	key := legacyNodeConfigKey(c.cfg.State.Prefix, nodeID)
-	data, _, exists, err := c.store.GetRaw(ctx, key)
-	if err != nil || !exists {
-		return false
-	}
-	nc, err := config.ParseNodeConfig(data)
-	if err != nil || nc.Node != nodeID || len(nc.Services) != 0 || nc.Services == nil ||
-		nc.DesiredRevision == "" || nc.PlacementRevision == "" || nc.RenderedRevision == "" || nc.RenderedRevision != rendered.Revision {
-		return false
-	}
-	immutable, _, exists, err := c.store.GetRaw(ctx, renderedNodeKey(c.cfg.State.Prefix, nc.RenderedRevision, nodeID))
-	if err != nil || !exists || !bytes.Equal(data, immutable) {
+	nc, ok := readExplicitEmptyNodeConfig(ctx, c.store, c.cfg.State.Prefix, nodeID)
+	if !ok || nc.RenderedRevision != rendered.Revision {
 		return false
 	}
 	var after RevisionPointer
 	_, exists, err = c.store.GetJSON(ctx, renderedCurrentKey(c.cfg.State.Prefix), &after)
 	return err == nil && exists && after.Revision == rendered.Revision
+}
+
+func readExplicitEmptyNodeConfig(ctx context.Context, store StateStore, prefix, nodeID string) (config.NodeConfig, bool) {
+	var zero config.NodeConfig
+	data, _, exists, err := store.GetRaw(ctx, legacyNodeConfigKey(prefix, nodeID))
+	if err != nil || !exists {
+		return zero, false
+	}
+	nc, err := config.ParseNodeConfig(data)
+	if err != nil || nc.Node != nodeID || len(nc.Services) != 0 || nc.Services == nil ||
+		nc.DesiredRevision == "" || nc.PlacementRevision == "" || nc.RenderedRevision == "" {
+		return zero, false
+	}
+	immutable, _, exists, err := store.GetRaw(ctx, renderedNodeKey(prefix, nc.RenderedRevision, nodeID))
+	if err != nil || !exists || !bytes.Equal(data, immutable) {
+		return zero, false
+	}
+	return nc, true
+}
+
+func confirmedNodeExecutionAbsent(ctx context.Context, store StateStore, prefix string, staleTTL time.Duration, nodeID string) bool {
+	key, err := nodeRecordKey(prefix, nodeID)
+	if err != nil {
+		return false
+	}
+	firstToken, exists, err := store.GetJSON(ctx, key, &NodeRecord{})
+	if err != nil || !exists {
+		return false
+	}
+	var record NodeRecord
+	token, exists, err := store.GetJSON(ctx, key, &record)
+	if err != nil || !exists || token != firstToken || record.NodeID != nodeID {
+		return false
+	}
+	status, fresh := freshAgentStatus(record, time.Now().UTC(), staleTTL)
+	if !fresh || !statusmodel.HasCompleteActualOnlyInventory(status) || status.ServicesTruncated ||
+		status.DesiredServices != 0 || status.ReadyServices != 0 || len(status.Services) != 0 || len(status.ActualOnlyServices) != 0 {
+		return false
+	}
+	firstConfig, ok := readExplicitEmptyNodeConfig(ctx, store, prefix, nodeID)
+	if !ok || status.DesiredRevision != firstConfig.DesiredRevision ||
+		status.PlacementRevision != firstConfig.PlacementRevision || status.ObservedRevision != firstConfig.RenderedRevision ||
+		status.AppliedRevision != firstConfig.RenderedRevision {
+		return false
+	}
+	secondToken, exists, err := store.GetJSON(ctx, key, &NodeRecord{})
+	if err != nil || !exists || secondToken != token {
+		return false
+	}
+	secondConfig, ok := readExplicitEmptyNodeConfig(ctx, store, prefix, nodeID)
+	return ok && secondConfig.DesiredRevision == firstConfig.DesiredRevision &&
+		secondConfig.PlacementRevision == firstConfig.PlacementRevision &&
+		secondConfig.RenderedRevision == firstConfig.RenderedRevision
 }
 
 func (c *Controller) retireNodeRecord(ctx context.Context, observed NodeRecord, observedToken objectstorage.WriteToken, reason string) error {

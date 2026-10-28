@@ -110,6 +110,16 @@ type PlacementRevision struct {
 	// agent turns that into a delete. But they are not converged either, so
 	// they are reported here rather than being invisible.
 	HeldServices []PendingPlacement `json:"held_services,omitempty"`
+	// UnconfirmedPrevious retains old service owners across subsequent
+	// placements until a fresh v2 observation proves their explicit empty
+	// config was applied and no actual-only VM remains. This bounded set keeps
+	// a second placement change from forgetting the first possible writer.
+	UnconfirmedPrevious []PreviousPlacementOwner `json:"unconfirmed_previous,omitempty"`
+}
+
+type PreviousPlacementOwner struct {
+	Service string `json:"service"`
+	Node    string `json:"node"`
 }
 
 type PendingPlacement struct {
@@ -217,8 +227,9 @@ func (r *VolumeRecord) clearRejection() bool {
 
 // RevisionPointer points to the current immutable revision.
 type RevisionPointer struct {
-	Revision  string    `json:"revision"`
-	UpdatedAt time.Time `json:"updated_at"`
+	Revision         string    `json:"revision"`
+	PreviousRevision string    `json:"previous_revision,omitempty"`
+	UpdatedAt        time.Time `json:"updated_at"`
 }
 
 // LeaderLock stores controller leadership lease.

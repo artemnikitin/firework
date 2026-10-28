@@ -75,19 +75,29 @@ type NodeDetail struct {
 	APIVersion string    `json:"api_version"`
 	ObservedAt time.Time `json:"observed_at"`
 	NodeSummary
-	HostIP            string           `json:"host_ip,omitempty"`
-	RegisteredAt      time.Time        `json:"registered_at,omitempty"`
-	UpdatedAt         time.Time        `json:"updated_at,omitempty"`
-	DesiredRevision   string           `json:"desired_revision,omitempty"`
-	PlacementRevision string           `json:"placement_revision,omitempty"`
-	ObservedRevision  string           `json:"observed_revision,omitempty"`
-	AppliedRevision   string           `json:"applied_revision,omitempty"`
-	Reconciliation    string           `json:"reconciliation"`
-	Message           string           `json:"message,omitempty"`
-	StatusMissing     bool             `json:"status_missing"`
-	StatusStale       bool             `json:"status_stale"`
-	Conditions        []Condition      `json:"conditions,omitempty"`
-	Services          []ServiceSummary `json:"services"`
+	HostIP                      string              `json:"host_ip,omitempty"`
+	RegisteredAt                time.Time           `json:"registered_at,omitempty"`
+	UpdatedAt                   time.Time           `json:"updated_at,omitempty"`
+	DesiredRevision             string              `json:"desired_revision,omitempty"`
+	PlacementRevision           string              `json:"placement_revision,omitempty"`
+	ObservedRevision            string              `json:"observed_revision,omitempty"`
+	AppliedRevision             string              `json:"applied_revision,omitempty"`
+	Reconciliation              string              `json:"reconciliation"`
+	Message                     string              `json:"message,omitempty"`
+	StatusMissing               bool                `json:"status_missing"`
+	StatusStale                 bool                `json:"status_stale"`
+	Conditions                  []Condition         `json:"conditions,omitempty"`
+	Services                    []ServiceSummary    `json:"services"`
+	ActualOnlyServices          []ActualOnlyService `json:"actual_only_services,omitempty"`
+	ActualOnlyServicesTruncated bool                `json:"actual_only_services_truncated,omitempty"`
+}
+
+type ActualOnlyService struct {
+	Name       string `json:"name"`
+	VMState    string `json:"vm_state"`
+	PID        int    `json:"pid,omitempty"`
+	ReasonCode string `json:"reason_code,omitempty"`
+	Message    string `json:"message,omitempty"`
 }
 
 // RevisionStatus is derived from current desired, placement, rendered, and
@@ -110,11 +120,12 @@ type RevisionStatus struct {
 	// Services counts desired services by their projected /v1/services
 	// state, so the overview needs no second request to show unhealthy or
 	// pending work. UnhealthyServices names the unhealthy ones.
-	Services          ServiceCounts       `json:"services"`
-	UnhealthyServices []string            `json:"unhealthy_services"`
-	Problems          []ProjectionProblem `json:"problems,omitempty"`
-	ReasonCode        string              `json:"reason_code,omitempty"`
-	Message           string              `json:"message,omitempty"`
+	Services                        ServiceCounts       `json:"services"`
+	UnhealthyServices               []string            `json:"unhealthy_services"`
+	PreviousNodeUnconfirmedServices []string            `json:"previous_node_unconfirmed_services,omitempty"`
+	Problems                        []ProjectionProblem `json:"problems,omitempty"`
+	ReasonCode                      string              `json:"reason_code,omitempty"`
+	Message                         string              `json:"message,omitempty"`
 }
 
 // ServiceCounts summarizes desired services. Ready counts running services
@@ -143,17 +154,19 @@ type ServiceStorageSummary struct {
 }
 
 type ServiceSummary struct {
-	Name             string                `json:"name"`
-	Node             string                `json:"node,omitempty"`
-	State            string                `json:"state"`
-	Health           string                `json:"health"`
-	VCPUs            int                   `json:"vcpus"`
-	MemoryMB         int                   `json:"memory_mb"`
-	Storage          ServiceStorageSummary `json:"storage"`
-	ObservedAt       time.Time             `json:"observed_at,omitempty"`
-	LastTransitionAt time.Time             `json:"last_transition_at,omitempty"`
-	ReasonCode       string                `json:"reason_code,omitempty"`
-	Message          string                `json:"message,omitempty"`
+	Name                    string                `json:"name"`
+	Node                    string                `json:"node,omitempty"`
+	State                   string                `json:"state"`
+	Health                  string                `json:"health"`
+	VCPUs                   int                   `json:"vcpus"`
+	MemoryMB                int                   `json:"memory_mb"`
+	Storage                 ServiceStorageSummary `json:"storage"`
+	ObservedAt              time.Time             `json:"observed_at,omitempty"`
+	LastTransitionAt        time.Time             `json:"last_transition_at,omitempty"`
+	ReasonCode              string                `json:"reason_code,omitempty"`
+	Message                 string                `json:"message,omitempty"`
+	PreviousNodeUnconfirmed bool                  `json:"previous_node_unconfirmed,omitempty"`
+	PreviousNodes           []string              `json:"previous_nodes,omitempty"`
 }
 
 type ServiceHealthDetail struct {
