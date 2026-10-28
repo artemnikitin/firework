@@ -438,10 +438,9 @@ func TestClearRecoveryPendingWriteFailureKeepsQuarantineInMemory(t *testing.T) {
 		t.Fatal(err)
 	}
 	inspector.socketErr = nil
-	if err := os.Chmod(manifest.VMDir, 0o500); err != nil {
-		t.Fatal(err)
+	manager.recoveryManifestWriter = func(string, *instanceManifest) error {
+		return errors.New("injected manifest write failure")
 	}
-	t.Cleanup(func() { _ = os.Chmod(manifest.VMDir, 0o700) })
 
 	result, err := manager.ClearRecoveryPending(manifest.Service)
 	if err == nil || result.Outcome != RecoveryOutcomeAmbiguous {
