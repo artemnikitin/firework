@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net"
 	"os"
 	"path/filepath"
@@ -357,7 +358,9 @@ func TestRecoveryControlIdleClientDoesNotBlockRequestsOrShutdown(t *testing.T) {
 
 func TestRecoveryControlBoundsConcurrentRequests(t *testing.T) {
 	stateDir := recoveryControlTestStateDir(t)
+	var calls atomic.Int32
 	server := startTestRecoveryControlServer(t, stateDir, func(service string) (vm.RecoveryResult, error) {
+		calls.Add(1)
 		return vm.RecoveryResult{Service: service, Outcome: vm.RecoveryOutcomeNoop}, nil
 	})
 	connections := make([]net.Conn, 0, recoveryControlMaxHandlers)
@@ -387,12 +390,142 @@ func TestRecoveryControlBoundsConcurrentRequests(t *testing.T) {
 		time.Sleep(time.Millisecond)
 	}
 
-	_, err := ClearRecovery(context.Background(), stateDir, "overflow")
-	if err == nil || !strings.Contains(err.Error(), "maximum number of requests") {
-		t.Fatalf("server did not reject an excess request: %v", err)
+	// Exercise both frame writes under sustained contention: an early server
+	// close used to intermittently turn the busy reply into a broken pipe.
+	for round := range 4 {
+		results := make(chan error, 64)
+		for request := range cap(results) {
+			go func() {
+				resolve := ClearRecovery
+				if request%2 != 0 {
+					resolve = ForgetRecovery
+				}
+				_, err := resolve(context.Background(), stateDir, "overflow")
+				results <- err
+			}()
+		}
+		for range cap(results) {
+			if err := <-results; err == nil || !strings.Contains(err.Error(), "maximum number of requests") {
+				t.Errorf("round %d: excess request did not receive a busy response: %v", round, err)
+			}
+		}
+		server.mu.Lock()
+		active := len(server.active)
+		server.mu.Unlock()
+		if active != recoveryControlMaxHandlers || calls.Load() != 0 {
+			t.Fatalf("overflow changed admitted requests: active=%d resolver calls=%d", active, calls.Load())
+		}
 	}
-	if err := server.Close(); err != nil {
+	for _, connection := range connections {
+		_ = connection.Close()
+	}
+	waitRecoveryControlConnections(t, server, 0, false)
+	result, err := ClearRecovery(context.Background(), stateDir, "app")
+	if err != nil || result.Service != "app" || calls.Load() != 1 {
+		t.Fatalf("server did not recover after saturation: result=%#v err=%v calls=%d", result, err, calls.Load())
+	}
+}
+
+func TestRecoveryControlBusyWaitsForCompleteRequest(t *testing.T) {
+	stateDir := recoveryControlTestStateDir(t)
+	server := saturateRecoveryControlServer(t, stateDir)
+	connection, err := net.Dial("unix", server.path)
+	if err != nil {
 		t.Fatal(err)
+	}
+	defer connection.Close()
+	body, err := json.Marshal(recoveryControlRequest{Version: recoveryControlProtocolVersion, Service: "overflow"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var header [4]byte
+	binary.BigEndian.PutUint32(header[:], uint32(len(body)))
+	if _, err := connection.Write(header[:]); err != nil {
+		t.Fatal(err)
+	}
+	_ = connection.SetReadDeadline(time.Now().Add(10 * time.Millisecond))
+	if _, err := connection.Read(make([]byte, 1)); err == nil {
+		t.Fatal("server replied before consuming the complete overflow request")
+	} else if timeout, ok := err.(net.Error); !ok || !timeout.Timeout() {
+		t.Fatalf("overflow connection closed before its request was complete: %v", err)
+	}
+	_ = connection.SetDeadline(time.Now().Add(time.Second))
+	if _, err := connection.Write(body); err != nil {
+		t.Fatalf("server closed before consuming the request body: %v", err)
+	}
+	responseBody, err := readRecoveryControlFrame(connection)
+	if err != nil {
+		t.Fatal(err)
+	}
+	response, err := decodeRecoveryControlResponse(responseBody)
+	if err != nil || !strings.Contains(response.Error, "maximum number of requests") {
+		t.Fatalf("fragmented overflow request did not receive a busy response: %#v err=%v", response, err)
+	}
+}
+
+func TestRecoveryControlIdleOverflowIsBoundedAndClosedOnShutdown(t *testing.T) {
+	for _, shutdown := range []bool{false, true} {
+		t.Run(fmt.Sprintf("shutdown=%t", shutdown), func(t *testing.T) {
+			stateDir := recoveryControlTestStateDir(t)
+			server := saturateRecoveryControlServer(t, stateDir)
+			idle, err := net.Dial("unix", server.path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer idle.Close()
+			waitRecoveryControlConnections(t, server, recoveryControlMaxHandlers, true)
+			if shutdown {
+				closed := make(chan error, 1)
+				go func() { closed <- server.Close() }()
+				select {
+				case err := <-closed:
+					if err != nil {
+						t.Fatal(err)
+					}
+				case <-time.After(time.Second):
+					t.Fatal("shutdown waited for an idle overflow connection")
+				}
+				return
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+			defer cancel()
+			if _, err := ClearRecovery(ctx, stateDir, "overflow"); err == nil || !strings.Contains(err.Error(), "maximum number of requests") {
+				t.Fatalf("idle overflow connection blocked the next busy response: %v", err)
+			}
+		})
+	}
+}
+
+func saturateRecoveryControlServer(t *testing.T, stateDir string) *recoveryControlServer {
+	t.Helper()
+	server := startTestRecoveryControlServer(t, stateDir, func(service string) (vm.RecoveryResult, error) {
+		return vm.RecoveryResult{}, fmt.Errorf("overflow request unexpectedly reached resolver for %q", service)
+	})
+	for range recoveryControlMaxHandlers {
+		connection, err := net.Dial("unix", server.path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = connection.Close() })
+	}
+	waitRecoveryControlConnections(t, server, recoveryControlMaxHandlers, false)
+	return server
+}
+
+func waitRecoveryControlConnections(t *testing.T, server *recoveryControlServer, wantActive int, wantRejecting bool) {
+	t.Helper()
+	deadline := time.Now().Add(time.Second)
+	for {
+		server.mu.Lock()
+		active, rejecting := len(server.active), server.rejecting != nil
+		server.mu.Unlock()
+		if active == wantActive && rejecting == wantRejecting {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("control connections: active=%d rejecting=%t; want active=%d rejecting=%t", active, rejecting, wantActive, wantRejecting)
+		}
+		time.Sleep(time.Millisecond)
 	}
 }
 

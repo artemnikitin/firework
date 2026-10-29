@@ -25,6 +25,7 @@ const (
 	recoveryControlDeadline        = 10 * time.Second
 	recoveryControlSocketName      = "recovery.sock"
 	recoveryControlMaxHandlers     = 16
+	recoveryControlBusyDeadline    = 250 * time.Millisecond
 	recoveryAcceptRetryInitial     = 10 * time.Millisecond
 	recoveryAcceptRetryMaximum     = time.Second
 )
@@ -115,6 +116,7 @@ type recoveryControlServer struct {
 	closing    chan struct{}
 	mu         sync.Mutex
 	active     map[*net.UnixConn]struct{}
+	rejecting  *net.UnixConn
 	handlers   sync.WaitGroup
 	closed     bool
 	closeOnce  sync.Once
@@ -296,13 +298,22 @@ func (s *recoveryControlServer) startConnection(connection *net.UnixConn) {
 		return
 	}
 	if len(s.active) >= recoveryControlMaxHandlers {
+		s.rejecting = connection
 		s.mu.Unlock()
-		_ = connection.SetWriteDeadline(time.Now().Add(250 * time.Millisecond))
+		// Drain one bounded request before replying. Closing with unread request
+		// bytes can reset the socket while the client is still writing its frame,
+		// hiding the busy response behind a broken-pipe error. Reject synchronously
+		// so overload cannot create an unbounded number of handlers.
+		_ = connection.SetDeadline(time.Now().Add(recoveryControlBusyDeadline))
+		_, _ = readRecoveryControlFrame(connection)
 		s.writeResponse(connection, recoveryControlResponse{
 			Version: recoveryControlProtocolVersion,
 			Error:   "recovery control server is handling its maximum number of requests",
 		})
 		_ = connection.Close()
+		s.mu.Lock()
+		s.rejecting = nil
+		s.mu.Unlock()
 		return
 	}
 	s.active[connection] = struct{}{}
@@ -372,6 +383,9 @@ func (s *recoveryControlServer) Close() error {
 		_ = s.listener.Close()
 		for connection := range s.active {
 			_ = connection.Close()
+		}
+		if s.rejecting != nil {
+			_ = s.rejecting.Close()
 		}
 		s.mu.Unlock()
 		<-s.done
