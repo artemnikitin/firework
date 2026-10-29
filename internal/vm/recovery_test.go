@@ -620,8 +620,8 @@ func TestLegacyPersistenceFailureCanRetry(t *testing.T) {
 	service := config.ServiceConfig{Name: "app", Image: "/image", Kernel: "/kernel", VCPUs: 1, MemoryMB: 128}
 
 	manager.recoveryManifestWriter = func(string, *instanceManifest) error { return errors.New("disk write failed") }
-	if _, err := manager.Recover(context.Background(), config.NodeConfig{Services: []config.ServiceConfig{service}}); err == nil {
-		t.Fatal("expected persistence failure")
+	if _, err := manager.Recover(context.Background(), config.NodeConfig{Services: []config.ServiceConfig{service}}); err != nil {
+		t.Fatal("one service persistence failure blocked recovery", err)
 	}
 	manager.recoveryManifestWriter = nil
 	inspector.socketErr = nil

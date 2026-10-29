@@ -818,8 +818,8 @@ func TestCreateService_RetainedFailedStartKeepsClaimedNetworkDevices(t *testing.
 	if len(net.deleteTAPCalls) != 0 || len(net.deleteBridgeCalls) != 0 {
 		t.Fatalf("networking was removed from a retained process: taps=%v bridges=%v", net.deleteTAPCalls, net.deleteBridgeCalls)
 	}
-	if len(r.pendingNetworkDevices) != 0 {
-		t.Fatalf("claimed devices remained pending for deletion: %#v", r.pendingNetworkDevices)
+	if len(r.pendingNetworkDevices) != 2 {
+		t.Fatalf("uncertain owner lost durable cleanup intent: %#v", r.pendingNetworkDevices)
 	}
 }
 

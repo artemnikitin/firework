@@ -12,7 +12,7 @@ import (
 )
 
 func TestRecoveryPolicySurvivesRestart(t *testing.T) {
-	for _, tc := range []string{"live stopping", "dead stopping", "missing identity", "dead with claimant"} {
+	for _, tc := range []string{"missing identity", "dead with claimant"} {
 		t.Run(tc, func(t *testing.T) {
 			m, f, i := recoveryFixture(t)
 			m.inspector = i
@@ -57,8 +57,8 @@ func TestUntrackedAdoptionWriteFailureCanRetry(t *testing.T) {
 	m, f, i := recoveryFixture(t)
 	m.inspector = i
 	m.recoveryManifestWriter = func(string, *instanceManifest) error { return errors.New("disk unavailable") }
-	if _, err := m.Recover(context.Background(), config.NodeConfig{}); err == nil {
-		t.Fatal("missing persistence failure")
+	if _, err := m.Recover(context.Background(), config.NodeConfig{}); err != nil {
+		t.Fatal("one service persistence failure blocked recovery", err)
 	}
 	if m.List()[f.Service] == nil {
 		t.Fatal("failed adoption not tracked")
@@ -129,7 +129,8 @@ func TestDeletedExecutableAndEqualsArgumentsPreserveIdentity(t *testing.T) {
 }
 
 func TestStartCannotBypassLegacyQuarantine(t *testing.T) {
-	m, f, _ := recoveryFixture(t)
+	m, f, inspector := recoveryFixture(t)
+	m.inspector = inspector
 	if err := os.Remove(manifestPath(f.VMDir)); err != nil {
 		t.Fatal(err)
 	}

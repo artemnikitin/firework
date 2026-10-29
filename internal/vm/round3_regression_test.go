@@ -131,7 +131,6 @@ func TestRound3PIDZeroLaunchRecovery(t *testing.T) {
 func TestRound3RecoveryNeverDeletesAnotherServicesDirectory(t *testing.T) {
 	m, victim, inspector := recoveryFixture(t)
 	m.inspector = inspector
-	delete(inspector.identities, victim.PID)
 	victim.Lifecycle, victim.PID = lifecycleStopped, 0
 	otherDir := filepath.Join(m.stateDir, "vms", "other")
 	if err := writeManifest(manifestPath(otherDir), victim); err != nil {
@@ -270,8 +269,8 @@ func TestRound3LegacyMigrationCanClearIfProcessDiesBeforePersistenceRetry(t *tes
 	inspector.identities[f.PID] = identity
 	inspector.find = []processIdentity{identity}
 	m.recoveryManifestWriter = func(string, *instanceManifest) error { return errors.New("disk temporarily unavailable") }
-	if _, err := m.Recover(context.Background(), config.NodeConfig{Services: []config.ServiceConfig{f.Config}}); err == nil {
-		t.Fatal("migration persistence failure was not returned")
+	if _, err := m.Recover(context.Background(), config.NodeConfig{Services: []config.ServiceConfig{f.Config}}); err != nil {
+		t.Fatal("one service persistence failure blocked recovery", err)
 	}
 	if got := m.List()[f.Service]; got == nil || got.State != StateRecoveryPending || got.recoveryCandidate == nil {
 		t.Fatalf("migration did not retain its pending candidate: %#v", got)
@@ -370,15 +369,9 @@ func TestRound3ForgetStoppingRequiresCompleteAbsenceProof(t *testing.T) {
 		t.Fatal("Forget accepted an incomplete claimant scan")
 	}
 	inspector.findErr = nil
-	if _, err := m.ClearRecoveryPending(f.Service); err == nil {
-		t.Fatal("ordinary Clear discarded unresolved shutdown acknowledgement")
-	}
-	if _, err := os.Stat(f.VMDir); err != nil {
-		t.Fatalf("failed absence checks removed shutdown metadata: %v", err)
-	}
-	result, err := m.ForgetRecoveryPending(f.Service)
+	result, err := m.ClearRecoveryPending(f.Service)
 	if err != nil || result.Outcome != RecoveryOutcomeCleared || result.State != StateStopped {
-		t.Fatalf("Forget did not clear a proven absent stopping owner: %#v %v", result, err)
+		t.Fatalf("Clear did not clear a proven absent stopping owner: %#v %v", result, err)
 	}
 	if _, err := os.Stat(f.VMDir); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("Forget retained proven absent state: %v", err)
@@ -496,11 +489,14 @@ func TestRound3DirectChildRetainsWaitMonitorThroughRecovery(t *testing.T) {
 					t.Fatal("uncertain Stop did not quarantine the live direct child")
 				}
 				inspector.setError(nil)
-				if _, err := m.ClearRecoveryPending(service.Name); err == nil {
-					t.Fatal("interrupted Stop was incorrectly readopted")
+				if result, err := m.ClearRecoveryPending(service.Name); err != nil || result.Outcome != RecoveryOutcomeReadopted {
+					t.Fatalf("interrupted Stop did not recover: %#v %v", result, err)
 				}
-				if _, err := m.ForgetRecoveryPending(service.Name); err == nil {
-					t.Fatal("live direct child was forgotten")
+				if got := m.List()[service.Name]; got.startID != started.startID {
+					t.Fatal("interrupted Stop lost real Wait monitor ownership")
+				}
+				if r, err := m.ForgetRecoveryPending(service.Name); err != nil || r.Outcome != RecoveryOutcomeNoop {
+					t.Fatalf("already adopted child should be unaffected: %#v %v", r, err)
 				}
 			} else {
 				m.quarantine(service.Name, started.manifest, errors.New("temporary identity uncertainty"))
@@ -517,10 +513,7 @@ func TestRound3DirectChildRetainsWaitMonitorThroughRecovery(t *testing.T) {
 			}
 			wantState := StateFailed
 			wantLifecycle := lifecycleFailed
-			if quarantine == "interrupted stop" {
-				wantState = StateRecoveryPending
-				wantLifecycle = lifecycleStopping
-			}
+
 			deadline := time.Now().Add(3 * time.Second)
 			for time.Now().Before(deadline) {
 				got := m.List()[service.Name]

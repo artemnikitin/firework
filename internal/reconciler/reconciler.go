@@ -12,6 +12,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"sync"
 	"time"
 
 	"github.com/artemnikitin/firework/internal/config"
@@ -72,6 +73,10 @@ type NetworkManager interface {
 // Reconciler compares desired state from the config store with the actual
 // state of running VMs and produces a plan to converge them.
 type Reconciler struct {
+	// cleanupMu serializes cleanup journal mutations with recovery commands.
+	// Cleanup retry may call Manager.List while holding it; the manager must
+	// release its own mutex before invoking the cleanup recorder.
+	cleanupMu       sync.Mutex
 	vmManager       VMManager
 	healthMon       *healthcheck.Monitor
 	networkMgr      NetworkManager
@@ -269,7 +274,7 @@ func New(vmManager VMManager, logger *slog.Logger, healthMon *healthcheck.Monito
 // Callers outside tests should use New; this exists so host networking can be
 // faked when exercising the agent's tick paths.
 func NewWithNetworkManager(vmManager VMManager, logger *slog.Logger, healthMon *healthcheck.Monitor, networkMgr NetworkManager, updateStrategy string, updateDelay time.Duration) *Reconciler {
-	return &Reconciler{
+	r := &Reconciler{
 		vmManager:             vmManager,
 		healthMon:             healthMon,
 		networkMgr:            networkMgr,
@@ -288,6 +293,8 @@ func NewWithNetworkManager(vmManager VMManager, logger *slog.Logger, healthMon *
 			}
 		},
 	}
+	r.installRecoveryCleanupRecorder()
+	return r
 }
 
 // pendingTeardownsFile is the name, under stateDir, of the file that
@@ -307,6 +314,8 @@ const pendingTeardownsFile = "pending_teardowns.json"
 // behaves exactly as before, tracking pending teardowns in memory only (the
 // default in tests).
 func (r *Reconciler) WithStateDir(dir string) *Reconciler {
+	r.cleanupMu.Lock()
+	defer r.cleanupMu.Unlock()
 	r.stateDir = dir
 	if dir == "" {
 		return r
@@ -380,6 +389,12 @@ var errJournalCorrupt = errors.New("pending teardowns journal is corrupt or unre
 // write-ahead path can refuse to remove a VM it cannot durably record the
 // cleanup for.
 func (r *Reconciler) persistPendingTeardowns() error {
+	r.cleanupMu.Lock()
+	defer r.cleanupMu.Unlock()
+	return r.persistPendingTeardownsLocked()
+}
+
+func (r *Reconciler) persistPendingTeardownsLocked() error {
 	if r.stateDir == "" {
 		return nil
 	}
@@ -507,6 +522,9 @@ func (r *Reconciler) Plan(desired config.NodeConfig) []Action {
 			actions = append(actions, Action{Type: ActionCreate, Service: svc})
 			continue
 		}
+		if inst.State == vm.StateRecoveryPending {
+			continue
+		}
 		if needsUpdate(inst, svc) {
 			prev := inst.Config
 			actions = append(actions, Action{
@@ -521,6 +539,9 @@ func (r *Reconciler) Plan(desired config.NodeConfig) []Action {
 	// Use inst.Config so the delete handler has full config for teardown
 	// (needed for network teardown and port forward cleanup).
 	for name, inst := range actual {
+		if inst.State == vm.StateRecoveryPending {
+			continue
+		}
 		if _, desired := desiredSet[name]; !desired {
 			actions = append(actions, Action{Type: ActionDelete, Service: inst.Config})
 		}
@@ -532,6 +553,16 @@ func (r *Reconciler) Plan(desired config.NodeConfig) []Action {
 // Apply executes the list of reconciliation actions.
 // Uses rolling strategy if configured, otherwise applies all at once.
 func (r *Reconciler) Apply(ctx context.Context, actions []Action) error {
+	// Recovery commands may quarantine an instance between planning and apply.
+	actual := r.vmManager.List()
+	filtered := make([]Action, 0, len(actions))
+	for _, action := range actions {
+		if instance := actual[action.Service.Name]; instance != nil && instance.State == vm.StateRecoveryPending {
+			continue
+		}
+		filtered = append(filtered, action)
+	}
+	actions = filtered
 	if r.updateStrategy == "rolling" {
 		return r.applyRolling(ctx, actions)
 	}
@@ -627,14 +658,6 @@ func (r *Reconciler) applyRolling(ctx context.Context, actions []Action) error {
 	}
 
 	for i, action := range updates {
-		if instance := r.vmManager.List()[action.Service.Name]; instance != nil && instance.State == vm.StateRecoveryPending {
-			// Quarantine requires a separate ownership decision. Keep it out of
-			// volume preflight and VM removal while independent rolling updates
-			// proceed, and retain an error so this revision is not marked applied.
-			errs = append(errs, stageError(FailureStageVM,
-				fmt.Errorf("update %s remains recovery_pending: %s", action.Service.Name, instance.LastError)))
-			continue
-		}
 		r.logger.Info("updating service (stop + start)", "service", action.Service.Name)
 		rejections, err := r.preflight(ctx, action.Service)
 		if err != nil {
@@ -762,9 +785,6 @@ func (r *Reconciler) Reconcile(ctx context.Context, desired config.NodeConfig) e
 			errs = append(errs, stageError(FailureStageVM, fmt.Errorf("recover VMs: %w", err)))
 		}
 	}
-	if err := r.acceptRecoveryTeardowns(); err != nil {
-		errs = append(errs, err)
-	}
 	if err := r.restoreRecovered(ctx, desired); err != nil {
 		errs = append(errs, err)
 	}
@@ -835,7 +855,7 @@ func (r *Reconciler) syncPortForwards(desired config.NodeConfig) error {
 			continue
 		}
 		// A service still waiting to be created has no guest to forward to.
-		if running[svc.Name] == nil {
+		if running[svc.Name] == nil || running[svc.Name].State == vm.StateRecoveryPending {
 			continue
 		}
 		for _, pf := range svc.PortForwards {
@@ -865,7 +885,7 @@ func (r *Reconciler) restoreRecovered(ctx context.Context, desired config.NodeCo
 		if instance == nil && r.healthMon != nil {
 			r.healthMon.Deregister(name)
 		}
-		if !wanted || instance == nil || needsUpdate(instance, service) {
+		if !wanted || instance == nil || instance.State == vm.StateRecoveryPending || needsUpdate(instance, service) {
 			delete(r.pendingRecovery, name)
 			continue
 		}
@@ -1086,6 +1106,8 @@ func (r *Reconciler) addPendingNetworkDevices(svc config.ServiceConfig) {
 // clearJournalledNetworkDevices drops svc's device entries once the running VM
 // has taken ownership of them, so the journal returns to empty in steady state.
 func (r *Reconciler) clearJournalledNetworkDevices(svc config.ServiceConfig) {
+	r.cleanupMu.Lock()
+	defer r.cleanupMu.Unlock()
 	changed := false
 	for _, dev := range networkDevicesForService(svc) {
 		if _, pending := r.pendingNetworkDevices[dev]; pending {
@@ -1094,7 +1116,7 @@ func (r *Reconciler) clearJournalledNetworkDevices(svc config.ServiceConfig) {
 		}
 	}
 	if changed {
-		r.logPersistFailure(r.persistPendingTeardowns())
+		r.logPersistFailure(r.persistPendingTeardownsLocked())
 	}
 }
 
@@ -1104,6 +1126,8 @@ func (r *Reconciler) clearJournalledNetworkDevices(svc config.ServiceConfig) {
 // atomicWriteFile leaves the previous file untouched when it fails, so rolling
 // back in memory restores agreement between the two.
 func (r *Reconciler) journalPendingCleanup(mutate func()) error {
+	r.cleanupMu.Lock()
+	defer r.cleanupMu.Unlock()
 	prevPortForwards := maps.Clone(r.pendingPortForwards)
 	prevNetworkDevices := maps.Clone(r.pendingNetworkDevices)
 	mutate()
@@ -1114,7 +1138,7 @@ func (r *Reconciler) journalPendingCleanup(mutate func()) error {
 	if maps.Equal(prevPortForwards, r.pendingPortForwards) && maps.Equal(prevNetworkDevices, r.pendingNetworkDevices) {
 		return nil
 	}
-	if err := r.persistPendingTeardowns(); err != nil {
+	if err := r.persistPendingTeardownsLocked(); err != nil {
 		r.pendingPortForwards = prevPortForwards
 		r.pendingNetworkDevices = prevNetworkDevices
 		return err
@@ -1128,6 +1152,8 @@ func (r *Reconciler) journalPendingCleanup(mutate func()) error {
 // success clears any entry under that same key, whichever generation of
 // svc.Name originally recorded it. A no-op if svc has no network.
 func (r *Reconciler) teardownAndTrackPortForwards(svc config.ServiceConfig, pfs []config.PortForward) error {
+	r.cleanupMu.Lock()
+	defer r.cleanupMu.Unlock()
 	if r.networkMgr == nil || svc.Network == nil || len(pfs) == 0 {
 		return nil
 	}
@@ -1153,6 +1179,8 @@ func (r *Reconciler) teardownAndTrackPortForwards(svc config.ServiceConfig, pfs 
 // identity, so a success clears whichever generation of svc.Name originally
 // recorded it. A no-op if there is no network manager or no network config.
 func (r *Reconciler) teardownAndTrackNetwork(svc config.ServiceConfig) error {
+	r.cleanupMu.Lock()
+	defer r.cleanupMu.Unlock()
 	if r.networkMgr == nil {
 		return nil
 	}
@@ -1231,7 +1259,8 @@ func (r *Reconciler) retryPendingTeardowns() error {
 // whatever entry.ServiceName's current config looks like.
 //
 // A rule is skipped — dropped from the pending set without being torn down —
-// whenever *any* currently running service's config claims it. Checking every
+// whenever *any* currently running service's config claims it. Uncertain
+// owners retain the journal entry until ownership resolves. Checking every
 // running service rather than only entry.ServiceName matters because a DNAT
 // rule is identified by its tuple alone: after a rename or a replacement,
 // service B can legitimately claim the exact (hostPort, guestIP, vmPort) that
@@ -1239,13 +1268,17 @@ func (r *Reconciler) retryPendingTeardowns() error {
 // while reporting a successful reconciliation. This mirrors the identical
 // guard in retryPendingNetworkDevices.
 func (r *Reconciler) retryPendingPortForwards() error {
+	r.cleanupMu.Lock()
+	defer r.cleanupMu.Unlock()
 	if r.networkMgr == nil || len(r.pendingPortForwards) == 0 {
 		return nil
 	}
 	claimed := make(map[portForwardKey]string)
+	retained := make(map[portForwardKey]bool)
 	for name, inst := range r.vmManager.List() {
 		for key := range portForwardKeys(inst.Config) {
 			claimed[key] = name
+			retained[key] = retained[key] || inst.State == vm.StateRecoveryPending || inst.State == vm.StateStarting || inst.State == vm.StateStartAborting
 		}
 	}
 	keys := make([]portForwardKey, 0, len(r.pendingPortForwards))
@@ -1268,6 +1301,9 @@ func (r *Reconciler) retryPendingPortForwards() error {
 	for _, key := range keys {
 		entry := r.pendingPortForwards[key]
 		if owner, live := claimed[key]; live {
+			if retained[key] {
+				continue // Keep write-ahead cleanup until this uncertain owner resolves.
+			}
 			r.logger.Debug("pending port forward is claimed by a running service; dropping without tearing down",
 				"host_port", key.hostPort, "guest_ip", key.guestIP, "vm_port", key.vmPort, "claimed_by", owner)
 			delete(r.pendingPortForwards, key)
@@ -1285,7 +1321,7 @@ func (r *Reconciler) retryPendingPortForwards() error {
 		changed = true
 	}
 	if changed {
-		r.logPersistFailure(r.persistPendingTeardowns())
+		r.logPersistFailure(r.persistPendingTeardownsLocked())
 	}
 	return combineErrors(errs)
 }
@@ -1299,20 +1335,25 @@ func (r *Reconciler) retryPendingPortForwards() error {
 // than through NetworkManager.Teardown, which always removes both.
 //
 // A device is skipped — dropped from the pending set without being deleted —
-// whenever *any* currently running service's config claims it. Checking every
-// running service rather than only entry.ServiceName is deliberate: an
+// whenever *any* currently running service's config claims it. Uncertain
+// owners retain their cleanup intent without removing their host devices.
+// Checking every running service rather than only entry.ServiceName is deliberate: an
 // explicit network.interface can be carried across a config change that alters
 // the rest of the service's networking, so the device that is obsolete for one
 // generation may be the live device of another. Deleting a claimed device
 // would break a running VM while reporting a successful reconciliation.
 func (r *Reconciler) retryPendingNetworkDevices() error {
+	r.cleanupMu.Lock()
+	defer r.cleanupMu.Unlock()
 	if r.networkMgr == nil || len(r.pendingNetworkDevices) == 0 {
 		return nil
 	}
 	claimed := make(map[networkDeviceKey]string)
+	retained := make(map[networkDeviceKey]bool)
 	for name, inst := range r.vmManager.List() {
 		for _, dev := range networkDevicesForService(inst.Config) {
 			claimed[dev] = name
+			retained[dev] = retained[dev] || inst.State == vm.StateRecoveryPending || inst.State == vm.StateStarting || inst.State == vm.StateStartAborting
 		}
 	}
 
@@ -1333,6 +1374,9 @@ func (r *Reconciler) retryPendingNetworkDevices() error {
 	for _, key := range keys {
 		entry := r.pendingNetworkDevices[key]
 		if owner, live := claimed[key]; live {
+			if retained[key] {
+				continue // A partial removal must retain its durable cleanup intent.
+			}
 			r.logger.Debug("pending network device is claimed by a running service; dropping without deleting",
 				"kind", key.kind, "device", key.name, "claimed_by", owner)
 			delete(r.pendingNetworkDevices, key)
@@ -1350,7 +1394,7 @@ func (r *Reconciler) retryPendingNetworkDevices() error {
 		changed = true
 	}
 	if changed {
-		r.logPersistFailure(r.persistPendingTeardowns())
+		r.logPersistFailure(r.persistPendingTeardownsLocked())
 	}
 	return combineErrors(errs)
 }

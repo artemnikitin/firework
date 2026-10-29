@@ -211,11 +211,10 @@ the process is proven gone. If it cannot be proven gone, it is retained as
 `recovery_pending` and keeps ownership of its host networking so reconciliation
 cannot tear resources down around a potentially live microVM.
 
-Recovery is spent once per agent process, including on a fresh node where the
-VM state directory does not exist yet. That directory appears as soon as the
-process creates its first VM, and a later pass would otherwise "recover" VMs the
-running process owns. Services already tracked in memory are skipped for the
-same reason.
+Recovery inspects untracked and quarantined runtime directories on reconciliation
+ticks. Services already owned in a nonquarantined state are skipped. A shared
+five-second pass budget and rotating service order bound retries and prevent one
+slow service from starving the others.
 
 A manifest whose recorded identity does not validate is re-proved from the live
 command line before it is quarantined. The instance ID is 128 bits generated
@@ -264,13 +263,13 @@ VM path. This permits dead PID-0 starts and unused legacy directories to recover
 without hand-editing files. Unknown, unreadable, or live ownership remains pending.
 A missing identity cannot authorize live adoption.
 
-An unresolved `stopping` manifest is not adopted automatically. If the VM is
-proved absent, use `firework-agent clear-recovery --forget SERVICE` to discard
-that runtime marker. This flag still requires the full absence proof; it is not
-an assertion that bypasses process checks. It never deletes persistent volumes.
-Losing runtime metadata does not prove filesystem consistency or guest quiesce.
-When integrated with #49, do not use forgetting as proof that a volume resize is
-safe: the offline filesystem/resize validation remains independently required.
+Recovery classifies actual process ownership independently of the recorded
+lifecycle label: proven absence permits cleanup, a live owned process with a
+valid API socket permits adoption, and uncertain ownership stays quarantined.
+This also applies to interrupted `stopping` records. The optional `--forget`
+flag restricts the command to absence-verified cleanup; it never adopts or kills
+a live process. Neither cleanup nor adoption proves guest quiesce or filesystem
+consistency. Issue #49's offline filesystem/resize validation remains independent.
 
 If proof fails, inspect the VM logs, ownership manifest, and recorded systemd
 unit. Stop/fence the actual owner before retrying. For corrupt metadata, preserve
@@ -325,8 +324,8 @@ emit an operator-intervention error.
 A quarantined direct child's exit remains eligible for recovery on the next
 tick or explicit retry. Its Wait monitor records the exit without clearing
 `recovery_pending`; the resolver still requires the full absence proof before
-removing runtime state. An interrupted `stopping` marker remains subject to
-guarded `--forget`, including after that child exits.
+removing runtime state. The old lifecycle marker does not prevent automatic
+cleanup once absence is proven.
 
 Process and unit inspections run outside the global manager lock. Final mutation
 revalidates the captured instance and durable record. Restricted process tables
@@ -338,11 +337,14 @@ Boot ID, start time, executable inode/device and launch arguments establish
 ownership. A `/proc/PID/exe` display-path ` (deleted)` suffix does not invalidate
 an otherwise proven process, including during legacy migration.
 
-Pending VM updates are isolated from independent rolling updates; ordinary
-rolling update failures still stop subsequent updates. An unresolved service
-keeps node convergence incomplete and the node's applied revision does not
-advance. Reporting a node-wide revision as applied would falsely acknowledge
-work on the blocked service.
+Quarantined services are excluded from both rolling and all-at-once plans. They
+retain their individual `vm_recovery_pending` status while independent services
+continue applying changes. A successfully executed plan advances the node's
+applied revision; this acknowledges processing the configuration, not health or
+convergence of every VM. Per-service status remains authoritative for readiness.
+Successful image synchronization is cached by nonempty store revision, so retrying
+quarantine does not repeat the completed image stage. Failed downloads remain
+eligible for retry; multi-label inputs without a combined revision still sync.
 
 Manager lock acquisition and commit checks have a five-second budget, shorter
 than the transport deadline. A lost response means its outcome is unknown;
@@ -356,12 +358,9 @@ VM directory; prelaunch failures discard only files belonging to that attempt.
 An abort during preparation marks the attempt and leaves any old runtime state
 intact. Final removal checks the same instance that was originally selected.
 
-Before recovery deletes VM state it atomically stores a validated full manifest
-under `<state_dir>/recovery-teardowns/`. The reconciler first copies its old
-network resources into the existing durable teardown journal, then acknowledges
-the outbox event. Physical cleanup uses the usual running-config claimant guards
-so resources reused by a new VM are preserved. Events remain pending during
-unresolved/starting/aborting VM state or journal failures. If removal only partly
-succeeds and removes `instance.json`, the retained snapshot permits a fresh
-absence proof and retry after restart. Multiple incompatible snapshots remain
-ambiguous rather than guessing which identity owns the directory.
+Before recovery deletes VM state it records old host-network resources directly
+in the existing reconciler teardown journal. There is no separate recovery
+outbox. Physical cleanup uses the usual running-config claimant guards so
+resources retained by a live or quarantined VM are preserved. When host network
+setup is disabled, recovery has no network cleanup obligation. A journal write
+failure preserves the VM directory for a later retry.

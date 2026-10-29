@@ -3,6 +3,7 @@
 package vm
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"os"
@@ -18,6 +19,13 @@ import (
 const processInspectionSupported = true
 
 func (osProcessInspector) Inspect(pid int) (processIdentity, error) {
+	return (osProcessInspector{}).InspectContext(context.Background(), pid)
+}
+
+func (osProcessInspector) InspectContext(ctx context.Context, pid int) (processIdentity, error) {
+	if err := ctx.Err(); err != nil {
+		return processIdentity{}, err
+	}
 	procDir := filepath.Join("/proc", strconv.Itoa(pid))
 	statData, err := os.ReadFile(filepath.Join(procDir, "stat"))
 	if errors.Is(err, os.ErrNotExist) {
@@ -48,7 +56,7 @@ func (osProcessInspector) Inspect(pid int) (processIdentity, error) {
 	}
 	info, err := os.Stat(filepath.Join(procDir, "exe"))
 	if err != nil {
-		if procExitedWithin(procDir, procExitConfirmTimeout) {
+		if procExitedWithinContext(ctx, procDir, procExitConfirmTimeout) {
 			return processIdentity{}, errProcessNotFound
 		}
 		return processIdentity{}, fmt.Errorf("stat process executable: %w", err)
@@ -59,7 +67,7 @@ func (osProcessInspector) Inspect(pid int) (processIdentity, error) {
 	}
 	cmdline, err := os.ReadFile(filepath.Join(procDir, "cmdline"))
 	if err != nil {
-		if procExitedWithin(procDir, procExitConfirmTimeout) {
+		if procExitedWithinContext(ctx, procDir, procExitConfirmTimeout) {
 			return processIdentity{}, errProcessNotFound
 		}
 		return processIdentity{}, fmt.Errorf("read process command line: %w", err)
@@ -68,7 +76,7 @@ func (osProcessInspector) Inspect(pid int) (processIdentity, error) {
 	// truncated identity would fail every argument comparison and quarantine a
 	// VM that merely exited, so confirm the exit before treating it as one.
 	if len(strings.Trim(string(cmdline), "\x00")) == 0 {
-		if procExitedWithin(procDir, procExitConfirmTimeout) {
+		if procExitedWithinContext(ctx, procDir, procExitConfirmTimeout) {
 			return processIdentity{}, errProcessNotFound
 		}
 		return processIdentity{}, fmt.Errorf("process %d has no command line", pid)
@@ -82,18 +90,26 @@ func (osProcessInspector) Inspect(pid int) (processIdentity, error) {
 }
 
 func (inspector osProcessInspector) FindByArguments(socketPath, configPath string) ([]processIdentity, error) {
+	return inspector.FindByArgumentsContext(context.Background(), socketPath, configPath)
+}
+
+func (inspector osProcessInspector) FindByArgumentsContext(ctx context.Context, socketPath, configPath string) ([]processIdentity, error) {
 	entries, err := os.ReadDir("/proc")
 	if err != nil {
 		return nil, fmt.Errorf("read process table: %w", err)
 	}
-	return findByVMArgumentsWith(entries, "/proc", socketPath, configPath, false, false,
-		readProcessCommandLine, inspector.Inspect)
+	return findByVMArgumentsContext(ctx, entries, "/proc", socketPath, configPath, false, false,
+		readProcessCommandLine, func(pid int) (processIdentity, error) { return inspector.InspectContext(ctx, pid) })
 }
 
 // FindByAnyArgument performs the strict claimant scan used before deleting VM
 // state. Either exact path reference is enough to retain the files, and an
 // unreadable live process makes the scan incomplete.
 func (inspector osProcessInspector) FindByAnyArgument(socketPath, configPath string) ([]processIdentity, error) {
+	return inspector.FindByAnyArgumentContext(context.Background(), socketPath, configPath)
+}
+
+func (inspector osProcessInspector) FindByAnyArgumentContext(ctx context.Context, socketPath, configPath string) ([]processIdentity, error) {
 	mounts, err := os.ReadFile("/proc/mounts")
 	if err != nil {
 		return nil, fmt.Errorf("cannot verify process table visibility: %w", err)
@@ -106,8 +122,8 @@ func (inspector osProcessInspector) FindByAnyArgument(socketPath, configPath str
 	if err != nil {
 		return nil, fmt.Errorf("read process table: %w", err)
 	}
-	return findByVMArgumentsWith(entries, "/proc", socketPath, configPath, true, true,
-		readProcessCommandLine, inspector.Inspect)
+	return findByVMArgumentsContext(ctx, entries, "/proc", socketPath, configPath, true, true,
+		readProcessCommandLine, func(pid int) (processIdentity, error) { return inspector.InspectContext(ctx, pid) })
 }
 
 func findByVMArgumentsWith(
@@ -117,8 +133,21 @@ func findByVMArgumentsWith(
 	readCommandLine func(string) ([]string, error),
 	inspect func(int) (processIdentity, error),
 ) ([]processIdentity, error) {
+	return findByVMArgumentsContext(context.Background(), entries, procRoot, socketPath, configPath, matchEither, failOnUnreadable, readCommandLine, inspect)
+}
+
+func findByVMArgumentsContext(
+	ctx context.Context, entries []os.DirEntry,
+	procRoot, socketPath, configPath string,
+	matchEither, failOnUnreadable bool,
+	readCommandLine func(string) ([]string, error),
+	inspect func(int) (processIdentity, error),
+) ([]processIdentity, error) {
 	var matches []processIdentity
 	for _, entry := range entries {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		pid, err := strconv.Atoi(entry.Name())
 		if err != nil {
 			continue
@@ -187,6 +216,10 @@ const procExitConfirmTimeout = time.Second
 // dead state counts as an exit, which keeps a live process — including one
 // whose PID was recycled during the wait — from ever being reported as gone.
 func procExitedWithin(procDir string, timeout time.Duration) bool {
+	return procExitedWithinContext(context.Background(), procDir, timeout)
+}
+
+func procExitedWithinContext(ctx context.Context, procDir string, timeout time.Duration) bool {
 	deadline := time.Now().Add(timeout)
 	for {
 		statData, err := os.ReadFile(filepath.Join(procDir, "stat"))
@@ -201,7 +234,11 @@ func procExitedWithin(procDir string, timeout time.Duration) bool {
 		if !time.Now().Before(deadline) {
 			return false
 		}
-		time.Sleep(10 * time.Millisecond)
+		select {
+		case <-ctx.Done():
+			return false
+		case <-time.After(10 * time.Millisecond):
+		}
 	}
 }
 

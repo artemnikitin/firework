@@ -3,6 +3,7 @@ package vm
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"os"
@@ -43,63 +44,41 @@ func TestClearRecoveryPendingRemovesStateOnlyAfterProcessIsProvenGone(t *testing
 	}
 }
 
-func TestClearRecoveryPendingDoesNotReadoptLiveStoppingVM(t *testing.T) {
-	manager, manifest, inspector := recoveryFixture(t)
-	manifest.Lifecycle = lifecycleStopping
-	if err := writeManifest(manifestPath(manifest.VMDir), manifest); err != nil {
-		t.Fatal(err)
-	}
-	manager.inspector = inspector
-	manager.addRecoveryPending(manifest.Service, manifest, "stop acknowledgement was interrupted")
-	launcher := &recordingLauncher{}
-	manager.launcher = launcher
-
-	result, err := manager.ClearRecoveryPending(manifest.Service)
-	if err == nil || result.Outcome != RecoveryOutcomeAmbiguous || !strings.Contains(err.Error(), "shutdown state is unresolved") {
-		t.Fatalf("live stopping VM was re-adopted: result=%#v err=%v", result, err)
-	}
-	if instance := manager.List()[manifest.Service]; instance == nil || instance.State != StateRecoveryPending {
-		t.Fatalf("live stopping VM left recovery_pending: %#v", instance)
-	}
-	if launcher.stops != 0 {
-		t.Fatalf("clear operation signalled a live stopping VM %d times", launcher.stops)
-	}
-}
-
-func TestClearRecoveryPendingPreservesDeadStoppingManifest(t *testing.T) {
-	manager, manifest, inspector := recoveryFixture(t)
-	manifest.Lifecycle = lifecycleStopping
-	if err := writeManifest(manifestPath(manifest.VMDir), manifest); err != nil {
-		t.Fatal(err)
-	}
-	manager.inspector = inspector
-	manager.addRecoveryPending(manifest.Service, manifest, "shutdown acknowledgement was interrupted")
-	delete(inspector.identities, manifest.PID)
-	launcher := &recordingLauncher{}
-	manager.launcher = launcher
-
-	result, err := manager.ClearRecoveryPending(manifest.Service)
-	if err == nil || result.Outcome != RecoveryOutcomeAmbiguous || !strings.Contains(err.Error(), "shutdown state is unresolved") {
-		t.Fatalf("dead stopping VM state was cleared: result=%#v err=%v", result, err)
-	}
-	if instance := manager.List()[manifest.Service]; instance == nil || instance.State != StateRecoveryPending {
-		t.Fatalf("dead stopping VM left recovery_pending: %#v", instance)
-	}
-	durable, err := readManifest(manifestPath(manifest.VMDir))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if durable.Lifecycle != lifecycleStopping {
-		t.Fatalf("dead stopping marker was changed: %#v", durable)
-	}
-	if _, err := os.Stat(manifest.VMDir); err != nil {
-		t.Fatalf("dead stopping VM runtime state was removed: %v", err)
-	}
-	if err := manager.Start(context.Background(), manifest.Config); err == nil || !strings.Contains(err.Error(), "ambiguous surviving state") {
-		t.Fatalf("start was not blocked by the retained stopping marker: %v", err)
-	}
-	if launcher.stops != 0 {
-		t.Fatalf("clear operation signalled a stopped VM %d times", launcher.stops)
+func TestClearRecoveryPendingResolvesStoppingByObservedOwnership(t *testing.T) {
+	for _, live := range []bool{true, false} {
+		t.Run(fmt.Sprint(live), func(t *testing.T) {
+			manager, manifest, inspector := recoveryFixture(t)
+			manager.inspector = inspector
+			manifest.Lifecycle = lifecycleStopping
+			if err := writeManifest(manifestPath(manifest.VMDir), manifest); err != nil {
+				t.Fatal(err)
+			}
+			manager.addRecoveryPending(manifest.Service, manifest, "stop acknowledgement was interrupted")
+			if !live {
+				delete(inspector.identities, manifest.PID)
+			}
+			launcher := &recordingLauncher{}
+			manager.launcher = launcher
+			result, err := manager.ClearRecoveryPending(manifest.Service)
+			want := RecoveryOutcomeCleared
+			if live {
+				want = RecoveryOutcomeReadopted
+			}
+			if err != nil || result.Outcome != want {
+				t.Fatalf("stopping result=%#v err=%v", result, err)
+			}
+			if live {
+				stopAdoptedMonitors(t, manager)
+				if got := manager.List()[manifest.Service]; got == nil || got.State != StateRunning {
+					t.Fatalf("live owner not adopted: %#v", got)
+				}
+			} else if _, err := os.Stat(manifest.VMDir); !errors.Is(err, os.ErrNotExist) {
+				t.Fatalf("absent owner retained state: %v", err)
+			}
+			if launcher.stops != 0 {
+				t.Fatal("resolution signalled a VM")
+			}
+		})
 	}
 }
 
@@ -200,8 +179,8 @@ func TestRecoverIdentityPersistenceFailureKeepsDurableIdentityAndRetries(t *test
 		return writeManifest(path, candidate)
 	}
 
-	if _, err := manager.Recover(context.Background(), config.NodeConfig{}); err == nil || !strings.Contains(err.Error(), "injected durable write failure") {
-		t.Fatalf("identity persistence failure was not returned: %v", err)
+	if _, err := manager.Recover(context.Background(), config.NodeConfig{}); err != nil {
+		t.Fatalf("one service persistence failure blocked recovery: %v", err)
 	}
 	instance := manager.List()[manifest.Service]
 	if instance == nil || instance.State != StateRecoveryPending || instance.recoveryCandidate == nil {
@@ -228,24 +207,6 @@ func TestRecoverIdentityPersistenceFailureKeepsDurableIdentityAndRetries(t *test
 	durable, err = readManifest(manifestPath(manifest.VMDir))
 	if err != nil || validateOwnedProcess(inspector, durable) != nil {
 		t.Fatalf("retry did not persist a valid process identity: manifest=%#v err=%v", durable, err)
-	}
-}
-
-func TestClearRecoveryPendingKeepsCurrentDirectChildWaitMonitor(t *testing.T) {
-	manager, manifest, inspector := recoveryFixture(t)
-	manager.inspector = inspector
-	manager.addRecoveryPending(manifest.Service, manifest, "temporary recovery verification")
-	manager.mu.Lock()
-	manager.instances[manifest.Service].startID = "current-direct-start"
-	manager.mu.Unlock()
-
-	result, err := manager.ClearRecoveryPending(manifest.Service)
-	if err != nil || result.Outcome != RecoveryOutcomeReadopted {
-		t.Fatalf("clear for a current direct child = %#v, %v", result, err)
-	}
-	instance := manager.List()[manifest.Service]
-	if instance == nil || instance.State != StateRunning || instance.startID != "current-direct-start" {
-		t.Fatalf("clear lost the current direct child's Wait monitor identity: %#v", instance)
 	}
 }
 
@@ -389,8 +350,9 @@ func TestClearRecoveryPendingRefusesMissingIdentityAndCorruptManifest(t *testing
 		}
 	})
 
-	t.Run("missing manifest", func(t *testing.T) {
-		manager, manifest, _ := recoveryFixture(t)
+	t.Run("missing manifest with live claimant", func(t *testing.T) {
+		manager, manifest, inspector := recoveryFixture(t)
+		manager.inspector = inspector
 		if err := os.Remove(manifestPath(manifest.VMDir)); err != nil {
 			t.Fatal(err)
 		}
@@ -479,7 +441,7 @@ func TestClearRecoveryPendingKeepsStartBlockedWithoutHoldingManagerLock(t *testi
 	go func() { startDone <- manager.Start(context.Background(), startService) }()
 	select {
 	case err := <-startDone:
-		if err == nil || !strings.Contains(err.Error(), "ambiguous surviving state") {
+		if !errors.Is(err, ErrStartInProgress) {
 			t.Fatalf("start did not refuse the quarantined service: %v", err)
 		}
 	case <-time.After(100 * time.Millisecond):
@@ -595,6 +557,7 @@ func TestClearRecoveryPendingUsesOnlyTheNamedVMDirectory(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(otherDir, "kept"), []byte("state"), 0o600); err != nil {
 		t.Fatal(err)
 	}
+	inspector.identities[77] = processIdentity{PID: 77, CommandLine: []string{"firecracker", "--api-sock", filepath.Join(otherDir, "firecracker.sock")}}
 	inspector.errors[manifest.PID] = errors.New("temporary process inspection failure")
 	manager.inspector = inspector
 	if _, err := manager.Recover(context.Background(), config.NodeConfig{}); err != nil {

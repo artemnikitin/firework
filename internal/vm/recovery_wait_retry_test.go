@@ -90,24 +90,12 @@ func TestQuarantinedChildExitRetainsRecoveryEligibility(t *testing.T) {
 			m.recoveryManifestWriter = nil
 			if tc.command {
 				r, err := m.ClearRecoveryPending(f.Service)
-				if tc.stopping {
-					if err == nil {
-						t.Fatal("stopping state cleared without guarded forget")
-					}
-				} else if err != nil || r.Outcome != RecoveryOutcomeCleared {
+				if err != nil || r.Outcome != RecoveryOutcomeCleared {
 					t.Fatalf("command retry: %#v %v", r, err)
 				}
 			} else {
 				if _, err := m.Recover(context.Background(), config.NodeConfig{Services: []config.ServiceConfig{f.Config}}); err != nil {
 					t.Fatal(err)
-				}
-			}
-			if tc.stopping {
-				if got := m.List()[f.Service]; got == nil || got.State != StateRecoveryPending {
-					t.Fatal("shutdown uncertainty lost")
-				}
-				if r, err := m.ForgetRecoveryPending(f.Service); err != nil || r.Outcome != RecoveryOutcomeCleared {
-					t.Fatalf("guarded forget: %#v %v", r, err)
 				}
 			}
 			if m.List()[f.Service] != nil || m.HasPendingRecovery() {

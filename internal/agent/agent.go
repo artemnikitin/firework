@@ -40,6 +40,11 @@ type routeSyncer interface {
 	SyncLocal(services []config.ServiceConfig) error
 }
 
+type imageSyncer interface {
+	Sync(context.Context, []config.ServiceConfig) error
+	Close() error
+}
+
 // Agent is the core component that runs on each node. It periodically pulls
 // the desired state from the config store and reconciles it with the actual
 // state of running Firecracker microVMs.
@@ -51,7 +56,7 @@ type Agent struct {
 	reconciler      *reconciler.Reconciler
 	healthMon       *healthcheck.Monitor
 	networkMgr      *network.Manager
-	imageSyncer     *imagesync.Syncer
+	imageSyncer     imageSyncer
 	apiServer       *api.Server
 	logger          *slog.Logger
 	metrics         *runtimeMetrics
@@ -65,6 +70,7 @@ type Agent struct {
 	forceReconcile  bool
 
 	lastRevision         string
+	lastImageRevision    string
 	lastKnownCapacity    capacity.NodeCapacity
 	hasLastKnownCapacity bool
 
@@ -133,7 +139,7 @@ func New(cfg agentconfig.AgentConfig, s store.Store, logger *slog.Logger) *Agent
 	}
 
 	// Set up optional image syncer.
-	var imgSyncer *imagesync.Syncer
+	var imgSyncer imageSyncer
 	switch {
 	case cfg.S3ImagesBucket != "":
 		var err error
@@ -509,7 +515,7 @@ func (a *Agent) tick(ctx context.Context) {
 	// Sync images from S3 before reconciling (ensures rootfs/kernels are present).
 	if a.imageSyncer != nil {
 		syncStart := time.Now()
-		err := a.imageSyncer.Sync(ctx, merged.Services)
+		err := a.syncImages(ctx, merged.Services, rev)
 		a.metrics.observeImageSync(time.Since(syncStart), err != nil)
 		if err != nil {
 			a.logger.Error("image sync failed", "error", err)
@@ -1107,4 +1113,21 @@ func (h *healthAdapter) Results() map[string]any {
 		}
 	}
 	return out
+}
+
+// syncImages commits its revision only after a complete successful sync. Recovery
+// retries for an unchanged desired revision do not repeat object-store downloads.
+// Multi-label stores have no combined revision, so they continue to sync.
+func (a *Agent) syncImages(ctx context.Context, services []config.ServiceConfig, revision string) error {
+	if revision != "" && revision == a.lastImageRevision {
+		return nil
+	}
+	// A failed sync may already have replaced some artifacts. Invalidate the
+	// previous revision too, so rolling back cannot reuse a partial download.
+	a.lastImageRevision = ""
+	if err := a.imageSyncer.Sync(ctx, services); err != nil {
+		return err
+	}
+	a.lastImageRevision = revision
+	return nil
 }

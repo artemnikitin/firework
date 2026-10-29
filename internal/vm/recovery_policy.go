@@ -14,14 +14,20 @@ import (
 
 // inspectRecoveryUnit treats activating/deactivating units as potential owners.
 // A missing unit is established by LoadState, never by a failed systemctl call.
-func (m *Manager) inspectRecoveryUnit(f *instanceManifest) (int, bool, error) {
+func (m *Manager) inspectRecoveryUnitContext(ctx context.Context, f *instanceManifest) (int, bool, error) {
+	if err := ctx.Err(); err != nil {
+		return 0, false, err
+	}
+	if m.recoveryUnitInspectorContext != nil {
+		return m.recoveryUnitInspectorContext(ctx, f)
+	}
 	if m.recoveryUnitInspector != nil {
 		return m.recoveryUnitInspector(f)
 	}
 	if f.LauncherUnit != "firework-vm-"+f.InstanceID+".service" {
 		return 0, false, fmt.Errorf("invalid systemd ownership unit")
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	ctx, cancel := context.WithTimeout(ctx, 2*time.Second)
 	defer cancel()
 	out, err := exec.CommandContext(ctx, "systemctl", "show", f.LauncherUnit, "--property=LoadState,ActiveState,MainPID").Output()
 	if err != nil {
@@ -43,8 +49,15 @@ func (m *Manager) inspectRecoveryUnit(f *instanceManifest) (int, bool, error) {
 }
 
 func (m *Manager) proveRecoveryAbsent(f *instanceManifest) error {
+	return m.proveRecoveryAbsentContext(context.Background(), f)
+}
+
+func (m *Manager) proveRecoveryAbsentContext(ctx context.Context, f *instanceManifest) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	if f.PID > 0 {
-		identity, err := m.inspector.Inspect(f.PID)
+		identity, err := inspectProcessContext(ctx, m.inspector, f.PID)
 		if err == nil && (f.ProcessStart == 0 || (identity.StartTicks == f.ProcessStart && identity.HostBootID == f.HostBootID)) {
 			return fmt.Errorf("recorded process is still live")
 		}
@@ -53,7 +66,7 @@ func (m *Manager) proveRecoveryAbsent(f *instanceManifest) error {
 		}
 	}
 	if f.Launcher == "systemd" {
-		_, inactive, err := m.inspectRecoveryUnit(f)
+		_, inactive, err := m.inspectRecoveryUnitContext(ctx, f)
 		if err != nil {
 			return err
 		}
@@ -61,7 +74,7 @@ func (m *Manager) proveRecoveryAbsent(f *instanceManifest) error {
 			return fmt.Errorf("systemd unit may still own the VM")
 		}
 	}
-	return m.noLiveClaimant(f)
+	return m.noLiveClaimantContext(ctx, f)
 }
 
 // All recovery deletion paths use the same unit and process-claimant proof.
@@ -76,7 +89,7 @@ func (m *Manager) removeRecoveryStateContext(ctx context.Context, f *instanceMan
 	if err := verifyRecoveryDirectories(f.VMDir); err != nil {
 		return err
 	}
-	if err := m.proveRecoveryAbsent(f); err != nil {
+	if err := m.proveRecoveryAbsentContext(ctx, f); err != nil {
 		return err
 	}
 	return m.removeProvenRecoveryState(ctx, f)
@@ -94,6 +107,9 @@ func (m *Manager) removeProvenRecoveryState(ctx context.Context, f *instanceMani
 	}
 	if err := m.persistRecoveryTeardown(f); err != nil {
 		return fmt.Errorf("persist recovery cleanup intent: %w", err)
+	}
+	if err := ctx.Err(); err != nil {
+		return err
 	}
 	return os.RemoveAll(f.VMDir)
 }

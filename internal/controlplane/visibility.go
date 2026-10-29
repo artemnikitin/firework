@@ -912,13 +912,25 @@ func (s visibilitySnapshot) nodeRevisionStatus() operatorapi.RevisionStatus {
 			continue
 		}
 		blockingFailure, unknownCondition, degraded := assessConditions(agentStatus.Conditions)
+		// Quarantine does not block applying independent services, but a live
+		// unresolved VM (including one no longer desired) prevents convergence.
+		recoveryPending := false
+		for _, service := range agentStatus.Services {
+			if service.VMState == "recovery_pending" {
+				recoveryPending = true
+				break
+			}
+		}
 		switch {
 		case blockingFailure:
 			status.FailedNodes = append(status.FailedNodes, nodeID)
 		case unknownCondition || agentStatus.Phase != statusmodel.PhaseReady:
 			status.UnknownNodes = append(status.UnknownNodes, nodeID)
-		case degraded:
+		case degraded || recoveryPending:
 			status.DegradedNodes = append(status.DegradedNodes, nodeID)
+			if recoveryPending {
+				degradedTypes["RecoveryPending"] = struct{}{}
+			}
 			for _, condition := range agentStatus.Conditions {
 				if statusmodel.IsNonBlockingCondition(condition.Type) && condition.Status == statusmodel.ConditionFalse {
 					degradedTypes[condition.Type] = struct{}{}
@@ -994,11 +1006,11 @@ func reportsAllServices(status statusmodel.AgentStatus, expected []string) bool 
 
 // degradedFleetReason names the fleet-level cause of a degraded phase. The
 // precedence is fixed rather than derived from map order so the reported reason
-// is stable, and a volume running at the wrong size outranks peer-route
-// telemetry because it describes the workload rather than the observability of
-// it.
+// is stable. Unresolved VMs and refused volume sizes outrank peer-route
+// telemetry because they describe workloads rather than their observability.
 func degradedFleetReason(types map[string]struct{}) string {
 	for _, candidate := range []struct{ conditionType, reason string }{
+		{"RecoveryPending", "vm_recovery_pending"},
 		{"VolumeSizesApplied", "volume_size_rejected"},
 		{"PeerRoutesReady", "peer_routes_degraded"},
 	} {

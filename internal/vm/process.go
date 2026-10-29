@@ -1,6 +1,7 @@
 package vm
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"net"
@@ -41,6 +42,18 @@ type processInspector interface {
 
 type osProcessInspector struct{}
 
+func inspectProcessContext(ctx context.Context, inspector processInspector, pid int) (processIdentity, error) {
+	if err := ctx.Err(); err != nil {
+		return processIdentity{}, err
+	}
+	if contextual, ok := inspector.(interface {
+		InspectContext(context.Context, int) (processIdentity, error)
+	}); ok {
+		return contextual.InspectContext(ctx, pid)
+	}
+	return inspector.Inspect(pid)
+}
+
 func (osProcessInspector) SocketReady(path string) error {
 	info, err := os.Lstat(path)
 	if err != nil {
@@ -57,10 +70,14 @@ func (osProcessInspector) SocketReady(path string) error {
 }
 
 func validateOwnedProcess(inspector processInspector, manifest *instanceManifest) error {
+	return validateOwnedProcessContext(context.Background(), inspector, manifest)
+}
+
+func validateOwnedProcessContext(ctx context.Context, inspector processInspector, manifest *instanceManifest) error {
 	if manifest.PID <= 0 {
 		return errProcessNotFound
 	}
-	identity, err := inspector.Inspect(manifest.PID)
+	identity, err := inspectProcessContext(ctx, inspector, manifest.PID)
 	if err != nil {
 		return err
 	}

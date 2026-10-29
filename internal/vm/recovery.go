@@ -7,7 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
-	"strings"
+	"sync"
 
 	"time"
 
@@ -21,6 +21,9 @@ const recoveryInterventionCommand = "firework-agent clear-recovery <service>"
 // It returns the names of safely adopted services so the reconciler can
 // recreate idempotent host networking and health-monitor state.
 func (m *Manager) Recover(ctx context.Context, desired config.NodeConfig) ([]string, error) {
+	caller := ctx
+	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
 
 	root := filepath.Join(m.stateDir, "vms")
 	entries, err := os.ReadDir(root)
@@ -40,20 +43,29 @@ func (m *Manager) Recover(ctx context.Context, desired config.NodeConfig) ([]str
 	}
 	seenIDs := make(map[string]string)
 	var adopted []string
-	var errs []error
-	for _, entry := range entries {
-		if err := ctx.Err(); err != nil {
-			return adopted, err
+	m.mu.Lock()
+	cursor := m.recoveryCursor
+	m.mu.Unlock()
+	start := sort.Search(len(entries), func(i int) bool { return entries[i].Name() > cursor })
+	for offset := range entries {
+		if ctx.Err() != nil {
+			return adopted, caller.Err()
 		}
+		entry := entries[(start+offset)%len(entries)]
 		if !entry.IsDir() {
 			continue
 		}
 		name := entry.Name()
+		m.mu.Lock()
+		m.recoveryCursor = name
+		m.mu.Unlock()
 		if !m.reserveRecoveryDiscovery(name) {
 			continue
 		}
 		func() {
 			defer m.releaseRecoveryDiscovery(name)
+			ctx, cancel := context.WithTimeout(ctx, time.Second)
+			defer cancel()
 			m.mu.Lock()
 			current, owned := m.instances[name]
 			pendingRecovery := owned && current.State == StateRecoveryPending
@@ -64,10 +76,7 @@ func (m *Manager) Recover(ctx context.Context, desired config.NodeConfig) ([]str
 					adopted = append(adopted, name)
 				}
 				if err != nil {
-					var pending *recoveryPendingError
-					if !errors.As(err, &pending) {
-						errs = append(errs, err)
-					}
+					m.recordRecoveryFailure(name, err)
 				}
 				return
 			}
@@ -79,21 +88,12 @@ func (m *Manager) Recover(ctx context.Context, desired config.NodeConfig) ([]str
 			vmDir := filepath.Join(root, name)
 			path := manifestPath(vmDir)
 			manifest, readErr := readManifest(path)
-			if errors.Is(readErr, os.ErrNotExist) {
-				if saved, lookupErr := m.recoveryTeardownManifest(name); lookupErr != nil {
-					errs = append(errs, lookupErr)
-					return
-				} else if saved != nil {
-					manifest = saved
-					readErr = nil
-				}
-			}
 			if readErr != nil {
 				if errors.Is(readErr, os.ErrNotExist) {
 					var handled bool
-					manifest, handled, err = m.recoverLegacy(name, vmDir, desiredByName)
+					manifest, handled, err = m.recoverLegacy(ctx, name, vmDir, desiredByName)
 					if err != nil {
-						errs = append(errs, err)
+						m.recordRecoveryFailure(name, err)
 					}
 					if handled {
 						return
@@ -109,7 +109,7 @@ func (m *Manager) Recover(ctx context.Context, desired config.NodeConfig) ([]str
 			if errors.Is(readErr, os.ErrNotExist) {
 				if err := m.writeRecoveryManifest(path, manifest); err != nil {
 					m.addRecoveryPendingWithCandidate(name, manifest, manifest, "legacy migration persistence failed")
-					errs = append(errs, err)
+					m.recordRecoveryFailure(name, err)
 					return
 				}
 			}
@@ -137,10 +137,7 @@ func (m *Manager) Recover(ctx context.Context, desired config.NodeConfig) ([]str
 					current.LastError = resolveErr.Error()
 				}
 				m.mu.Unlock()
-				var pending *recoveryPendingError
-				if !errors.As(resolveErr, &pending) {
-					errs = append(errs, resolveErr)
-				}
+
 				m.logger.Warn("VM recovery remains pending", "service", name, "error", resolveErr)
 				return
 			}
@@ -149,9 +146,6 @@ func (m *Manager) Recover(ctx context.Context, desired config.NodeConfig) ([]str
 			}
 		}()
 
-	}
-	if len(errs) > 0 {
-		return adopted, fmt.Errorf("VM recovery had %d error(s): %v", len(errs), errs)
 	}
 	return adopted, nil
 }
@@ -166,11 +160,11 @@ func (m *Manager) Recover(ctx context.Context, desired config.NodeConfig) ([]str
 // carries the instance ID, 128 bits generated once for this launch and never
 // reused, so a process presenting it with this instance's socket and config
 // paths is the process this manifest was written for.
-func (m *Manager) repairOwnership(name string, manifest *instanceManifest, cause error) bool {
+func (m *Manager) repairOwnership(ctx context.Context, name string, manifest *instanceManifest, cause error) bool {
 	if errors.Is(cause, errIdentityNotRecorded) || manifest.Legacy || manifest.InstanceID == "" {
 		return false
 	}
-	identity, err := m.inspector.Inspect(manifest.PID)
+	identity, err := inspectProcessContext(ctx, m.inspector, manifest.PID)
 	if err != nil || !matchesOwnedArguments(identity, manifest) {
 		return false
 	}
@@ -205,33 +199,46 @@ func cloneInstanceManifest(manifest *instanceManifest) *instanceManifest {
 	return &clone
 }
 
-func (m *Manager) recoverLegacy(name, vmDir string, desired map[string]config.ServiceConfig) (*instanceManifest, bool, error) {
+func (m *Manager) recoverLegacy(ctx context.Context, name, vmDir string, desired map[string]config.ServiceConfig) (*instanceManifest, bool, error) {
 	service, wanted := desired[name]
 	partial := &instanceManifest{
 		SchemaVersion: manifestSchemaVersion, Service: name, VMDir: vmDir,
 		SocketPath: filepath.Join(vmDir, "firecracker.sock"), ConfigPath: filepath.Join(vmDir, "vm-config.json"),
 	}
-	if !wanted {
-		m.addRecoveryPending(name, partial, "legacy VM state has no ownership manifest and no desired service configuration")
-		return nil, true, nil
+	var matches []processIdentity
+	var err error
+	if scanner, ok := m.inspector.(interface {
+		FindByArgumentsContext(context.Context, string, string) ([]processIdentity, error)
+	}); ok {
+		matches, err = scanner.FindByArgumentsContext(ctx, partial.SocketPath, partial.ConfigPath)
+	} else {
+		matches, err = m.inspector.FindByArguments(partial.SocketPath, partial.ConfigPath)
 	}
-	matches, err := m.inspector.FindByArguments(partial.SocketPath, partial.ConfigPath)
 	if err != nil {
 		m.addRecoveryPending(name, partial, fmt.Sprintf("cannot inspect legacy VM processes: %v", err))
 		return nil, true, nil
 	}
-	expectedExecutable, err := filepath.EvalSymlinks(m.firecrackerBin)
-	if err != nil {
-		m.addRecoveryPending(name, partial, fmt.Sprintf("cannot resolve configured Firecracker executable: %v", err))
+	if len(matches) == 0 {
+		if err := m.removeRecoveryStateContext(ctx, partial); err != nil {
+			m.addRecoveryPending(name, partial, fmt.Sprintf("legacy runtime absence remains unproved: %v", err))
+		}
 		return nil, true, nil
 	}
-	expectedExecutable, err = filepath.Abs(expectedExecutable)
+	if !wanted {
+		m.addRecoveryPending(name, partial, "live legacy VM has no desired service configuration for adoption")
+		return nil, true, nil
+	}
+	// Legacy launches have no instance ID. Their executable identity is
+	// pinned from the live process, whose argv[0] must identify the configured
+	// launch path. Resolving a symlink now would compare against the upgraded
+	// binary instead of the executable that the surviving process launched.
+	expectedExecutable, err := filepath.Abs(m.firecrackerBin)
 	if err != nil {
-		return nil, true, fmt.Errorf("resolve Firecracker executable path: %w", err)
+		return nil, true, err
 	}
 	var owned []processIdentity
 	for _, identity := range matches {
-		if strings.TrimSuffix(identity.Executable, " (deleted)") == expectedExecutable {
+		if len(identity.CommandLine) > 0 && identity.CommandLine[0] == expectedExecutable {
 			owned = append(owned, identity)
 		}
 	}
@@ -240,7 +247,7 @@ func (m *Manager) recoverLegacy(name, vmDir string, desired map[string]config.Se
 			m.addRecoveryPending(name, partial, "legacy process arguments match but its executable is not the configured Firecracker binary")
 			return nil, true, nil
 		}
-		if err := m.removeRecoveryState(partial); err != nil {
+		if err := m.removeRecoveryStateContext(ctx, partial); err != nil {
 			return nil, true, fmt.Errorf("clean stale legacy state for %s: %w", name, err)
 		}
 		return nil, true, nil
@@ -302,7 +309,7 @@ func (m *Manager) publishRecoveryPending(name string, manifest, candidate *insta
 }
 
 func (m *Manager) logRecoveryIntervention(service string, reason any) {
-	m.logger.Error("VM recovery requires operator intervention",
+	m.logger.Warn("VM recovery pending; verification will retry",
 		"service", service, "error", reason, "command", recoveryInterventionCommand)
 }
 
@@ -349,7 +356,6 @@ func (m *Manager) markExistingRecoveryPending(name, reason string) {
 		instance.LastError = reason
 		if instance.manifest != nil {
 			instance.manifest.LastError = reason
-			_ = m.writeRecoveryManifest(manifestPath(instance.manifest.VMDir), instance.manifest)
 		}
 	}
 	m.mu.Unlock()
@@ -385,6 +391,7 @@ func (m *Manager) monitorAdopted(name, instanceID string) {
 		}
 
 		m.mu.Lock()
+		m.waitRecoveryPublicationLocked(name)
 		current := m.instances[name]
 		if current != instance || current == nil || current.instanceID != instanceID || current.State != StateRunning {
 			m.mu.Unlock()
@@ -408,6 +415,7 @@ func (m *Manager) monitorAdopted(name, instanceID string) {
 
 func (m *Manager) quarantineIfCurrent(name string, expected *Instance, instanceID string, reason error) bool {
 	m.mu.Lock()
+	m.waitRecoveryPublicationLocked(name)
 	instance := m.instances[name]
 	if instance != expected || instance == nil || instance.instanceID != instanceID || instance.State != StateRunning {
 		m.mu.Unlock()
@@ -427,9 +435,7 @@ func (m *Manager) quarantineIfCurrent(name string, expected *Instance, instanceI
 }
 
 func (m *Manager) resolveRecovery(ctx context.Context, service string) (RecoveryResult, error) {
-	attempt, cancel := context.WithTimeout(ctx, 5*time.Second)
-	defer cancel()
-	return m.clearRecoveryPending(attempt, service)
+	return m.resolveRecoveryReserved(ctx, service, false)
 }
 
 // Runtime identity is the directory key, even when a corrupt manifest claims
@@ -459,5 +465,30 @@ func (m *Manager) reserveRecoveryDiscovery(name string) bool {
 func (m *Manager) releaseRecoveryDiscovery(name string) {
 	m.mu.Lock()
 	delete(m.recoveryReservations, name)
+	if m.recoveryCondition != nil {
+		m.recoveryCondition.Broadcast()
+	}
 	m.mu.Unlock()
+}
+
+// Wait owns the process exit result but lets a reserved recovery transaction
+// finish its filesystem commit before publishing it. Only this service waits;
+// the condition releases Manager.mu while recovery performs disk I/O.
+func (m *Manager) waitRecoveryPublicationLocked(name string) {
+	for m.recoveryReservations[name] {
+		if m.recoveryCondition == nil {
+			m.recoveryCondition = sync.NewCond(&m.mu)
+		}
+		m.recoveryCondition.Wait()
+	}
+}
+
+// Service-local failures remain retryable and do not block unrelated services.
+func (m *Manager) recordRecoveryFailure(name string, err error) {
+	m.mu.Lock()
+	if instance := m.instances[name]; instance != nil && instance.State == StateRecoveryPending {
+		instance.LastError = err.Error()
+	}
+	m.mu.Unlock()
+	m.logger.Warn("VM recovery remains pending", "service", name, "error", err)
 }

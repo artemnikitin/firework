@@ -316,3 +316,9 @@ discarded, so a slow load can never overwrite the view you navigated to.
 Rotate access by replacing the operator token secret and restarting the API
 role. Existing browser sessions become invalid because their derived session
 value no longer matches.
+
+An applied node revision acknowledges processing the desired configuration; it
+does not assert that every VM is healthy. A `recovery_pending` service keeps its
+individual status and makes fleet status degraded with `vm_recovery_pending`.
+Quarantined survivors removed from desired configuration remain reported until
+their runtime ownership is resolved. Independent services continue reconciling.

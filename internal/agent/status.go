@@ -344,6 +344,17 @@ func (a *Agent) refreshAgentStatus(phase statusmodel.Phase, code, message string
 		}
 		services = append(services, service)
 	}
+	// Removed desired entries can still own live runtime state. Keep their
+	// quarantine visible until recovery proves it safe to remove them.
+	reported := make(map[string]bool, len(services))
+	for _, service := range services {
+		reported[service.Name] = true
+	}
+	for name, instance := range instances {
+		if instance.State == vm.StateRecoveryPending && !reported[name] {
+			services = append(services, statusmodel.ServiceStatus{Name: name, VMState: string(instance.State), Health: "unknown", ReasonCode: "vm_recovery_pending", Message: statusmodel.BoundedMessage(instance.LastError)})
+		}
+	}
 	sort.Slice(services, func(i, j int) bool { return services[i].Name < services[j].Name })
 	servicesTruncated := len(services) > statusmodel.MaxServices
 	if servicesTruncated {
