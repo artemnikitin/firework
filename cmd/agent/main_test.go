@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	goruntime "runtime"
 	"strings"
 	"testing"
 	"time"
@@ -177,8 +178,17 @@ enable_capacity_check: false
 		"FIREWORK_CLEAR_RECOVERY_FORGET=1",
 	)
 	output, err = command.CombinedOutput()
-	if err == nil || !strings.Contains(string(output), "remains recovery_pending") {
-		t.Fatalf("guarded forget did not preserve the agent's refusal of ambiguous runtime state: err=%v output=%s", err, output)
+	// Forget deletes corrupt metadata only once a process scan proves that
+	// nothing owns it. Platforms that cannot scan processes keep refusing.
+	if goruntime.GOOS == "linux" {
+		if err != nil || !strings.Contains(string(output), "cleared") {
+			t.Fatalf("guarded forget did not clear absence-proven corrupt state: err=%v output=%s", err, output)
+		}
+		if _, err := os.Stat(quarantinedDir); !os.IsNotExist(err) {
+			t.Fatalf("forgotten corrupt state remains: %v", err)
+		}
+	} else if err == nil || !strings.Contains(string(output), "remains recovery_pending") {
+		t.Fatalf("guarded forget did not preserve the agent's refusal of unproven runtime state: err=%v output=%s", err, output)
 	}
 }
 
