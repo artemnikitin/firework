@@ -379,6 +379,8 @@ func (a *Agent) tick(ctx context.Context) {
 	// Fence persisted survivors before assigning resources or planning new VMs.
 	if err := a.vmManager.DiscoverRecoveryState(); err != nil {
 		a.failAgentStatus("VMsReconciled", "recovery_discovery_failed", err.Error())
+		a.refreshRuntimeMetrics()
+		a.syncRegistryAfterTick(ctx, nodeCap, capacity.NodeCapacity{})
 		return
 	}
 

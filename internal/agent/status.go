@@ -345,10 +345,11 @@ func (a *Agent) refreshAgentStatus(phase statusmodel.Phase, code, message string
 				service.ReasonCode = "health_check_failed"
 			}
 		}
-		if reason := held[desired.Name]; reason != "" && service.VMState != string(vm.StateRecoveryPending) {
+		if reason := held[desired.Name]; reason != "" && service.ReasonCode == "" {
 			// Keep the running/health observation while explaining why a
 			// requested change is deferred. A passing health check does not
-			// erase the resource hold, and quarantine keeps its own diagnosis.
+			// erase the resource hold, but an actual failure (VM, volume or
+			// health check) or quarantine keeps its own diagnosis.
 			service.ReasonCode = "resource_held"
 			service.Message = statusmodel.BoundedMessage(reason)
 		}

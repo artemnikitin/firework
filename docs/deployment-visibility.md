@@ -331,6 +331,11 @@ runtime inventory. A false value carries `vm_recovery_pending`, including when
 survivor summaries exceed the status limit. Desired services take priority in
 that list. Truncated survivor summaries permit degraded classification only
 when all desired summaries remain present and the recovery condition explains
-the truncation; missing desired telemetry remains unknown. Older control planes
-classify this new condition as unknown, so update the control plane before
-agents to obtain the new degradation reporting.
+the truncation; missing desired telemetry remains unknown.
+
+Upgrade the control plane before agents. Agents always report
+`VMRecoveryReady`, even when it is true, and an older control plane treats any
+condition type it does not know as unknown. Until the control plane is
+upgraded, every node running the new agent, including healthy ones, shows as
+`unknown`, and fleet status cannot converge. An older agent works with the new
+control plane unchanged.
