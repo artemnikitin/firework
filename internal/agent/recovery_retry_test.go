@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"github.com/artemnikitin/firework/internal/config"
+	"github.com/artemnikitin/firework/internal/statusmodel"
 )
 
 type recordingImageSyncer struct {
@@ -137,6 +138,16 @@ func TestRecoveryHoldsApplyRevisionAsDegraded(t *testing.T) {
 	}
 	if condition, ok := agentCondition(status, "VMRecoveryReady"); !ok || condition.Status != "false" {
 		t.Fatalf("held revision is not explained by recovery: %#v", status.Conditions)
+	}
+	// The control plane reports degraded only for a ready node whose blocking
+	// conditions are all true; anything else would show as unknown or failed.
+	if status.Phase != statusmodel.PhaseReady {
+		t.Fatalf("held revision is not reported ready: %#v", status)
+	}
+	for _, conditionType := range statusmodel.BlockingConditionTypes() {
+		if condition, ok := agentCondition(status, conditionType); !ok || condition.Status != statusmodel.ConditionTrue {
+			t.Fatalf("held revision left blocking condition %s unset or not true: %#v", conditionType, status.Conditions)
+		}
 	}
 	if !a.forceReconcile {
 		t.Fatal("held work would not be retried on an unchanged revision")

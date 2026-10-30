@@ -286,6 +286,9 @@ proof uses only the service's canonical paths. Once that proof succeeds, its
 unknown resource claims stop fencing other services, and `--forget` deletes it;
 for a symlinked entry, only the link is removed. A state directory removed by
 hand is cleared after the same proof, because no metadata remains to preserve.
+Untrusted metadata names no trusted host resources, so releasing or forgetting
+it records no network cleanup. Unless the host rebooted, check for its leftover
+port forwards and any explicitly named TAP by hand.
 Stopping the agent does not stop surviving VMs. Do not delete ownership records
 while a claimant may be alive.
 
