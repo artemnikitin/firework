@@ -86,3 +86,40 @@ func TestRevisionStatusDegradesForQuarantineWithoutHidingIndependentServices(t *
 		})
 	}
 }
+
+func TestRevisionStatusReportsRecoveryHoldsAsDegraded(t *testing.T) {
+	ctx := context.Background()
+	store := newBlobStateStore(newMemBlob())
+	cfg := validConfigForRole(RoleAPI)
+	cfg.NodeStaleTTL = time.Minute
+	services := []config.ServiceConfig{{Name: "held"}, {Name: "healthy"}}
+	desired := DesiredRevision{Revision: "desired-1", Services: services}
+	placement := PlacementRevision{Revision: "placement-1", DesiredRevision: desired.Revision, NodeConfigs: []config.NodeConfig{{Node: "node-1", Services: services}}}
+	putCurrentState(t, ctx, store, desired, placement, "rendered-1")
+	status := currentAgentStatus(statusmodel.PhaseReady, "rendered-1")
+	status.DesiredServices = len(services)
+	status.Conditions = append(status.Conditions, statusmodel.Condition{Type: "VMRecoveryReady", Status: statusmodel.ConditionFalse, ReasonCode: "vm_recovery_pending"})
+	status.Services = []statusmodel.ServiceStatus{
+		{Name: "healthy", VMState: "running", Health: "healthy"},
+		{Name: "held", Health: "unknown", ReasonCode: "resource_held", Message: "runtime resource claims are unknown for stale"},
+		{Name: "stale", VMState: "recovery_pending", Health: "unknown", ReasonCode: "vm_recovery_pending"},
+	}
+	putNode(t, ctx, store, cfg, NodeRecord{NodeID: "node-1", State: NodeStateReady, LastSeenAt: time.Now().UTC(), AgentStatus: status})
+	visibility := NewVisibilityService(cfg, store)
+	got, err := visibility.Revision(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Phase != "degraded" || got.ReasonCode != "vm_recovery_pending" || len(got.DegradedNodes) != 1 {
+		t.Fatalf("recovery hold was not reported as degradation: %#v", got)
+	}
+	items, err := visibility.Services(ctx, "", "", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, service := range items.Items {
+		if service.Name == "held" && service.ReasonCode != "resource_held" {
+			t.Fatalf("held service lost its reason: %#v", service)
+		}
+	}
+}

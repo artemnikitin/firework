@@ -322,6 +322,9 @@ does not assert that every VM is healthy. A `recovery_pending` service keeps its
 individual status and makes fleet status degraded with `vm_recovery_pending`.
 Quarantined survivors removed from desired configuration remain reported until
 their runtime ownership is resolved. Independent services continue reconciling.
+A desired service waiting on resources retained by an unresolved VM reports
+`resource_held` on the applied revision, and fleet status stays degraded until
+the hold clears.
 
 The agent reports the nonblocking `VMRecoveryReady` condition from its complete
 runtime inventory. A false value carries `vm_recovery_pending`, including when

@@ -382,8 +382,12 @@ allocations (creates and updates) until ownership resolves or absence is
 proven. Deletes still proceed, but leave their host cleanup in the journal
 until then. Running services that need no change keep their networking, health
 checks and port forwards. Conflicting desired services are
-held with `resource_held`; independent actions continue, while the revision
-remains incomplete until the conflicts resolve. Running guests retain their
+held with `resource_held`; independent actions continue. When VM recovery is
+pending, the agent applies the revision with those holds and reports
+`VMRecoveryReady=False`, so the node shows as degraded instead of progressing.
+Pending recovery keeps forcing reconciliation, so held work retries on an
+unchanged revision. Holds with no pending recovery, such as waiting on another
+start or stop, leave the revision incomplete. Running guests retain their
 assigned addresses after a survivor clears.
 
 Agent ticks and health-driven Stop/Start transactions are serialized. A failed

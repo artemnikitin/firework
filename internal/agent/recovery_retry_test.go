@@ -112,3 +112,33 @@ func TestFailedImageSyncInvalidatesPreviousRevision(t *testing.T) {
 		t.Fatalf("rollback reused partial artifacts: calls=%d", s.calls)
 	}
 }
+
+func TestRecoveryHoldsApplyRevisionAsDegraded(t *testing.T) {
+	cfg := testAgentConfig(t)
+	dir := filepath.Join(cfg.StateDir, "vms", "stale")
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "instance.json"), []byte("{invalid"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	s := &fakeStore{data: map[string][]byte{"web": []byte("node: web\nservices:\n- name: service\n  image: /img/service\n  kernel: /kern\n  vcpus: 1\n  memory_mb: 128\n")}, revision: "one"}
+	a := New(cfg, s, testLogger())
+	a.tick(context.Background())
+
+	// The unknown claims hold the new service. The node must report that as
+	// degradation on an applied revision rather than progressing forever.
+	status := a.agentStatusSnapshot()
+	if status.AppliedRevision != "one" {
+		t.Fatalf("recovery hold froze the revision: %#v", status)
+	}
+	if len(status.Services) < 1 || status.Services[0].Name != "service" || status.Services[0].ReasonCode != "resource_held" {
+		t.Fatalf("held service lost its reason: %#v", status.Services)
+	}
+	if condition, ok := agentCondition(status, "VMRecoveryReady"); !ok || condition.Status != "false" {
+		t.Fatalf("held revision is not explained by recovery: %#v", status.Conditions)
+	}
+	if !a.forceReconcile {
+		t.Fatal("held work would not be retried on an unchanged revision")
+	}
+}

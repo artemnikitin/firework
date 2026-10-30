@@ -534,6 +534,15 @@ func (a *Agent) tick(ctx context.Context) {
 	if err == nil {
 		a.forceReconcile = false
 	}
+	if err != nil && reconciler.OnlyHeld(err) && a.vmManager.HasPendingRecovery() {
+		// Every hold waits on unresolved VM ownership, which VMRecoveryReady
+		// reports as degradation and held services report as resource_held.
+		// Freezing the revision would hide both behind "progressing". Pending
+		// recovery keeps forcing reconciliation, so the holds still retry.
+		a.logger.Info("applying revision with services held for VM recovery", "error", err)
+		a.forceReconcile = true
+		err = nil
+	}
 	if err != nil && reconciler.IsIncomplete(err) {
 		// Every collected error was a benign start race: a stop or remove
 		// arrived while a start was preparing volumes, or two starts

@@ -91,6 +91,18 @@ func IsIncomplete(err error) bool {
 	return true
 }
 
+// OnlyHeld reports whether every reconciliation error is a retained-resource
+// hold, with no start race or failure among them.
+func OnlyHeld(err error) bool {
+	leaves := reconcileLeaves(err, nil)
+	for _, leaf := range leaves {
+		if !errors.Is(leaf, ErrServiceHeld) {
+			return false
+		}
+	}
+	return len(leaves) > 0
+}
+
 // reconcileLeaves flattens an aggregate error into the individual errors it was
 // built from. Joined branches are walked; a plain wrapped chain is followed to
 // its innermost error, which is where a sentinel lives.
