@@ -1190,15 +1190,8 @@ func (a *Agent) reserveCapacity(services []config.ServiceConfig, cap capacity.No
 		used.VCPUs += svc.VCPUs
 		used.MemoryMB += svc.MemoryMB
 	}
-	names := make(map[string]bool, len(retained))
-	for _, svc := range retained {
-		names[svc.Name] = true
-	}
 	holds := map[string]string{}
 	for _, svc := range services {
-		if names[svc.Name] {
-			continue
-		}
 		next := used
 		old := allocations[svc.Name]
 		if svc.VCPUs > old.VCPUs {

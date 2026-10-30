@@ -12,6 +12,8 @@ import (
 
 	"github.com/artemnikitin/firework/internal/capacity"
 	"github.com/artemnikitin/firework/internal/config"
+	"github.com/artemnikitin/firework/internal/reconciler"
+	"github.com/artemnikitin/firework/internal/vm"
 )
 
 func retainedResourceAgent(t *testing.T) *Agent {
@@ -21,16 +23,22 @@ func retainedResourceAgent(t *testing.T) *Agent {
 	cfg.VMGateway = "172.16.0.1"
 	a := New(cfg, &fakeStore{}, testLogger())
 	svc := config.ServiceConfig{Name: "removed", Image: "/image", Kernel: "/kernel", VCPUs: 2, MemoryMB: 256, Network: &config.NetworkConfig{GuestIP: "172.16.0.2", GuestMAC: guestMACForIndex(0)}}
+	addRetainedResource(t, a, svc)
+	return a
+}
+
+func addRetainedResource(t *testing.T, a *Agent, svc config.ServiceConfig) {
+	t.Helper()
 	body, err := json.Marshal(svc)
 	if err != nil {
 		t.Fatal(err)
 	}
 	hash := sha256.Sum256(body)
-	dir := filepath.Join(cfg.StateDir, "vms", svc.Name)
+	dir := filepath.Join(a.cfg.StateDir, "vms", svc.Name)
 	if err := os.MkdirAll(dir, 0700); err != nil {
 		t.Fatal(err)
 	}
-	manifest := map[string]any{"schema_version": 1, "service": svc.Name, "instance_id": "retained-instance", "lifecycle": "running", "config": svc, "config_hash": hex.EncodeToString(hash[:]), "pid": 42, "host_boot_id": "old", "process_start_ticks": 1, "executable": "/firecracker", "executable_device": 1, "executable_inode": 2, "vm_dir": dir, "socket_path": filepath.Join(dir, "firecracker.sock"), "config_path": filepath.Join(dir, "vm-config.json"), "launcher": "direct"}
+	manifest := map[string]any{"schema_version": 1, "service": svc.Name, "instance_id": "retained-" + svc.Name, "lifecycle": "running", "config": svc, "config_hash": hex.EncodeToString(hash[:]), "pid": 42, "host_boot_id": "old", "process_start_ticks": 1, "executable": "/firecracker", "executable_device": 1, "executable_inode": 2, "vm_dir": dir, "socket_path": filepath.Join(dir, "firecracker.sock"), "config_path": filepath.Join(dir, "vm-config.json"), "launcher": "direct"}
 	body, err = json.Marshal(manifest)
 	if err != nil {
 		t.Fatal(err)
@@ -41,7 +49,6 @@ func retainedResourceAgent(t *testing.T) *Agent {
 	if err := a.vmManager.DiscoverRecoveryState(); err != nil {
 		t.Fatal(err)
 	}
-	return a
 }
 
 func TestNetworkAndCapacityReserveRemovedQuarantine(t *testing.T) {
@@ -77,5 +84,97 @@ func TestHealthRestartWaitsForReconciliationLifecycleTransaction(t *testing.T) {
 	case <-done:
 	case <-time.After(time.Second):
 		t.Fatal("health restart did not resume")
+	}
+}
+
+// Recovery resolves ownership after admission checks but before the plan. Holds
+// must survive that transition, including when the old VM is cleaned entirely.
+type resolvingCapacityManager struct {
+	instances   map[string]*vm.Instance
+	clear       bool
+	resolveName string
+	started     []config.ServiceConfig
+}
+
+func (m *resolvingCapacityManager) List() map[string]*vm.Instance { return m.instances }
+func (m *resolvingCapacityManager) Recover(context.Context, config.NodeConfig) ([]string, error) {
+	name := m.resolveName
+	if name == "" {
+		name = "removed"
+	}
+	if m.clear {
+		delete(m.instances, name)
+	} else {
+		m.instances[name].State = vm.StateRunning
+	}
+	return []string{name}, nil
+}
+func (m *resolvingCapacityManager) Remove(name string) error { delete(m.instances, name); return nil }
+func (m *resolvingCapacityManager) Start(_ context.Context, svc config.ServiceConfig) error {
+	m.started = append(m.started, svc)
+	m.instances[svc.Name] = &vm.Instance{Name: svc.Name, Config: svc, State: vm.StateRunning}
+	return nil
+}
+func TestCapacityHoldsSurviveSameTickRecovery(t *testing.T) {
+	for _, clear := range []bool{false, true} {
+		for _, memory := range []bool{false, true} {
+			a := retainedResourceAgent(t)
+			old := a.vmManager.List()["removed"].Config
+			desired := old
+			if memory {
+				desired.MemoryMB = 2048
+			} else {
+				desired.VCPUs = 8
+			}
+			limit := capacity.NodeCapacity{VCPUs: 4, MemoryMB: 1024}
+			independent := config.ServiceConfig{Name: "independent", VCPUs: 1, MemoryMB: 64}
+			services := []config.ServiceConfig{desired, independent}
+			_, held := a.reserveCapacity(services, limit, true)
+			if held[desired.Name] == "" {
+				t.Fatalf("clear=%v memory=%v: desired growth escaped capacity admission", clear, memory)
+			}
+			manager := &resolvingCapacityManager{clear: clear, instances: map[string]*vm.Instance{old.Name: {Name: old.Name, Config: old, State: vm.StateRecoveryPending}}}
+			r := reconciler.New(manager, testLogger(), nil, nil, "", 0)
+			r.SetHeldServices(held)
+			if err := r.Reconcile(context.Background(), config.NodeConfig{Services: services}); !reconciler.IsIncomplete(err) {
+				t.Fatalf("capacity hold should remain incomplete: %v", err)
+			}
+			if len(manager.started) != 1 || manager.started[0].Name != independent.Name {
+				t.Fatalf("held work admitted or independent blocked: %#v", manager.started)
+			}
+		}
+	}
+}
+
+func TestCapacityReservesRetainedDesiredGrowthBeforeNewServices(t *testing.T) {
+	a := retainedResourceAgent(t)
+	desired := a.vmManager.List()["removed"].Config
+	desired.VCPUs = 4
+	next := config.ServiceConfig{Name: "new", VCPUs: 1, MemoryMB: 64}
+	used, held := a.reserveCapacity([]config.ServiceConfig{desired, next}, capacity.NodeCapacity{VCPUs: 4, MemoryMB: 1024}, true)
+	if used.VCPUs != 4 || held["new"] == "" {
+		t.Fatalf("growth not reserved: used=%#v held=%v", used, held)
+	}
+}
+
+func TestCapacityIncludesRemovedOwnerWhenDesiredFitsAlone(t *testing.T) {
+	a := retainedResourceAgent(t)
+	old := config.ServiceConfig{Name: "wanted", Image: "/image", Kernel: "/kernel", VCPUs: 2, MemoryMB: 128}
+	addRetainedResource(t, a, old)
+	desired := old
+	desired.VCPUs = 3
+	limit := capacity.NodeCapacity{VCPUs: 4, MemoryMB: 1024}
+	used, held := a.reserveCapacity([]config.ServiceConfig{desired}, limit, true)
+	if held[old.Name] == "" || used.VCPUs != 4 {
+		t.Fatalf("desired fits alone but overcommits retained owners: used=%#v holds=%v", used, held)
+	}
+	manager := &resolvingCapacityManager{resolveName: old.Name, instances: a.vmManager.List()}
+	r := reconciler.New(manager, testLogger(), nil, nil, "", 0)
+	r.SetHeldServices(held)
+	if err := r.Reconcile(context.Background(), config.NodeConfig{Services: []config.ServiceConfig{desired}}); !reconciler.IsIncomplete(err) {
+		t.Fatalf("same-tick recovery lost hold: %v", err)
+	}
+	if len(manager.started) != 0 {
+		t.Fatal("overcommitted after ownership resolved")
 	}
 }
