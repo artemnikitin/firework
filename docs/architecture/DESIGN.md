@@ -396,7 +396,8 @@ Each tick's Recover/Plan/Apply section and health-driven Stop/Start transactions
 are serialized; config fetch, image sync and route refresh do not delay a
 restart. A failed
 start-time cleanup retains retryable quarantine instead of dropping the previous
-instance. Confirmed exited systemd owners use their unit's terminal state for
+instance. A health restart whose Start fails later forces the next tick to
+reconcile, so an unchanged revision still recreates the service. Confirmed exited systemd owners use their unit's terminal state for
 normal restart; deactivating or unreadable units remain retryable. Cleanup
 journal work also triggers reconciliation on an unchanged revision.
 

@@ -142,3 +142,24 @@ func TestRecoveryHoldsApplyRevisionAsDegraded(t *testing.T) {
 		t.Fatal("held work would not be retried on an unchanged revision")
 	}
 }
+
+func TestUnchangedRevisionRecreatesMissingDesiredVM(t *testing.T) {
+	s := &fakeStore{data: map[string][]byte{"web": []byte("node: web\nservices:\n- name: service\n  image: /img/service\n  kernel: /kern\n  vcpus: 1\n  memory_mb: 128\n")}, revision: "one"}
+	a := New(testAgentConfig(t), s, testLogger())
+	images := &recordingImageSyncer{}
+	a.imageSyncer = images
+	a.lastRevision = "one"
+	a.tick(context.Background())
+	if images.calls != 0 {
+		t.Fatalf("unchanged revision did not take the shortcut: image syncs=%d", images.calls)
+	}
+	// A failed health-restart Start dropped the service's VM without changing
+	// the revision. The next restart attempt finds no VM to restart.
+	if err := a.restartService(context.Background(), "service"); err != nil {
+		t.Fatal(err)
+	}
+	a.tick(context.Background())
+	if images.calls != 1 {
+		t.Fatalf("unchanged revision skipped the missing VM: image syncs=%d", images.calls)
+	}
+}

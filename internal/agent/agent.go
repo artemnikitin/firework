@@ -12,6 +12,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/artemnikitin/firework/internal/agentconfig"
@@ -69,6 +70,10 @@ type Agent struct {
 	recoveryQueue   map[string]bool
 	forceReconcile  bool
 	lifecycleMu     sync.Mutex
+	// restartNeedsReconcile is set by a health restart that left its service
+	// without a running VM; the next tick then skips the unchanged-revision
+	// shortcut.
+	restartNeedsReconcile atomic.Bool
 
 	lastRevision         string
 	lastImageRevision    string
@@ -397,7 +402,9 @@ func (a *Agent) tick(ctx context.Context) {
 			a.logger.Error("failed to get store revision", "error", err)
 		}
 		a.setStatusServices(*merged, rev)
-		if a.vmManager.HasPendingRecovery() || a.reconciler.HasPendingCleanup() {
+		// A health restart that could not restore its VM leaves the revision
+		// unchanged; only a full tick recreates the service.
+		if a.vmManager.HasPendingRecovery() || a.reconciler.HasPendingCleanup() || a.restartNeedsReconcile.Swap(false) {
 			a.forceReconcile = true
 		}
 		if rev != "" && rev == a.lastRevision && !a.forceReconcile {
@@ -1231,6 +1238,8 @@ func (a *Agent) restartService(ctx context.Context, name string) error {
 	}
 	inst := a.vmManager.List()[name]
 	if inst == nil {
+		// An earlier restart's failed Start may have dropped the VM.
+		a.restartNeedsReconcile.Store(true)
 		return nil
 	}
 	a.metrics.recordServiceRestart(name, tenantForService(inst.Config))
@@ -1238,5 +1247,9 @@ func (a *Agent) restartService(ctx context.Context, name string) error {
 	if err := a.vmManager.Stop(name); err != nil {
 		a.logger.Warn("failed to stop service during health restart", "service", name, "error", err)
 	}
-	return a.vmManager.Start(ctx, inst.Config)
+	if err := a.vmManager.Start(ctx, inst.Config); err != nil {
+		a.restartNeedsReconcile.Store(true)
+		return err
+	}
+	return nil
 }
