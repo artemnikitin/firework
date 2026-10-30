@@ -59,7 +59,12 @@ func (r *Reconciler) HeldServices(desired config.NodeConfig) map[string]string {
 			continue // Its quarantine already reports why no desired work applies.
 		}
 		if unknown != "" {
-			held[service.Name] = "runtime resource claims are unknown for " + unknown
+			// Unknown claims can collide only with new allocations. A running
+			// service that needs no change keeps its network, health and
+			// port forwards.
+			if instance := actual[service.Name]; instance == nil || needsUpdate(instance, service) {
+				held[service.Name] = "runtime resource claims are unknown for " + unknown
+			}
 			continue
 		}
 		if instance := actual[service.Name]; instance != nil && retainsRuntime(instance.State) && instance.State != vm.StateRecoveryPending {
@@ -123,7 +128,9 @@ func conflictingResource(service, owner config.ServiceConfig) string {
 
 func (r *Reconciler) actionHold(action Action) string {
 	actual := r.vmManager.List()
-	if unknown := unknownRuntimeOwner(actual); unknown != "" {
+	// A delete releases resources; deleteService defers its host cleanup to
+	// the journal while unknown claims remain.
+	if unknown := unknownRuntimeOwner(actual); unknown != "" && action.Type != ActionDelete {
 		return "runtime resource claims are unknown for " + unknown
 	}
 	if instance := actual[action.Service.Name]; instance != nil && retainsRuntime(instance.State) {

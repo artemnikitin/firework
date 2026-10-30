@@ -377,8 +377,11 @@ failure preserves the VM directory for a later retry.
 
 Discovery publishes every persisted VM directory before spending the inspection
 budget. Valid ownership records reserve their old CPU, memory, guest IP/MAC,
-host-port and host-link claims. Unknown resource metadata fences foreign
-mutations until ownership can be resolved. Conflicting desired services are
+host-port and host-link claims. Unknown resource metadata holds new
+allocations (creates and updates) until ownership resolves or absence is
+proven. Deletes still proceed, but leave their host cleanup in the journal
+until then. Running services that need no change keep their networking, health
+checks and port forwards. Conflicting desired services are
 held with `resource_held`; independent actions continue, while the revision
 remains incomplete until the conflicts resolve. Running guests retain their
 assigned addresses after a survivor clears.

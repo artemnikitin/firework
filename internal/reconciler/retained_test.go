@@ -143,28 +143,56 @@ func TestUnknownRuntimeClaimsHoldMutationsAndCleanupUntilResolved(t *testing.T) 
 		t.Fatalf("unknown quarantine blocked its own excluded service: %v", err)
 	}
 	old := forwardedService("old")
+	old.Network = &config.NetworkConfig{GuestIP: "172.16.0.3"}
 	manager.instances[old.Name] = &vm.Instance{Name: old.Name, Config: old, State: vm.StateRunning}
+	kept := forwardedService("kept")
+	kept.Network = &config.NetworkConfig{GuestIP: "172.16.0.4"}
+	kept.PortForwards = []config.PortForward{{HostPort: 9090, VMPort: 90}}
+	manager.instances[kept.Name] = &vm.Instance{Name: kept.Name, Config: kept, State: vm.StateRunning}
 	if err := r.journalIntendedTeardowns(forwardedService("gone")); err != nil {
 		t.Fatal(err)
 	}
-	desired := config.NodeConfig{Services: []config.ServiceConfig{forwardedService("new")}}
+	desired := config.NodeConfig{Services: []config.ServiceConfig{forwardedService("new"), kept}}
 	for tick := 0; tick < 2; tick++ {
 		if err := r.Reconcile(context.Background(), desired); !IsIncomplete(err) {
-			t.Fatalf("unknown claims must hold work: %v", err)
+			t.Fatalf("unknown claims must hold new allocations: %v", err)
 		}
-		if len(manager.startCalls) != 0 || len(manager.removeCalls) != 0 || len(network.deleteTAPCalls) != 0 || len(network.teardownForwardCalls) != 0 || len(network.setupForwardCalls) != 0 {
-			t.Fatal("unknown claims allowed runtime or host mutations")
+		if len(manager.startCalls) != 0 {
+			t.Fatalf("unknown claims allowed a new allocation: %v", manager.startCalls)
 		}
-		if !r.HasPendingCleanup() {
-			t.Fatal("unknown ownership discarded cleanup intent")
+		// Releasing a VM cannot collide with unknown claims, but its host
+		// cleanup waits in the journal because any device or rule may be shared.
+		if len(manager.removeCalls) != 1 || manager.removeCalls[0] != old.Name || manager.instances[old.Name] != nil {
+			t.Fatalf("unknown claims blocked an independent delete: %v", manager.removeCalls)
+		}
+		if len(network.deleteTAPCalls) != 0 || len(network.teardownForwardCalls) != 0 || !r.HasPendingCleanup() {
+			t.Fatal("unknown claims allowed host cleanup or discarded its intent")
+		}
+		if len(network.setupForwardCalls) != tick+1 || network.setupForwardCalls[tick] != 9090 {
+			t.Fatalf("running unchanged service lost port-forward re-assertion: %v", network.setupForwardCalls)
+		}
+		if held := r.HeldServices(desired); held[kept.Name] != "" || held["new"] == "" {
+			t.Fatalf("holds were not limited to new allocations: %v", held)
 		}
 	}
 	delete(manager.instances, unknown.Name)
 	if err := r.Reconcile(context.Background(), desired); err != nil {
 		t.Fatalf("resolved ownership did not resume work: %v", err)
 	}
-	if manager.instances["new"] == nil || manager.instances[old.Name] != nil || r.HasPendingCleanup() {
+	if manager.instances["new"] == nil || r.HasPendingCleanup() {
 		t.Fatal("resolved ownership failed to finish held work and cleanup")
+	}
+	// "gone" shares its DNAT tuple with the new service, so only old's rule
+	// is torn down.
+	if len(network.teardownForwardCalls) != 1 || len(network.deleteTAPCalls) == 0 {
+		t.Fatalf("deferred cleanup was not finished: forwards=%v taps=%v", network.teardownForwardCalls, network.deleteTAPCalls)
+	}
+
+	// Proven absence of the unknown owner releases its fence without forgetting it.
+	r2, manager2 := newNetworkTestReconciler(&fakeNetworkManager{})
+	manager2.instances[unknown.Name] = &vm.Instance{Name: unknown.Name, Config: unknown.Config, State: vm.StateRecoveryPending, RecoveryConfigUnknown: true, RecoveryOwnerAbsent: true}
+	if err := r2.Reconcile(context.Background(), config.NodeConfig{Services: []config.ServiceConfig{forwardedService("new")}}); err != nil {
+		t.Fatalf("absent unknown owner still fenced allocations: %v", err)
 	}
 }
 

@@ -1072,6 +1072,15 @@ func (r *Reconciler) deleteService(svc config.ServiceConfig) error {
 		r.healthMon.Deregister(svc.Name)
 	}
 
+	// An unknown owner may use any device or rule. Leave svc's cleanup in the
+	// journal written above; retryPendingTeardowns finishes it once that
+	// ownership resolves.
+	if unknown := unknownRuntimeOwner(r.vmManager.List()); unknown != "" {
+		r.logger.Info("deferring host cleanup until runtime claims are known",
+			"service", svc.Name, "unknown_owner", unknown)
+		return nil
+	}
+
 	// Neither teardown failure here is returned: the update path skips the
 	// recreate when this function errors, and a transient teardown failure
 	// must not leave a service deleted. The VM is already gone, though, so
