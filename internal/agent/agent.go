@@ -328,8 +328,6 @@ func (a *Agent) shutdown() {
 
 // tick performs a single reconciliation cycle.
 func (a *Agent) tick(ctx context.Context) {
-	a.lifecycleMu.Lock()
-	defer a.lifecycleMu.Unlock()
 	a.logger.Debug("reconciliation tick starting")
 	a.beginTickStatus()
 	defer a.finishTickStatus()
@@ -529,7 +527,13 @@ func (a *Agent) tick(ctx context.Context) {
 
 	// Reconcile desired vs actual state.
 	reconcileStart := time.Now()
+	// Serialize only Recover/Plan/Apply with health-driven Stop/Start, so a
+	// restart never waits behind config fetch, image sync or route refresh.
+	// assignNetworking already reserved addresses of every tracked VM,
+	// including one between a restart's Stop and Start.
+	a.lifecycleMu.Lock()
 	err := a.reconciler.Reconcile(ctx, *merged)
+	a.lifecycleMu.Unlock()
 	a.metrics.observeReconcile(time.Since(reconcileStart), err != nil)
 	if err == nil {
 		a.forceReconcile = false
@@ -755,11 +759,12 @@ func (a *Agent) assignNetworking(services []config.ServiceConfig) {
 	var retainedServices []config.ServiceConfig
 	if a.reconciler != nil {
 		retainedServices = a.reconciler.RetainedServices()
-		// Keep live addresses stable when a quarantine resolves on an unchanged
-		// revision; a route-only tick must not shift a running guest to a freed IP.
+		// Every tracked VM keeps its address: a route-only tick must not shift
+		// a running guest to a freed IP, and a crashed or restarting service
+		// must not lose its IP to first-fit reallocation.
 		if a.vmManager != nil {
 			for _, inst := range a.vmManager.List() {
-				if inst.State == vm.StateRunning && inst.Config.Network != nil && ipNet.Contains(net.ParseIP(inst.Config.Network.GuestIP)) {
+				if inst.Config.Network != nil && ipNet.Contains(net.ParseIP(inst.Config.Network.GuestIP)) {
 					retainedServices = append(retainedServices, inst.Config)
 				}
 			}

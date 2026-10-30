@@ -178,3 +178,34 @@ func TestCapacityIncludesRemovedOwnerWhenDesiredFitsAlone(t *testing.T) {
 		t.Fatal("overcommitted after ownership resolved")
 	}
 }
+
+type blockingImageSyncer struct {
+	entered chan struct{}
+	release chan struct{}
+}
+
+func (s *blockingImageSyncer) Sync(context.Context, []config.ServiceConfig) error {
+	close(s.entered)
+	<-s.release
+	return nil
+}
+func (s *blockingImageSyncer) Close() error { return nil }
+
+func TestHealthRestartDoesNotWaitForImageSync(t *testing.T) {
+	s := &fakeStore{data: map[string][]byte{"web": []byte("node: web\nservices:\n- name: service\n  image: /img/service\n  kernel: /kern\n  vcpus: 1\n  memory_mb: 128\n")}, revision: "one"}
+	a := New(testAgentConfig(t), s, testLogger())
+	images := &blockingImageSyncer{entered: make(chan struct{}), release: make(chan struct{})}
+	a.imageSyncer = images
+	ticked := make(chan struct{})
+	go func() { a.tick(context.Background()); close(ticked) }()
+	<-images.entered
+	restarted := make(chan struct{})
+	go func() { _ = a.restartService(context.Background(), "missing"); close(restarted) }()
+	select {
+	case <-restarted:
+	case <-time.After(time.Second):
+		t.Fatal("health restart waited for image sync")
+	}
+	close(images.release)
+	<-ticked
+}

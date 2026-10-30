@@ -104,19 +104,21 @@ Registry state is persisted in S3 or GCS objects under
 `cp/v1/registry/nodes/*.json`.
 This keeps discovery semantics cloud-agnostic.
 
-## Deterministic Network Assignment
+## Stable Network Assignment
 
-Guest IPs, MACs, and TAP device names are assigned deterministically from the ordered
-list of services, not stored in any database. Specifically, services are sorted by name
-before IP allocation, so the same set of services always produces the same assignments.
+Guest IPs, MACs, and TAP device names are not stored in any database. A service whose
+VM the agent tracks keeps that VM's address, whatever its state: running, failed,
+stopped, restarting, or quarantined. Every other service takes the lowest free
+address, in service-name order.
 
 This means:
-- No persistent state needed for network configuration
-- Agent restarts or node reboots converge to the same network layout
-- Adding or removing a service changes subsequent assignments predictably
+- No separate network allocation store; addresses come from VM ownership records
+- Removing a service or a crash does not shift the addresses of existing VMs
+- A fresh node with no VM state assigns addresses in service-name order
 
-The implication is that renaming a service or changing the set of services can shift IP
-assignments for other services. It could be a problem for very dynamic workloads.
+The implication is that the layout depends on history: the same set of services can hold
+different addresses on two nodes, and a service created after a removal can take the freed
+address.
 
 ## Static Service Linking
 
@@ -390,7 +392,9 @@ unchanged revision. Holds with no pending recovery, such as waiting on another
 start or stop, leave the revision incomplete. Running guests retain their
 assigned addresses after a survivor clears.
 
-Agent ticks and health-driven Stop/Start transactions are serialized. A failed
+Each tick's Recover/Plan/Apply section and health-driven Stop/Start transactions
+are serialized; config fetch, image sync and route refresh do not delay a
+restart. A failed
 start-time cleanup retains retryable quarantine instead of dropping the previous
 instance. Confirmed exited systemd owners use their unit's terminal state for
 normal restart; deactivating or unreadable units remain retryable. Cleanup
