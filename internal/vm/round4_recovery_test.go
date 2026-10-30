@@ -323,3 +323,16 @@ func TestStartReclaimsInterruptedPreparationWithoutRecoveryTick(t *testing.T) {
 		t.Fatalf("partial directory remains: %v", err)
 	}
 }
+
+// quarantine is fixture-only; production quarantine uses guarded lifecycle paths.
+func (m *Manager) quarantine(name string, manifest *instanceManifest, err error) {
+	m.mu.Lock()
+	manifest.LastError = err.Error()
+	_ = m.writeRecoveryManifest(manifestPath(manifest.VMDir), manifest)
+	if inst := m.instances[name]; inst != nil {
+		inst.State = StateRecoveryPending
+		inst.LastError = err.Error()
+	}
+	m.mu.Unlock()
+	m.logRecoveryIntervention(name, err)
+}

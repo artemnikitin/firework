@@ -1118,18 +1118,6 @@ func newInstanceID() (string, error) {
 	return hex.EncodeToString(data), nil
 }
 
-func (m *Manager) quarantine(name string, manifest *instanceManifest, err error) {
-	m.mu.Lock()
-	manifest.LastError = err.Error()
-	_ = m.writeRecoveryManifest(manifestPath(manifest.VMDir), manifest)
-	if inst := m.instances[name]; inst != nil {
-		inst.State = StateRecoveryPending
-		inst.LastError = err.Error()
-	}
-	m.mu.Unlock()
-	m.logRecoveryIntervention(name, err)
-}
-
 // writeVMConfig writes a Firecracker JSON config file for the given service.
 func (m *Manager) writeVMConfig(vmDir string, svc config.ServiceConfig, prepared []volume.PreparedVolume) (string, error) {
 	sort.Slice(prepared, func(i, j int) bool { return prepared[i].LogicalID < prepared[j].LogicalID })
