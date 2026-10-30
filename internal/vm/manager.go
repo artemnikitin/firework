@@ -600,12 +600,15 @@ func (m *Manager) finishStart(ctx context.Context, svc config.ServiceConfig, sta
 	if err != nil {
 		manifest.Lifecycle = lifecycleFailed
 		manifest.LastError = err.Error()
-		_ = m.writeRecoveryManifest(manifestPath(vmDir), manifest)
+		writeErr := m.writeRecoveryManifest(manifestPath(vmDir), manifest)
 		if launcherKind == "systemd" {
 			// systemd-run can create the unit before its command times out.
 			// Keep the service tracked so callers retain host networking and
 			// recovery can establish whether a VM was actually launched.
-			m.instances[svc.Name] = instanceFromManifest(manifest, StateRecoveryPending, manifest.LastError)
+			// Recovery compares memory with disk, so publish whichever record
+			// is durable if the failed-lifecycle write did not land.
+			snapshot := recoverySnapshotAfterWrite(manifestPath(vmDir), launchManifest, manifest, writeErr)
+			m.instances[svc.Name] = instanceFromManifest(snapshot, StateRecoveryPending, manifest.LastError)
 		} else {
 			delete(m.instances, svc.Name)
 		}
@@ -615,8 +618,9 @@ func (m *Manager) finishStart(ctx context.Context, svc config.ServiceConfig, sta
 	manifest.Launcher = launched.Launcher
 	manifest.LauncherUnit = launched.Unit
 	if identityErr := m.recordLaunchedIdentity(manifest, launched); identityErr != nil {
-		if m.abandonLaunch(svc.Name, manifest, launched, identityErr) {
-			m.instances[svc.Name] = instanceFromManifest(manifest, StateRecoveryPending, manifest.LastError)
+		if retained, writeErr := m.abandonLaunch(svc.Name, manifest, launched, identityErr); retained {
+			snapshot := recoverySnapshotAfterWrite(manifestPath(vmDir), launchManifest, manifest, writeErr)
+			m.instances[svc.Name] = instanceFromManifest(snapshot, StateRecoveryPending, manifest.LastError)
 		} else {
 			delete(m.instances, svc.Name)
 		}
@@ -767,7 +771,7 @@ func awaitLaunchedIdentityContext(ctx context.Context, inspector processInspecto
 // reconcile start a duplicate Firecracker against the same socket and TAP. It
 // reports whether the ambiguous launch was retained so Start can expose it as
 // recovery_pending while it still holds the manager lock.
-func (m *Manager) abandonLaunch(service string, manifest *instanceManifest, launched *launchedProcess, cause error) bool {
+func (m *Manager) abandonLaunch(service string, manifest *instanceManifest, launched *launchedProcess, cause error) (retained bool, writeErr error) {
 	m.logger.Error("abandoning microVM launch with unprovable process identity",
 		"service", service, "pid", launched.PID, "error", cause)
 	// Signalling is unit-scoped for systemd launches and, for direct launches,
@@ -795,14 +799,14 @@ func (m *Manager) abandonLaunch(service string, manifest *instanceManifest, laun
 		manifest.PID = 0
 		manifest.LastError = cause.Error()
 		_ = m.writeRecoveryManifest(manifestPath(manifest.VMDir), manifest)
-		return false
+		return false, nil
 	}
 	manifest.Lifecycle = lifecycleFailed
 	manifest.LastError = fmt.Sprintf("launch identity is unprovable and the process did not exit: %v", cause)
-	_ = m.writeRecoveryManifest(manifestPath(manifest.VMDir), manifest)
+	writeErr = m.writeRecoveryManifest(manifestPath(manifest.VMDir), manifest)
 	m.logger.Error("abandoned microVM launch did not exit; its state is retained for recovery",
 		"service", service, "pid", launched.PID, "command", recoveryInterventionCommand)
-	return true
+	return true, writeErr
 }
 
 // launchIdentityTimeout and launchExitTimeout fall back to the package

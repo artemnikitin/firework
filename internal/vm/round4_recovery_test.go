@@ -336,3 +336,67 @@ func (m *Manager) quarantine(name string, manifest *instanceManifest, err error)
 	m.mu.Unlock()
 	m.logRecoveryIntervention(name, err)
 }
+
+// If recording the failed launch does not reach disk, the published record
+// must match the durable starting record, or every later recovery attempt
+// rejects the memory/disk mismatch.
+func TestSystemdLaunchFailureWithUnwrittenRecordStaysRecoverable(t *testing.T) {
+	for _, live := range []bool{true, false} {
+		t.Run(map[bool]string{true: "live unit adopts", false: "absent unit clears"}[live], func(t *testing.T) {
+			stateDir := t.TempDir()
+			binary := filepath.Join(stateDir, "firecracker")
+			run := filepath.Join(stateDir, "systemd-run")
+			ctl := filepath.Join(stateDir, "systemctl")
+			for _, path := range []string{run, ctl} {
+				if err := os.WriteFile(path, []byte("#!/bin/sh\necho 0\n"), 0755); err != nil {
+					t.Fatal(err)
+				}
+			}
+			m := NewManager(binary, stateDir, slog.New(slog.NewTextHandler(io.Discard, nil)))
+			m.launcher = &systemdLauncher{binary: binary, systemdRun: run, systemctl: ctl, pollInterval: time.Millisecond}
+			writes := 0
+			m.recoveryManifestWriter = func(path string, manifest *instanceManifest) error {
+				writes++
+				if writes == 2 {
+					return errors.New("disk full before rename")
+				}
+				return writeManifest(path, manifest)
+			}
+			service := config.ServiceConfig{Name: "app", Image: "/image", Kernel: "/kernel", VCPUs: 1, MemoryMB: 128}
+			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Millisecond)
+			defer cancel()
+			if err := m.Start(ctx, service); err == nil {
+				t.Fatal("expected MainPID timeout")
+			}
+			pending := m.List()[service.Name]
+			durable, err := readManifest(manifestPath(filepath.Join(stateDir, "vms", service.Name)))
+			if err != nil || pending == nil || pending.State != StateRecoveryPending || !sameRecoveryIdentity(pending.manifest, durable) {
+				t.Fatalf("published record does not match disk: pending=%#v durable=%#v err=%v", pending, durable, err)
+			}
+			f := pending.manifest
+			if live {
+				m.inspector = &fakeProcessInspector{identities: map[int]processIdentity{42: {PID: 42, HostBootID: "boot", StartTicks: 5, Executable: binary, ExecutableDev: 1, ExecutableIno: 2, CommandLine: []string{binary, "--id", f.InstanceID, "--api-sock", f.SocketPath, "--config-file", f.ConfigPath}}}, errors: make(map[int]error)}
+				m.recoveryUnitInspectorContext = func(context.Context, *instanceManifest) (int, bool, error) { return 42, false, nil }
+			} else {
+				m.inspector = &fakeProcessInspector{}
+				m.recoveryUnitInspectorContext = func(context.Context, *instanceManifest) (int, bool, error) { return 0, true, nil }
+			}
+			if _, err := m.Recover(context.Background(), config.NodeConfig{}); err != nil {
+				t.Fatal(err)
+			}
+			stopAdoptedMonitors(t, m)
+			got := m.List()[service.Name]
+			if live && (got == nil || got.State != StateRunning || got.PID != 42) {
+				t.Fatalf("live launch was not adopted after the failed write: %#v", got)
+			}
+			if !live {
+				if got != nil {
+					t.Fatalf("absent launch was not cleared after the failed write: %#v", got)
+				}
+				if _, err := os.Stat(f.VMDir); !os.IsNotExist(err) {
+					t.Fatalf("absent launch state remains: %v", err)
+				}
+			}
+		})
+	}
+}
