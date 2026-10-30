@@ -378,3 +378,13 @@ start-time cleanup retains retryable quarantine instead of dropping the previous
 instance. Confirmed exited systemd owners use their unit's terminal state for
 normal restart; deactivating or unreadable units remain retryable. Cleanup
 journal work also triggers reconciliation on an unchanged revision.
+
+Capacity admission reserves desired growth for retained service names as well
+as new services: ownership may resolve between admission and planning in the
+same tick. Capacity holds persist through that transition, so adoption or
+cleanup cannot authorize an allocation that skipped the capacity check.
+
+The opt-in `scripts/systemd-recovery/run.sh` validation runs real systemd units,
+Linux process inspection and TAP ownership in a disposable container. It also
+confirms that recreating a same-name TAP cannot reconnect an old descriptor.
+See its README for prerequisites and the simulated-VMM validation boundary.
