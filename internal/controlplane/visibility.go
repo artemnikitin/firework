@@ -880,7 +880,7 @@ func (s visibilitySnapshot) nodeRevisionStatus() operatorapi.RevisionStatus {
 			continue
 		}
 		agentStatus, fresh := s.freshStatus(record)
-		if !fresh || agentStatus.ServicesTruncated {
+		if !fresh || (agentStatus.ServicesTruncated && !truncatedRecoverySurvivors(agentStatus, expectedServices[nodeID])) {
 			status.UnknownNodes = append(status.UnknownNodes, nodeID)
 			continue
 		}
@@ -912,25 +912,13 @@ func (s visibilitySnapshot) nodeRevisionStatus() operatorapi.RevisionStatus {
 			continue
 		}
 		blockingFailure, unknownCondition, degraded := assessConditions(agentStatus.Conditions)
-		// Quarantine does not block applying independent services, but a live
-		// unresolved VM (including one no longer desired) prevents convergence.
-		recoveryPending := false
-		for _, service := range agentStatus.Services {
-			if service.VMState == "recovery_pending" {
-				recoveryPending = true
-				break
-			}
-		}
 		switch {
 		case blockingFailure:
 			status.FailedNodes = append(status.FailedNodes, nodeID)
 		case unknownCondition || agentStatus.Phase != statusmodel.PhaseReady:
 			status.UnknownNodes = append(status.UnknownNodes, nodeID)
-		case degraded || recoveryPending:
+		case degraded:
 			status.DegradedNodes = append(status.DegradedNodes, nodeID)
-			if recoveryPending {
-				degradedTypes["RecoveryPending"] = struct{}{}
-			}
 			for _, condition := range agentStatus.Conditions {
 				if statusmodel.IsNonBlockingCondition(condition.Type) && condition.Status == statusmodel.ConditionFalse {
 					degradedTypes[condition.Type] = struct{}{}
@@ -1004,13 +992,30 @@ func reportsAllServices(status statusmodel.AgentStatus, expected []string) bool 
 	return true
 }
 
+// truncatedRecoverySurvivors permits a degraded result when all desired
+// services are present and the agent explicitly reports recovery uncertainty
+// across its full runtime inventory. Omitted survivor details cannot hide that
+// degradation. Any missing desired service or unexplained truncation still
+// leaves the node unknown.
+func truncatedRecoverySurvivors(status statusmodel.AgentStatus, expected []string) bool {
+	if status.DesiredServices != len(expected) || !reportsAllServices(status, expected) {
+		return false
+	}
+	for _, condition := range status.Conditions {
+		if condition.Type == "VMRecoveryReady" && condition.Status == statusmodel.ConditionFalse {
+			return true
+		}
+	}
+	return false
+}
+
 // degradedFleetReason names the fleet-level cause of a degraded phase. The
 // precedence is fixed rather than derived from map order so the reported reason
 // is stable. Unresolved VMs and refused volume sizes outrank peer-route
 // telemetry because they describe workloads rather than their observability.
 func degradedFleetReason(types map[string]struct{}) string {
 	for _, candidate := range []struct{ conditionType, reason string }{
-		{"RecoveryPending", "vm_recovery_pending"},
+		{"VMRecoveryReady", "vm_recovery_pending"},
 		{"VolumeSizesApplied", "volume_size_rejected"},
 		{"PeerRoutesReady", "peer_routes_degraded"},
 	} {

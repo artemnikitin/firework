@@ -11,12 +11,15 @@ import (
 
 func TestRevisionStatusDegradesForQuarantineWithoutHidingIndependentServices(t *testing.T) {
 	for _, tc := range []struct {
-		name    string
-		desired []config.ServiceConfig
+		name          string
+		desired       []config.ServiceConfig
+		omitSurvivors bool
 	}{
 		{name: "desired quarantine", desired: []config.ServiceConfig{{Name: "quarantined"}, {Name: "healthy"}}},
 		{name: "removed quarantine", desired: []config.ServiceConfig{{Name: "healthy"}}},
 		{name: "empty desired with quarantine"},
+		{name: "truncated survivors", desired: []config.ServiceConfig{{Name: "healthy"}}, omitSurvivors: true},
+		{name: "empty desired with truncated survivors", omitSurvivors: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			ctx := context.Background()
@@ -27,8 +30,14 @@ func TestRevisionStatusDegradesForQuarantineWithoutHidingIndependentServices(t *
 			placement := PlacementRevision{Revision: "placement-1", DesiredRevision: desired.Revision, NodeConfigs: []config.NodeConfig{{Node: "node-1", Services: tc.desired}}}
 			putCurrentState(t, ctx, store, desired, placement, "rendered-1")
 			status := currentAgentStatus(statusmodel.PhaseReady, "rendered-1")
+			status.DesiredServices = len(tc.desired)
+			status.Conditions = append(status.Conditions, statusmodel.Condition{Type: "VMRecoveryReady", Status: statusmodel.ConditionFalse, ReasonCode: "vm_recovery_pending"})
 			status.Services = []statusmodel.ServiceStatus{
 				{Name: "quarantined", VMState: "recovery_pending", Health: "unknown", ReasonCode: "vm_recovery_pending"},
+			}
+			if tc.omitSurvivors {
+				status.Services = nil
+				status.ServicesTruncated = true
 			}
 			if len(tc.desired) > 0 {
 				status.Services = append(status.Services, statusmodel.ServiceStatus{Name: "healthy", VMState: "running", Health: "healthy"})
@@ -64,6 +73,8 @@ func TestRevisionStatusDegradesForQuarantineWithoutHidingIndependentServices(t *
 			// A later successful recovery clears degradation without requiring a
 			// new desired revision or changing independent service observations.
 			status.Services = nil
+			status.ServicesTruncated = false
+			status.Conditions[len(status.Conditions)-1] = statusmodel.Condition{Type: "VMRecoveryReady", Status: statusmodel.ConditionTrue}
 			for _, service := range tc.desired {
 				status.Services = append(status.Services, statusmodel.ServiceStatus{Name: service.Name, VMState: "running", Health: "healthy"})
 			}

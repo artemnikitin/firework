@@ -364,3 +364,17 @@ outbox. Physical cleanup uses the usual running-config claimant guards so
 resources retained by a live or quarantined VM are preserved. When host network
 setup is disabled, recovery has no network cleanup obligation. A journal write
 failure preserves the VM directory for a later retry.
+
+Discovery publishes every persisted VM directory before spending the inspection
+budget. Valid ownership records reserve their old CPU, memory, guest IP/MAC,
+host-port and host-link claims. Unknown resource metadata fences foreign
+mutations until ownership can be resolved. Conflicting desired services are
+held with `resource_held`; independent actions continue, while the revision
+remains incomplete until the conflicts resolve. Running guests retain their
+assigned addresses after a survivor clears.
+
+Agent ticks and health-driven Stop/Start transactions are serialized. A failed
+start-time cleanup retains retryable quarantine instead of dropping the previous
+instance. Confirmed exited systemd owners use their unit's terminal state for
+normal restart; deactivating or unreadable units remain retryable. Cleanup
+journal work also triggers reconciliation on an unchanged revision.

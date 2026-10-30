@@ -921,12 +921,15 @@ func TestTick_DistinctHostPortsReconcileNormally(t *testing.T) {
 // runningVMManager reports a service as already running, which is what steady
 // state looks like: port forwards are only asserted for services that have a
 // guest to forward to.
-type runningVMManager struct{ names []string }
+type runningVMManager struct {
+	names   []string
+	configs map[string]config.ServiceConfig
+}
 
 func (r *runningVMManager) List() map[string]*vm.Instance {
 	out := make(map[string]*vm.Instance, len(r.names))
 	for _, name := range r.names {
-		out[name] = &vm.Instance{Name: name, State: vm.StateRunning}
+		out[name] = &vm.Instance{Name: name, State: vm.StateRunning, Config: r.configs[name]}
 	}
 	return out
 }
@@ -975,7 +978,7 @@ services:
 	cfg.VMGateway = "172.16.0.1"
 	a := New(cfg, s, testLogger())
 	net := &fakeNetwork{}
-	a.reconciler = reconciler.NewWithNetworkManager(&runningVMManager{names: []string{"local"}}, testLogger(), nil, net, "", 0)
+	a.reconciler = reconciler.NewWithNetworkManager(&runningVMManager{names: []string{"local"}, configs: map[string]config.ServiceConfig{"local": {Name: "local", Network: &config.NetworkConfig{GuestIP: "172.16.0.2"}, PortForwards: []config.PortForward{{HostPort: 8080, VMPort: 8080}}}}}, testLogger(), nil, net, "", 0)
 	a.traefikMgr = &fakeRouteSyncer{}
 	a.lastRevision = "rev-1"
 
@@ -1008,7 +1011,7 @@ services:
 	cfg.VMSubnet = "172.16.0.0/24"
 	cfg.VMGateway = "172.16.0.1"
 	a := New(cfg, s, testLogger())
-	a.reconciler = reconciler.NewWithNetworkManager(&runningVMManager{names: []string{"local"}}, testLogger(),
+	a.reconciler = reconciler.NewWithNetworkManager(&runningVMManager{names: []string{"local"}, configs: map[string]config.ServiceConfig{"local": {Name: "local", Network: &config.NetworkConfig{GuestIP: "172.16.0.2"}, PortForwards: []config.PortForward{{HostPort: 8080, VMPort: 8080}}}}}, testLogger(),
 		nil, &fakeNetwork{setupForwardErr: errors.New("nat table flushed")}, "", 0)
 	a.traefikMgr = &fakeRouteSyncer{}
 	a.lastRevision = "rev-1"

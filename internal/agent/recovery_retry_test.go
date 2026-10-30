@@ -73,6 +73,10 @@ func TestQuarantineDoesNotFreezeAppliedRevisionOrRepeatImages(t *testing.T) {
 		if len(status.Services) != 1 || status.Services[0].ReasonCode != "vm_recovery_pending" {
 			t.Fatalf("quarantine lost service status: %#v", status.Services)
 		}
+		condition, ok := agentCondition(status, "VMRecoveryReady")
+		if !ok || condition.Status != "false" || condition.ReasonCode != "vm_recovery_pending" {
+			t.Fatalf("quarantine lost degraded condition: %#v", status.Conditions)
+		}
 	}
 	s.data["web"] = []byte("node: web\nservices: []\n")
 	s.revision = "three"
@@ -80,6 +84,9 @@ func TestQuarantineDoesNotFreezeAppliedRevisionOrRepeatImages(t *testing.T) {
 	status := a.agentStatusSnapshot()
 	if status.AppliedRevision != "three" || status.DesiredServices != 0 || len(status.Services) != 1 || status.Services[0].ReasonCode != "vm_recovery_pending" {
 		t.Fatalf("removed quarantine lost or froze revision: %#v", status)
+	}
+	if condition, ok := agentCondition(status, "VMRecoveryReady"); !ok || condition.Status != "false" {
+		t.Fatalf("removed quarantine lost degraded condition: %#v", status.Conditions)
 	}
 	if images.calls != 3 {
 		t.Fatalf("pending retries repeated image sync: %d", images.calls)
