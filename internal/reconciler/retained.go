@@ -27,7 +27,7 @@ func retainsRuntime(state vm.State) bool {
 func (r *Reconciler) RetainedServices() []config.ServiceConfig {
 	var retained []config.ServiceConfig
 	for _, instance := range r.vmManager.List() {
-		if retainsRuntime(instance.State) {
+		if retainsRuntime(instance.State) && !instance.ReleasedRecoveryClaims() {
 			retained = append(retained, instance.Config)
 		}
 	}
@@ -152,7 +152,7 @@ func (r *Reconciler) actionHold(action Action) string {
 func unknownRuntimeOwner(actual map[string]*vm.Instance) string {
 	var names []string
 	for name, instance := range actual {
-		if instance.State == vm.StateRecoveryPending && instance.RecoveryConfigUnknown && !instance.RecoveryOwnerAbsent {
+		if instance.State == vm.StateRecoveryPending && instance.RecoveryConfigUnknown && !instance.ReleasedRecoveryClaims() {
 			names = append(names, name)
 		}
 	}

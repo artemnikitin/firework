@@ -773,7 +773,7 @@ func (a *Agent) assignNetworking(services []config.ServiceConfig) {
 		// must not lose its IP to first-fit reallocation.
 		if a.vmManager != nil {
 			for _, inst := range a.vmManager.List() {
-				if inst.Config.Network != nil && ipNet.Contains(net.ParseIP(inst.Config.Network.GuestIP)) {
+				if !inst.ReleasedRecoveryClaims() && inst.Config.Network != nil && ipNet.Contains(net.ParseIP(inst.Config.Network.GuestIP)) {
 					retainedServices = append(retainedServices, inst.Config)
 				}
 			}
@@ -1204,7 +1204,7 @@ func (a *Agent) reserveCapacity(services []config.ServiceConfig, cap capacity.No
 	}
 	allocations := make(map[string]config.ServiceConfig)
 	for name, inst := range a.vmManager.List() {
-		if inst.State != vm.StateStopped && inst.State != vm.StateFailed {
+		if inst.State != vm.StateStopped && inst.State != vm.StateFailed && !inst.ReleasedRecoveryClaims() {
 			allocations[name] = inst.Config
 		}
 	}

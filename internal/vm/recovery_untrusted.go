@@ -124,13 +124,20 @@ func (m *Manager) resolveUntrustedRecovery(ctx context.Context, result RecoveryR
 	}
 	probe := recoveryAbsenceProbe(service, vmDir, recorded, untrusted)
 	absenceErr := m.proveRecoveryAbsentContext(ctx, probe)
+	var journalErr error
+	if absenceErr == nil && untrusted {
+		journalErr = m.journalReleasedRecoveryClaims(service, vmDir, instance, recorded)
+	}
 	m.mu.Lock()
 	if m.instances[service] == instance {
-		instance.RecoveryOwnerAbsent = absenceErr == nil
+		instance.RecoveryOwnerAbsent = absenceErr == nil && journalErr == nil
 	}
 	m.mu.Unlock()
 	if absenceErr != nil {
 		return recoveryAmbiguous(result, fmt.Sprintf("%s and absence remains unproved: %v", reason, absenceErr))
+	}
+	if journalErr != nil {
+		return recoveryAmbiguous(result, fmt.Sprintf("%s; no process owns it, but its claims stay reserved: %v", reason, journalErr))
 	}
 	preservesMetadata := before.kind == "symlink" || (before.kind == "dir" && before.manifest != "missing")
 	if preservesMetadata && !forget {
@@ -175,4 +182,22 @@ func (m *Manager) resolveUntrustedRecovery(ctx context.Context, result RecoveryR
 	result.Message = fmt.Sprintf("%s; proved no process owns it and removed its VM runtime state", reason)
 	m.logger.Info("cleared stale VM recovery state", "service", service, "reason", reason)
 	return result, nil
+}
+
+// journalReleasedRecoveryClaims records the host cleanup that a readable but
+// untrusted record describes, before its claims are released for reuse.
+// Otherwise its stale port forwards could shadow a replacement's. The
+// journal's claimant guards keep any device or rule a live service uses.
+func (m *Manager) journalReleasedRecoveryClaims(service, vmDir string, instance *Instance, recorded *instanceManifest) error {
+	m.mu.Lock()
+	released := m.instances[service] == instance && instance.RecoveryOwnerAbsent
+	m.mu.Unlock()
+	if released || recorded.Service != service || recorded.Config.Name != service ||
+		verifyRecoveryManifestPaths(service, vmDir, recorded) != nil {
+		return nil // Already journaled, or the record names no readable claims.
+	}
+	if err := m.persistRecoveryTeardown(recorded); err != nil {
+		return fmt.Errorf("persist cleanup intent: %w", err)
+	}
+	return nil
 }

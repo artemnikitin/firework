@@ -285,13 +285,16 @@ it for diagnosis and restore a trusted ownership record before retrying; the
 agent must not guess a new owner. A restored record is used on the next retry
 without restarting the agent. Untrusted metadata (an unreadable or mismatched
 manifest, or a symlinked service entry) never authorizes adoption. Its absence
-proof uses only the service's canonical paths. Once that proof succeeds, its
-unknown resource claims stop fencing other services, and `--forget` deletes it;
-for a symlinked entry, only the link is removed. A state directory removed by
-hand is cleared after the same proof, because no metadata remains to preserve.
-Untrusted metadata names no trusted host resources, so releasing or forgetting
-it records no network cleanup. Unless the host rebooted, check for its leftover
-port forwards and any explicitly named TAP by hand.
+proof uses only the service's canonical paths. Once that proof succeeds, the
+record stays for diagnosis but claims nothing: other services may reuse its
+addresses, ports, devices and capacity, and `--forget` deletes it; for a
+symlinked entry, only the link is removed. Before releasing a readable record,
+recovery journals the host cleanup it describes, under the usual claimant
+guards; if that write fails, the claims stay reserved and recovery retries. An
+unreadable record names no host resources: unless the host rebooted, check for
+its leftover port forwards and any explicitly named TAP by hand. A state
+directory removed by hand is cleared after the same proof, because no metadata
+remains to preserve.
 Stopping the agent does not stop surviving VMs. Do not delete ownership records
 while a claimant may be alive.
 

@@ -258,3 +258,33 @@ func TestPendingBridgeCleanupProtectsRetainedTAPWithTheSameName(t *testing.T) {
 		t.Fatal("bridge cleanup did not resume after retained TAP resolved")
 	}
 }
+
+func TestAbsenceProvenUntrustedStateReleasesResourcesButKeepsRecord(t *testing.T) {
+	network := &fakeNetworkManager{}
+	r, manager := newNetworkTestReconciler(network)
+	old := config.ServiceConfig{Name: "corrupt", VCPUs: 2, Network: &config.NetworkConfig{GuestIP: "172.16.0.9", Interface: "tap-old"}, PortForwards: []config.PortForward{{HostPort: 8080, VMPort: 80}}}
+	released := &vm.Instance{Name: old.Name, Config: old, State: vm.StateRecoveryPending, RecoveryConfigUnknown: true, RecoveryOwnerAbsent: true}
+	manager.instances[old.Name] = released
+	// Recovery journaled the record's cleanup before releasing its claims.
+	if err := r.journalIntendedTeardowns(old); err != nil {
+		t.Fatal(err)
+	}
+	replacement := forwardedService("replacement")
+	replacement.Network = &config.NetworkConfig{GuestIP: "172.16.0.10"}
+	desired := config.NodeConfig{Services: []config.ServiceConfig{replacement}}
+	if held := r.HeldServices(desired); len(held) != 0 {
+		t.Fatalf("absent owner's old host port still holds its replacement: %v", held)
+	}
+	if retained := r.RetainedServices(); len(retained) != 0 {
+		t.Fatalf("absent owner still reserves resources: %#v", retained)
+	}
+	if err := r.Reconcile(context.Background(), desired); err != nil {
+		t.Fatalf("replacement or cleanup stayed blocked: %v", err)
+	}
+	if manager.instances[replacement.Name] == nil || manager.instances[old.Name] != released {
+		t.Fatal("replacement was not admitted, or the diagnostic record was dropped")
+	}
+	if r.HasPendingCleanup() || len(network.teardownForwardCalls) != 1 || len(network.deleteTAPCalls) != 1 || network.deleteTAPCalls[0] != "tap-old" {
+		t.Fatalf("absent owner's journaled cleanup did not resume: forwards=%v taps=%v", network.teardownForwardCalls, network.deleteTAPCalls)
+	}
+}

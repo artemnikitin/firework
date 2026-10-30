@@ -163,3 +163,49 @@ func TestUntrustedRecoveryWaitsForQueuedSystemdLaunch(t *testing.T) {
 		t.Fatalf("absent launch was not forgotten: result=%#v err=%v", result, err)
 	}
 }
+
+func TestAbsentUntrustedStateJournalsReadableClaimsBeforeReleasing(t *testing.T) {
+	for _, journalFails := range []bool{false, true} {
+		t.Run(map[bool]string{false: "journaled", true: "journal failure keeps claims"}[journalFails], func(t *testing.T) {
+			m, f, inspector := recoveryFixture(t)
+			m.inspector = inspector
+			delete(inspector.identities, f.PID)
+			changed := cloneInstanceManifest(f)
+			changed.Config.Network = &config.NetworkConfig{GuestIP: "172.16.0.9", Interface: "tap-old"}
+			changed.Config.PortForwards = []config.PortForward{{HostPort: 8080, VMPort: 80}}
+			if err := writeManifest(manifestPath(f.VMDir), changed); err != nil { // hash no longer matches
+				t.Fatal(err)
+			}
+			var recorded []config.ServiceConfig
+			m.SetRecoveryCleanupRecorder(func(service config.ServiceConfig) error {
+				recorded = append(recorded, service)
+				if journalFails {
+					return os.ErrPermission
+				}
+				return nil
+			})
+			if _, err := m.Recover(context.Background(), config.NodeConfig{}); err != nil {
+				t.Fatal(err)
+			}
+			for attempt := 0; attempt < 2; attempt++ {
+				if result, err := m.ClearRecoveryPending(f.Service); err == nil || result.Outcome != RecoveryOutcomeAmbiguous {
+					t.Fatalf("untrusted metadata was resolved without --forget: result=%#v err=%v", result, err)
+				}
+			}
+			got := m.List()[f.Service]
+			if got == nil || got.ReleasedRecoveryClaims() == journalFails {
+				t.Fatalf("claims released=%v despite journal failure=%v: %#v", got != nil && got.ReleasedRecoveryClaims(), journalFails, got)
+			}
+			if _, err := os.Stat(manifestPath(f.VMDir)); err != nil {
+				t.Fatalf("diagnostic record was removed: %v", err)
+			}
+			want := 1
+			if journalFails {
+				want = 2 // retried until the cleanup intent is durable
+			}
+			if len(recorded) != want || recorded[0].PortForwards[0].HostPort != 8080 || recorded[0].Network.Interface != "tap-old" {
+				t.Fatalf("readable claims were not journaled once before release: %#v", recorded)
+			}
+		})
+	}
+}
