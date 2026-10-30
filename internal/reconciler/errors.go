@@ -1,10 +1,15 @@
 package reconciler
 
 import (
+	"errors"
 	"fmt"
 
 	"github.com/artemnikitin/firework/internal/vm"
 )
+
+// ErrServiceHeld means retained runtime resources or capacity prevent a service
+// change. Independent work can proceed, but the revision remains retryable.
+var ErrServiceHeld = errors.New("service held for retained runtime resources")
 
 // FailureStage identifies the blocking host stage that prevented convergence.
 // It is intentionally a small, stable set so agents can publish bounded
@@ -58,9 +63,9 @@ func HasFailureStage(err error, stage FailureStage) bool {
 	return false
 }
 
-// IsIncomplete reports whether a reconciliation error consists *only* of benign
-// start-barrier races — a start that was aborted by a concurrent stop or
-// remove, or one that collided with another start still preparing volumes.
+// IsIncomplete reports whether a reconciliation error consists only of retained
+// resource holds or benign start-barrier races: an aborted start or a collision
+// with another start still preparing volumes.
 //
 // The distinction matters because of what an ordinary nil return would do. The
 // agent advances lastRevision at the end of a successful tick, and the next
@@ -79,7 +84,7 @@ func IsIncomplete(err error) bool {
 		return false
 	}
 	for _, leaf := range leaves {
-		if !vm.IsStartRace(leaf) {
+		if !vm.IsStartRace(leaf) && !errors.Is(leaf, ErrServiceHeld) {
 			return false
 		}
 	}
