@@ -266,7 +266,10 @@ A missing identity cannot authorize live adoption.
 Recovery classifies actual process ownership independently of the recorded
 lifecycle label: proven absence permits cleanup, a live owned process with a
 valid API socket permits adoption, and uncertain ownership stays quarantined.
-This also applies to interrupted `stopping` records. The optional `--forget`
+This also applies to interrupted `stopping` records. A stop whose owned process
+outlives SIGKILL enters `recovery_pending` with its `stopping` record, so later
+ticks re-adopt the live owner and plan the stop again, or clear it after exit.
+The optional `--forget`
 flag restricts the command to absence-verified cleanup; it never adopts or kills
 a live process. Neither cleanup nor adoption proves guest quiesce or filesystem
 consistency. Issue #49's offline filesystem/resize validation remains independent.

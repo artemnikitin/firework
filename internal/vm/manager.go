@@ -38,6 +38,10 @@ const (
 	// write timeout. Overrunning them is benign: the launch is retried on the
 	// next tick.
 	launchExitConfirmTimeout = 2 * time.Second
+	// stopGraceTimeout and stopKillTimeout bound waiting for an owned process
+	// to exit after SIGTERM and after SIGKILL during Stop.
+	stopGraceTimeout = 5 * time.Second
+	stopKillTimeout  = 2 * time.Second
 )
 
 // State represents the lifecycle state of a microVM.
@@ -130,6 +134,8 @@ type Manager struct {
 	// They are fields so tests do not have to sleep out the real budgets.
 	identityTimeout    time.Duration
 	exitConfirmTimeout time.Duration
+	stopGrace          time.Duration
+	stopKill           time.Duration
 	// recoveryManifestWriter is normally nil, which uses writeManifest. Tests
 	// can inject a one-shot durable-write failure to cover recovery retries.
 	recoveryManifestWriter       func(string, *instanceManifest) error
@@ -162,6 +168,8 @@ func NewManagerWithVolumes(firecrackerBin, stateDir string, logger *slog.Logger,
 
 		identityTimeout:    launchIdentityTimeout,
 		exitConfirmTimeout: launchExitConfirmTimeout,
+		stopGrace:          stopGraceTimeout,
+		stopKill:           stopKillTimeout,
 
 		instances:    make(map[string]*Instance),
 		volumeErrors: make(map[string]string),
@@ -811,6 +819,17 @@ func (m *Manager) launchExitTimeout() time.Duration {
 	return m.exitConfirmTimeout
 }
 
+func (m *Manager) stopTimeouts() (grace, kill time.Duration) {
+	grace, kill = m.stopGrace, m.stopKill
+	if grace <= 0 {
+		grace = stopGraceTimeout
+	}
+	if kill <= 0 {
+		kill = stopKillTimeout
+	}
+	return grace, kill
+}
+
 func awaitProcessExit(inspector processInspector, pid int, timeout, interval time.Duration) bool {
 	deadline := time.Now().Add(timeout)
 	for {
@@ -895,7 +914,8 @@ func (m *Manager) stopInstance(name string, expected *Instance) error {
 			_ = launcher.Stop(&ownedManifest, syscall.SIGKILL)
 		}
 
-		exited, waitErr := waitForOwnedProcessExit(m.inspector, &ownedManifest, 5*time.Second)
+		graceTimeout, killTimeout := m.stopTimeouts()
+		exited, waitErr := waitForOwnedProcessExit(m.inspector, &ownedManifest, graceTimeout)
 		if waitErr != nil {
 			m.quarantineStopIfCurrent(name, inst, ownedManifest.InstanceID, fmt.Errorf("process identity changed while stopping: %w", waitErr))
 			return fmt.Errorf("refusing to signal pid %d again: %w", pid, waitErr)
@@ -903,13 +923,18 @@ func (m *Manager) stopInstance(name string, expected *Instance) error {
 		if !exited {
 			m.logger.Warn("microVM did not exit after SIGTERM, sending SIGKILL", "service", name, "pid", pid)
 			_ = launcher.Stop(&ownedManifest, syscall.SIGKILL)
-			exited, waitErr = waitForOwnedProcessExit(m.inspector, &ownedManifest, 2*time.Second)
+			exited, waitErr = waitForOwnedProcessExit(m.inspector, &ownedManifest, killTimeout)
 			if waitErr != nil {
 				m.quarantineStopIfCurrent(name, inst, ownedManifest.InstanceID, fmt.Errorf("process identity changed after SIGKILL: %w", waitErr))
 				return fmt.Errorf("process identity changed after SIGKILL: %w", waitErr)
 			}
 			if !exited {
-				return fmt.Errorf("process %d did not exit after SIGKILL", pid)
+				// Nothing else moves a systemd or adopted VM out of stopping.
+				// Recovery retries it: a later exit is cleared, and a live owner
+				// is re-adopted so the reconciler can plan the stop again.
+				err := fmt.Errorf("process %d did not exit after SIGKILL", pid)
+				m.quarantineStopIfCurrent(name, inst, ownedManifest.InstanceID, err)
+				return err
 			}
 		}
 	}
