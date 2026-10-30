@@ -314,7 +314,7 @@ func TestStartReclaimsInterruptedPreparationWithoutRecoveryTick(t *testing.T) {
 	if err := os.Remove(manifestPath(f.VMDir)); err != nil {
 		t.Fatal(err)
 	}
-	id, _, _, err := m.beginStart(f.Config)
+	id, _, _, err := m.beginStartContext(context.Background(), f.Config)
 	if err != nil {
 		t.Fatalf("empty preparation required another tick: %v", err)
 	}

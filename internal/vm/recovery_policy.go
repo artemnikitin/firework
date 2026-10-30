@@ -21,15 +21,16 @@ func (m *Manager) inspectRecoveryUnitContext(ctx context.Context, f *instanceMan
 	if m.recoveryUnitInspectorContext != nil {
 		return m.recoveryUnitInspectorContext(ctx, f)
 	}
-	if m.recoveryUnitInspector != nil {
-		return m.recoveryUnitInspector(f)
-	}
 	if f.LauncherUnit != "firework-vm-"+f.InstanceID+".service" {
 		return 0, false, fmt.Errorf("invalid systemd ownership unit")
 	}
 	ctx, cancel := context.WithTimeout(ctx, 2*time.Second)
 	defer cancel()
-	out, err := exec.CommandContext(ctx, "systemctl", "show", f.LauncherUnit, "--property=LoadState,ActiveState,MainPID").Output()
+	run := m.recoveryCommandOutput
+	if run == nil {
+		run = commandOutput
+	}
+	out, err := run(ctx, "systemctl", "show", f.LauncherUnit, "--property=LoadState,ActiveState,MainPID")
 	if err != nil {
 		return 0, false, fmt.Errorf("inspect systemd ownership: %w", err)
 	}
@@ -48,8 +49,8 @@ func (m *Manager) inspectRecoveryUnitContext(ctx context.Context, f *instanceMan
 	return pid, absent && pid == 0, nil
 }
 
-func (m *Manager) proveRecoveryAbsent(f *instanceManifest) error {
-	return m.proveRecoveryAbsentContext(context.Background(), f)
+func commandOutput(ctx context.Context, name string, args ...string) ([]byte, error) {
+	return exec.CommandContext(ctx, name, args...).Output()
 }
 
 func (m *Manager) proveRecoveryAbsentContext(ctx context.Context, f *instanceManifest) error {
@@ -78,13 +79,6 @@ func (m *Manager) proveRecoveryAbsentContext(ctx context.Context, f *instanceMan
 }
 
 // All recovery deletion paths use the same unit and process-claimant proof.
-func (m *Manager) removeRecoveryState(f *instanceManifest) error {
-	if err := verifyRecoveryManifestPaths(f.Service, filepath.Join(m.stateDir, "vms", f.Service), f); err != nil {
-		return err
-	}
-	return m.removeRecoveryStateContext(context.Background(), f)
-}
-
 func (m *Manager) removeRecoveryStateContext(ctx context.Context, f *instanceManifest) error {
 	if err := verifyRecoveryDirectories(f.VMDir); err != nil {
 		return err

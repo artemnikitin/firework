@@ -205,7 +205,7 @@ func TestRecoverCleansStartingSystemdStateWhenMainProcessExited(t *testing.T) {
 	if err := writeManifest(manifestPath(manifest.VMDir), manifest); err != nil {
 		t.Fatal(err)
 	}
-	manager.recoveryUnitInspector = func(*instanceManifest) (int, bool, error) { return 0, true, nil }
+	manager.recoveryUnitInspectorContext = func(context.Context, *instanceManifest) (int, bool, error) { return 0, true, nil }
 	delete(inspector.identities, 3637)
 	delete(inspector.identities, 42)
 	manager.inspector = inspector
@@ -244,7 +244,7 @@ func TestRecoverPersistsStartingSystemdIdentityBeforeSocketQuarantine(t *testing
 	}
 	inspector.socketErr = os.ErrNotExist
 	manager.inspector = inspector
-	manager.recoveryUnitInspector = func(*instanceManifest) (int, bool, error) { return 42, false, nil }
+	manager.recoveryUnitInspectorContext = func(context.Context, *instanceManifest) (int, bool, error) { return 42, false, nil }
 
 	binDir := t.TempDir()
 	systemctl := filepath.Join(binDir, "systemctl")

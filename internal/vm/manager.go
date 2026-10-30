@@ -102,13 +102,18 @@ type Instance struct {
 	// failed. The durable and published manifests remain unchanged until a
 	// later ClearRecoveryPending retries the write successfully.
 	recoveryCandidate *instanceManifest
+	// recoveryDiscoveryPending fences directories not yet inspected this process.
+	recoveryDiscoveryPending bool
+	// RecoveryConfigUnknown means resource allocation must conservatively fence
+	// changes until recovery establishes this directory's service configuration.
+	RecoveryConfigUnknown bool
 	// startID identifies one Start attempt. Phase 3 validates against it
 	// rather than against the service name, so a placeholder that was cleared
 	// and replaced by a later attempt is never mistaken for one's own.
 	startID string
-	// exitedOwner records the exact direct child reaped by Wait (or whose
-	// absence Stop verified). It permits a normal restart even if the final
-	// stopped manifest write failed, without rescanning every host process.
+	// exitedOwner records the exact owner reaped by Wait or whose absence
+	// Stop or the adopted-process monitor verified. It permits a normal restart
+	// even if the final stopped manifest write failed, without a host process scan.
 	exitedOwner *instanceManifest
 }
 
@@ -128,9 +133,9 @@ type Manager struct {
 	// recoveryManifestWriter is normally nil, which uses writeManifest. Tests
 	// can inject a one-shot durable-write failure to cover recovery retries.
 	recoveryManifestWriter       func(string, *instanceManifest) error
-	recoveryUnitInspector        func(*instanceManifest) (int, bool, error)
 	recoveryUnitInspectorContext func(context.Context, *instanceManifest) (int, bool, error)
 	recoveryCleanupRecorder      func(config.ServiceConfig) error
+	recoveryCommandOutput        func(context.Context, string, ...string) ([]byte, error)
 
 	mu                   sync.Mutex
 	instances            map[string]*Instance
@@ -353,7 +358,7 @@ func (m *Manager) List() map[string]*Instance {
 // Phase 3 confirms ownership before any side effect: no manifest is written
 // and nothing is launched unless the placeholder is still this attempt's own.
 func (m *Manager) Start(ctx context.Context, svc config.ServiceConfig) error {
-	startID, vmDir, socketPath, err := m.beginStart(svc)
+	startID, vmDir, socketPath, err := m.beginStartContext(ctx, svc)
 	if err != nil {
 		return err
 	}
@@ -373,11 +378,15 @@ func (m *Manager) Start(ctx context.Context, svc config.ServiceConfig) error {
 
 // beginStart is phase 1: it takes the entry checks and publishes the starting
 // placeholder under the manager lock.
-func (m *Manager) beginStart(svc config.ServiceConfig) (startID, vmDir, socketPath string, err error) {
+func (m *Manager) beginStartContext(ctx context.Context, svc config.ServiceConfig) (startID, vmDir, socketPath string, err error) {
+	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
 	if err := ValidateRecoveryServiceName(svc.Name); err != nil {
 		return "", "", "", err
 	}
-	m.mu.Lock()
+	if err := m.lockRecovery(ctx); err != nil {
+		return "", "", "", err
+	}
 	locked := true
 	defer func() {
 		if locked {
@@ -416,16 +425,27 @@ func (m *Manager) beginStart(svc config.ServiceConfig) (startID, vmDir, socketPa
 	}
 	m.mu.Unlock()
 	locked = false
-	if err := m.reclaimStartState(svc.Name, vmDir, previous); err != nil {
-		m.discardStart(svc.Name, startID)
+	if err := m.reclaimStartState(ctx, svc.Name, vmDir, previous); err != nil {
+		m.retainFailedReclaim(svc.Name, startID, vmDir, previous, err)
 		return "", "", "", err
 	}
 	return startID, vmDir, socketPath, nil
 }
 
-func (m *Manager) reclaimStartState(service, vmDir string, previous *Instance) error {
-	if previous == nil || previous.startID == "" || previous.exitedOwner == nil || previous.exitedOwner.Launcher != "direct" {
-		return m.reclaimUnownedState(service, vmDir)
+func (m *Manager) reclaimStartState(ctx context.Context, service, vmDir string, previous *Instance) error {
+	if previous == nil || previous.exitedOwner == nil {
+		return m.reclaimUnownedStateContext(ctx, service, vmDir)
+	}
+	// This process confirmed the exact owner exited. systemd can still be
+	// deactivating; wait for its terminal state before reusing the directory.
+	if previous.exitedOwner.Launcher == "systemd" {
+		_, inactive, err := m.inspectRecoveryUnitContext(ctx, previous.exitedOwner)
+		if err != nil {
+			return err
+		}
+		if !inactive {
+			return fmt.Errorf("systemd unit may still own the VM")
+		}
 	}
 	if err := verifyRecoveryManifestPaths(service, vmDir, previous.exitedOwner); err != nil {
 		return err
@@ -446,7 +466,27 @@ func (m *Manager) reclaimStartState(service, vmDir string, previous *Instance) e
 	if err := verifyRecoveryManifestIntegrity(durable); err != nil {
 		return err
 	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	return os.RemoveAll(vmDir)
+}
+
+// retainFailedReclaim keeps durable ownership visible to the periodic resolver.
+func (m *Manager) retainFailedReclaim(service, startID, vmDir string, previous *Instance, cause error) {
+	manifest, err := readManifest(manifestPath(vmDir))
+	if previous != nil && previous.manifest != nil && (err != nil ||
+		(!sameRecoveryIdentity(manifest, previous.manifest) && (previous.exitedOwner == nil || !sameRecoveryIdentity(manifest, previous.exitedOwner)))) {
+		manifest = cloneInstanceManifest(previous.manifest)
+	} else if err != nil {
+		manifest = &instanceManifest{Service: service, VMDir: vmDir,
+			SocketPath: filepath.Join(vmDir, "firecracker.sock"), ConfigPath: filepath.Join(vmDir, "vm-config.json")}
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if current := m.instances[service]; current != nil && current.startID == startID {
+		m.instances[service] = m.recoveryInstanceForService(service, manifest, cause.Error())
+	}
 }
 
 // prepareVolumes is phase 2. It runs without the manager lock, so it records
@@ -622,7 +662,7 @@ func (m *Manager) finishStart(ctx context.Context, svc config.ServiceConfig, sta
 // did not create a child. The same is not true for systemd: systemd-run can
 // create a unit and then fail while Firework is waiting for MainPID, so a
 // missing recorded PID does not prove that no process exists.
-func (m *Manager) reclaimUnownedState(service, vmDir string) error {
+func (m *Manager) reclaimUnownedStateContext(ctx context.Context, service, vmDir string) error {
 	manifest, err := readManifest(manifestPath(vmDir))
 	if errors.Is(err, os.ErrNotExist) {
 		if _, statErr := os.Lstat(vmDir); errors.Is(statErr, os.ErrNotExist) {
@@ -632,8 +672,6 @@ func (m *Manager) reclaimUnownedState(service, vmDir string) error {
 		// manifest. Use the same absence proof now instead of wasting a tick.
 		partial := &instanceManifest{Service: service, VMDir: vmDir,
 			SocketPath: filepath.Join(vmDir, "firecracker.sock"), ConfigPath: filepath.Join(vmDir, "vm-config.json")}
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
 		return m.removeRecoveryStateContext(ctx, partial)
 	}
 	if err == nil {
@@ -644,7 +682,7 @@ func (m *Manager) reclaimUnownedState(service, vmDir string) error {
 	if err == nil && manifest.PID == 0 &&
 		(manifest.Lifecycle == lifecycleStopped ||
 			(manifest.Lifecycle == lifecycleFailed && manifest.Launcher == "direct")) {
-		if removeErr := m.removeRecoveryState(manifest); removeErr != nil {
+		if removeErr := m.removeRecoveryStateContext(ctx, manifest); removeErr != nil {
 			return fmt.Errorf("removing exited VM state for %s: %w", service, removeErr)
 		}
 		return nil

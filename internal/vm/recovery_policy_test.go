@@ -46,7 +46,7 @@ func TestRecoveryPolicySurvivesRestart(t *testing.T) {
 				t.Fatal(err)
 			}
 			delete(m.instances, f.Service)
-			if err := m.reclaimUnownedState(f.Service, f.VMDir); err == nil {
+			if err := m.reclaimUnownedStateContext(context.Background(), f.Service, f.VMDir); err == nil {
 				t.Fatal("start bypassed policy")
 			}
 		})
@@ -94,15 +94,17 @@ func TestSystemdUnitBlocksDeadPIDCleanupAndRetriesStarting(t *testing.T) {
 	f.Launcher = "systemd"
 	f.LauncherUnit = "firework-vm-" + f.InstanceID + ".service"
 	delete(i.identities, f.PID)
-	m.recoveryUnitInspector = func(*instanceManifest) (int, bool, error) { return 77, false, nil }
-	if err := m.proveRecoveryAbsent(f); err == nil {
+	m.recoveryUnitInspectorContext = func(context.Context, *instanceManifest) (int, bool, error) { return 77, false, nil }
+	if err := m.proveRecoveryAbsentContext(context.Background(), f); err == nil {
 		t.Fatal("active unit ignored")
 	}
-	m.recoveryUnitInspector = func(*instanceManifest) (int, bool, error) { return 0, false, errors.New("unavailable") }
-	if err := m.proveRecoveryAbsent(f); err == nil {
+	m.recoveryUnitInspectorContext = func(context.Context, *instanceManifest) (int, bool, error) {
+		return 0, false, errors.New("unavailable")
+	}
+	if err := m.proveRecoveryAbsentContext(context.Background(), f); err == nil {
 		t.Fatal("unit error ignored")
 	}
-	m.recoveryUnitInspector = func(*instanceManifest) (int, bool, error) { return 0, true, nil }
+	m.recoveryUnitInspectorContext = func(context.Context, *instanceManifest) (int, bool, error) { return 0, true, nil }
 	f.PID = 0
 	f.Lifecycle = lifecycleStarting
 	if err := writeManifest(manifestPath(f.VMDir), f); err != nil {
@@ -134,7 +136,7 @@ func TestStartCannotBypassLegacyQuarantine(t *testing.T) {
 	if err := os.Remove(manifestPath(f.VMDir)); err != nil {
 		t.Fatal(err)
 	}
-	if err := m.reclaimUnownedState(f.Service, f.VMDir); err == nil {
+	if err := m.reclaimUnownedStateContext(context.Background(), f.Service, f.VMDir); err == nil {
 		t.Fatal("missing manifest silently authorized Start")
 	}
 }
@@ -146,7 +148,7 @@ func TestFailedPreparationAndConfigCanRetryWithoutRestart(t *testing.T) {
 	if err := m.Start(context.Background(), f.Config); err == nil {
 		t.Fatal("expected config failure")
 	}
-	id, dir, _, err := m.beginStart(f.Config)
+	id, dir, _, err := m.beginStartContext(context.Background(), f.Config)
 	if err != nil {
 		t.Fatal("retry wedged", err)
 	}
@@ -158,7 +160,7 @@ func TestFailedPreparationAndConfigCanRetryWithoutRestart(t *testing.T) {
 	if err := m.Start(context.Background(), f.Config); err == nil {
 		t.Fatal("expected volume failure")
 	}
-	id, _, _, err = m.beginStart(f.Config)
+	id, _, _, err = m.beginStartContext(context.Background(), f.Config)
 	if err != nil {
 		t.Fatal("prepare retry wedged", err)
 	}
@@ -174,7 +176,7 @@ func TestReclaimCannotDeleteOtherService(t *testing.T) {
 	if err := writeManifest(manifestPath(other), f); err != nil {
 		t.Fatal(err)
 	}
-	if err := m.reclaimUnownedState("other", other); err == nil {
+	if err := m.reclaimUnownedStateContext(context.Background(), "other", other); err == nil {
 		t.Fatal("accepted other service manifest")
 	}
 	if _, err := os.Stat(f.VMDir); err != nil {

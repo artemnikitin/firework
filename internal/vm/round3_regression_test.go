@@ -23,7 +23,7 @@ func TestRound3LiveSystemdOwnerDoesNotDependOnUnitInspection(t *testing.T) {
 	if err := writeManifest(manifestPath(f.VMDir), f); err != nil {
 		t.Fatal(err)
 	}
-	m.recoveryUnitInspector = func(*instanceManifest) (int, bool, error) {
+	m.recoveryUnitInspectorContext = func(context.Context, *instanceManifest) (int, bool, error) {
 		return 0, false, errors.New("temporary systemctl bus failure")
 	}
 	adopted, err := m.Recover(context.Background(), config.NodeConfig{})
@@ -49,7 +49,7 @@ func TestRound3RecoverRetriesSocketAndUnitFailures(t *testing.T) {
 					t.Fatal(err)
 				}
 				delete(inspector.identities, f.PID)
-				m.recoveryUnitInspector = func(*instanceManifest) (int, bool, error) {
+				m.recoveryUnitInspectorContext = func(context.Context, *instanceManifest) (int, bool, error) {
 					if failure == "systemctl unavailable" {
 						return 0, false, errors.New("systemctl unavailable")
 					}
@@ -66,7 +66,7 @@ func TestRound3RecoverRetriesSocketAndUnitFailures(t *testing.T) {
 				t.Fatalf("uncertain owner lost its state: %v", err)
 			}
 			inspector.socketErr = nil
-			m.recoveryUnitInspector = func(*instanceManifest) (int, bool, error) { return 0, true, nil }
+			m.recoveryUnitInspectorContext = func(context.Context, *instanceManifest) (int, bool, error) { return 0, true, nil }
 			if _, err := m.Recover(context.Background(), config.NodeConfig{}); err != nil {
 				t.Fatal(err)
 			}
@@ -100,7 +100,7 @@ func TestRound3PIDZeroLaunchRecovery(t *testing.T) {
 			} else {
 				f.Lifecycle = lifecycleFailed
 				f.LauncherUnit = "firework-vm-" + f.InstanceID + ".service"
-				m.recoveryUnitInspector = func(*instanceManifest) (int, bool, error) { return 42, false, nil }
+				m.recoveryUnitInspectorContext = func(context.Context, *instanceManifest) (int, bool, error) { return 42, false, nil }
 			}
 			if err := writeManifest(manifestPath(f.VMDir), f); err != nil {
 				t.Fatal(err)
@@ -312,7 +312,7 @@ func TestRound3ClearDoesNotHoldManagerLockDuringExternalInspection(t *testing.T)
 			if inspection == "systemd" {
 				f.Launcher = "systemd"
 				f.LauncherUnit = "firework-vm-" + f.InstanceID + ".service"
-				m.recoveryUnitInspector = func(*instanceManifest) (int, bool, error) {
+				m.recoveryUnitInspectorContext = func(context.Context, *instanceManifest) (int, bool, error) {
 					close(entered)
 					<-release
 					return 0, true, nil
@@ -409,7 +409,7 @@ func TestRound3FailedAndAbortedCreationCanLaunchOnRetry(t *testing.T) {
 				}
 				m.recoveryManifestWriter = nil
 			case "aborted preparation":
-				id, dir, socket, err := m.beginStart(service)
+				id, dir, socket, err := m.beginStartContext(context.Background(), service)
 				if err != nil {
 					t.Fatal(err)
 				}

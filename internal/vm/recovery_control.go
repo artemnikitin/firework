@@ -131,7 +131,7 @@ func (m *Manager) resolveRecoveryAttempt(ctx context.Context, service string, fo
 				m.mu.Unlock()
 				return recoveryAmbiguous(result, err.Error())
 			}
-			m.instances[service] = recoveryInstanceForService(service, manifest, "retrying durable recovery")
+			m.instances[service] = m.recoveryInstanceForService(service, manifest, "retrying durable recovery")
 		}
 		m.mu.Unlock()
 		return result, errRecoveryRetry
@@ -531,6 +531,9 @@ func (m *Manager) isCurrentRecoveryInstanceLocked(service string, expected *Inst
 }
 
 func (m *Manager) lockRecovery(ctx context.Context) error {
+	delay := time.Millisecond
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
 	for {
 		if err := ctx.Err(); err != nil {
 			return err
@@ -545,7 +548,9 @@ func (m *Manager) lockRecovery(ctx context.Context) error {
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
-		case <-time.After(time.Millisecond):
+		case <-timer.C:
+			delay = min(delay*2, 20*time.Millisecond)
+			timer.Reset(delay)
 		}
 	}
 }

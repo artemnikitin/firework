@@ -80,7 +80,7 @@ func TestRecoveryCleanupSupportsConfiguredStateRootSymlink(t *testing.T) {
 	}
 	var called bool
 	m.SetRecoveryCleanupRecorder(func(config.ServiceConfig) error { called = true; return nil })
-	if err := m.removeRecoveryState(manifest); err != nil {
+	if err := m.removeRecoveryStateContext(context.Background(), manifest); err != nil {
 		t.Fatalf("configured root symlink blocked safe cleanup: %v", err)
 	}
 	if !called {
