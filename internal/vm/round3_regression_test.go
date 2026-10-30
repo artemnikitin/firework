@@ -148,13 +148,19 @@ func TestRound3RecoveryNeverDeletesAnotherServicesDirectory(t *testing.T) {
 	if _, err := m.Recover(context.Background(), config.NodeConfig{}); err != nil {
 		t.Fatal(err)
 	}
-	for _, resolve := range []func(string) (RecoveryResult, error){m.ClearRecoveryPending, m.ForgetRecoveryPending} {
-		if _, err := resolve("other"); err == nil {
-			t.Fatal("foreign manifest was accepted")
-		}
-		if contents, err := os.ReadFile(marker); err != nil || string(contents) != "victim" {
-			t.Fatalf("foreign manifest deleted victim state: contents=%q err=%v", contents, err)
-		}
+	if _, err := m.ClearRecoveryPending("other"); err == nil {
+		t.Fatal("foreign manifest was accepted")
+	}
+	// Forgetting untrusted metadata deletes only the named service's own
+	// canonical directory, never the one its manifest names.
+	if result, err := m.ForgetRecoveryPending("other"); err != nil || result.Outcome != RecoveryOutcomeCleared {
+		t.Fatalf("absent untrusted state was not forgotten: result=%#v err=%v", result, err)
+	}
+	if _, err := os.Stat(otherDir); !os.IsNotExist(err) {
+		t.Fatalf("forgotten state remains: %v", err)
+	}
+	if contents, err := os.ReadFile(marker); err != nil || string(contents) != "victim" {
+		t.Fatalf("foreign manifest deleted victim state: contents=%q err=%v", contents, err)
 	}
 }
 
@@ -182,13 +188,28 @@ func TestRound3RecoveryCannotDeleteStateThroughSymlink(t *testing.T) {
 			if _, err := m.Recover(context.Background(), config.NodeConfig{}); err != nil {
 				t.Fatal(err)
 			}
-			for _, resolve := range []func(string) (RecoveryResult, error){m.ClearRecoveryPending, m.ForgetRecoveryPending} {
-				if _, err := resolve(f.Service); err == nil {
-					t.Fatal("symlinked runtime directory was accepted for deletion")
+			if _, err := m.ClearRecoveryPending(f.Service); err == nil {
+				t.Fatal("symlinked runtime directory was accepted for deletion")
+			}
+			_, forgetErr := m.ForgetRecoveryPending(f.Service)
+			if link == "vms parent" && forgetErr == nil {
+				t.Fatal("state behind a symlinked VM root was accepted for deletion")
+			}
+			if link == "service directory" {
+				// Forget removes only the link, never the directory it names.
+				if forgetErr != nil {
+					t.Fatalf("absent symlinked service entry was not forgotten: %v", forgetErr)
 				}
-				if contents, err := os.ReadFile(marker); err != nil || string(contents) != "must survive" {
-					t.Fatalf("recovery deleted state behind a symlink: contents=%q err=%v", contents, err)
+				if _, err := os.Lstat(linkedPath); !os.IsNotExist(err) {
+					t.Fatalf("service symlink remains: %v", err)
 				}
+			}
+			protected := filepath.Join(target, "protected-data")
+			if link == "vms parent" {
+				protected = filepath.Join(target, f.Service, "protected-data")
+			}
+			if contents, err := os.ReadFile(protected); err != nil || string(contents) != "must survive" {
+				t.Fatalf("recovery deleted state behind a symlink: contents=%q err=%v", contents, err)
 			}
 		})
 	}

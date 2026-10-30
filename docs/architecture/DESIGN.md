@@ -277,8 +277,15 @@ consistency. Issue #49's offline filesystem/resize validation remains independen
 If proof fails, inspect the VM logs, ownership manifest, and recorded systemd
 unit. Stop/fence the actual owner before retrying. For corrupt metadata, preserve
 it for diagnosis and restore a trusted ownership record before retrying; the
-agent must not guess a new owner. Stopping the agent does not stop surviving VMs.
-Do not delete ownership records while a claimant may be alive.
+agent must not guess a new owner. A restored record is used on the next retry
+without restarting the agent. Untrusted metadata (an unreadable or mismatched
+manifest, or a symlinked service entry) never authorizes adoption. Its absence
+proof uses only the service's canonical paths. Once that proof succeeds, its
+unknown resource claims stop fencing other services, and `--forget` deletes it;
+for a symlinked entry, only the link is removed. A state directory removed by
+hand is cleared after the same proof, because no metadata remains to preserve.
+Stopping the agent does not stop surviving VMs. Do not delete ownership records
+while a claimant may be alive.
 
 A process observed mid-exit is classified as exited, not ambiguous. Linux
 releases a process's address space, and with it its `exe` link and command line,

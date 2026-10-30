@@ -153,8 +153,12 @@ func (m *Manager) resolveRecoveryAttempt(ctx context.Context, service string, fo
 	recoveryCandidate := cloneInstanceManifest(instance.recoveryCandidate)
 	instanceID := instance.instanceID
 	instancePID := instance.PID
+	untrusted := instance.RecoveryConfigUnknown
 	m.mu.Unlock()
 	vmDir, manifestPath := m.recoveryManifestPath(service)
+	if untrusted || verifyRecoveryDirectories(vmDir) != nil {
+		return m.resolveUntrustedRecovery(ctx, result, instance, &initialManifest, untrusted, forget)
+	}
 	if err := verifyRecoveryManifestPaths(service, vmDir, &manifest); err != nil {
 		return recoveryAmbiguous(result, err.Error())
 	}

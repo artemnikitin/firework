@@ -145,7 +145,7 @@ func (r *Reconciler) actionHold(action Action) string {
 func unknownRuntimeOwner(actual map[string]*vm.Instance) string {
 	var names []string
 	for name, instance := range actual {
-		if instance.State == vm.StateRecoveryPending && instance.RecoveryConfigUnknown {
+		if instance.State == vm.StateRecoveryPending && instance.RecoveryConfigUnknown && !instance.RecoveryOwnerAbsent {
 			names = append(names, name)
 		}
 	}
