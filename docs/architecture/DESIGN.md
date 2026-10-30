@@ -260,8 +260,11 @@ A fully validated live process does not require an additional systemctl query.
 
 Cleanup first attempts a complete absence proof, independently of whether the
 old PID/identity is populated. Systemd-owned state requires an inactive or absent
-unit with no MainPID, and all cleanup requires no live process referencing either
-VM path. This permits dead PID-0 starts and unused legacy directories to recover
+unit with no MainPID and no queued job: `systemd-run --no-block` can leave a
+queued unit with no process yet. Where the agent launches through systemd, or
+the record names a unit, no `firework-vm-*` unit may name either VM path in its
+command line, which covers metadata too damaged to name its unit. All cleanup
+also requires no live process referencing either VM path. This permits dead PID-0 starts and unused legacy directories to recover
 without hand-editing files. Unknown, unreadable, or live ownership remains pending.
 A missing identity cannot authorize live adoption.
 

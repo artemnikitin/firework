@@ -137,3 +137,29 @@ func TestRecoveryClearsRemovedStateDirectoryAfterAbsenceProof(t *testing.T) {
 		t.Fatalf("trusted host cleanup was not journaled: %#v", recorded)
 	}
 }
+
+func TestUntrustedRecoveryWaitsForQueuedSystemdLaunch(t *testing.T) {
+	m, f, inspector := recoveryFixture(t)
+	m.inspector = inspector
+	delete(inspector.identities, f.PID)
+	m.launcher = &systemdLauncher{systemctl: "systemctl"}
+	if err := os.WriteFile(manifestPath(f.VMDir), []byte("{"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	queued := "Id=firework-vm-lost.service\nActiveState=inactive\nMainPID=0\nJob=145\nExecStart={ path=/fc ; argv[]=/fc --id lost --api-sock " + f.SocketPath + " ; ignore_errors=no }\n"
+	units := queued
+	m.recoveryCommandOutput = func(context.Context, string, ...string) ([]byte, error) { return []byte(units), nil }
+	if _, err := m.Recover(context.Background(), config.NodeConfig{}); err != nil {
+		t.Fatal(err)
+	}
+	if result, err := m.ForgetRecoveryPending(f.Service); err == nil || result.Outcome != RecoveryOutcomeAmbiguous {
+		t.Fatalf("queued launch was forgotten: result=%#v err=%v", result, err)
+	}
+	if got := m.List()[f.Service]; got == nil || got.RecoveryOwnerAbsent {
+		t.Fatalf("queued launch released its unknown claims: %#v", got)
+	}
+	units = ""
+	if result, err := m.ForgetRecoveryPending(f.Service); err != nil || result.Outcome != RecoveryOutcomeCleared {
+		t.Fatalf("absent launch was not forgotten: result=%#v err=%v", result, err)
+	}
+}

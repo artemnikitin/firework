@@ -225,3 +225,69 @@ func main(){flag.String("id","","");p:=flag.String("api-sock","","");flag.String
 	}
 	t.Log("live ambiguous VM and kernel TAP survived clear, forget, Remove, Stop; repaired record readopted")
 }
+
+// A --no-block launch can sit queued behind a start job with no process for
+// the claimant scan to find. Untrusted metadata names no unit, so recovery
+// must find the queued unit by its launch paths before releasing claims.
+func TestSystemdIntegrationQueuedUnitBlocksUntrustedCleanup(t *testing.T) {
+	if os.Getenv("FIREWORK_REAL_SYSTEMD") != "1" {
+		t.Skip("requires isolated real systemd")
+	}
+	root := t.TempDir()
+	m := NewManager("/bin/sh", root, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	if _, ok := m.launcher.(*systemdLauncher); !ok {
+		t.Fatalf("not using real systemd: %T", m.launcher)
+	}
+	vmDir := filepath.Join(root, "vms", "queued")
+	if err := os.MkdirAll(vmDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(manifestPath(vmDir), []byte("{"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	suffix := fmt.Sprintf("%d", time.Now().UnixNano())
+	blocker, unit := "fw-blocker-"+suffix+".service", "firework-vm-"+suffix+".service"
+	defer exec.Command("systemctl", "stop", unit, blocker).Run()
+	for _, args := range [][]string{
+		{"--unit=" + blocker, "--service-type=oneshot", "--no-block", "--", "sleep", "60"},
+		{"--unit=" + unit, "--service-type=exec", "--collect", "--no-block", "--property=After=" + blocker, "--property=Wants=" + blocker,
+			"--", "/bin/sh", "-c", "sleep 300", "fc", "--id", suffix,
+			"--api-sock", filepath.Join(vmDir, "firecracker.sock"), "--config-file", filepath.Join(vmDir, "vm-config.json")},
+	} {
+		if out, err := exec.Command("systemd-run", args...).CombinedOutput(); err != nil {
+			t.Fatalf("systemd-run: %v %s", err, out)
+		}
+	}
+	if out, err := exec.Command("systemctl", "show", unit, "--property=ActiveState,MainPID,Job").Output(); err != nil || !strings.Contains(string(out), "MainPID=0") || strings.Contains(string(out), "Job=\n") {
+		t.Fatalf("unit is not queued without a process: %v %s", err, out)
+	}
+	ctx := context.Background()
+	if _, err := m.Recover(ctx, config.NodeConfig{}); err != nil {
+		t.Fatal(err)
+	}
+	if result, err := m.ForgetRecoveryPending("queued"); err == nil || result.Outcome != RecoveryOutcomeAmbiguous {
+		t.Fatalf("queued launch was forgotten: %#v %v", result, err)
+	}
+	if got := m.List()["queued"]; got == nil || got.RecoveryOwnerAbsent {
+		t.Fatalf("queued launch released its unknown claims: %#v", got)
+	}
+	if _, err := os.Stat(manifestPath(vmDir)); err != nil {
+		t.Fatalf("queued launch state was removed: %v", err)
+	}
+
+	if out, err := exec.Command("systemctl", "stop", unit, blocker).CombinedOutput(); err != nil {
+		t.Fatalf("stop queued units: %v %s", err, out)
+	}
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		result, err := m.ForgetRecoveryPending("queued")
+		if err == nil && result.Outcome == RecoveryOutcomeCleared {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("absent launch was not forgotten: %#v %v", result, err)
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	t.Log("queued systemd launch blocked untrusted cleanup until it was gone")
+}

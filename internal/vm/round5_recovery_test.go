@@ -32,7 +32,7 @@ func TestTrackedSystemdExitRestartDoesNotNeedCleanupJournalOrScan(t *testing.T) 
 			m.instances[f.Service] = instanceFromManifest(cloneInstanceManifest(f), StateRunning, "")
 			m.SetRecoveryCleanupRecorder(func(config.ServiceConfig) error { t.Fatal("normal restart wrote recovery cleanup intent"); return nil })
 			m.recoveryCommandOutput = func(_ context.Context, name string, args ...string) ([]byte, error) {
-				if name != "systemctl" || !reflect.DeepEqual(args, []string{"show", f.LauncherUnit, "--property=LoadState,ActiveState,MainPID"}) {
+				if name != "systemctl" || !reflect.DeepEqual(args, []string{"show", f.LauncherUnit, "--property=LoadState,ActiveState,MainPID,Job"}) {
 					t.Fatalf("unexpected unit query: %s %v", name, args)
 				}
 				return systemdRecoveryOutput("inactive"), nil

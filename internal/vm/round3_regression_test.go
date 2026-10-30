@@ -49,6 +49,7 @@ func TestRound3RecoverRetriesSocketAndUnitFailures(t *testing.T) {
 					t.Fatal(err)
 				}
 				delete(inspector.identities, f.PID)
+				withoutSystemdLaunches(m)
 				m.recoveryUnitInspectorContext = func(context.Context, *instanceManifest) (int, bool, error) {
 					if failure == "systemctl unavailable" {
 						return 0, false, errors.New("systemctl unavailable")
@@ -333,6 +334,7 @@ func TestRound3ClearDoesNotHoldManagerLockDuringExternalInspection(t *testing.T)
 			if inspection == "systemd" {
 				f.Launcher = "systemd"
 				f.LauncherUnit = "firework-vm-" + f.InstanceID + ".service"
+				withoutSystemdLaunches(m)
 				m.recoveryUnitInspectorContext = func(context.Context, *instanceManifest) (int, bool, error) {
 					close(entered)
 					<-release

@@ -95,6 +95,7 @@ func TestSystemdUnitBlocksDeadPIDCleanupAndRetriesStarting(t *testing.T) {
 	f.LauncherUnit = "firework-vm-" + f.InstanceID + ".service"
 	delete(i.identities, f.PID)
 	m.recoveryUnitInspectorContext = func(context.Context, *instanceManifest) (int, bool, error) { return 77, false, nil }
+	withoutSystemdLaunches(m)
 	if err := m.proveRecoveryAbsentContext(context.Background(), f); err == nil {
 		t.Fatal("active unit ignored")
 	}
@@ -181,5 +182,65 @@ func TestReclaimCannotDeleteOtherService(t *testing.T) {
 	}
 	if _, err := os.Stat(f.VMDir); err != nil {
 		t.Fatal("deleted victim", err)
+	}
+}
+
+// withoutSystemdLaunches fakes a host whose systemd lists no Firework units.
+func withoutSystemdLaunches(m *Manager) {
+	m.recoveryCommandOutput = func(context.Context, string, ...string) ([]byte, error) { return nil, nil }
+}
+
+func TestSystemdLaunchScanFindsQueuedAndLiveClaimants(t *testing.T) {
+	socket, config := "/var/lib/fw/vms/app/firecracker.sock", "/var/lib/fw/vms/app/vm-config.json"
+	unit := func(id, state, pid, job, argv string) string {
+		return "MainPID=" + pid + "\nExecStart={ path=/bin/fc ; argv[]=" + argv + " ; ignore_errors=no ; start_time=[n/a] }\nId=" + id + "\nActiveState=" + state + "\nJob=" + job + "\n"
+	}
+	own := "/bin/fc --id x --api-sock " + socket + " --config-file " + config
+	for _, tc := range []struct {
+		name   string
+		output string
+		claims bool
+	}{
+		{"queued start job", unit("firework-vm-x.service", "inactive", "0", "145", own), true},
+		{"active", unit("firework-vm-x.service", "active", "77", "", own), true},
+		{"deactivating", unit("firework-vm-x.service", "deactivating", "77", "", own), true},
+		{"equals form", unit("firework-vm-x.service", "active", "77", "", "/bin/fc --api-sock="+socket), true},
+		{"inactive without job", unit("firework-vm-x.service", "inactive", "0", "", own), false},
+		{"failed without job", unit("firework-vm-x.service", "failed", "0", "", own), false},
+		{"other service", unit("firework-vm-y.service", "active", "78", "", "/bin/fc --api-sock /var/lib/fw/vms/app2/firecracker.sock"), false},
+		{"second unit queued", unit("firework-vm-y.service", "active", "78", "", "/bin/fc --api-sock /other") + "\n" + unit("firework-vm-x.service", "inactive", "0", "9", own), true},
+		{"no units", "", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			m, _, _ := recoveryFixture(t)
+			m.launcher = &systemdLauncher{systemctl: "/usr/bin/systemctl"}
+			m.recoveryCommandOutput = func(_ context.Context, name string, args ...string) ([]byte, error) {
+				if name != "/usr/bin/systemctl" || len(args) < 2 || args[0] != "show" || args[1] != "firework-vm-*.service" {
+					t.Fatalf("unexpected launch query: %s %v", name, args)
+				}
+				return []byte(tc.output), nil
+			}
+			err := m.noClaimingUnitContext(context.Background(), &instanceManifest{SocketPath: socket, ConfigPath: config})
+			if (err != nil) != tc.claims {
+				t.Fatalf("claim = %v, want %v", err, tc.claims)
+			}
+		})
+	}
+}
+
+func TestRecordedSystemdUnitWithQueuedJobIsNotAbsent(t *testing.T) {
+	m, f, _ := recoveryFixture(t)
+	f.Launcher = "systemd"
+	f.LauncherUnit = "firework-vm-" + f.InstanceID + ".service"
+	for _, tc := range []struct {
+		job    string
+		absent bool
+	}{{"145", false}, {"", true}} {
+		m.recoveryCommandOutput = func(context.Context, string, ...string) ([]byte, error) {
+			return []byte("LoadState=loaded\nActiveState=inactive\nMainPID=0\nJob=" + tc.job + "\n"), nil
+		}
+		if _, absent, err := m.inspectRecoveryUnitContext(context.Background(), f); err != nil || absent != tc.absent {
+			t.Fatalf("job %q: absent=%v err=%v, want %v", tc.job, absent, err, tc.absent)
+		}
 	}
 }
