@@ -49,8 +49,10 @@ func TestUntrustedRecoveryReleasesClaimsAndRequiresForgetToDelete(t *testing.T) 
 					t.Fatalf("untrusted metadata was resolved without --forget: result=%#v err=%v", result, err)
 				}
 				got := m.List()[f.Service]
-				if got == nil || got.State != StateRecoveryPending || got.RecoveryOwnerAbsent == live {
-					t.Fatalf("owner absence was not recorded correctly: %#v", got)
+				// Even a proven-absent owner keeps its claims fenced until an
+				// operator forgets the record.
+				if got == nil || got.State != StateRecoveryPending || !got.RecoveryConfigUnknown {
+					t.Fatalf("untrusted claims left the fence before --forget: %#v", got)
 				}
 				if _, err := os.Stat(manifestPath(f.VMDir)); err != nil {
 					t.Fatalf("untrusted metadata was not preserved for diagnosis: %v", err)
@@ -154,9 +156,6 @@ func TestUntrustedRecoveryWaitsForQueuedSystemdLaunch(t *testing.T) {
 	}
 	if result, err := m.ForgetRecoveryPending(f.Service); err == nil || result.Outcome != RecoveryOutcomeAmbiguous {
 		t.Fatalf("queued launch was forgotten: result=%#v err=%v", result, err)
-	}
-	if got := m.List()[f.Service]; got == nil || got.RecoveryOwnerAbsent {
-		t.Fatalf("queued launch released its unknown claims: %#v", got)
 	}
 	units = ""
 	if result, err := m.ForgetRecoveryPending(f.Service); err != nil || result.Outcome != RecoveryOutcomeCleared {

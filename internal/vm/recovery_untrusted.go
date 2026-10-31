@@ -88,10 +88,10 @@ func recoveryAbsenceProbe(service, vmDir string, recorded *instanceManifest, unt
 
 // resolveUntrustedRecovery handles state that can never authorize adoption:
 // an unreadable or mismatched manifest, or a service path that is not a real
-// directory. Proven absence releases its unknown resource claims. Deleting it
-// requires --forget when metadata would be lost, so corrupt records stay
-// available for diagnosis by default; a missing directory or manifest has
-// nothing to preserve and is cleared automatically.
+// directory. Its claims stay fenced until --forget deletes it after an absence
+// proof, or a restored trusted record replaces it, so corrupt records stay
+// available for diagnosis; a missing directory or manifest has nothing to
+// preserve and is cleared automatically.
 func (m *Manager) resolveUntrustedRecovery(ctx context.Context, result RecoveryResult, instance *Instance, recorded *instanceManifest, untrusted, forget bool) (RecoveryResult, error) {
 	service := result.Service
 	vmDir, path := m.recoveryManifestPath(service)
@@ -124,17 +124,14 @@ func (m *Manager) resolveUntrustedRecovery(ctx context.Context, result RecoveryR
 	}
 	probe := recoveryAbsenceProbe(service, vmDir, recorded, untrusted)
 	absenceErr := m.proveRecoveryAbsentContext(ctx, probe)
-	m.mu.Lock()
-	if m.instances[service] == instance {
-		instance.RecoveryOwnerAbsent = absenceErr == nil
-	}
-	m.mu.Unlock()
 	if absenceErr != nil {
 		return recoveryAmbiguous(result, fmt.Sprintf("%s and absence remains unproved: %v", reason, absenceErr))
 	}
 	preservesMetadata := before.kind == "symlink" || (before.kind == "dir" && before.manifest != "missing")
 	if preservesMetadata && !forget {
-		return recoveryAmbiguous(result, fmt.Sprintf("%s; no process owns it, so it is preserved for diagnosis: restore a trusted ownership record or run firework-agent clear-recovery --forget %s", reason, service))
+		// What a dead owner left on the host is unknown, so its claims stay
+		// fenced until an operator decides; recovery never releases them.
+		return recoveryAmbiguous(result, fmt.Sprintf("%s; no process owns it, so it is preserved for diagnosis and its claims stay fenced: restore a trusted ownership record or run firework-agent clear-recovery --forget %s", reason, service))
 	}
 
 	if err := m.lockRecovery(ctx); err != nil {

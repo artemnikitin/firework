@@ -188,12 +188,6 @@ func TestUnknownRuntimeClaimsHoldMutationsAndCleanupUntilResolved(t *testing.T) 
 		t.Fatalf("deferred cleanup was not finished: forwards=%v taps=%v", network.teardownForwardCalls, network.deleteTAPCalls)
 	}
 
-	// Proven absence of the unknown owner releases its fence without forgetting it.
-	r2, manager2 := newNetworkTestReconciler(&fakeNetworkManager{})
-	manager2.instances[unknown.Name] = &vm.Instance{Name: unknown.Name, Config: unknown.Config, State: vm.StateRecoveryPending, RecoveryConfigUnknown: true, RecoveryOwnerAbsent: true}
-	if err := r2.Reconcile(context.Background(), config.NodeConfig{Services: []config.ServiceConfig{forwardedService("new")}}); err != nil {
-		t.Fatalf("absent unknown owner still fenced allocations: %v", err)
-	}
 }
 
 func TestCapacityHoldPublicationSupportsConcurrentTelemetry(t *testing.T) {

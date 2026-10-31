@@ -268,9 +268,6 @@ func TestSystemdIntegrationQueuedUnitBlocksUntrustedCleanup(t *testing.T) {
 	if result, err := m.ForgetRecoveryPending("queued"); err == nil || result.Outcome != RecoveryOutcomeAmbiguous {
 		t.Fatalf("queued launch was forgotten: %#v %v", result, err)
 	}
-	if got := m.List()["queued"]; got == nil || got.RecoveryOwnerAbsent {
-		t.Fatalf("queued launch released its unknown claims: %#v", got)
-	}
 	if _, err := os.Stat(manifestPath(vmDir)); err != nil {
 		t.Fatalf("queued launch state was removed: %v", err)
 	}
