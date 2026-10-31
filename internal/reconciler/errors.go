@@ -11,6 +11,11 @@ import (
 // change. Independent work can proceed, but the revision remains retryable.
 var ErrServiceHeld = errors.New("service held for retained runtime resources")
 
+// ErrRecoveryHeld is a hold caused by unresolved VM ownership. It is distinct
+// from ErrServiceHeld so the agent can tell which holds pending recovery
+// explains; both leave a reconciliation incomplete.
+var ErrRecoveryHeld = errors.New("service held for unresolved VM ownership")
+
 // FailureStage identifies the blocking host stage that prevented convergence.
 // It is intentionally a small, stable set so agents can publish bounded
 // condition and reason values without parsing error strings.
@@ -84,19 +89,19 @@ func IsIncomplete(err error) bool {
 		return false
 	}
 	for _, leaf := range leaves {
-		if !vm.IsStartRace(leaf) && !errors.Is(leaf, ErrServiceHeld) {
+		if !vm.IsStartRace(leaf) && !errors.Is(leaf, ErrServiceHeld) && !errors.Is(leaf, ErrRecoveryHeld) {
 			return false
 		}
 	}
 	return true
 }
 
-// OnlyHeld reports whether every reconciliation error is a retained-resource
-// hold, with no start race or failure among them.
-func OnlyHeld(err error) bool {
+// OnlyRecoveryHeld reports whether every reconciliation error is a hold that
+// unresolved VM ownership caused, with no other hold, start race or failure.
+func OnlyRecoveryHeld(err error) bool {
 	leaves := reconcileLeaves(err, nil)
 	for _, leaf := range leaves {
-		if !errors.Is(leaf, ErrServiceHeld) {
+		if !errors.Is(leaf, ErrRecoveryHeld) {
 			return false
 		}
 	}

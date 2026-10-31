@@ -501,8 +501,10 @@ func (a *Agent) tick(ctx context.Context) {
 
 	// Check node capacity before reconciling; skip if resources are exceeded.
 	used, capacityHolds := a.reserveCapacity(merged.Services, nodeCap, hasCap)
-	holds := make(map[string]string, len(capacityHolds)+len(addressHolds))
-	maps.Copy(holds, addressHolds)
+	holds := make(map[string]reconciler.Hold, len(capacityHolds)+len(addressHolds))
+	for name, reason := range addressHolds {
+		holds[name] = reconciler.Hold{Reason: reason}
+	}
 	maps.Copy(holds, capacityHolds)
 	a.reconciler.SetHeldServices(holds)
 	// Update the heartbeat goroutine with the latest used resources now, before
@@ -551,11 +553,13 @@ func (a *Agent) tick(ctx context.Context) {
 	if err == nil {
 		a.forceReconcile = false
 	}
-	if err != nil && reconciler.OnlyHeld(err) && a.vmManager.HasPendingRecovery() {
-		// Every hold waits on unresolved VM ownership, which VMRecoveryReady
-		// reports as degradation and held services report as resource_held.
-		// Freezing the revision would hide both behind "progressing". Pending
-		// recovery keeps forcing reconciliation, so the holds still retry.
+	if err != nil && reconciler.OnlyRecoveryHeld(err) && a.vmManager.HasPendingRecovery() {
+		// Every hold was caused by unresolved VM ownership, which
+		// VMRecoveryReady reports as degradation and held services report as
+		// resource_held. Freezing the revision would hide both behind
+		// "progressing". Pending recovery keeps forcing reconciliation, so the
+		// holds still retry. Any other hold, such as genuine over-capacity or
+		// an exhausted subnet, leaves the revision incomplete.
 		a.logger.Info("applying revision with services held for VM recovery", "error", err)
 		a.forceReconcile = true
 		err = nil
@@ -1215,39 +1219,59 @@ func (a *Agent) syncImages(ctx context.Context, services []config.ServiceConfig,
 
 // Count retained runtime allocations before admitting desired services. Their
 // old config can differ from desired and remains authoritative until resolved.
-func (a *Agent) reserveCapacity(services []config.ServiceConfig, cap capacity.NodeCapacity, known bool) (capacity.NodeCapacity, map[string]string) {
+// A hold is attributed to recovery only if the service would fit once every
+// recovery_pending owner resolved; otherwise the node is genuinely full.
+func (a *Agent) reserveCapacity(services []config.ServiceConfig, cap capacity.NodeCapacity, known bool) (capacity.NodeCapacity, map[string]reconciler.Hold) {
 	retained := a.reconciler.RetainedServices()
 	if len(retained) == 0 {
 		return sumResources(services), nil
 	}
 	allocations := make(map[string]config.ServiceConfig)
+	pending := make(map[string]bool)
 	for name, inst := range a.vmManager.List() {
 		if inst.State != vm.StateStopped && inst.State != vm.StateFailed {
 			allocations[name] = inst.Config
+			pending[name] = inst.State == vm.StateRecoveryPending
 		}
 	}
-	var used capacity.NodeCapacity
-	for _, svc := range allocations {
-		used.VCPUs += svc.VCPUs
-		used.MemoryMB += svc.MemoryMB
+	// settled is the allocation without unresolved owners.
+	var used, settled capacity.NodeCapacity
+	for name, svc := range allocations {
+		used = growAllocation(used, svc, config.ServiceConfig{})
+		if !pending[name] {
+			settled = growAllocation(settled, svc, config.ServiceConfig{})
+		}
 	}
-	holds := map[string]string{}
+	exceeds := func(c capacity.NodeCapacity) bool { return c.VCPUs > cap.VCPUs || c.MemoryMB > cap.MemoryMB }
+	holds := map[string]reconciler.Hold{}
 	for _, svc := range services {
-		next := used
-		old := allocations[svc.Name]
-		if svc.VCPUs > old.VCPUs {
-			next.VCPUs += svc.VCPUs - old.VCPUs
+		old, settledOld := allocations[svc.Name], allocations[svc.Name]
+		if pending[svc.Name] {
+			settledOld = config.ServiceConfig{}
 		}
-		if svc.MemoryMB > old.MemoryMB {
-			next.MemoryMB += svc.MemoryMB - old.MemoryMB
-		}
-		if known && len(retained) > 0 && (next.VCPUs > cap.VCPUs || next.MemoryMB > cap.MemoryMB) {
-			holds[svc.Name] = "capacity retained by unresolved VM ownership"
+		next, nextSettled := growAllocation(used, svc, old), growAllocation(settled, svc, settledOld)
+		if known && exceeds(next) {
+			if exceeds(nextSettled) {
+				holds[svc.Name] = reconciler.Hold{Reason: "desired services exceed node capacity"}
+			} else {
+				holds[svc.Name] = reconciler.Hold{Reason: "capacity retained by unresolved VM ownership", Recovery: true}
+			}
 			continue
 		}
-		used = next
+		used, settled = next, nextSettled
 	}
 	return used, holds
+}
+
+// growAllocation adds svc's growth over its old allocation to base.
+func growAllocation(base capacity.NodeCapacity, svc, old config.ServiceConfig) capacity.NodeCapacity {
+	if svc.VCPUs > old.VCPUs {
+		base.VCPUs += svc.VCPUs - old.VCPUs
+	}
+	if svc.MemoryMB > old.MemoryMB {
+		base.MemoryMB += svc.MemoryMB - old.MemoryMB
+	}
+	return base
 }
 
 func (a *Agent) restartService(ctx context.Context, name string) error {

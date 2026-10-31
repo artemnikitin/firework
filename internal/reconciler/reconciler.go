@@ -86,7 +86,7 @@ type Reconciler struct {
 	sleepFn         func(context.Context, time.Duration) error
 	pendingRecovery map[string]struct{}
 	heldMu          sync.RWMutex
-	heldServices    map[string]string
+	heldServices    map[string]Hold
 	// pendingPortForwards holds every DNAT rule whose teardown has failed,
 	// keyed by the rule's own (hostPort, guestIP, vmPort) identity — not by
 	// service name. A service can pass through several configs in a row
@@ -580,8 +580,8 @@ func (r *Reconciler) applyAllAtOnce(ctx context.Context, actions []Action) error
 	var errs []error
 
 	for _, action := range actions {
-		if reason := r.actionHold(action); reason != "" {
-			errs = append(errs, fmt.Errorf("hold %s (%s): %w", action.Service.Name, reason, ErrServiceHeld))
+		if hold := r.actionHold(action); hold.Reason != "" {
+			errs = append(errs, hold.err(action.Service.Name))
 			continue
 		}
 		switch action.Type {
@@ -641,8 +641,8 @@ func (r *Reconciler) applyRolling(ctx context.Context, actions []Action) error {
 		if action.Type != ActionDelete {
 			continue
 		}
-		if reason := r.actionHold(action); reason != "" {
-			errs = append(errs, fmt.Errorf("hold %s (%s): %w", action.Service.Name, reason, ErrServiceHeld))
+		if hold := r.actionHold(action); hold.Reason != "" {
+			errs = append(errs, hold.err(action.Service.Name))
 			continue
 		}
 		r.logger.Info("deleting service", "service", action.Service.Name)
@@ -656,8 +656,8 @@ func (r *Reconciler) applyRolling(ctx context.Context, actions []Action) error {
 		if action.Type != ActionCreate {
 			continue
 		}
-		if reason := r.actionHold(action); reason != "" {
-			errs = append(errs, fmt.Errorf("hold %s (%s): %w", action.Service.Name, reason, ErrServiceHeld))
+		if hold := r.actionHold(action); hold.Reason != "" {
+			errs = append(errs, hold.err(action.Service.Name))
 			continue
 		}
 		r.logger.Info("creating service", "service", action.Service.Name)
@@ -676,8 +676,8 @@ func (r *Reconciler) applyRolling(ctx context.Context, actions []Action) error {
 	}
 
 	for i, action := range updates {
-		if reason := r.actionHold(action); reason != "" {
-			errs = append(errs, fmt.Errorf("hold %s (%s): %w", action.Service.Name, reason, ErrServiceHeld))
+		if hold := r.actionHold(action); hold.Reason != "" {
+			errs = append(errs, hold.err(action.Service.Name))
 			continue
 		}
 		r.logger.Info("updating service (stop + start)", "service", action.Service.Name)
@@ -810,8 +810,8 @@ func (r *Reconciler) Reconcile(ctx context.Context, desired config.NodeConfig) e
 	if err := r.restoreRecovered(ctx, desired); err != nil {
 		errs = append(errs, err)
 	}
-	for name, reason := range r.HeldServices(desired) {
-		errs = append(errs, fmt.Errorf("hold %s (%s): %w", name, reason, ErrServiceHeld))
+	for name, hold := range r.holds(desired) {
+		errs = append(errs, hold.err(name))
 	}
 	actions := r.Plan(desired)
 
@@ -1317,7 +1317,7 @@ func (r *Reconciler) retryPendingPortForwards() error {
 	retained := make(map[portForwardKey]bool)
 	actual := r.vmManager.List()
 	if unknown := unknownRuntimeOwner(actual); unknown != "" {
-		return fmt.Errorf("cleanup held by unknown runtime claims for %s: %w", unknown, ErrServiceHeld)
+		return fmt.Errorf("cleanup held by unknown runtime claims for %s: %w", unknown, ErrRecoveryHeld)
 	}
 	for name, inst := range actual {
 		for key := range portForwardKeys(inst.Config) {
@@ -1398,7 +1398,7 @@ func (r *Reconciler) retryPendingNetworkDevices() error {
 	retained := make(map[string]bool)
 	actual := r.vmManager.List()
 	if unknown := unknownRuntimeOwner(actual); unknown != "" {
-		return fmt.Errorf("cleanup held by unknown runtime claims for %s: %w", unknown, ErrServiceHeld)
+		return fmt.Errorf("cleanup held by unknown runtime claims for %s: %w", unknown, ErrRecoveryHeld)
 	}
 	for name, inst := range actual {
 		for _, dev := range networkDevicesForService(inst.Config) {

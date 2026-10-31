@@ -10,9 +10,25 @@ import (
 	"github.com/artemnikitin/firework/internal/vm"
 )
 
-// SetHeldServices replaces the caller's capacity holds. Telemetry may read the
-// resulting holds concurrently with the serialized reconciliation loop.
-func (r *Reconciler) SetHeldServices(held map[string]string) {
+// Hold explains why a desired service's work is deferred. Recovery marks holds
+// that unresolved VM ownership caused: those alone let a revision apply as
+// degraded, because pending recovery explains them and keeps retrying them.
+type Hold struct {
+	Reason   string
+	Recovery bool
+}
+
+func (h Hold) err(service string) error {
+	sentinel := ErrServiceHeld
+	if h.Recovery {
+		sentinel = ErrRecoveryHeld
+	}
+	return fmt.Errorf("hold %s (%s): %w", service, h.Reason, sentinel)
+}
+
+// SetHeldServices replaces the caller's capacity and address holds. Telemetry
+// may read them concurrently with the serialized reconciliation loop.
+func (r *Reconciler) SetHeldServices(held map[string]Hold) {
 	r.heldMu.Lock()
 	defer r.heldMu.Unlock()
 	r.heldServices = maps.Clone(held)
@@ -26,16 +42,24 @@ func retainsRuntime(state vm.State) bool {
 // safely be reused yet. Desired configuration may differ from these claims.
 func (r *Reconciler) RetainedServices() []config.ServiceConfig {
 	var retained []config.ServiceConfig
+	for _, instance := range r.retainedInstances() {
+		retained = append(retained, instance.Config)
+	}
+	return retained
+}
+
+func (r *Reconciler) retainedInstances() []*vm.Instance {
+	var retained []*vm.Instance
 	for _, instance := range r.vmManager.List() {
 		if retainsRuntime(instance.State) {
-			retained = append(retained, instance.Config)
+			retained = append(retained, instance)
 		}
 	}
-	slices.SortFunc(retained, func(a, b config.ServiceConfig) int {
-		if a.Name < b.Name {
+	slices.SortFunc(retained, func(a, b *vm.Instance) int {
+		if a.Config.Name < b.Config.Name {
 			return -1
 		}
-		if a.Name > b.Name {
+		if a.Config.Name > b.Config.Name {
 			return 1
 		}
 		return 0
@@ -47,8 +71,16 @@ func (r *Reconciler) RetainedServices() []config.ServiceConfig {
 // runtime resources or capacity. Quarantine itself remains service scoped;
 // independent services can still converge while these holds are retried.
 func (r *Reconciler) HeldServices(desired config.NodeConfig) map[string]string {
-	held := make(map[string]string)
-	retained := r.RetainedServices()
+	reasons := make(map[string]string)
+	for name, hold := range r.holds(desired) {
+		reasons[name] = hold.Reason
+	}
+	return reasons
+}
+
+func (r *Reconciler) holds(desired config.NodeConfig) map[string]Hold {
+	held := make(map[string]Hold)
+	retained := r.retainedInstances()
 	actual := r.vmManager.List()
 	unknown := unknownRuntimeOwner(actual)
 	r.heldMu.RLock()
@@ -63,30 +95,30 @@ func (r *Reconciler) HeldServices(desired config.NodeConfig) map[string]string {
 			// service that needs no change keeps its network, health and
 			// port forwards.
 			if instance := actual[service.Name]; instance == nil || needsUpdate(instance, service) {
-				held[service.Name] = "runtime resource claims are unknown for " + unknown
+				held[service.Name] = Hold{Reason: "runtime resource claims are unknown for " + unknown, Recovery: true}
 			}
 			continue
 		}
 		if instance := actual[service.Name]; instance != nil && retainsRuntime(instance.State) && instance.State != vm.StateRecoveryPending {
-			held[service.Name] = "runtime lifecycle is in progress"
+			held[service.Name] = Hold{Reason: "runtime lifecycle is in progress"}
 			continue
 		}
-		if reason, ok := capacityHolds[service.Name]; ok {
-			held[service.Name] = reason
+		if hold, ok := capacityHolds[service.Name]; ok {
+			held[service.Name] = hold
 			continue
 		}
 		for _, owner := range retained {
-			if owner.Name == service.Name {
+			if owner.Config.Name == service.Name {
 				continue
 			}
-			resource := conflictingResource(service, owner)
+			resource := conflictingResource(service, owner.Config)
 			// An update also removes the old runtime's host resources. Protect
 			// shared claims even when its desired config no longer names them.
 			if resource == "" && actual[service.Name] != nil {
-				resource = conflictingResource(actual[service.Name].Config, owner)
+				resource = conflictingResource(actual[service.Name].Config, owner.Config)
 			}
 			if resource != "" {
-				held[service.Name] = fmt.Sprintf("%s retained by %s", resource, owner.Name)
+				held[service.Name] = Hold{Reason: fmt.Sprintf("%s retained by %s", resource, owner.Config.Name), Recovery: owner.State == vm.StateRecoveryPending}
 				break
 			}
 		}
@@ -126,27 +158,27 @@ func conflictingResource(service, owner config.ServiceConfig) string {
 	return ""
 }
 
-func (r *Reconciler) actionHold(action Action) string {
+func (r *Reconciler) actionHold(action Action) Hold {
 	actual := r.vmManager.List()
 	// A delete releases resources; deleteService defers its host cleanup to
 	// the journal while unknown claims remain.
 	if unknown := unknownRuntimeOwner(actual); unknown != "" && action.Type != ActionDelete {
-		return "runtime resource claims are unknown for " + unknown
+		return Hold{Reason: "runtime resource claims are unknown for " + unknown, Recovery: true}
 	}
 	if instance := actual[action.Service.Name]; instance != nil && retainsRuntime(instance.State) {
-		return "runtime ownership or lifecycle is unresolved"
+		return Hold{Reason: "runtime ownership or lifecycle is unresolved", Recovery: instance.State == vm.StateRecoveryPending}
 	}
 	if action.Type != ActionDelete {
-		return r.HeldServices(config.NodeConfig{Services: []config.ServiceConfig{action.Service}})[action.Service.Name]
+		return r.holds(config.NodeConfig{Services: []config.ServiceConfig{action.Service}})[action.Service.Name]
 	}
-	for _, owner := range r.RetainedServices() {
-		if owner.Name != action.Service.Name {
-			if resource := conflictingResource(action.Service, owner); resource != "" {
-				return fmt.Sprintf("%s retained by %s", resource, owner.Name)
+	for _, owner := range r.retainedInstances() {
+		if owner.Config.Name != action.Service.Name {
+			if resource := conflictingResource(action.Service, owner.Config); resource != "" {
+				return Hold{Reason: fmt.Sprintf("%s retained by %s", resource, owner.Config.Name), Recovery: owner.State == vm.StateRecoveryPending}
 			}
 		}
 	}
-	return ""
+	return Hold{}
 }
 
 func unknownRuntimeOwner(actual map[string]*vm.Instance) string {

@@ -91,7 +91,7 @@ func TestCallerCapacityHoldRetriesWithoutMutatingHeldRuntime(t *testing.T) {
 	r := newTestReconciler("", 0)
 	manager := r.vmManager.(*fakeVMManager)
 	desired := config.NodeConfig{Services: []config.ServiceConfig{{Name: "held"}, {Name: "independent"}}}
-	r.SetHeldServices(map[string]string{"held": "retained CPU capacity"})
+	r.SetHeldServices(map[string]Hold{"held": {Reason: "retained CPU capacity"}})
 	if err := r.Reconcile(context.Background(), desired); !IsIncomplete(err) {
 		t.Fatalf("capacity hold was reported successful: %v", err)
 	}
@@ -198,7 +198,7 @@ func TestCapacityHoldPublicationSupportsConcurrentTelemetry(t *testing.T) {
 	go func() {
 		defer workers.Done()
 		for i := 0; i < 100; i++ {
-			r.SetHeldServices(map[string]string{"app": "retained capacity"})
+			r.SetHeldServices(map[string]Hold{"app": {Reason: "retained capacity"}})
 			r.SetHeldServices(nil)
 		}
 	}()
@@ -250,5 +250,27 @@ func TestPendingBridgeCleanupProtectsRetainedTAPWithTheSameName(t *testing.T) {
 	}
 	if len(network.deleteBridgeCalls) != 1 || r.HasPendingCleanup() {
 		t.Fatal("bridge cleanup did not resume after retained TAP resolved")
+	}
+}
+
+func TestOnlyRecoveryCausedHoldsAreRecoveryHolds(t *testing.T) {
+	for _, tc := range []struct {
+		state    vm.State
+		recovery bool
+	}{{vm.StateRecoveryPending, true}, {vm.StateStarting, false}} {
+		r := newTestReconciler("", 0)
+		manager := r.vmManager.(*fakeVMManager)
+		owner := config.ServiceConfig{Name: "owner", PortForwards: []config.PortForward{{HostPort: 8080, VMPort: 80}}}
+		manager.instances[owner.Name] = &vm.Instance{Name: owner.Name, Config: owner, State: tc.state}
+		desired := config.NodeConfig{Services: []config.ServiceConfig{{Name: "new", PortForwards: []config.PortForward{{HostPort: 8080, VMPort: 90}}}}}
+		err := r.Reconcile(context.Background(), desired)
+		if !IsIncomplete(err) || OnlyRecoveryHeld(err) != tc.recovery {
+			t.Fatalf("owner %s: incomplete=%v recoveryHeld=%v, want recoveryHeld=%v: %v", tc.state, IsIncomplete(err), OnlyRecoveryHeld(err), tc.recovery, err)
+		}
+	}
+	r := newTestReconciler("", 0)
+	r.SetHeldServices(map[string]Hold{"new": {Reason: "desired services exceed node capacity"}})
+	if err := r.Reconcile(context.Background(), config.NodeConfig{Services: []config.ServiceConfig{{Name: "new"}}}); !IsIncomplete(err) || OnlyRecoveryHeld(err) {
+		t.Fatalf("capacity hold was treated as recovery-caused: %v", err)
 	}
 }
