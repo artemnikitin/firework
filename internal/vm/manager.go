@@ -112,7 +112,7 @@ type Instance struct {
 	// changes until recovery establishes this directory's service configuration.
 	RecoveryConfigUnknown bool
 	// RecoveryOwnerAbsent records that the latest recovery attempt proved no
-	// process owns this untrusted state, so its claims are not live.
+	// process owns this untrusted state, so its unknown claims are not live.
 	RecoveryOwnerAbsent bool
 	// startID identifies one Start attempt. Phase 3 validates against it
 	// rather than against the service name, so a placeholder that was cleared
@@ -122,13 +122,6 @@ type Instance struct {
 	// Stop or the adopted-process monitor verified. It permits a normal restart
 	// even if the final stopped manifest write failed, without a host process scan.
 	exitedOwner *instanceManifest
-}
-
-// ReleasedRecoveryClaims reports whether this is untrusted recovery state kept
-// only for diagnosis: no process owns it, so its recorded resources (IP, MAC,
-// ports, devices, capacity) must not be reserved or protected from cleanup.
-func (i *Instance) ReleasedRecoveryClaims() bool {
-	return i.State == StateRecoveryPending && i.RecoveryConfigUnknown && i.RecoveryOwnerAbsent
 }
 
 // Manager manages the lifecycle of Firecracker microVMs on the local host.

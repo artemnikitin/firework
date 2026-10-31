@@ -1320,9 +1320,6 @@ func (r *Reconciler) retryPendingPortForwards() error {
 		return fmt.Errorf("cleanup held by unknown runtime claims for %s: %w", unknown, ErrServiceHeld)
 	}
 	for name, inst := range actual {
-		if inst.ReleasedRecoveryClaims() {
-			continue // Absence-proven untrusted state claims nothing.
-		}
 		for key := range portForwardKeys(inst.Config) {
 			claimed[key] = name
 			retained[key] = retained[key] || retainsRuntime(inst.State)
@@ -1404,9 +1401,6 @@ func (r *Reconciler) retryPendingNetworkDevices() error {
 		return fmt.Errorf("cleanup held by unknown runtime claims for %s: %w", unknown, ErrServiceHeld)
 	}
 	for name, inst := range actual {
-		if inst.ReleasedRecoveryClaims() {
-			continue
-		}
 		for _, dev := range networkDevicesForService(inst.Config) {
 			claimed[dev.name] = name
 			retained[dev.name] = retained[dev.name] || retainsRuntime(inst.State)
