@@ -38,6 +38,16 @@ func (f *fakeProcessInspector) FindByArguments(_, _ string) ([]processIdentity, 
 	return append([]processIdentity(nil), f.find...), f.findErr
 }
 
+func (f *fakeProcessInspector) FindByAnyArgument(socket, config string) ([]processIdentity, error) {
+	matches := append([]processIdentity(nil), f.find...)
+	for _, identity := range f.identities {
+		if hasExactArgument(identity.CommandLine, "--api-sock", socket) || hasExactArgument(identity.CommandLine, "--config-file", config) {
+			matches = append(matches, identity)
+		}
+	}
+	return matches, f.findErr
+}
+
 func (f *fakeProcessInspector) SocketReady(string) error { return f.socketErr }
 
 type recordingLauncher struct {
@@ -80,6 +90,7 @@ func TestRecoverQuarantinesPIDReuseAndNeverSignalsIt(t *testing.T) {
 	identity := inspector.identities[manifest.PID]
 	identity.StartTicks++
 	inspector.identities[manifest.PID] = identity
+	inspector.find = []processIdentity{inspector.identities[manifest.PID]}
 	manager.inspector = inspector
 	launcher := &recordingLauncher{}
 	manager.launcher = launcher
@@ -165,6 +176,7 @@ func TestRecoverCleansStateAfterAHostReboot(t *testing.T) {
 	// mismatch proves the recorded process cannot have survived.
 	identity := inspector.identities[manifest.PID]
 	identity.HostBootID = "boot-after-reboot"
+	identity.CommandLine = []string{"other-process"}
 	inspector.identities[manifest.PID] = identity
 	manager.inspector = inspector
 
@@ -193,7 +205,9 @@ func TestRecoverCleansStartingSystemdStateWhenMainProcessExited(t *testing.T) {
 	if err := writeManifest(manifestPath(manifest.VMDir), manifest); err != nil {
 		t.Fatal(err)
 	}
+	manager.recoveryUnitInspectorContext = func(context.Context, *instanceManifest) (int, bool, error) { return 0, true, nil }
 	delete(inspector.identities, 3637)
+	delete(inspector.identities, 42)
 	manager.inspector = inspector
 
 	binDir := t.TempDir()
@@ -211,6 +225,53 @@ func TestRecoverCleansStartingSystemdStateWhenMainProcessExited(t *testing.T) {
 	}
 	if _, err := os.Stat(manifest.VMDir); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("dead starting VM state was not removed: %v", err)
+	}
+}
+
+func TestRecoverPersistsStartingSystemdIdentityBeforeSocketQuarantine(t *testing.T) {
+	manager, manifest, inspector := recoveryFixture(t)
+	manifest.PID = 0
+	manifest.HostBootID = ""
+	manifest.ProcessStart = 0
+	manifest.Executable = ""
+	manifest.ExecutableDev = 0
+	manifest.ExecutableIno = 0
+	manifest.Lifecycle = lifecycleStarting
+	manifest.Launcher = "systemd"
+	manifest.LauncherUnit = "firework-vm-test.service"
+	if err := writeManifest(manifestPath(manifest.VMDir), manifest); err != nil {
+		t.Fatal(err)
+	}
+	inspector.socketErr = os.ErrNotExist
+	manager.inspector = inspector
+	manager.recoveryUnitInspectorContext = func(context.Context, *instanceManifest) (int, bool, error) { return 42, false, nil }
+
+	binDir := t.TempDir()
+	systemctl := filepath.Join(binDir, "systemctl")
+	if err := os.WriteFile(systemctl, []byte("#!/bin/sh\nprintf '42\\n'\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	if adopted, err := manager.Recover(context.Background(), config.NodeConfig{}); err != nil || len(adopted) != 0 {
+		t.Fatalf("starting systemd recovery = %v, %v", adopted, err)
+	}
+	instance := manager.List()[manifest.Service]
+	if instance == nil || instance.State != StateRecoveryPending {
+		t.Fatalf("starting survivor was not quarantined while its socket was unavailable: %#v", instance)
+	}
+	durable, err := readManifest(manifestPath(manifest.VMDir))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if durable.PID != manifest.PID+42 || durable.HostBootID == "" || durable.ProcessStart == 0 || durable.Executable == "" {
+		t.Fatalf("systemd-starting identity was not reconstructed durably: %#v", durable)
+	}
+
+	inspector.socketErr = nil
+	result, err := manager.ClearRecoveryPending(manifest.Service)
+	if err != nil || result.Outcome != RecoveryOutcomeReadopted {
+		t.Fatalf("clear after systemd socket recovery = %#v, %v", result, err)
 	}
 }
 
@@ -263,7 +324,8 @@ func TestRecoverRepairsIdentityCapturedBeforeTheLaunchedExec(t *testing.T) {
 			},
 		},
 		{
-			name: "inspection captured nothing at all",
+			name:     "inspection captured nothing at all",
+			wantKept: true,
 			mutate: func(manifest *instanceManifest) {
 				manifest.HostBootID = ""
 				manifest.ProcessStart = 0
@@ -287,6 +349,9 @@ func TestRecoverRepairsIdentityCapturedBeforeTheLaunchedExec(t *testing.T) {
 				t.Fatal(err)
 			}
 			manager.inspector = inspector
+			if testCase.wantKept && manifest.ProcessStart != 0 {
+				inspector.find = []processIdentity{inspector.identities[manifest.PID]}
+			}
 			launcher := &recordingLauncher{}
 			manager.launcher = launcher
 
@@ -480,5 +545,87 @@ func TestRecoverAdoptsSurvivorFromManifestWrittenBeforeNodeType(t *testing.T) {
 	if len(adopted) != 1 || adopted[0] != manifest.Service {
 		instance := manager.List()[manifest.Service]
 		t.Fatalf("pre-upgrade survivor was not adopted: adopted=%v instance=%#v", adopted, instance)
+	}
+}
+
+func TestLegacySocketQuarantineCanRetry(t *testing.T) {
+	stateDir := t.TempDir()
+	vmDir := filepath.Join(stateDir, "vms", "app")
+	if err := os.MkdirAll(vmDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	binary := filepath.Join(stateDir, "firecracker")
+	if err := os.WriteFile(binary, []byte("binary"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	resolvedBinary, err := filepath.EvalSymlinks(binary)
+	if err != nil {
+		t.Fatal(err)
+	}
+	socketPath := filepath.Join(vmDir, "firecracker.sock")
+	configPath := filepath.Join(vmDir, "vm-config.json")
+	identity := processIdentity{
+		PID: 51, HostBootID: "boot", StartTicks: 200, Executable: resolvedBinary,
+		ExecutableDev: 11, ExecutableIno: 12,
+		CommandLine: []string{binary, "--api-sock", socketPath, "--config-file", configPath},
+	}
+	inspector := &fakeProcessInspector{
+		identities: map[int]processIdentity{identity.PID: identity}, errors: make(map[int]error),
+		find: []processIdentity{identity},
+	}
+	manager := NewManager(binary, stateDir, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	manager.inspector = inspector
+	service := config.ServiceConfig{Name: "app", Image: "/image", Kernel: "/kernel", VCPUs: 1, MemoryMB: 128}
+
+	inspector.socketErr = os.ErrNotExist
+	if _, err := manager.Recover(context.Background(), config.NodeConfig{Services: []config.ServiceConfig{service}}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(manifestPath(vmDir)); err != nil {
+		t.Fatal("legacy identity was not persisted", err)
+	}
+	inspector.socketErr = nil
+	if r, err := manager.ClearRecoveryPending(service.Name); err != nil || r.Outcome != RecoveryOutcomeReadopted {
+		t.Fatalf("legacy retry: %#v %v", r, err)
+	}
+}
+
+func TestLegacyPersistenceFailureCanRetry(t *testing.T) {
+	stateDir := t.TempDir()
+	vmDir := filepath.Join(stateDir, "vms", "app")
+	if err := os.MkdirAll(vmDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	binary := filepath.Join(stateDir, "firecracker")
+	if err := os.WriteFile(binary, []byte("binary"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	resolvedBinary, err := filepath.EvalSymlinks(binary)
+	if err != nil {
+		t.Fatal(err)
+	}
+	socketPath := filepath.Join(vmDir, "firecracker.sock")
+	configPath := filepath.Join(vmDir, "vm-config.json")
+	identity := processIdentity{
+		PID: 51, HostBootID: "boot", StartTicks: 200, Executable: resolvedBinary,
+		ExecutableDev: 11, ExecutableIno: 12,
+		CommandLine: []string{binary, "--api-sock", socketPath, "--config-file", configPath},
+	}
+	inspector := &fakeProcessInspector{
+		identities: map[int]processIdentity{identity.PID: identity}, errors: make(map[int]error),
+		find: []processIdentity{identity},
+	}
+	manager := NewManager(binary, stateDir, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	manager.inspector = inspector
+	service := config.ServiceConfig{Name: "app", Image: "/image", Kernel: "/kernel", VCPUs: 1, MemoryMB: 128}
+
+	manager.recoveryManifestWriter = func(string, *instanceManifest) error { return errors.New("disk write failed") }
+	if _, err := manager.Recover(context.Background(), config.NodeConfig{Services: []config.ServiceConfig{service}}); err != nil {
+		t.Fatal("one service persistence failure blocked recovery", err)
+	}
+	manager.recoveryManifestWriter = nil
+	inspector.socketErr = nil
+	if r, err := manager.ClearRecoveryPending(service.Name); err != nil || r.Outcome != RecoveryOutcomeReadopted {
+		t.Fatalf("legacy retry: %#v %v", r, err)
 	}
 }

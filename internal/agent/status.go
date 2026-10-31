@@ -154,6 +154,10 @@ func (a *Agent) recordRestart(name string) {
 func (a *Agent) setStatusCondition(kind string, value statusmodel.ConditionStatus, code, message string) {
 	a.statusMu.Lock()
 	defer a.statusMu.Unlock()
+	a.setStatusConditionLocked(kind, value, code, message)
+}
+
+func (a *Agent) setStatusConditionLocked(kind string, value statusmodel.ConditionStatus, code, message string) {
 	now := time.Now().UTC()
 	message = statusmodel.BoundedMessage(message)
 	if a.evaluatedConditions != nil {
@@ -256,6 +260,15 @@ func (a *Agent) refreshAgentStatus(phase statusmodel.Phase, code, message string
 	if a.healthMon != nil {
 		results = a.healthMon.Results()
 	}
+	// Reconciler queries can inspect runtime ownership. Resolve holds before
+	// taking statusMu so status readers cannot invert the runtime lock order.
+	a.statusMu.RLock()
+	desiredServices := append([]config.ServiceConfig(nil), a.statusServices...)
+	a.statusMu.RUnlock()
+	var held map[string]string
+	if a.reconciler != nil {
+		held = a.reconciler.HeldServices(config.NodeConfig{Services: desiredServices})
+	}
 
 	a.statusMu.Lock()
 	defer a.statusMu.Unlock()
@@ -332,6 +345,14 @@ func (a *Agent) refreshAgentStatus(phase statusmodel.Phase, code, message string
 				service.ReasonCode = "health_check_failed"
 			}
 		}
+		if reason := held[desired.Name]; reason != "" && service.ReasonCode == "" {
+			// Keep the running/health observation while explaining why a
+			// requested change is deferred. A passing health check does not
+			// erase the resource hold, but an actual failure (VM, volume or
+			// health check) or quarantine keeps its own diagnosis.
+			service.ReasonCode = "resource_held"
+			service.Message = statusmodel.BoundedMessage(reason)
+		}
 		if serviceReady(service) {
 			ready++
 		}
@@ -344,11 +365,41 @@ func (a *Agent) refreshAgentStatus(phase statusmodel.Phase, code, message string
 		}
 		services = append(services, service)
 	}
+	// Desired entries have priority over removed survivors at the wire bound.
+	// Sort each group independently before truncating, then sort the retained
+	// entries together for stable output.
 	sort.Slice(services, func(i, j int) bool { return services[i].Name < services[j].Name })
+	reported := make(map[string]bool, len(services))
+	for _, service := range services {
+		reported[service.Name] = true
+	}
+	var survivors []statusmodel.ServiceStatus
+	var recoveryPending []string
+	for name, instance := range instances {
+		if instance == nil || instance.State != vm.StateRecoveryPending {
+			continue
+		}
+		recoveryPending = append(recoveryPending, name)
+		if !reported[name] {
+			survivors = append(survivors, statusmodel.ServiceStatus{Name: name, VMState: string(instance.State), Health: "unknown", ReasonCode: "vm_recovery_pending", Message: statusmodel.BoundedMessage(instance.LastError)})
+		}
+	}
+	// This condition is built from the complete inventory, before telemetry is
+	// truncated, and refreshed on every snapshot so recovery clears it promptly.
+	if len(recoveryPending) > 0 {
+		sort.Strings(recoveryPending)
+		a.setStatusConditionLocked("VMRecoveryReady", statusmodel.ConditionFalse, "vm_recovery_pending",
+			fmt.Sprintf("VM ownership recovery pending for: %s", strings.Join(recoveryPending, ", ")))
+	} else {
+		a.setStatusConditionLocked("VMRecoveryReady", statusmodel.ConditionTrue, "", "")
+	}
+	sort.Slice(survivors, func(i, j int) bool { return survivors[i].Name < survivors[j].Name })
+	services = append(services, survivors...)
 	servicesTruncated := len(services) > statusmodel.MaxServices
 	if servicesTruncated {
 		services = services[:statusmodel.MaxServices]
 	}
+	sort.Slice(services, func(i, j int) bool { return services[i].Name < services[j].Name })
 
 	a.currentStatus.SchemaVersion = statusmodel.SchemaVersion
 	a.currentStatus.AgentVersion = version.Version

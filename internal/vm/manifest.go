@@ -69,6 +69,13 @@ func manifestPath(vmDir string) string {
 }
 
 func readManifest(path string) (*instanceManifest, error) {
+	info, err := os.Lstat(path)
+	if err != nil {
+		return nil, err
+	}
+	if !info.Mode().IsRegular() {
+		return nil, fmt.Errorf("ownership manifest is not a regular file")
+	}
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return nil, err

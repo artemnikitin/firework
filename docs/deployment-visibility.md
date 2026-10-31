@@ -316,3 +316,26 @@ discarded, so a slow load can never overwrite the view you navigated to.
 Rotate access by replacing the operator token secret and restarting the API
 role. Existing browser sessions become invalid because their derived session
 value no longer matches.
+
+An applied node revision acknowledges processing the desired configuration; it
+does not assert that every VM is healthy. A `recovery_pending` service keeps its
+individual status and makes fleet status degraded with `vm_recovery_pending`.
+Quarantined survivors removed from desired configuration remain reported until
+their runtime ownership is resolved. Independent services continue reconciling.
+A desired service waiting on resources retained by an unresolved VM reports
+`resource_held` on the applied revision, and fleet status stays degraded until
+the hold clears.
+
+The agent reports the nonblocking `VMRecoveryReady` condition from its complete
+runtime inventory. A false value carries `vm_recovery_pending`, including when
+survivor summaries exceed the status limit. Desired services take priority in
+that list. Truncated survivor summaries permit degraded classification only
+when all desired summaries remain present and the recovery condition explains
+the truncation; missing desired telemetry remains unknown.
+
+Upgrade the control plane before agents. Agents always report
+`VMRecoveryReady`, even when it is true, and an older control plane treats any
+condition type it does not know as unknown. Until the control plane is
+upgraded, every node running the new agent, including healthy ones, shows as
+`unknown`, and fleet status cannot converge. An older agent works with the new
+control plane unchanged.

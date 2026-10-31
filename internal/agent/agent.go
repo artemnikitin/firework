@@ -8,10 +8,12 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"maps"
 	"net"
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/artemnikitin/firework/internal/agentconfig"
@@ -40,26 +42,42 @@ type routeSyncer interface {
 	SyncLocal(services []config.ServiceConfig) error
 }
 
+type imageSyncer interface {
+	Sync(context.Context, []config.ServiceConfig) error
+	Close() error
+}
+
 // Agent is the core component that runs on each node. It periodically pulls
 // the desired state from the config store and reconciles it with the actual
 // state of running Firecracker microVMs.
 type Agent struct {
-	cfg            agentconfig.AgentConfig
-	store          store.Store
-	vmManager      *vm.Manager
-	volumeManager  *volume.Manager
-	reconciler     *reconciler.Reconciler
-	healthMon      *healthcheck.Monitor
-	networkMgr     *network.Manager
-	imageSyncer    *imagesync.Syncer
-	apiServer      *api.Server
-	logger         *slog.Logger
-	metrics        *runtimeMetrics
-	capacityReader capacity.Reader
-	traefikMgr     routeSyncer
-	registryClient *registryClient
+	cfg             agentconfig.AgentConfig
+	store           store.Store
+	vmManager       *vm.Manager
+	volumeManager   *volume.Manager
+	reconciler      *reconciler.Reconciler
+	healthMon       *healthcheck.Monitor
+	networkMgr      *network.Manager
+	imageSyncer     imageSyncer
+	apiServer       *api.Server
+	logger          *slog.Logger
+	metrics         *runtimeMetrics
+	capacityReader  capacity.Reader
+	traefikMgr      routeSyncer
+	registryClient  *registryClient
+	recoveryControl *recoveryControlServer
+	recoveryWake    chan struct{}
+	recoveryMu      sync.Mutex
+	recoveryQueue   map[string]bool
+	forceReconcile  bool
+	lifecycleMu     sync.Mutex
+	// restartNeedsReconcile is set by a health restart that left its service
+	// without a running VM; the next tick then skips the unchanged-revision
+	// shortcut.
+	restartNeedsReconcile atomic.Bool
 
 	lastRevision         string
+	lastImageRevision    string
 	lastKnownCapacity    capacity.NodeCapacity
 	hasLastKnownCapacity bool
 
@@ -91,18 +109,7 @@ func New(cfg agentconfig.AgentConfig, s store.Store, logger *slog.Logger) *Agent
 	var healthMon *healthcheck.Monitor
 	if cfg.EnableHealthChecks == nil || *cfg.EnableHealthChecks {
 		restartFn := func(ctx context.Context, name string) error {
-			inst := vmMgr.List()[name]
-			if inst == nil {
-				return nil
-			}
-			metrics.recordServiceRestart(name, tenantForService(inst.Config))
-			if agentRef != nil {
-				agentRef.recordRestart(name)
-			}
-			if err := vmMgr.Stop(name); err != nil {
-				logger.Warn("failed to stop service during health restart", "service", name, "error", err)
-			}
-			return vmMgr.Start(ctx, inst.Config)
+			return agentRef.restartService(ctx, name)
 		}
 		healthMon = healthcheck.NewMonitor(logger, restartFn)
 	}
@@ -128,7 +135,7 @@ func New(cfg agentconfig.AgentConfig, s store.Store, logger *slog.Logger) *Agent
 	}
 
 	// Set up optional image syncer.
-	var imgSyncer *imagesync.Syncer
+	var imgSyncer imageSyncer
 	switch {
 	case cfg.S3ImagesBucket != "":
 		var err error
@@ -177,6 +184,8 @@ func New(cfg agentconfig.AgentConfig, s store.Store, logger *slog.Logger) *Agent
 		capacityReader: capReader,
 		traefikMgr:     traefikMgr,
 		restartCounts:  make(map[string]int),
+		recoveryWake:   make(chan struct{}, 1),
+		recoveryQueue:  make(map[string]bool),
 		currentStatus: statusmodel.AgentStatus{
 			SchemaVersion: statusmodel.SchemaVersion,
 			NodeID:        cfg.NodeID,
@@ -217,8 +226,19 @@ func (a *Agent) Run(ctx context.Context) error {
 	// empty node while durable VM ownership is still being reconstructed.
 	a.tick(ctx)
 
+	control, err := startRecoveryControlServer(a.cfg.StateDir, a.logger, a.clearRecoveryPending, a.forgetRecoveryPending)
+	if err != nil {
+		a.logger.Warn("local recovery control is unavailable", "error", err)
+	} else {
+		a.recoveryControl = control
+	}
+
 	if a.apiServer != nil {
 		if err := a.apiServer.Start(); err != nil {
+			if a.recoveryControl != nil {
+				_ = a.recoveryControl.Close()
+				a.recoveryControl = nil
+			}
 			return err
 		}
 	}
@@ -236,6 +256,8 @@ func (a *Agent) Run(ctx context.Context) error {
 			a.logger.Info("agent shutting down")
 			a.shutdown()
 			return ctx.Err()
+		case <-a.recoveryWake:
+			a.applyRecoveryRequests(ctx)
 		case <-ticker.C:
 			a.tick(ctx)
 		}
@@ -286,6 +308,12 @@ func (a *Agent) getHeartbeatResources() (cap capacity.NodeCapacity, used capacit
 
 // shutdown cleans up all resources.
 func (a *Agent) shutdown() {
+	if a.recoveryControl != nil {
+		if err := a.recoveryControl.Close(); err != nil {
+			a.logger.Warn("failed to close recovery control socket", "error", err)
+		}
+		a.recoveryControl = nil
+	}
 	if a.imageSyncer != nil {
 		_ = a.imageSyncer.Close()
 	}
@@ -349,6 +377,14 @@ func (a *Agent) tick(ctx context.Context) {
 	a.setStatusCondition("ConfigFetched", statusmodel.ConditionTrue, "", "")
 	a.setStatusCondition("ConfigParsed", statusmodel.ConditionTrue, "", "")
 
+	// Fence persisted survivors before assigning resources or planning new VMs.
+	if err := a.vmManager.DiscoverRecoveryState(); err != nil {
+		a.failAgentStatus("VMsReconciled", "recovery_discovery_failed", err.Error())
+		a.refreshRuntimeMetrics()
+		a.syncRegistryAfterTick(ctx, nodeCap, capacity.NodeCapacity{})
+		return
+	}
+
 	// Clamp any volume size this node has already refused, before anything
 	// else in the tick reads the merged configuration. Normalizing later — say,
 	// just before Plan — would leave the status snapshot describing the raw
@@ -369,7 +405,12 @@ func (a *Agent) tick(ctx context.Context) {
 			a.logger.Error("failed to get store revision", "error", err)
 		}
 		a.setStatusServices(*merged, rev)
-		if rev != "" && rev == a.lastRevision {
+		// A health restart that could not restore its VM leaves the revision
+		// unchanged; only a full tick recreates the service.
+		if a.vmManager.HasPendingRecovery() || a.reconciler.HasPendingCleanup() || a.restartNeedsReconcile.Swap(false) {
+			a.forceReconcile = true
+		}
+		if rev != "" && rev == a.lastRevision && !a.forceReconcile {
 			// A local revision does not describe the peer node configs used for
 			// remote Traefik routes. Refresh routes on every poll even when the
 			// local VM configuration is unchanged, but avoid the expensive image
@@ -447,7 +488,7 @@ func (a *Agent) tick(ctx context.Context) {
 	// condition contract says an unreached stage should be.
 
 	// Assign networking (IPs, MACs, kernel args) to services that need it.
-	a.assignNetworking(merged.Services)
+	addressHolds := a.assignNetworking(merged.Services)
 	a.setStatusServices(*merged, rev)
 
 	// Resolve service links: look up each linked service's guest IP and
@@ -459,14 +500,20 @@ func (a *Agent) tick(ctx context.Context) {
 	a.injectEnvVars(merged.Services)
 
 	// Check node capacity before reconciling; skip if resources are exceeded.
-	used := sumResources(merged.Services)
+	used, capacityHolds := a.reserveCapacity(merged.Services, nodeCap, hasCap)
+	holds := make(map[string]reconciler.Hold, len(capacityHolds)+len(addressHolds))
+	for name, reason := range addressHolds {
+		holds[name] = reconciler.Hold{Reason: reason}
+	}
+	maps.Copy(holds, capacityHolds)
+	a.reconciler.SetHeldServices(holds)
 	// Update the heartbeat goroutine with the latest used resources now, before
 	// the potentially long-running image sync, so heartbeats reflect current
 	// scheduling intent while downloads are in progress.
 	if hasCap {
 		a.setHeartbeatResources(nodeCap, used)
 	}
-	if !a.checkCapacity(nodeCap, used, hasCap) {
+	if len(capacityHolds) == 0 && !a.checkCapacity(nodeCap, used, hasCap) {
 		a.failAgentStatus("CapacityReady", "capacity_exceeded", "desired services exceed node capacity")
 		a.syncRegistryAfterTick(ctx, nodeCap, used)
 		return
@@ -480,7 +527,7 @@ func (a *Agent) tick(ctx context.Context) {
 	// Sync images from S3 before reconciling (ensures rootfs/kernels are present).
 	if a.imageSyncer != nil {
 		syncStart := time.Now()
-		err := a.imageSyncer.Sync(ctx, merged.Services)
+		err := a.syncImages(ctx, merged.Services, rev)
 		a.metrics.observeImageSync(time.Since(syncStart), err != nil)
 		if err != nil {
 			a.logger.Error("image sync failed", "error", err)
@@ -495,8 +542,28 @@ func (a *Agent) tick(ctx context.Context) {
 
 	// Reconcile desired vs actual state.
 	reconcileStart := time.Now()
+	// Serialize only Recover/Plan/Apply with health-driven Stop/Start, so a
+	// restart never waits behind config fetch, image sync or route refresh.
+	// assignNetworking already reserved addresses of every tracked VM,
+	// including one between a restart's Stop and Start.
+	a.lifecycleMu.Lock()
 	err := a.reconciler.Reconcile(ctx, *merged)
+	a.lifecycleMu.Unlock()
 	a.metrics.observeReconcile(time.Since(reconcileStart), err != nil)
+	if err == nil {
+		a.forceReconcile = false
+	}
+	if err != nil && reconciler.OnlyRecoveryHeld(err) && a.vmManager.HasPendingRecovery() {
+		// Every hold was caused by unresolved VM ownership, which
+		// VMRecoveryReady reports as degradation and held services report as
+		// resource_held. Freezing the revision would hide both behind
+		// "progressing". Pending recovery keeps forcing reconciliation, so the
+		// holds still retry. Any other hold, such as genuine over-capacity or
+		// an exhausted subnet, leaves the revision incomplete.
+		a.logger.Info("applying revision with services held for VM recovery", "error", err)
+		a.forceReconcile = true
+		err = nil
+	}
 	if err != nil && reconciler.IsIncomplete(err) {
 		// Every collected error was a benign start race: a stop or remove
 		// arrived while a start was preparing volumes, or two starts
@@ -682,10 +749,11 @@ func usableRevisionMetadata(revision string) string {
 
 // assignNetworking fills in IP, MAC, and kernel IP boot args for services
 // that have networking enabled. Services must be sorted by name for
-// deterministic IP allocation.
-func (a *Agent) assignNetworking(services []config.ServiceConfig) {
+// deterministic IP allocation. It returns the services that could not get an
+// address, as holds with their reason.
+func (a *Agent) assignNetworking(services []config.ServiceConfig) map[string]string {
 	if a.cfg.VMSubnet == "" {
-		return
+		return nil
 	}
 
 	gateway := stripCIDR(a.cfg.VMGateway)
@@ -695,27 +763,81 @@ func (a *Agent) assignNetworking(services []config.ServiceConfig) {
 	ip, ipNet, err := net.ParseCIDR(a.cfg.VMSubnet)
 	if err != nil {
 		a.logger.Error("invalid vm_subnet", "subnet", a.cfg.VMSubnet, "error", err)
-		return
+		return nil
 	}
 	ip = ip.To4()
 	if ip == nil {
 		a.logger.Error("vm_subnet is not IPv4", "subnet", a.cfg.VMSubnet)
-		return
+		return nil
 	}
 	ipNet.IP = ip
 
+	reservedIP, reservedMAC := map[string]string{}, map[string]string{}
+	retained := map[string]config.ServiceConfig{}
+	var retainedServices []config.ServiceConfig
+	if a.reconciler != nil {
+		retainedServices = a.reconciler.RetainedServices()
+		// Every tracked VM keeps its address: a route-only tick must not shift
+		// a running guest to a freed IP, and a crashed or restarting service
+		// must not lose its IP to first-fit reallocation.
+		if a.vmManager != nil {
+			for _, inst := range a.vmManager.List() {
+				if inst.Config.Network != nil && ipNet.Contains(net.ParseIP(inst.Config.Network.GuestIP)) {
+					retainedServices = append(retainedServices, inst.Config)
+				}
+			}
+		}
+	}
+	for _, svc := range retainedServices {
+		retained[svc.Name] = svc
+		if svc.Network != nil {
+			reservedIP[svc.Network.GuestIP] = svc.Name
+			reservedMAC[strings.ToLower(svc.Network.GuestMAC)] = svc.Name
+		}
+	}
+	// Restore every existing assignment before allocating any new one, so a
+	// new service that exhausts the subnet can never leave an existing VM's
+	// desired config without its address and trigger a restart.
+	for i := range services {
+		svc := &services[i]
+		if old, ok := retained[svc.Name]; ok && svc.Network != nil && old.Network != nil {
+			svc.Network.GuestIP, svc.Network.GuestMAC = old.Network.GuestIP, old.Network.GuestMAC
+			if !hasKernelArgPrefix(svc.KernelArgs, "ip=") {
+				svc.KernelArgs = insertKernelArg(svc.KernelArgs, fmt.Sprintf("ip=%s::%s:%s::eth0:off", old.Network.GuestIP, gateway, netmask))
+			}
+		}
+	}
+	var held map[string]string
 	idx := 0
 	for i := range services {
 		svc := &services[i]
 		if svc.Network == nil {
 			continue
 		}
-
+		if old, ok := retained[svc.Name]; ok && old.Network != nil {
+			continue
+		}
+		for {
+			candidate, ok := guestIPv4ForIndex(ipNet, idx)
+			if !ok {
+				break
+			}
+			_, ipUsed := reservedIP[candidate]
+			_, macUsed := reservedMAC[strings.ToLower(guestMACForIndex(idx))]
+			if !ipUsed && !macUsed {
+				break
+			}
+			idx++
+		}
 		guestIP, ok := guestIPv4ForIndex(ipNet, idx)
 		if !ok {
-			a.logger.Error("vm_subnet has no available guest IPs",
-				"subnet", a.cfg.VMSubnet, "assigned_services", idx)
-			return
+			// Hold the service instead of reconciling it without an address.
+			if held == nil {
+				held = make(map[string]string)
+			}
+			held[svc.Name] = "no free guest address in vm_subnet " + a.cfg.VMSubnet
+			a.logger.Error("vm_subnet has no available guest IPs", "subnet", a.cfg.VMSubnet, "service", svc.Name)
+			continue
 		}
 		mac := guestMACForIndex(idx)
 
@@ -731,6 +853,7 @@ func (a *Agent) assignNetworking(services []config.ServiceConfig) {
 
 		idx++
 	}
+	return held
 }
 
 func guestIPv4ForIndex(ipNet *net.IPNet, idx int) (string, bool) {
@@ -1075,4 +1198,102 @@ func (h *healthAdapter) Results() map[string]any {
 		}
 	}
 	return out
+}
+
+// syncImages commits its revision only after a complete successful sync. Recovery
+// retries for an unchanged desired revision do not repeat object-store downloads.
+// Multi-label stores have no combined revision, so they continue to sync.
+func (a *Agent) syncImages(ctx context.Context, services []config.ServiceConfig, revision string) error {
+	if revision != "" && revision == a.lastImageRevision {
+		return nil
+	}
+	// A failed sync may already have replaced some artifacts. Invalidate the
+	// previous revision too, so rolling back cannot reuse a partial download.
+	a.lastImageRevision = ""
+	if err := a.imageSyncer.Sync(ctx, services); err != nil {
+		return err
+	}
+	a.lastImageRevision = revision
+	return nil
+}
+
+// Count retained runtime allocations before admitting desired services. Their
+// old config can differ from desired and remains authoritative until resolved.
+// A hold is attributed to recovery only if the service would fit once every
+// recovery_pending owner resolved; otherwise the node is genuinely full.
+func (a *Agent) reserveCapacity(services []config.ServiceConfig, cap capacity.NodeCapacity, known bool) (capacity.NodeCapacity, map[string]reconciler.Hold) {
+	retained := a.reconciler.RetainedServices()
+	if len(retained) == 0 {
+		return sumResources(services), nil
+	}
+	allocations := make(map[string]config.ServiceConfig)
+	pending := make(map[string]bool)
+	for name, inst := range a.vmManager.List() {
+		if inst.State != vm.StateStopped && inst.State != vm.StateFailed {
+			allocations[name] = inst.Config
+			pending[name] = inst.State == vm.StateRecoveryPending
+		}
+	}
+	// settled is the allocation without unresolved owners.
+	var used, settled capacity.NodeCapacity
+	for name, svc := range allocations {
+		used = growAllocation(used, svc, config.ServiceConfig{})
+		if !pending[name] {
+			settled = growAllocation(settled, svc, config.ServiceConfig{})
+		}
+	}
+	exceeds := func(c capacity.NodeCapacity) bool { return c.VCPUs > cap.VCPUs || c.MemoryMB > cap.MemoryMB }
+	holds := map[string]reconciler.Hold{}
+	for _, svc := range services {
+		old, settledOld := allocations[svc.Name], allocations[svc.Name]
+		if pending[svc.Name] {
+			settledOld = config.ServiceConfig{}
+		}
+		next, nextSettled := growAllocation(used, svc, old), growAllocation(settled, svc, settledOld)
+		if known && exceeds(next) {
+			if exceeds(nextSettled) {
+				holds[svc.Name] = reconciler.Hold{Reason: "desired services exceed node capacity"}
+			} else {
+				holds[svc.Name] = reconciler.Hold{Reason: "capacity retained by unresolved VM ownership", Recovery: true}
+			}
+			continue
+		}
+		used, settled = next, nextSettled
+	}
+	return used, holds
+}
+
+// growAllocation adds svc's growth over its old allocation to base.
+func growAllocation(base capacity.NodeCapacity, svc, old config.ServiceConfig) capacity.NodeCapacity {
+	if svc.VCPUs > old.VCPUs {
+		base.VCPUs += svc.VCPUs - old.VCPUs
+	}
+	if svc.MemoryMB > old.MemoryMB {
+		base.MemoryMB += svc.MemoryMB - old.MemoryMB
+	}
+	return base
+}
+
+func (a *Agent) restartService(ctx context.Context, name string) error {
+	a.lifecycleMu.Lock()
+	defer a.lifecycleMu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	inst := a.vmManager.List()[name]
+	if inst == nil {
+		// An earlier restart's failed Start may have dropped the VM.
+		a.restartNeedsReconcile.Store(true)
+		return nil
+	}
+	a.metrics.recordServiceRestart(name, tenantForService(inst.Config))
+	a.recordRestart(name)
+	if err := a.vmManager.Stop(name); err != nil {
+		a.logger.Warn("failed to stop service during health restart", "service", name, "error", err)
+	}
+	if err := a.vmManager.Start(ctx, inst.Config); err != nil {
+		a.restartNeedsReconcile.Store(true)
+		return err
+	}
+	return nil
 }

@@ -109,3 +109,118 @@ func TestInspectReportsZombieProcessAsNotFound(t *testing.T) {
 		t.Fatalf("Inspect(zombie pid %d) = %v, want errProcessNotFound", pid, err)
 	}
 }
+
+func TestReadProcessCommandLineFailsClosedForUnreadableLiveEntry(t *testing.T) {
+	info, err := os.Stat(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = readProcessCommandLineWith("/proc/123", func(string) ([]byte, error) {
+		return nil, os.ErrPermission
+	}, func(string) (os.FileInfo, error) {
+		return info, nil
+	})
+	if !errors.Is(err, os.ErrPermission) {
+		t.Fatalf("unreadable live process command line error = %v, want permission error", err)
+	}
+}
+
+func TestReadProcessCommandLineSkipsOnlyVanishedEntry(t *testing.T) {
+	_, err := readProcessCommandLineWith("/proc/123", func(string) ([]byte, error) {
+		return nil, os.ErrNotExist
+	}, func(string) (os.FileInfo, error) {
+		return nil, os.ErrNotExist
+	})
+	if !errors.Is(err, errProcessNotFound) {
+		t.Fatalf("vanished process error = %v, want errProcessNotFound", err)
+	}
+}
+
+func TestVMArgumentScansKeepLegacyToleranceAndFailClosedForCleanup(t *testing.T) {
+	procRoot := t.TempDir()
+	for _, pid := range []string{"101", "102", "103"} {
+		if err := os.Mkdir(filepath.Join(procRoot, pid), 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	entries, err := os.ReadDir(procRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	read := func(path string) ([]string, error) {
+		switch filepath.Base(path) {
+		case "101":
+			return nil, os.ErrPermission
+		case "102":
+			return []string{"other-process"}, nil
+		default:
+			return nil, errProcessNotFound
+		}
+	}
+	inspectCalls := 0
+	inspect := func(pid int) (processIdentity, error) {
+		inspectCalls++
+		return processIdentity{PID: pid}, nil
+	}
+	legacy, err := findByVMArgumentsWith(entries, procRoot, "/vm/firecracker.sock", "/vm/vm-config.json", false, false, read, inspect)
+	if err != nil || len(legacy) != 0 {
+		t.Fatalf("legacy discovery failed on an unrelated unreadable PID: matches=%v err=%v", legacy, err)
+	}
+	if inspectCalls != 0 {
+		t.Fatalf("legacy discovery inspected %d unrelated processes", inspectCalls)
+	}
+	if _, err := findByVMArgumentsWith(entries, procRoot, "/vm/firecracker.sock", "/vm/vm-config.json", true, true, read, inspect); !errors.Is(err, os.ErrPermission) {
+		t.Fatalf("strict cleanup scan treated an incomplete process table as complete: %v", err)
+	}
+}
+
+func TestCleanupClaimantScanMatchesEitherVMPathArgument(t *testing.T) {
+	procRoot := t.TempDir()
+	for _, pid := range []string{"201", "202", "203"} {
+		if err := os.Mkdir(filepath.Join(procRoot, pid), 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	entries, err := os.ReadDir(procRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	arguments := map[string][]string{
+		"201": {"firecracker", "--api-sock", "/vm/firecracker.sock"},
+		"202": {"firecracker", "--config-file", "/vm/vm-config.json"},
+		"203": {"firecracker", "--api-sock", "/vm/other.sock", "--config-file", "/vm/other.json"},
+	}
+	read := func(path string) ([]string, error) { return arguments[filepath.Base(path)], nil }
+	matches, err := findByVMArgumentsWith(entries, procRoot, "/vm/firecracker.sock", "/vm/vm-config.json", true, true, read,
+		func(pid int) (processIdentity, error) { return processIdentity{PID: pid}, nil })
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(matches) != 2 || matches[0].PID != 201 || matches[1].PID != 202 {
+		t.Fatalf("cleanup scan matches = %#v, want the socket-only and config-only processes", matches)
+	}
+}
+
+func TestCleanupRefusesHiddenProcessTable(t *testing.T) {
+	for _, option := range []string{"hidepid=1", "hidepid=2", "hidepid=invisible"} {
+		if verifyProcessVisibilityFor("proc /proc proc rw,"+option+" 0 0", 1000, nil) == nil {
+			t.Fatal(option)
+		}
+	}
+	if err := verifyProcessTableVisibility("proc /proc proc rw,hidepid=0 0 0"); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestHidepidExemptions(t *testing.T) {
+	mounts := "proc /proc proc rw,hidepid=invisible,gid=0 0 0"
+	if err := verifyProcessVisibilityFor(mounts, 0, nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := verifyProcessVisibilityFor(mounts, 1000, []int{0}); err != nil {
+		t.Fatal(err)
+	}
+	if err := verifyProcessVisibilityFor(mounts, 1000, []int{1000}); err == nil {
+		t.Fatal("nonexempt viewer accepted")
+	}
+}

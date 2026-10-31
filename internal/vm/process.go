@@ -1,6 +1,7 @@
 package vm
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"net"
@@ -17,6 +18,11 @@ var errProcessNotFound = errors.New("process not found")
 // proves nothing about the recorded process, so the VM stays quarantined
 // instead of having its state cleaned while the process may still be alive.
 var errIdentityNotRecorded = errors.New("process ownership identity was never recorded")
+
+// errProcessIdentityReused marks a PID whose current start time differs from
+// the durable owner. The recorded process is gone, but recovery still checks
+// whether another live process is using the same VM paths before removing them.
+var errProcessIdentityReused = errors.New("process PID was reused")
 
 type processIdentity struct {
 	PID           int
@@ -36,6 +42,18 @@ type processInspector interface {
 
 type osProcessInspector struct{}
 
+func inspectProcessContext(ctx context.Context, inspector processInspector, pid int) (processIdentity, error) {
+	if err := ctx.Err(); err != nil {
+		return processIdentity{}, err
+	}
+	if contextual, ok := inspector.(interface {
+		InspectContext(context.Context, int) (processIdentity, error)
+	}); ok {
+		return contextual.InspectContext(ctx, pid)
+	}
+	return inspector.Inspect(pid)
+}
+
 func (osProcessInspector) SocketReady(path string) error {
 	info, err := os.Lstat(path)
 	if err != nil {
@@ -52,10 +70,14 @@ func (osProcessInspector) SocketReady(path string) error {
 }
 
 func validateOwnedProcess(inspector processInspector, manifest *instanceManifest) error {
+	return validateOwnedProcessContext(context.Background(), inspector, manifest)
+}
+
+func validateOwnedProcessContext(ctx context.Context, inspector processInspector, manifest *instanceManifest) error {
 	if manifest.PID <= 0 {
 		return errProcessNotFound
 	}
-	identity, err := inspector.Inspect(manifest.PID)
+	identity, err := inspectProcessContext(ctx, inspector, manifest.PID)
 	if err != nil {
 		return err
 	}
@@ -72,19 +94,13 @@ func validateOwnedProcess(inspector processInspector, manifest *instanceManifest
 		return fmt.Errorf("process start time: %w", errIdentityNotRecorded)
 	}
 	if identity.StartTicks != manifest.ProcessStart {
-		return fmt.Errorf("process start time does not match")
+		return fmt.Errorf("process start time does not match: %w", errProcessIdentityReused)
 	}
 	if manifest.ExecutableDev == 0 || manifest.ExecutableIno == 0 {
 		return fmt.Errorf("process executable device and inode: %w", errIdentityNotRecorded)
 	}
 	if identity.ExecutableDev != manifest.ExecutableDev || identity.ExecutableIno != manifest.ExecutableIno {
 		return fmt.Errorf("process executable identity does not match")
-	}
-	if manifest.Executable == "" {
-		return fmt.Errorf("process executable path: %w", errIdentityNotRecorded)
-	}
-	if identity.Executable != manifest.Executable {
-		return fmt.Errorf("process executable path does not match")
 	}
 	if !matchesOwnedArguments(identity, manifest) {
 		if !manifest.Legacy && !hasExactArgument(identity.CommandLine, "--id", manifest.InstanceID) {
@@ -124,8 +140,11 @@ func validateOwnedSocket(inspector processInspector, manifest *instanceManifest)
 }
 
 func hasExactArgument(args []string, name, value string) bool {
-	for i := 0; i+1 < len(args); i++ {
-		if args[i] == name && args[i+1] == value {
+	for i := 0; i < len(args); i++ {
+		if args[i] == name+"="+value {
+			return true
+		}
+		if i+1 < len(args) && args[i] == name && args[i+1] == value {
 			return true
 		}
 	}

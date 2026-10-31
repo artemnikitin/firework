@@ -104,19 +104,24 @@ Registry state is persisted in S3 or GCS objects under
 `cp/v1/registry/nodes/*.json`.
 This keeps discovery semantics cloud-agnostic.
 
-## Deterministic Network Assignment
+## Stable Network Assignment
 
-Guest IPs, MACs, and TAP device names are assigned deterministically from the ordered
-list of services, not stored in any database. Specifically, services are sorted by name
-before IP allocation, so the same set of services always produces the same assignments.
+Guest IPs, MACs, and TAP device names are not stored in any database. A service whose
+VM the agent tracks keeps that VM's address, whatever its state: running, failed,
+stopped, restarting, or quarantined. Every other service takes the lowest free
+address, in service-name order.
 
 This means:
-- No persistent state needed for network configuration
-- Agent restarts or node reboots converge to the same network layout
-- Adding or removing a service changes subsequent assignments predictably
+- No separate network allocation store; addresses come from VM ownership records
+- Removing a service or a crash does not shift the addresses of existing VMs
+- A fresh node with no VM state assigns addresses in service-name order
+- Existing assignments are restored before any new one is made; a new service
+  that finds no free address is held with `resource_held` instead of being
+  reconciled without networking
 
-The implication is that renaming a service or changing the set of services can shift IP
-assignments for other services. It could be a problem for very dynamic workloads.
+The implication is that the layout depends on history: the same set of services can hold
+different addresses on two nodes, and a service created after a removal can take the freed
+address.
 
 ## Static Service Linking
 
@@ -211,11 +216,10 @@ the process is proven gone. If it cannot be proven gone, it is retained as
 `recovery_pending` and keeps ownership of its host networking so reconciliation
 cannot tear resources down around a potentially live microVM.
 
-Recovery is spent once per agent process, including on a fresh node where the
-VM state directory does not exist yet. That directory appears as soon as the
-process creates its first VM, and a later pass would otherwise "recover" VMs the
-running process owns. Services already tracked in memory are skipped for the
-same reason.
+Recovery inspects untracked and quarantined runtime directories on reconciliation
+ticks. Services already owned in a nonquarantined state are skipped. A shared
+five-second pass budget and rotating service order bound retries and prevent one
+slow service from starving the others.
 
 A manifest whose recorded identity does not validate is re-proved from the live
 command line before it is quarantined. The instance ID is 128 bits generated
@@ -242,25 +246,58 @@ still be alive.
 Ambiguous cases — including PID reuse, mismatched command lines, corrupt
 manifests, and a live process with a missing or invalid socket — enter
 `recovery_pending`. Firework does not signal the process, delete its files, or
-launch a duplicate in that state. The condition is exposed in agent status for
-operator investigation. There is no supported interface for clearing it while
-the agent runs. To resolve it manually:
+launch a duplicate in that state. Agent status exposes the condition and the
+recovery log names the supported command.
 
-1. Stop the agent to prevent reconciliation while investigating.
-2. Preserve and inspect `<state_dir>/vms/<service>/instance.json`, the VM logs,
-   and the associated process or transient systemd unit. Stopping the agent
-   does not stop independently supervised Firecracker processes.
-3. Resolve the ownership ambiguity. If the claimant is still alive, identify
-   and stop the correct process or unit explicitly, then confirm it has exited.
-   Do not delete ownership records, sockets, or configuration while a claimant
-   may still be running.
-4. Only after confirming no live claimant remains, remove the stale
-   `<state_dir>/vms/<service>/` directory and start the agent again. A service
-   still present in desired state will be launched again.
+Run `firework-agent clear-recovery SERVICE` on the node as root or as the agent's
+Unix user. Pass `--config PATH` when the agent uses a nondefault config file.
+The command connects to `<state_dir>/control/recovery.sock`, which the agent
+creates with a private directory and owner-only socket permissions. The command
+rechecks the named service through the running manager, so memory and the
+ownership manifest change together.
 
-Deleting the directory while a VM survives removes its ownership evidence and
-can permit a duplicate VM to use the same persistent volume. Volume data lives
-outside the VM state directory; leave that data and its volume records intact.
+The command re-adopts a VM only when the manifest, config hash, process identity,
+launch arguments, and API socket validate. Recovery retries transient failures
+on later reconciliation ticks, including when desired configuration is unchanged.
+A fully validated live process does not require an additional systemctl query.
+
+Cleanup first attempts a complete absence proof, independently of whether the
+old PID/identity is populated. Systemd-owned state requires an inactive or absent
+unit with no MainPID and no queued job: `systemd-run --no-block` can leave a
+queued unit with no process yet. Where the agent launches through systemd, or
+the record names a unit, no `firework-vm-*` unit may name either VM path in its
+command line, which covers metadata too damaged to name its unit. All cleanup
+also requires no live process referencing either VM path. This permits dead PID-0 starts and unused legacy directories to recover
+without hand-editing files. Unknown, unreadable, or live ownership remains pending.
+A missing identity cannot authorize live adoption.
+
+Recovery classifies actual process ownership independently of the recorded
+lifecycle label: proven absence permits cleanup, a live owned process with a
+valid API socket permits adoption, and uncertain ownership stays quarantined.
+This also applies to interrupted `stopping` records. A stop whose owned process
+outlives SIGKILL enters `recovery_pending` with its `stopping` record, so later
+ticks re-adopt the live owner and plan the stop again, or clear it after exit.
+The optional `--forget`
+flag restricts the command to absence-verified cleanup; it never adopts or kills
+a live process. Neither cleanup nor adoption proves guest quiesce or filesystem
+consistency. Issue #49's offline filesystem/resize validation remains independent.
+
+If proof fails, inspect the VM logs, ownership manifest, and recorded systemd
+unit. Stop/fence the actual owner before retrying. For corrupt metadata, preserve
+it for diagnosis and restore a trusted ownership record before retrying; the
+agent must not guess a new owner. A restored record is used on the next retry
+without restarting the agent. Untrusted metadata (an unreadable or mismatched
+manifest, or a symlinked service entry) never authorizes adoption. Its absence
+proof uses only the service's canonical paths. Recovery never releases its
+claims on its own, even once absence is proven, because what a dead owner left
+on the host is unknown. They stay fenced until an operator restores a trusted
+record or runs `--forget`, which deletes the record after the same proof; for a
+symlinked entry, only the link is removed. Untrusted metadata never drives host
+cleanup, so after `--forget`, unless the host rebooted, check for its leftover
+port forwards and any explicitly named TAP by hand. A state directory removed by
+hand is cleared after the same proof, because no metadata remains to preserve.
+Stopping the agent does not stop surviving VMs. Do not delete ownership records
+while a claimant may be alive.
 
 A process observed mid-exit is classified as exited, not ambiguous. Linux
 releases a process's address space, and with it its `exe` link and command line,
@@ -297,3 +334,91 @@ bridge, and the scheduler does not yet enforce tenant-to-node separation. Any
 deployment that requires network-level tenant isolation must provide additional
 controls. Adding workload mTLS would require a sidecar or library inside each
 VM.
+
+### Recovery policy across restart and explicit retry
+
+Restart and the operator command share the same resolver. Start-time reclamation
+uses the same absence proof, bound to the requested service's canonical runtime
+directory. Quarantined status exposes the directory's service name even if a
+malformed manifest names another service. Healthy startup verification does not
+emit an operator-intervention error.
+
+A quarantined direct child's exit remains eligible for recovery on the next
+tick or explicit retry. Its Wait monitor records the exit without clearing
+`recovery_pending`; the resolver still requires the full absence proof before
+removing runtime state. The old lifecycle marker does not prevent automatic
+cleanup once absence is proven.
+
+Process and unit inspections run outside the global manager lock. Final mutation
+revalidates the captured instance and durable record. Restricted process tables
+are accepted for root or the configured exempt group; an unprivileged nonexempt
+viewer cannot prove absence. An unreadable process during a strict scan still
+prevents deletion. The runtime assumes the agent runs in the host PID namespace.
+
+Boot ID, start time, executable inode/device and launch arguments establish
+ownership. A `/proc/PID/exe` display-path ` (deleted)` suffix does not invalidate
+an otherwise proven process, including during legacy migration.
+
+Quarantined services are excluded from both rolling and all-at-once plans. They
+retain their individual `vm_recovery_pending` status while independent services
+continue applying changes. A successfully executed plan advances the node's
+applied revision; this acknowledges processing the configuration, not health or
+convergence of every VM. Per-service status remains authoritative for readiness.
+Successful image synchronization is cached by nonempty store revision, so retrying
+quarantine does not repeat the completed image stage. Failed downloads remain
+eligible for retry; multi-label inputs without a combined revision still sync.
+
+Manager lock acquisition and commit checks have a five-second budget, shorter
+than the transport deadline. A lost response means its outcome is unknown;
+inspect status before retrying. Clearing an absent removed VM also deregisters
+its health probe on the main loop.
+
+
+Recovery discovery reserves a service name before inspecting old files. Start
+and Remove cannot overtake that inspection. Start preparation does not create a
+VM directory; prelaunch failures discard only files belonging to that attempt.
+An abort during preparation marks the attempt and leaves any old runtime state
+intact. Final removal checks the same instance that was originally selected.
+
+Before recovery deletes VM state it records old host-network resources directly
+in the existing reconciler teardown journal. There is no separate recovery
+outbox. Physical cleanup uses the usual running-config claimant guards so
+resources retained by a live or quarantined VM are preserved. When host network
+setup is disabled, recovery has no network cleanup obligation. A journal write
+failure preserves the VM directory for a later retry.
+
+Discovery publishes every persisted VM directory before spending the inspection
+budget. Valid ownership records reserve their old CPU, memory, guest IP/MAC,
+host-port and host-link claims. Unknown resource metadata holds new
+allocations (creates and updates) until its record is forgotten or replaced by
+a trusted one. Deletes still proceed, but leave their host cleanup in the
+journal until then. Running services that need no change keep their networking, health
+checks and port forwards. Conflicting desired services are
+held with `resource_held`; independent actions continue. When every hold was
+caused by unresolved VM ownership (unknown claims, a resource retained by a
+`recovery_pending` owner, or capacity that its resolution would free), the agent
+applies the revision with those holds and reports `VMRecoveryReady=False`, so
+the node shows as degraded instead of progressing. Pending recovery keeps
+forcing reconciliation, so held work retries on an unchanged revision. Any
+other hold, such as genuine over-capacity, an exhausted subnet, or waiting on
+another start or stop, leaves the revision incomplete. Running guests retain
+their assigned addresses after a survivor clears.
+
+Each tick's Recover/Plan/Apply section and health-driven Stop/Start transactions
+are serialized; config fetch, image sync and route refresh do not delay a
+restart. A failed
+start-time cleanup retains retryable quarantine instead of dropping the previous
+instance. A health restart whose Start fails later forces the next tick to
+reconcile, so an unchanged revision still recreates the service. Confirmed exited systemd owners use their unit's terminal state for
+normal restart; deactivating or unreadable units remain retryable. Cleanup
+journal work also triggers reconciliation on an unchanged revision.
+
+Capacity admission reserves desired growth for retained service names as well
+as new services: ownership may resolve between admission and planning in the
+same tick. Capacity holds persist through that transition, so adoption or
+cleanup cannot authorize an allocation that skipped the capacity check.
+
+The opt-in `scripts/systemd-recovery/run.sh` validation runs real systemd units,
+Linux process inspection and TAP ownership in a disposable container. It also
+confirms that recreating a same-name TAP cannot reconnect an old descriptor.
+See its README for prerequisites and the simulated-VMM validation boundary.

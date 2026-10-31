@@ -16,3 +16,7 @@ func (osProcessInspector) Inspect(_ int) (processIdentity, error) {
 func (osProcessInspector) FindByArguments(_, _ string) ([]processIdentity, error) {
 	return nil, fmt.Errorf("process discovery is unsupported on this platform")
 }
+
+func (osProcessInspector) FindByAnyArgument(_, _ string) ([]processIdentity, error) {
+	return nil, fmt.Errorf("process discovery is unsupported on this platform")
+}

@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"log/slog"
@@ -13,22 +14,82 @@ import (
 	"github.com/artemnikitin/firework/internal/agentconfig"
 	"github.com/artemnikitin/firework/internal/store"
 	"github.com/artemnikitin/firework/internal/version"
+	"github.com/artemnikitin/firework/internal/vm"
 )
 
 func main() {
-	configPath := flag.String("config", "/etc/firework/agent.yaml", "path to agent config file")
-	showVersion := flag.Bool("version", false, "print version and exit")
-	flag.Parse()
-
-	if *showVersion {
-		fmt.Println("firework-agent", version.String())
-		return
-	}
-
-	if err := run(*configPath); err != nil {
+	if err := runCommand(os.Args[1:], "/etc/firework/agent.yaml"); err != nil && !errors.Is(err, flag.ErrHelp) {
 		fmt.Fprintf(os.Stderr, "error: %v\n", err)
 		os.Exit(1)
 	}
+}
+
+func runCommand(args []string, defaultConfigPath string) error {
+	commandFlags := flag.NewFlagSet("firework-agent", flag.ContinueOnError)
+	commandFlags.SetOutput(os.Stderr)
+	configPath := commandFlags.String("config", defaultConfigPath, "path to agent config file")
+	showVersion := commandFlags.Bool("version", false, "print version and exit")
+	if err := commandFlags.Parse(args); err != nil {
+		return err
+	}
+
+	if *showVersion {
+		fmt.Println("firework-agent", version.String())
+		return nil
+	}
+	if commandFlags.NArg() > 0 {
+		if commandFlags.Arg(0) != "clear-recovery" {
+			return fmt.Errorf("unexpected argument %q", commandFlags.Arg(0))
+		}
+		return runClearRecovery(commandFlags.Args()[1:], *configPath)
+	}
+
+	return run(*configPath)
+}
+
+func runClearRecovery(args []string, defaultConfigPath string) error {
+	commandFlags := flag.NewFlagSet("clear-recovery", flag.ContinueOnError)
+	commandFlags.SetOutput(os.Stderr)
+	configPath := commandFlags.String("config", defaultConfigPath, "path to agent config file")
+	forget := commandFlags.Bool("forget", false, "only clean up a proven absent VM; do not adopt a live VM")
+	commandFlags.Usage = func() {
+		fmt.Fprintln(commandFlags.Output(), "Usage: firework-agent clear-recovery [--config PATH] [--forget] SERVICE")
+		commandFlags.PrintDefaults()
+	}
+	if err := commandFlags.Parse(args); err != nil {
+		return err
+	}
+	if commandFlags.NArg() != 1 {
+		commandFlags.Usage()
+		return fmt.Errorf("clear-recovery requires one service name")
+	}
+	cfg, err := agentconfig.LoadAgentConfig(*configPath)
+	if err != nil {
+		return fmt.Errorf("loading config: %w", err)
+	}
+	resolve := agent.ClearRecovery
+	if *forget {
+		resolve = agent.ForgetRecovery
+	}
+	result, err := resolve(context.Background(), cfg.StateDir, commandFlags.Arg(0))
+	if err != nil {
+		return err
+	}
+	switch result.Outcome {
+	case vm.RecoveryOutcomeNoop:
+		if result.State == "" {
+			fmt.Fprintf(os.Stdout, "service %s has no tracked VM\n", result.Service)
+		} else {
+			fmt.Fprintf(os.Stdout, "service %s is not recovery_pending (state %s)\n", result.Service, result.State)
+		}
+	case vm.RecoveryOutcomeCleared:
+		fmt.Fprintf(os.Stdout, "cleared stale VM state for service %s\n", result.Service)
+	case vm.RecoveryOutcomeReadopted:
+		fmt.Fprintf(os.Stdout, "re-adopted the live VM for service %s; reconciliation was queued\n", result.Service)
+	default:
+		return fmt.Errorf("unexpected recovery outcome %q for service %s", result.Outcome, result.Service)
+	}
+	return nil
 }
 
 func run(configPath string) error {

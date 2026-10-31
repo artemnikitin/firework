@@ -38,6 +38,10 @@ const (
 	// write timeout. Overrunning them is benign: the launch is retried on the
 	// next tick.
 	launchExitConfirmTimeout = 2 * time.Second
+	// stopGraceTimeout and stopKillTimeout bound waiting for an owned process
+	// to exit after SIGTERM and after SIGKILL during Stop.
+	stopGraceTimeout = 5 * time.Second
+	stopKillTimeout  = 2 * time.Second
 )
 
 // State represents the lifecycle state of a microVM.
@@ -98,10 +102,23 @@ type Instance struct {
 
 	instanceID string
 	manifest   *instanceManifest
+	// recoveryCandidate holds a re-proved process identity if persisting it
+	// failed. The durable and published manifests remain unchanged until a
+	// later ClearRecoveryPending retries the write successfully.
+	recoveryCandidate *instanceManifest
+	// recoveryDiscoveryPending fences directories not yet inspected this process.
+	recoveryDiscoveryPending bool
+	// RecoveryConfigUnknown means resource allocation must conservatively fence
+	// changes until recovery establishes this directory's service configuration.
+	RecoveryConfigUnknown bool
 	// startID identifies one Start attempt. Phase 3 validates against it
 	// rather than against the service name, so a placeholder that was cleared
 	// and replaced by a later attempt is never mistaken for one's own.
 	startID string
+	// exitedOwner records the exact owner reaped by Wait or whose absence
+	// Stop or the adopted-process monitor verified. It permits a normal restart
+	// even if the final stopped manifest write failed, without a host process scan.
+	exitedOwner *instanceManifest
 }
 
 // Manager manages the lifecycle of Firecracker microVMs on the local host.
@@ -117,11 +134,21 @@ type Manager struct {
 	// They are fields so tests do not have to sleep out the real budgets.
 	identityTimeout    time.Duration
 	exitConfirmTimeout time.Duration
+	stopGrace          time.Duration
+	stopKill           time.Duration
+	// recoveryManifestWriter is normally nil, which uses writeManifest. Tests
+	// can inject a one-shot durable-write failure to cover recovery retries.
+	recoveryManifestWriter       func(string, *instanceManifest) error
+	recoveryUnitInspectorContext func(context.Context, *instanceManifest) (int, bool, error)
+	recoveryCleanupRecorder      func(config.ServiceConfig) error
+	recoveryCommandOutput        func(context.Context, string, ...string) ([]byte, error)
 
-	mu           sync.Mutex
-	instances    map[string]*Instance
-	volumeErrors map[string]string
-	recovered    bool
+	mu                   sync.Mutex
+	instances            map[string]*Instance
+	recoveryReservations map[string]bool
+	recoveryCondition    *sync.Cond
+	recoveryCursor       string
+	volumeErrors         map[string]string
 }
 
 // NewManager creates a new VM manager.
@@ -141,6 +168,8 @@ func NewManagerWithVolumes(firecrackerBin, stateDir string, logger *slog.Logger,
 
 		identityTimeout:    launchIdentityTimeout,
 		exitConfirmTimeout: launchExitConfirmTimeout,
+		stopGrace:          stopGraceTimeout,
+		stopKill:           stopKillTimeout,
 
 		instances:    make(map[string]*Instance),
 		volumeErrors: make(map[string]string),
@@ -337,7 +366,7 @@ func (m *Manager) List() map[string]*Instance {
 // Phase 3 confirms ownership before any side effect: no manifest is written
 // and nothing is launched unless the placeholder is still this attempt's own.
 func (m *Manager) Start(ctx context.Context, svc config.ServiceConfig) error {
-	startID, vmDir, socketPath, err := m.beginStart(svc)
+	startID, vmDir, socketPath, err := m.beginStartContext(ctx, svc)
 	if err != nil {
 		return err
 	}
@@ -357,11 +386,27 @@ func (m *Manager) Start(ctx context.Context, svc config.ServiceConfig) error {
 
 // beginStart is phase 1: it takes the entry checks and publishes the starting
 // placeholder under the manager lock.
-func (m *Manager) beginStart(svc config.ServiceConfig) (startID, vmDir, socketPath string, err error) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
+func (m *Manager) beginStartContext(ctx context.Context, svc config.ServiceConfig) (startID, vmDir, socketPath string, err error) {
+	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	if err := ValidateRecoveryServiceName(svc.Name); err != nil {
+		return "", "", "", err
+	}
+	if err := m.lockRecovery(ctx); err != nil {
+		return "", "", "", err
+	}
+	locked := true
+	defer func() {
+		if locked {
+			m.mu.Unlock()
+		}
+	}()
 
-	if inst, exists := m.instances[svc.Name]; exists {
+	if m.recoveryReservations[svc.Name] {
+		return "", "", "", fmt.Errorf("service %s recovery discovery in progress: %w", svc.Name, ErrStartInProgress)
+	}
+	previous := m.instances[svc.Name]
+	if inst := previous; inst != nil {
 		switch inst.State {
 		case StateRecoveryPending:
 			return "", "", "", fmt.Errorf("service %s has ambiguous surviving state: %s", svc.Name, inst.LastError)
@@ -377,17 +422,7 @@ func (m *Manager) beginStart(svc config.ServiceConfig) (startID, vmDir, socketPa
 	m.logger.Info("starting microVM", "service", svc.Name, "vcpus", svc.VCPUs, "memory_mb", svc.MemoryMB)
 
 	vmDir = filepath.Join(m.stateDir, "vms", svc.Name)
-	if err := m.reclaimUnownedState(svc.Name, vmDir); err != nil {
-		return "", "", "", err
-	}
-	if err := os.MkdirAll(vmDir, 0o755); err != nil {
-		return "", "", "", fmt.Errorf("creating vm dir: %w", err)
-	}
-
 	socketPath = filepath.Join(vmDir, "firecracker.sock")
-	// Remove stale socket if it exists.
-	_ = os.Remove(socketPath)
-
 	startID, err = newInstanceID()
 	if err != nil {
 		return "", "", "", err
@@ -396,7 +431,70 @@ func (m *Manager) beginStart(svc config.ServiceConfig) (startID, vmDir, socketPa
 		Name: svc.Name, Config: svc, State: StateStarting,
 		SocketPath: socketPath, startID: startID,
 	}
+	m.mu.Unlock()
+	locked = false
+	if err := m.reclaimStartState(ctx, svc.Name, vmDir, previous); err != nil {
+		m.retainFailedReclaim(svc.Name, startID, vmDir, previous, err)
+		return "", "", "", err
+	}
 	return startID, vmDir, socketPath, nil
+}
+
+func (m *Manager) reclaimStartState(ctx context.Context, service, vmDir string, previous *Instance) error {
+	if previous == nil || previous.exitedOwner == nil {
+		return m.reclaimUnownedStateContext(ctx, service, vmDir)
+	}
+	// This process confirmed the exact owner exited. systemd can still be
+	// deactivating; wait for its terminal state before reusing the directory.
+	if previous.exitedOwner.Launcher == "systemd" {
+		_, inactive, err := m.inspectRecoveryUnitContext(ctx, previous.exitedOwner)
+		if err != nil {
+			return err
+		}
+		if !inactive {
+			return fmt.Errorf("systemd unit may still own the VM")
+		}
+	}
+	if err := verifyRecoveryManifestPaths(service, vmDir, previous.exitedOwner); err != nil {
+		return err
+	}
+	if _, err := os.Lstat(vmDir); errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err := verifyRecoveryDirectories(vmDir); err != nil {
+		return err
+	}
+	durable, err := readManifest(manifestPath(vmDir))
+	if err != nil {
+		return err
+	}
+	if !sameRecoveryIdentity(durable, previous.exitedOwner) && !sameRecoveryIdentity(durable, previous.manifest) {
+		return fmt.Errorf("service %s durable ownership changed after its child exited", service)
+	}
+	if err := verifyRecoveryManifestIntegrity(durable); err != nil {
+		return err
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	return os.RemoveAll(vmDir)
+}
+
+// retainFailedReclaim keeps durable ownership visible to the periodic resolver.
+func (m *Manager) retainFailedReclaim(service, startID, vmDir string, previous *Instance, cause error) {
+	manifest, err := readManifest(manifestPath(vmDir))
+	if previous != nil && previous.manifest != nil && (err != nil ||
+		(!sameRecoveryIdentity(manifest, previous.manifest) && (previous.exitedOwner == nil || !sameRecoveryIdentity(manifest, previous.exitedOwner)))) {
+		manifest = cloneInstanceManifest(previous.manifest)
+	} else if err != nil {
+		manifest = &instanceManifest{Service: service, VMDir: vmDir,
+			SocketPath: filepath.Join(vmDir, "firecracker.sock"), ConfigPath: filepath.Join(vmDir, "vm-config.json")}
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if current := m.instances[service]; current != nil && current.startID == startID {
+		m.instances[service] = m.recoveryInstanceForService(service, manifest, cause.Error())
+	}
 }
 
 // prepareVolumes is phase 2. It runs without the manager lock, so it records
@@ -452,6 +550,16 @@ func (m *Manager) finishStart(ctx context.Context, svc config.ServiceConfig, sta
 	// later.
 	svc = clampToPrepared(svc, prepared)
 
+	if err := os.MkdirAll(vmDir, 0755); err != nil {
+		delete(m.instances, svc.Name)
+		return err
+	}
+	launchAttempted := false
+	defer func() {
+		if !launchAttempted {
+			_ = os.RemoveAll(vmDir)
+		}
+	}()
 	configPath, err := m.writeVMConfig(vmDir, svc, prepared)
 	if err != nil {
 		delete(m.instances, svc.Name)
@@ -476,10 +584,12 @@ func (m *Manager) finishStart(ctx context.Context, svc config.ServiceConfig, sta
 		Launcher: launcherKind, LauncherUnit: launcherUnit,
 		StartedAt: time.Now().UTC(), Volumes: append([]volume.PreparedVolume(nil), prepared...),
 	}
-	if err := writeManifest(manifestPath(vmDir), manifest); err != nil {
+	if err := m.writeRecoveryManifest(manifestPath(vmDir), manifest); err != nil {
 		delete(m.instances, svc.Name)
 		return err
 	}
+	launchManifest := cloneInstanceManifest(manifest)
+	launchAttempted = true
 	launched, err := m.launcher.Launch(ctx, launchSpec{
 		InstanceID: instanceID, SocketPath: socketPath, ConfigPath: configPath,
 		LogPath: filepath.Join(vmDir, "firecracker.log"),
@@ -487,25 +597,48 @@ func (m *Manager) finishStart(ctx context.Context, svc config.ServiceConfig, sta
 	if err != nil {
 		manifest.Lifecycle = lifecycleFailed
 		manifest.LastError = err.Error()
-		_ = writeManifest(manifestPath(vmDir), manifest)
-		delete(m.instances, svc.Name)
+		writeErr := m.writeRecoveryManifest(manifestPath(vmDir), manifest)
+		if launcherKind == "systemd" {
+			// systemd-run can create the unit before its command times out.
+			// Keep the service tracked so callers retain host networking and
+			// recovery can establish whether a VM was actually launched.
+			// Recovery compares memory with disk, so publish whichever record
+			// is durable if the failed-lifecycle write did not land.
+			snapshot := recoverySnapshotAfterWrite(manifestPath(vmDir), launchManifest, manifest, writeErr)
+			m.instances[svc.Name] = instanceFromManifest(snapshot, StateRecoveryPending, manifest.LastError)
+		} else {
+			delete(m.instances, svc.Name)
+		}
 		return fmt.Errorf("starting firecracker: %w", err)
 	}
 	manifest.PID = launched.PID
 	manifest.Launcher = launched.Launcher
 	manifest.LauncherUnit = launched.Unit
 	if identityErr := m.recordLaunchedIdentity(manifest, launched); identityErr != nil {
-		if m.abandonLaunch(svc.Name, manifest, launched, identityErr) {
-			m.instances[svc.Name] = instanceFromManifest(manifest, StateRecoveryPending, manifest.LastError)
+		if retained, writeErr := m.abandonLaunch(svc.Name, manifest, launched, identityErr); retained {
+			snapshot := recoverySnapshotAfterWrite(manifestPath(vmDir), launchManifest, manifest, writeErr)
+			m.instances[svc.Name] = instanceFromManifest(snapshot, StateRecoveryPending, manifest.LastError)
 		} else {
 			delete(m.instances, svc.Name)
 		}
 		return fmt.Errorf("confirming launched process identity: %w", identityErr)
 	}
 	manifest.Lifecycle = lifecycleRunning
-	if err := writeManifest(manifestPath(vmDir), manifest); err != nil {
-		_ = m.launcher.Stop(manifest, syscall.SIGKILL)
-		delete(m.instances, svc.Name)
+	if err := m.writeRecoveryManifest(manifestPath(vmDir), manifest); err != nil {
+		// The VM is live even when recording its identity fails. Publish the
+		// durable snapshot and retain the verified identity for a later retry.
+		durable, readErr := readManifest(manifestPath(vmDir))
+		if readErr != nil || durable.InstanceID != manifest.InstanceID {
+			durable = launchManifest
+		}
+		pending := instanceFromManifest(durable, StateRecoveryPending, err.Error())
+		pending.startID = startID
+		pending.recoveryCandidate = cloneInstanceManifest(manifest)
+		pending.recoveryCandidate.Lifecycle = durable.Lifecycle
+		m.instances[svc.Name] = pending
+		if launched.Cmd != nil {
+			go m.monitor(svc.Name, instanceID, launched)
+		}
 		return err
 	}
 
@@ -541,18 +674,27 @@ func (m *Manager) finishStart(ctx context.Context, svc config.ServiceConfig, sta
 // did not create a child. The same is not true for systemd: systemd-run can
 // create a unit and then fail while Firework is waiting for MainPID, so a
 // missing recorded PID does not prove that no process exists.
-func (m *Manager) reclaimUnownedState(service, vmDir string) error {
-	if _, loaded := m.instances[service]; loaded {
-		return nil
-	}
+func (m *Manager) reclaimUnownedStateContext(ctx context.Context, service, vmDir string) error {
 	manifest, err := readManifest(manifestPath(vmDir))
 	if errors.Is(err, os.ErrNotExist) {
-		return nil
+		if _, statErr := os.Lstat(vmDir); errors.Is(statErr, os.ErrNotExist) {
+			return nil
+		}
+		// Interrupted preparation may leave a directory before its first
+		// manifest. Use the same absence proof now instead of wasting a tick.
+		partial := &instanceManifest{Service: service, VMDir: vmDir,
+			SocketPath: filepath.Join(vmDir, "firecracker.sock"), ConfigPath: filepath.Join(vmDir, "vm-config.json")}
+		return m.removeRecoveryStateContext(ctx, partial)
+	}
+	if err == nil {
+		if err := verifyRecoveryManifestPaths(service, vmDir, manifest); err != nil {
+			return err
+		}
 	}
 	if err == nil && manifest.PID == 0 &&
 		(manifest.Lifecycle == lifecycleStopped ||
 			(manifest.Lifecycle == lifecycleFailed && manifest.Launcher == "direct")) {
-		if removeErr := os.RemoveAll(vmDir); removeErr != nil {
+		if removeErr := m.removeRecoveryStateContext(ctx, manifest); removeErr != nil {
 			return fmt.Errorf("removing exited VM state for %s: %w", service, removeErr)
 		}
 		return nil
@@ -591,10 +733,14 @@ func (m *Manager) recordLaunchedIdentity(manifest *instanceManifest, launched *l
 // read from that same inspection so the manifest it populates validates by
 // construction.
 func awaitLaunchedIdentity(inspector processInspector, manifest *instanceManifest, pid int, timeout, interval time.Duration) (processIdentity, error) {
+	return awaitLaunchedIdentityContext(context.Background(), inspector, manifest, pid, timeout, interval)
+}
+
+func awaitLaunchedIdentityContext(ctx context.Context, inspector processInspector, manifest *instanceManifest, pid int, timeout, interval time.Duration) (processIdentity, error) {
 	deadline := time.Now().Add(timeout)
 	var lastErr error
 	for {
-		identity, err := inspector.Inspect(pid)
+		identity, err := inspectProcessContext(ctx, inspector, pid)
 		switch {
 		case errors.Is(err, errProcessNotFound):
 			return processIdentity{}, fmt.Errorf("process %d exited before it ran Firecracker: %w", pid, err)
@@ -608,7 +754,11 @@ func awaitLaunchedIdentity(inspector processInspector, manifest *instanceManifes
 		if !time.Now().Before(deadline) {
 			return processIdentity{}, lastErr
 		}
-		time.Sleep(interval)
+		select {
+		case <-ctx.Done():
+			return processIdentity{}, ctx.Err()
+		case <-time.After(interval):
+		}
 	}
 }
 
@@ -618,7 +768,7 @@ func awaitLaunchedIdentity(inspector processInspector, manifest *instanceManifes
 // reconcile start a duplicate Firecracker against the same socket and TAP. It
 // reports whether the ambiguous launch was retained so Start can expose it as
 // recovery_pending while it still holds the manager lock.
-func (m *Manager) abandonLaunch(service string, manifest *instanceManifest, launched *launchedProcess, cause error) bool {
+func (m *Manager) abandonLaunch(service string, manifest *instanceManifest, launched *launchedProcess, cause error) (retained bool, writeErr error) {
 	m.logger.Error("abandoning microVM launch with unprovable process identity",
 		"service", service, "pid", launched.PID, "error", cause)
 	// Signalling is unit-scoped for systemd launches and, for direct launches,
@@ -639,18 +789,21 @@ func (m *Manager) abandonLaunch(service string, manifest *instanceManifest, laun
 		gone = awaitProcessExit(m.inspector, launched.PID, m.launchExitTimeout(), launchIdentityInterval)
 	}
 	if gone {
-		if err := os.RemoveAll(manifest.VMDir); err != nil {
-			m.logger.Error("could not remove abandoned microVM state",
-				"service", service, "error", err)
-		}
-		return false
+		// No process is owned by this attempt any more, but leave reclamation
+		// to the next unlocked recovery/start pass. Unit and claimant checks
+		// must not run under the launch's manager lock.
+		manifest.Lifecycle = lifecycleFailed
+		manifest.PID = 0
+		manifest.LastError = cause.Error()
+		_ = m.writeRecoveryManifest(manifestPath(manifest.VMDir), manifest)
+		return false, nil
 	}
 	manifest.Lifecycle = lifecycleFailed
 	manifest.LastError = fmt.Sprintf("launch identity is unprovable and the process did not exit: %v", cause)
-	_ = writeManifest(manifestPath(manifest.VMDir), manifest)
+	writeErr = m.writeRecoveryManifest(manifestPath(manifest.VMDir), manifest)
 	m.logger.Error("abandoned microVM launch did not exit; its state is retained for recovery",
-		"service", service, "pid", launched.PID)
-	return true
+		"service", service, "pid", launched.PID, "command", recoveryInterventionCommand)
+	return true, writeErr
 }
 
 // launchIdentityTimeout and launchExitTimeout fall back to the package
@@ -670,6 +823,17 @@ func (m *Manager) launchExitTimeout() time.Duration {
 	return m.exitConfirmTimeout
 }
 
+func (m *Manager) stopTimeouts() (grace, kill time.Duration) {
+	grace, kill = m.stopGrace, m.stopKill
+	if grace <= 0 {
+		grace = stopGraceTimeout
+	}
+	if kill <= 0 {
+		kill = stopKillTimeout
+	}
+	return grace, kill
+}
+
 func awaitProcessExit(inspector processInspector, pid int, timeout, interval time.Duration) bool {
 	deadline := time.Now().Add(timeout)
 	for {
@@ -684,12 +848,18 @@ func awaitProcessExit(inspector processInspector, pid int, timeout, interval tim
 }
 
 // Stop gracefully shuts down a running microVM.
-func (m *Manager) Stop(name string) error {
+func (m *Manager) Stop(name string) error { return m.stopInstance(name, nil) }
+
+func (m *Manager) stopInstance(name string, expected *Instance) error {
 	m.mu.Lock()
 	inst, exists := m.instances[name]
 	if !exists {
 		m.mu.Unlock()
 		return fmt.Errorf("service %s not found", name)
+	}
+	if expected != nil && inst != expected {
+		m.mu.Unlock()
+		return fmt.Errorf("service %s ownership changed before stop: %w", name, ErrStartInProgress)
 	}
 	if inst.State == StateRecoveryPending {
 		err := fmt.Errorf("refusing to stop service %s: process ownership is ambiguous: %s", name, inst.LastError)
@@ -715,10 +885,16 @@ func (m *Manager) Stop(name string) error {
 	}
 	pid := manifest.PID
 	socketPath := manifest.SocketPath
+	previousLifecycle := manifest.Lifecycle
 	inst.State = StateStopping
 	manifest.Lifecycle = lifecycleStopping
-	if err := writeManifest(manifestPath(manifest.VMDir), manifest); err != nil {
+	if err := m.writeRecoveryManifest(manifestPath(manifest.VMDir), manifest); err != nil {
 		inst.State = StateRunning
+		if durable, readErr := readManifest(manifestPath(manifest.VMDir)); readErr == nil && durable.InstanceID == manifest.InstanceID {
+			inst.manifest = durable
+		} else {
+			manifest.Lifecycle = previousLifecycle
+		}
 		m.mu.Unlock()
 		return err
 	}
@@ -732,7 +908,7 @@ func (m *Manager) Stop(name string) error {
 
 	if err := validateOwnedProcess(m.inspector, &ownedManifest); err != nil {
 		if !errors.Is(err, errProcessNotFound) {
-			m.quarantine(name, manifest, fmt.Errorf("ownership validation failed before stop: %w", err))
+			m.quarantineStopIfCurrent(name, inst, ownedManifest.InstanceID, fmt.Errorf("ownership validation failed before stop: %w", err))
 			return fmt.Errorf("refusing to signal pid %d: %w", pid, err)
 		}
 	} else {
@@ -742,35 +918,47 @@ func (m *Manager) Stop(name string) error {
 			_ = launcher.Stop(&ownedManifest, syscall.SIGKILL)
 		}
 
-		exited, waitErr := waitForOwnedProcessExit(m.inspector, &ownedManifest, 5*time.Second)
+		graceTimeout, killTimeout := m.stopTimeouts()
+		exited, waitErr := waitForOwnedProcessExit(m.inspector, &ownedManifest, graceTimeout)
 		if waitErr != nil {
-			m.quarantine(name, manifest, fmt.Errorf("process identity changed while stopping: %w", waitErr))
+			m.quarantineStopIfCurrent(name, inst, ownedManifest.InstanceID, fmt.Errorf("process identity changed while stopping: %w", waitErr))
 			return fmt.Errorf("refusing to signal pid %d again: %w", pid, waitErr)
 		}
 		if !exited {
 			m.logger.Warn("microVM did not exit after SIGTERM, sending SIGKILL", "service", name, "pid", pid)
 			_ = launcher.Stop(&ownedManifest, syscall.SIGKILL)
-			exited, waitErr = waitForOwnedProcessExit(m.inspector, &ownedManifest, 2*time.Second)
+			exited, waitErr = waitForOwnedProcessExit(m.inspector, &ownedManifest, killTimeout)
 			if waitErr != nil {
-				m.quarantine(name, manifest, fmt.Errorf("process identity changed after SIGKILL: %w", waitErr))
+				m.quarantineStopIfCurrent(name, inst, ownedManifest.InstanceID, fmt.Errorf("process identity changed after SIGKILL: %w", waitErr))
 				return fmt.Errorf("process identity changed after SIGKILL: %w", waitErr)
 			}
 			if !exited {
-				return fmt.Errorf("process %d did not exit after SIGKILL", pid)
+				// Nothing else moves a systemd or adopted VM out of stopping.
+				// Recovery retries it: a later exit is cleared, and a live owner
+				// is re-adopted so the reconciler can plan the stop again.
+				err := fmt.Errorf("process %d did not exit after SIGKILL", pid)
+				m.quarantineStopIfCurrent(name, inst, ownedManifest.InstanceID, err)
+				return err
 			}
 		}
 	}
 
 	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.instances[name] != inst || inst.instanceID != ownedManifest.InstanceID {
+		return fmt.Errorf("service %s ownership changed before stop completion: %w", name, ErrStartInProgress)
+	}
 	inst.State = StateStopped
 	inst.PID = 0
+	inst.exitedOwner = cloneInstanceManifest(&ownedManifest)
 	manifest.Lifecycle = lifecycleStopped
 	manifest.PID = 0
-	_ = writeManifest(manifestPath(manifest.VMDir), manifest)
-	m.mu.Unlock()
-
-	// Clean up socket.
+	writeErr := m.writeRecoveryManifest(manifestPath(manifest.VMDir), manifest)
+	// Keep unlink serialized with replacement starts, just like manifest commit.
 	_ = os.Remove(socketPath)
+	if writeErr != nil {
+		return fmt.Errorf("persist stopped VM state: %w", writeErr)
+	}
 
 	m.logger.Info("microVM stopped", "service", name)
 	return nil
@@ -778,61 +966,94 @@ func (m *Manager) Stop(name string) error {
 
 // Remove stops (if running) and removes all state for a service.
 func (m *Manager) Remove(name string) error {
+	if err := ValidateRecoveryServiceName(name); err != nil {
+		return err
+	}
 	m.mu.Lock()
+	if m.recoveryReservations[name] {
+		m.mu.Unlock()
+		return fmt.Errorf("service %s recovery discovery in progress: %w", name, ErrStartInProgress)
+	}
 	inst, exists := m.instances[name]
 	aborting := exists && (inst.State == StateStarting || inst.State == StateStartAborting)
 	if aborting {
 		inst.State = StateStartAborting
 	}
+	state := StateStopped
+	lastError := ""
+	if exists {
+		state = inst.State
+		lastError = inst.LastError
+	}
 	m.mu.Unlock()
 
-	// Removing the VM state directory while phase 2 runs is safe: volume
-	// preparation writes only under the storage pool, and writeVMConfig — the
-	// only writer of this directory — lives in phase 3, which will abort. The
-	// placeholder is left for phase 3 to clear, so a second Remove before then
-	// takes this same branch and also succeeds.
+	// A starting reservation may still be inspecting old runtime state.
+	// Mark only; preparation creates no VM directory and finishStart will
+	// observe the abort before writing anything. Never delete an old owner's
+	// files just because a new attempt reserved the name.
 	if aborting {
 		m.logger.Info("aborting in-flight start instead of removing", "service", name)
-		if err := os.RemoveAll(filepath.Join(m.stateDir, "vms", name)); err != nil {
-			return fmt.Errorf("removing vm dir: %w", err)
-		}
 		return nil
 	}
 
-	if exists && (inst.State == StateRunning || inst.State == StateStopping) {
-		if err := m.Stop(name); err != nil {
+	if exists && (state == StateRunning || state == StateStopping) {
+		if err := m.stopInstance(name, inst); err != nil {
 			return fmt.Errorf("stopping VM during remove: %w", err)
 		}
 	}
-	if exists && inst.State == StateRecoveryPending {
-		return fmt.Errorf("refusing to remove service %s while recovery is pending: %s", name, inst.LastError)
+	if exists && state == StateRecoveryPending {
+		return fmt.Errorf("refusing to remove service %s while recovery is pending: %s", name, lastError)
 	}
 
 	m.mu.Lock()
-	delete(m.instances, name)
-	m.mu.Unlock()
-
+	defer m.mu.Unlock()
+	current := m.instances[name]
+	if current != inst {
+		if current != nil && (current.State == StateStarting || current.State == StateStartAborting) {
+			current.State = StateStartAborting
+		}
+		return fmt.Errorf("service %s ownership changed while removing: %w", name, ErrStartInProgress)
+	}
 	vmDir := filepath.Join(m.stateDir, "vms", name)
+	if !exists {
+		if _, err := os.Lstat(vmDir); err == nil {
+			return fmt.Errorf("untracked VM state requires recovery before removal")
+		} else if !errors.Is(err, os.ErrNotExist) {
+			return err
+		}
+		return nil
+	}
+	if current.State == StateRecoveryPending || current.State == StateStarting || current.State == StateRunning {
+		return fmt.Errorf("service %s is not stopped", name)
+	}
+	if current.PID > 0 || (current.manifest != nil && current.manifest.PID > 0) {
+		current.State = StateRecoveryPending
+		return fmt.Errorf("service %s requires process absence verification before removal", name)
+	}
+	if current.manifest != nil {
+		if err := verifyRecoveryManifestPaths(name, vmDir, current.manifest); err != nil {
+			return err
+		}
+	}
+	if err := verifyRecoveryDirectories(vmDir); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
 	if err := os.RemoveAll(vmDir); err != nil {
 		return fmt.Errorf("removing vm dir: %w", err)
 	}
-
+	delete(m.instances, name)
 	return nil
 }
 
-// IsRunning checks if the process for a service is still alive.
 func (m *Manager) IsRunning(name string) bool {
 	m.mu.Lock()
-	inst, exists := m.instances[name]
-	m.mu.Unlock()
-
-	if !exists || inst.State != StateRunning {
-		return false
-	}
-	if inst.manifest == nil {
+	inst := m.instances[name]
+	if inst == nil || inst.State != StateRunning || inst.manifest == nil {
+		m.mu.Unlock()
 		return false
 	}
 	manifest := *inst.manifest
+	m.mu.Unlock()
 	return validateOwnedProcess(m.inspector, &manifest) == nil
 }
 
@@ -844,12 +1065,16 @@ func (m *Manager) monitor(name, instanceID string, launched *launchedProcess) {
 
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	m.waitRecoveryPublicationLocked(name)
 
 	inst, exists := m.instances[name]
 	if !exists || inst.instanceID != instanceID {
 		return
 	}
 
+	wasRecoveryPending := inst.State == StateRecoveryPending
+	previousManifest := cloneInstanceManifest(inst.manifest)
+	inst.exitedOwner = cloneInstanceManifest(previousManifest)
 	if err != nil {
 		// Stop() marks instances as stopped before process exit. In that case
 		// a non-zero Wait result is expected and should not flip state to failed.
@@ -866,16 +1091,37 @@ func (m *Manager) monitor(name, instanceID string, launched *launchedProcess) {
 		m.logger.Info("microVM exited cleanly", "service", name)
 		inst.State = StateStopped
 	}
+	terminalState := inst.State
+	if wasRecoveryPending {
+		inst.State = StateRecoveryPending
+		inst.LastError = "quarantined Firecracker process exited; recovery verification pending"
+		inst.recoveryCandidate = nil
+	}
 	inst.PID = 0
 	if inst.manifest != nil {
 		inst.manifest.PID = 0
 		inst.manifest.LastError = inst.LastError
-		if inst.State == StateFailed {
+		if terminalState == StateFailed {
 			inst.manifest.Lifecycle = lifecycleFailed
 		} else {
 			inst.manifest.Lifecycle = lifecycleStopped
 		}
-		_ = writeManifest(manifestPath(inst.manifest.VMDir), inst.manifest)
+		if wasRecoveryPending && previousManifest.Lifecycle == lifecycleStopping {
+			inst.manifest.Lifecycle = lifecycleStopping
+		}
+		if writeErr := m.writeRecoveryManifest(manifestPath(inst.manifest.VMDir), inst.manifest); writeErr != nil && wasRecoveryPending {
+			// Rename may have succeeded before directory sync failed. Align
+			// memory with whichever trusted snapshot is actually durable.
+			terminalManifest := inst.manifest
+			durable, readErr := readManifest(manifestPath(previousManifest.VMDir))
+			if readErr == nil && (sameRecoveryIdentity(durable, previousManifest) || sameRecoveryIdentity(durable, terminalManifest)) {
+				inst.manifest = durable
+			} else {
+				inst.manifest = previousManifest
+			}
+			inst.PID = inst.manifest.PID
+			inst.LastError = fmt.Sprintf("persist quarantined process exit: %v", writeErr)
+		}
 	}
 }
 
@@ -899,17 +1145,6 @@ func newInstanceID() (string, error) {
 		return "", fmt.Errorf("generate instance ID: %w", err)
 	}
 	return hex.EncodeToString(data), nil
-}
-
-func (m *Manager) quarantine(name string, manifest *instanceManifest, err error) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	manifest.LastError = err.Error()
-	_ = writeManifest(manifestPath(manifest.VMDir), manifest)
-	if inst := m.instances[name]; inst != nil {
-		inst.State = StateRecoveryPending
-		inst.LastError = err.Error()
-	}
 }
 
 // writeVMConfig writes a Firecracker JSON config file for the given service.
@@ -1028,4 +1263,20 @@ func insertBeforeApplicationSeparator(args, value string) string {
 		return value
 	}
 	return args + " " + value
+}
+
+func (m *Manager) quarantineStopIfCurrent(name string, expected *Instance, id string, cause error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	current := m.instances[name]
+	if current != expected || current.instanceID != id || current.State != StateStopping {
+		return
+	}
+	current.State = StateRecoveryPending
+	current.LastError = cause.Error()
+	if current.manifest != nil {
+		current.manifest.LastError = cause.Error()
+		_ = m.writeRecoveryManifest(manifestPath(current.manifest.VMDir), current.manifest)
+	}
+	m.logRecoveryIntervention(name, cause)
 }
