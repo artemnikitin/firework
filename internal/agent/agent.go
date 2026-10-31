@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"maps"
 	"net"
 	"sort"
 	"strings"
@@ -487,7 +488,7 @@ func (a *Agent) tick(ctx context.Context) {
 	// condition contract says an unreached stage should be.
 
 	// Assign networking (IPs, MACs, kernel args) to services that need it.
-	a.assignNetworking(merged.Services)
+	addressHolds := a.assignNetworking(merged.Services)
 	a.setStatusServices(*merged, rev)
 
 	// Resolve service links: look up each linked service's guest IP and
@@ -500,7 +501,10 @@ func (a *Agent) tick(ctx context.Context) {
 
 	// Check node capacity before reconciling; skip if resources are exceeded.
 	used, capacityHolds := a.reserveCapacity(merged.Services, nodeCap, hasCap)
-	a.reconciler.SetHeldServices(capacityHolds)
+	holds := make(map[string]string, len(capacityHolds)+len(addressHolds))
+	maps.Copy(holds, addressHolds)
+	maps.Copy(holds, capacityHolds)
+	a.reconciler.SetHeldServices(holds)
 	// Update the heartbeat goroutine with the latest used resources now, before
 	// the potentially long-running image sync, so heartbeats reflect current
 	// scheduling intent while downloads are in progress.
@@ -741,10 +745,11 @@ func usableRevisionMetadata(revision string) string {
 
 // assignNetworking fills in IP, MAC, and kernel IP boot args for services
 // that have networking enabled. Services must be sorted by name for
-// deterministic IP allocation.
-func (a *Agent) assignNetworking(services []config.ServiceConfig) {
+// deterministic IP allocation. It returns the services that could not get an
+// address, as holds with their reason.
+func (a *Agent) assignNetworking(services []config.ServiceConfig) map[string]string {
 	if a.cfg.VMSubnet == "" {
-		return
+		return nil
 	}
 
 	gateway := stripCIDR(a.cfg.VMGateway)
@@ -754,12 +759,12 @@ func (a *Agent) assignNetworking(services []config.ServiceConfig) {
 	ip, ipNet, err := net.ParseCIDR(a.cfg.VMSubnet)
 	if err != nil {
 		a.logger.Error("invalid vm_subnet", "subnet", a.cfg.VMSubnet, "error", err)
-		return
+		return nil
 	}
 	ip = ip.To4()
 	if ip == nil {
 		a.logger.Error("vm_subnet is not IPv4", "subnet", a.cfg.VMSubnet)
-		return
+		return nil
 	}
 	ipNet.IP = ip
 
@@ -786,18 +791,26 @@ func (a *Agent) assignNetworking(services []config.ServiceConfig) {
 			reservedMAC[strings.ToLower(svc.Network.GuestMAC)] = svc.Name
 		}
 	}
+	// Restore every existing assignment before allocating any new one, so a
+	// new service that exhausts the subnet can never leave an existing VM's
+	// desired config without its address and trigger a restart.
+	for i := range services {
+		svc := &services[i]
+		if old, ok := retained[svc.Name]; ok && svc.Network != nil && old.Network != nil {
+			svc.Network.GuestIP, svc.Network.GuestMAC = old.Network.GuestIP, old.Network.GuestMAC
+			if !hasKernelArgPrefix(svc.KernelArgs, "ip=") {
+				svc.KernelArgs = insertKernelArg(svc.KernelArgs, fmt.Sprintf("ip=%s::%s:%s::eth0:off", old.Network.GuestIP, gateway, netmask))
+			}
+		}
+	}
+	var held map[string]string
 	idx := 0
 	for i := range services {
 		svc := &services[i]
 		if svc.Network == nil {
 			continue
 		}
-
 		if old, ok := retained[svc.Name]; ok && old.Network != nil {
-			svc.Network.GuestIP, svc.Network.GuestMAC = old.Network.GuestIP, old.Network.GuestMAC
-			if !hasKernelArgPrefix(svc.KernelArgs, "ip=") {
-				svc.KernelArgs = insertKernelArg(svc.KernelArgs, fmt.Sprintf("ip=%s::%s:%s::eth0:off", old.Network.GuestIP, gateway, netmask))
-			}
 			continue
 		}
 		for {
@@ -814,9 +827,13 @@ func (a *Agent) assignNetworking(services []config.ServiceConfig) {
 		}
 		guestIP, ok := guestIPv4ForIndex(ipNet, idx)
 		if !ok {
-			a.logger.Error("vm_subnet has no available guest IPs",
-				"subnet", a.cfg.VMSubnet, "assigned_services", idx)
-			return
+			// Hold the service instead of reconciling it without an address.
+			if held == nil {
+				held = make(map[string]string)
+			}
+			held[svc.Name] = "no free guest address in vm_subnet " + a.cfg.VMSubnet
+			a.logger.Error("vm_subnet has no available guest IPs", "subnet", a.cfg.VMSubnet, "service", svc.Name)
+			continue
 		}
 		mac := guestMACForIndex(idx)
 
@@ -832,6 +849,7 @@ func (a *Agent) assignNetworking(services []config.ServiceConfig) {
 
 		idx++
 	}
+	return held
 }
 
 func guestIPv4ForIndex(ipNet *net.IPNet, idx int) (string, bool) {

@@ -470,7 +470,10 @@ func TestAssignNetworking_StopsWhenSubnetExhausted(t *testing.T) {
 		{Name: "second", Network: &config.NetworkConfig{Interface: "tap-second"}},
 	}
 
-	a.assignNetworking(services)
+	held := a.assignNetworking(services)
+	if len(held) != 1 || held["second"] == "" {
+		t.Fatalf("expected only the second service to be held, got %v", held)
+	}
 
 	if got := services[0].Network.GuestIP; got != "172.16.0.2" {
 		t.Fatalf("expected first guest IP 172.16.0.2, got %s", got)

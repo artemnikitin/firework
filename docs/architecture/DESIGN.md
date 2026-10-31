@@ -115,6 +115,9 @@ This means:
 - No separate network allocation store; addresses come from VM ownership records
 - Removing a service or a crash does not shift the addresses of existing VMs
 - A fresh node with no VM state assigns addresses in service-name order
+- Existing assignments are restored before any new one is made; a new service
+  that finds no free address is held with `resource_held` instead of being
+  reconciled without networking
 
 The implication is that the layout depends on history: the same set of services can hold
 different addresses on two nodes, and a service created after a removal can take the freed

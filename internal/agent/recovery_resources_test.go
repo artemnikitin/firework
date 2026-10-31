@@ -5,8 +5,10 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"net"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -208,4 +210,58 @@ func TestHealthRestartDoesNotWaitForImageSync(t *testing.T) {
 	}
 	close(images.release)
 	<-ticked
+}
+
+// A full subnet must hold the new service, never strip existing services of
+// their addresses: Reconcile would recreate those healthy VMs without networking.
+func TestAddressExhaustionHoldsNewServiceAndKeepsExistingAssignments(t *testing.T) {
+	cfg := testAgentConfig(t)
+	cfg.VMSubnet = "172.16.0.0/29"
+	cfg.VMGateway = "172.16.0.1"
+	a := New(cfg, &fakeStore{}, testLogger())
+	_, ipNet, err := net.ParseCIDR(cfg.VMSubnet)
+	if err != nil {
+		t.Fatal(err)
+	}
+	existing := []string{"b", "c", "d", "e", "f"}
+	for i, name := range existing {
+		ip, ok := guestIPv4ForIndex(ipNet, i)
+		if !ok {
+			t.Fatalf("fixture subnet too small for %s", name)
+		}
+		addRetainedResource(t, a, config.ServiceConfig{Name: name, Image: "/image", Kernel: "/kernel", VCPUs: 1, MemoryMB: 64,
+			Network: &config.NetworkConfig{GuestIP: ip, GuestMAC: guestMACForIndex(i)}})
+	}
+	if _, ok := guestIPv4ForIndex(ipNet, len(existing)); ok {
+		t.Fatal("fixture subnet is not full")
+	}
+	// b was removed but stays quarantined; a sorts before every existing service.
+	desired := []config.ServiceConfig{{Name: "a", Network: &config.NetworkConfig{}}}
+	for _, name := range existing[1:] {
+		desired = append(desired, config.ServiceConfig{Name: name, Network: &config.NetworkConfig{}})
+	}
+	held := a.assignNetworking(desired)
+	if len(held) != 1 || held["a"] == "" {
+		t.Fatalf("exhausted new service was not held: %v", held)
+	}
+	defer func() {
+		// A full tick turns the address hold into a reconciler hold with a reason.
+		a.store = &fakeStore{data: map[string][]byte{"web": []byte("node: web\nservices:\n- name: a\n  image: /img\n  kernel: /kern\n  vcpus: 1\n  memory_mb: 64\n  network: {}\n")}, revision: "one"}
+		a.tick(context.Background())
+		status := a.agentStatusSnapshot()
+		for _, service := range status.Services {
+			if service.Name == "a" && (service.ReasonCode != "resource_held" || !strings.Contains(service.Message, "no free guest address")) {
+				t.Fatalf("exhausted service was not reported as held: %#v", service)
+			}
+		}
+	}()
+	if desired[0].Network.GuestIP != "" {
+		t.Fatalf("held service got an address: %s", desired[0].Network.GuestIP)
+	}
+	for i, svc := range desired[1:] {
+		want, _ := guestIPv4ForIndex(ipNet, i+1)
+		if svc.Network.GuestIP != want || svc.Network.GuestMAC != guestMACForIndex(i+1) || !strings.Contains(svc.KernelArgs, "ip="+want+"::") {
+			t.Fatalf("existing service %s lost its assignment: %#v kernel=%q", svc.Name, svc.Network, svc.KernelArgs)
+		}
+	}
 }
