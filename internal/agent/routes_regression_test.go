@@ -193,3 +193,34 @@ func TestRouteOnlyTickKeepsCommittedHostname(t *testing.T) {
 		t.Fatalf("metadata-only change recreated the VM: starts=%v removes=%v", manager.startCalls, manager.removeCalls)
 	}
 }
+
+// While the peer list cannot be fetched, a held service's stale hostname is
+// still checked against the last listing, whose remote files stay published:
+// it must not reappear next to the peer's preserved route for that host.
+func TestStaleRouteChecksLastPeerListingWhilePeersAreUnavailable(t *testing.T) {
+	routeDir := t.TempDir()
+	original := routingPersistenceService()
+	store := &fakeStore{listResult: []config.NodeConfig{{Node: "peer", HostIP: "10.0.0.9", Services: []config.ServiceConfig{
+		{Name: "other", Metadata: map[string]string{"host": "original.example.com"}, PortForwards: []config.PortForward{{HostPort: 8080, VMPort: 80}}},
+	}}}}
+	a, manager := routingPersistenceAgent(t, routeDir, original, "owner-old")
+	a.store = store
+	desired := original
+	desired.Image = "/new"
+	desired.Metadata = map[string]string{"host": "moved.example.com"}
+	holdRoutingReplacement(manager)
+	for _, peersUnavailable := range []bool{false, true} {
+		if peersUnavailable {
+			store.listErr = os.ErrPermission
+		}
+		if err := a.syncTraefikConfigs(context.Background(), []config.ServiceConfig{desired}); err != nil {
+			t.Fatal(err)
+		}
+		if body, ok := readRoute(t, routeDir, "app.yaml"); ok {
+			t.Fatalf("peersUnavailable=%v: held app kept a hostname the peer owns:\n%s", peersUnavailable, body)
+		}
+		if _, ok := readRoute(t, routeDir, "remote-other.yaml"); !ok {
+			t.Fatalf("peersUnavailable=%v: peer route missing", peersUnavailable)
+		}
+	}
+}

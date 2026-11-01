@@ -9,7 +9,9 @@ import (
 
 // Peer discovery precedes this lifecycle transaction, so a slow store cannot
 // delay health-driven restarts, while selecting and publishing the local
-// snapshot is serialized with VM replacement.
+// snapshot is serialized with VM replacement. When localOnly is set, the peer
+// files on disk are preserved and remoteNodes is the listing they came from,
+// used only for hostname claims.
 func (a *Agent) syncRuntimeRoutes(services []config.ServiceConfig, remoteNodes []config.NodeConfig, localOnly bool) error {
 	a.lifecycleMu.Lock()
 	defer a.lifecycleMu.Unlock()
