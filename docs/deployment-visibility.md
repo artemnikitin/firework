@@ -335,7 +335,8 @@ Other holds do not let the revision apply. `VMsReconciled` reports
   services that fit still converge.
 - A service waiting on another VM's start or stop, on a host port, address or
   device another VM still uses, or on capacity or a guest address still held by
-  VMs that are starting, stopping or being removed keeps the node reconciling,
+  VMs that are starting, stopping, being removed or kept by other holds keeps
+  the node reconciling,
   and the next poll retries it. A guest address kept by a quarantined VM is a
   recovery hold.
 

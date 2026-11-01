@@ -11,6 +11,18 @@ import (
 	"github.com/artemnikitin/firework/internal/vm"
 )
 
+// runtimeUsage sums what live VMs use between ticks.
+func runtimeUsage(m *recoveryTestVMManager) (vcpus, memoryMB int) {
+	for _, inst := range m.instances {
+		switch inst.State {
+		case vm.StateRunning, vm.StateStarting, vm.StateStopping, vm.StateRecoveryPending:
+			vcpus += inst.Config.VCPUs
+			memoryMB += inst.Config.MemoryMB
+		}
+	}
+	return vcpus, memoryMB
+}
+
 type convergenceService struct {
 	name       string
 	vcpus      int
@@ -49,6 +61,9 @@ func converge(t *testing.T, cap int, from, to []convergenceService) string {
 	store.data["web"] = convergenceYAML(to)
 	for tick := 0; tick < 3; tick++ {
 		a.tick(context.Background())
+		if used, _ := runtimeUsage(manager); used > cap {
+			return fmt.Sprintf("tick %d runs %d vCPUs on a %d vCPU node", tick, used, cap)
+		}
 	}
 	for _, want := range to {
 		got := manager.instances[want.name]

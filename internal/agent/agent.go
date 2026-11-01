@@ -8,7 +8,9 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"maps"
 	"net"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -497,20 +499,7 @@ func (a *Agent) tick(ctx context.Context) {
 	// Admit desired growth against node capacity service by service. A
 	// service that does not fit is held while independent work, including
 	// recovery, still runs; genuine over-capacity fails the revision below.
-	used, capacityHolds := a.reserveCapacity(merged.Services, nodeCap, hasCap)
-	holds := make(map[string]reconciler.Hold, len(capacityHolds)+len(addressHolds))
-	for name, hold := range addressHolds {
-		holds[name] = hold
-	}
-	// Do not replace an address hold that recovery does not explain with a
-	// weaker recovery-only capacity hold for the same service.
-	for name, hold := range capacityHolds {
-		if existing, ok := holds[name]; ok && !existing.Recovery {
-			continue
-		}
-		holds[name] = hold
-	}
-	a.reconciler.SetHeldServices(holds)
+	used, capacityHolds := a.admit(merged.Services, nodeCap, hasCap, addressHolds)
 	// Update the heartbeat goroutine with the latest used resources now, before
 	// the potentially long-running image sync, so heartbeats reflect current
 	// scheduling intent while downloads are in progress.
@@ -816,10 +805,11 @@ func (a *Agent) assignNetworking(services []config.ServiceConfig) map[string]rec
 			networked++
 		}
 	}
-	// Why an undesired VM keeps an address: quarantine, or a removal this
-	// tick's plan performs.
+	// Why an undesired VM keeps an address or MAC: quarantine or a removal
+	// that recovery holds, or a removal this tick's plan performs.
 	var quarantinedReserves, departingReserves bool
 	if a.reconciler != nil {
+		deleteHolds := a.reconciler.DeleteHolds(config.NodeConfig{Services: services})
 		// Every tracked VM keeps its address: a route-only tick must not shift
 		// a running guest to a freed IP, and a crashed or restarting service
 		// must not lose its IP to first-fit reallocation. Retained VMs keep
@@ -840,8 +830,9 @@ func (a *Agent) assignNetworking(services []config.ServiceConfig) map[string]rec
 			}
 			reservedIP[svc.Network.GuestIP] = name
 			reservedMAC[strings.ToLower(svc.Network.GuestMAC)] = name
-			if inSubnet && !desired[name] {
-				if inst.State == vm.StateRecoveryPending {
+			// A VM outside the subnet still takes a MAC index.
+			if !desired[name] {
+				if inst.State == vm.StateRecoveryPending || deleteHolds[name].Recovery {
 					quarantinedReserves = true
 				} else {
 					departingReserves = true
@@ -849,13 +840,13 @@ func (a *Agent) assignNetworking(services []config.ServiceConfig) map[string]rec
 			}
 		}
 	}
-	exhausted := reconciler.Hold{Reason: addressExhaustedReason + a.cfg.VMSubnet}
+	exhausted := reconciler.Hold{Reason: addressExhaustedReason + a.cfg.VMSubnet, Admission: "guest_addresses_exhausted"}
 	switch {
 	case networked > guestAddressCount(ipNet):
-	case departingReserves:
-		exhausted = reconciler.Hold{Reason: addressTransientReason}
-	case quarantinedReserves:
+	case quarantinedReserves && !departingReserves:
 		exhausted = reconciler.Hold{Reason: addressRecoveryReason, Recovery: true}
+	case quarantinedReserves || departingReserves:
+		exhausted = reconciler.Hold{Reason: addressTransientReason}
 	}
 	// Restore every existing assignment before allocating any new one, so a
 	// new service that exhausts the subnet can never leave an existing VM's
@@ -1280,92 +1271,247 @@ func (a *Agent) syncImages(ctx context.Context, services []config.ServiceConfig,
 const (
 	capacityExceededReason  = "desired services exceed node capacity"
 	capacityRecoveryReason  = "capacity retained by unresolved VM ownership"
-	capacityTransientReason = "capacity is still allocated to VMs being started or stopped"
+	capacityTransientReason = "capacity is still used by VMs that are starting, stopping or held"
 )
 
-// reserveCapacity admits desired growth service by service. Only allocations
-// this tick's plan cannot release stay counted: VMs that are starting,
-// stopping or quarantined. Running VMs count at their desired size, and
-// undesired running VMs not at all, because the plan resizes or removes them;
-// counting their old size could make two updates wait on each other forever.
-// The price is the same brief overcommit as before while one apply replaces
-// VMs. A service that does not fit is held, and the reason names the cause:
-// desired state that does not fit at all, capacity that resolving quarantined
-// VMs would free, or capacity still allocated to VMs starting or stopping. The
-// first is the same failure whether or not anything happens to be retained.
+// reserveCapacity admits the desired services against node capacity and
+// returns what the node uses once this tick's plan has run, with the capacity
+// holds. Address holds from prepareDesired are given as well, because they
+// can hold other services through the claims of held VMs.
+//
+// Admission and holds depend on each other: a held VM keeps its current size,
+// which can hold others for capacity, and a capacity-held VM owns its claims,
+// which can hold others in turn. They are computed together, starting every
+// tick from no capacity holds, so every hold traces back to a cause outside
+// admission and resolves with it. A VM the plan updates this tick counts at
+// the smaller of its current and desired size, so a shrink frees capacity for
+// another service's growth in the same tick and two such updates never wait
+// on each other; the price is a brief overcommit while one apply grows a VM
+// before it shrinks another.
 func (a *Agent) reserveCapacity(services []config.ServiceConfig, cap capacity.NodeCapacity, known bool) (capacity.NodeCapacity, map[string]reconciler.Hold) {
-	allocations := make(map[string]config.ServiceConfig)
-	pending := make(map[string]bool)
-	for name, inst := range a.reconciler.Instances() {
-		switch inst.State {
-		case vm.StateStarting, vm.StateStartAborting, vm.StateStopping, vm.StateRecoveryPending:
-			allocations[name] = inst.Config
-			pending[name] = inst.State == vm.StateRecoveryPending
-		}
-	}
-	// Compute the complete post-recovery demand independently of admission:
-	// held services still consume desired capacity once their ownership resolves.
-	var used, settled capacity.NodeCapacity
-	for name, svc := range allocations {
-		used = growAllocation(used, svc, config.ServiceConfig{})
-		if !pending[name] {
-			settled = growAllocation(settled, svc, config.ServiceConfig{})
-		}
-	}
-	for _, svc := range services {
-		old := allocations[svc.Name]
-		if pending[svc.Name] {
-			old = config.ServiceConfig{}
-		}
-		settled = growAllocation(settled, svc, old)
-	}
-	exceeds := func(c capacity.NodeCapacity) bool { return c.VCPUs > cap.VCPUs || c.MemoryMB > cap.MemoryMB }
-	desiredExceeds := exceeds(sumResources(services))
-	holds := map[string]reconciler.Hold{}
-	for _, svc := range services {
-		next := growAllocation(used, svc, allocations[svc.Name])
-		if known && exceeds(next) {
-			switch {
-			case desiredExceeds:
-				holds[svc.Name] = reconciler.Hold{Reason: capacityExceededReason}
-			case !exceeds(settled):
-				holds[svc.Name] = reconciler.Hold{Reason: capacityRecoveryReason, Recovery: true}
-			default:
-				holds[svc.Name] = reconciler.Hold{Reason: capacityTransientReason}
+	return a.admit(services, cap, known, nil)
+}
+
+func (a *Agent) admit(services []config.ServiceConfig, cap capacity.NodeCapacity, known bool, addressHolds map[string]reconciler.Hold) (capacity.NodeCapacity, map[string]reconciler.Hold) {
+	desired := config.NodeConfig{Services: services}
+	var used capacity.NodeCapacity
+	var capacityHolds map[string]reconciler.Hold
+	for pass := 0; pass <= len(services); pass++ {
+		a.reconciler.SetHeldServices(mergeHolds(addressHolds, capacityHolds))
+		var next map[string]reconciler.Hold
+		used, next = a.admitPass(services, cap, known, a.reconciler.Holds(desired), a.reconciler.DeleteHolds(desired))
+		settled := len(next) == len(capacityHolds)
+		for name := range next {
+			if _, ok := capacityHolds[name]; !ok {
+				settled = false
 			}
+		}
+		capacityHolds = next
+		if settled {
+			break
+		}
+	}
+	a.reconciler.SetHeldServices(mergeHolds(addressHolds, capacityHolds))
+	return used, capacityHolds
+}
+
+// mergeHolds combines address and capacity holds. A capacity hold does not
+// replace an address hold that recovery does not explain.
+func mergeHolds(addressHolds, capacityHolds map[string]reconciler.Hold) map[string]reconciler.Hold {
+	holds := make(map[string]reconciler.Hold, len(addressHolds)+len(capacityHolds))
+	maps.Copy(holds, addressHolds)
+	for name, hold := range capacityHolds {
+		if existing, ok := holds[name]; ok && !existing.Recovery {
 			continue
 		}
-		used = next
+		holds[name] = hold
+	}
+	return holds
+}
+
+// admitPass decides which desired services fit by what the node runs once
+// this tick's plan has finished:
+//   - starting, stopping and quarantined VMs keep their current size, and a
+//     desired one's growth is admitted like a create's;
+//   - a running VM held for another reason keeps its current size and
+//     reserves its growth;
+//   - an undesired running VM counts only while its removal is held;
+//   - a crashed or stopped VM uses nothing until it is recreated;
+//   - an update that only shrinks always proceeds;
+//   - every other create or update is admitted by the change it makes, in
+//     service-name order. Updates that fit only together, such as two VMs
+//     trading sizes, are admitted together. A held one keeps its current size.
+//
+// The node never ends a tick over capacity, while one apply can briefly
+// exceed it when it grows a VM before it shrinks another. A service held for
+// another reason is admitted too, because its hold can clear during the apply
+// once an earlier action releases its claim.
+//
+// A service that does not fit is held, and the reason names the cause:
+// desired state that does not fit at all, capacity that resolving every
+// recovery-caused hold would free, or capacity still used by VMs starting,
+// stopping or kept by other holds. The first is the same failure whether or
+// not anything happens to be retained.
+func (a *Agent) admitPass(services []config.ServiceConfig, cap capacity.NodeCapacity, known bool, held, deleteHeld map[string]reconciler.Hold) (capacity.NodeCapacity, map[string]reconciler.Hold) {
+	type candidate struct {
+		svc   config.ServiceConfig
+		delta capacity.NodeCapacity
+	}
+	plus := func(a, b capacity.NodeCapacity) capacity.NodeCapacity {
+		return capacity.NodeCapacity{VCPUs: a.VCPUs + b.VCPUs, MemoryMB: a.MemoryMB + b.MemoryMB}
+	}
+	size := func(svc config.ServiceConfig) capacity.NodeCapacity {
+		return capacity.NodeCapacity{VCPUs: svc.VCPUs, MemoryMB: svc.MemoryMB}
+	}
+	minus := func(a, b capacity.NodeCapacity) capacity.NodeCapacity {
+		return capacity.NodeCapacity{VCPUs: a.VCPUs - b.VCPUs, MemoryMB: a.MemoryMB - b.MemoryMB}
+	}
+	exceeds := func(c capacity.NodeCapacity) bool { return c.VCPUs > cap.VCPUs || c.MemoryMB > cap.MemoryMB }
+	heldOtherwise := func(name string) (reconciler.Hold, bool) {
+		hold, ok := held[name]
+		return hold, ok && hold.Reason != "" && !hold.Capacity
+	}
+	instances := a.reconciler.Instances()
+	byName := make(map[string]bool, len(services))
+	for _, svc := range services {
+		byName[svc.Name] = true
+	}
+	// used is the node once this tick's plan finished, assuming no candidate
+	// is admitted. settled is the end state once every recovery cause
+	// resolved and every desired service applied: it decides whether
+	// recovery explains a hold.
+	var used, settled, recovery capacity.NodeCapacity
+	for _, name := range slices.Sorted(maps.Keys(instances)) {
+		inst := instances[name]
+		if byName[name] {
+			continue
+		}
+		hold, removalHeld := deleteHeld[name]
+		switch {
+		case reconciler.RetainsRuntime(inst.State):
+			used = plus(used, size(inst.Config))
+			if inst.State == vm.StateRecoveryPending {
+				recovery = plus(recovery, size(inst.Config))
+			} else {
+				settled = plus(settled, size(inst.Config))
+			}
+		case removalHeld && inst.State == vm.StateRunning:
+			used = plus(used, size(inst.Config))
+			if hold.Recovery {
+				recovery = plus(recovery, size(inst.Config))
+			} else {
+				settled = plus(settled, size(inst.Config))
+			}
+		}
+	}
+	var candidates []candidate
+	for _, svc := range services {
+		inst := instances[svc.Name]
+		hold, other := heldOtherwise(svc.Name)
+		switch {
+		case inst != nil && reconciler.RetainsRuntime(inst.State):
+			// It keeps its current size. Its growth is admitted like any
+			// other, so a hold persists if recovery resolves it this tick.
+			current := size(inst.Config)
+			used = plus(used, current)
+			if inst.State == vm.StateRecoveryPending {
+				settled = plus(settled, size(svc))
+				recovery = plus(recovery, current)
+			} else {
+				settled = plus(settled, size(growAllocationConfig(inst.Config, svc)))
+			}
+			if growth := minus(size(growAllocationConfig(inst.Config, svc)), current); growth.VCPUs > 0 || growth.MemoryMB > 0 {
+				candidates = append(candidates, candidate{svc, growth})
+			}
+		case inst != nil && inst.State == vm.StateRunning && other:
+			keep := size(growAllocationConfig(inst.Config, svc))
+			used = plus(used, keep)
+			if hold.Recovery {
+				settled = plus(settled, size(svc))
+				recovery = plus(recovery, keep)
+			} else {
+				settled = plus(settled, keep)
+			}
+		case inst != nil && inst.State == vm.StateRunning:
+			current := size(inst.Config)
+			settled = plus(settled, size(svc))
+			if svc.VCPUs <= inst.Config.VCPUs && svc.MemoryMB <= inst.Config.MemoryMB {
+				used = plus(used, size(svc)) // A pure shrink always proceeds.
+				continue
+			}
+			used = plus(used, current)
+			candidates = append(candidates, candidate{svc, minus(size(svc), current)})
+		default:
+			settled = plus(settled, size(svc))
+			candidates = append(candidates, candidate{svc, size(svc)})
+		}
+	}
+	if !known {
+		return used, map[string]reconciler.Hold{}
+	}
+	// Admit in service-name order, retrying what waits after every admission:
+	// a later update's shrink can make room for an earlier service's growth.
+	waiting := candidates
+	for admitted := true; admitted; {
+		admitted = false
+		var still []candidate
+		for _, c := range waiting {
+			if next := plus(used, c.delta); !exceeds(next) {
+				used, admitted = next, true
+				continue
+			}
+			still = append(still, c)
+		}
+		waiting = still
+	}
+	if len(waiting) > 1 {
+		together := used
+		for _, c := range waiting {
+			together = plus(together, c.delta)
+		}
+		if !exceeds(together) {
+			return together, map[string]reconciler.Hold{}
+		}
+	}
+	desiredExceeds := exceeds(sumResources(services))
+	holds := map[string]reconciler.Hold{}
+	for _, c := range waiting {
+		switch {
+		case desiredExceeds:
+			holds[c.svc.Name] = reconciler.Hold{Reason: capacityExceededReason, Admission: "capacity_exceeded", Capacity: true}
+		case (recovery.VCPUs > 0 || recovery.MemoryMB > 0) && !exceeds(settled):
+			holds[c.svc.Name] = reconciler.Hold{Reason: capacityRecoveryReason, Recovery: true, Capacity: true}
+		default:
+			holds[c.svc.Name] = reconciler.Hold{Reason: capacityTransientReason, Capacity: true}
+		}
 	}
 	return used, holds
+}
+
+// growAllocationConfig is the larger of two allocations, field by field.
+func growAllocationConfig(current, desired config.ServiceConfig) config.ServiceConfig {
+	return config.ServiceConfig{VCPUs: max(current.VCPUs, desired.VCPUs), MemoryMB: max(current.MemoryMB, desired.MemoryMB)}
 }
 
 // admissionFailure reports holds that no amount of waiting resolves: desired
 // services that exceed node capacity, or a subnet without a free address.
 // They fail the revision instead of leaving it reconciling.
 func admissionFailure(addressHolds, capacityHolds map[string]reconciler.Hold) (string, string) {
-	var names []string
-	for name, hold := range capacityHolds {
-		if hold.Reason == capacityExceededReason {
-			names = append(names, name)
+	for _, holds := range []map[string]reconciler.Hold{capacityHolds, addressHolds} {
+		var names []string
+		var code, reason string
+		for name, hold := range holds {
+			if hold.Admission != "" {
+				names = append(names, name)
+				code, reason = hold.Admission, hold.Reason
+			}
+		}
+		if len(names) > 0 {
+			sort.Strings(names)
+			return code, reason + "; held: " + strings.Join(names, ", ")
 		}
 	}
-	if len(names) > 0 {
-		sort.Strings(names)
-		return "capacity_exceeded", capacityExceededReason + "; held: " + strings.Join(names, ", ")
-	}
-	var reason string
-	for name, hold := range addressHolds {
-		if strings.HasPrefix(hold.Reason, addressExhaustedReason) {
-			names = append(names, name)
-			reason = hold.Reason
-		}
-	}
-	if len(names) == 0 {
-		return "", ""
-	}
-	sort.Strings(names)
-	return "guest_addresses_exhausted", reason + "; held: " + strings.Join(names, ", ")
+	return "", ""
 }
 
 // prepareDesired completes desired state for this node: guest addresses,
@@ -1376,17 +1522,6 @@ func (a *Agent) prepareDesired(services []config.ServiceConfig) map[string]recon
 	a.resolveLinks(services)
 	a.injectEnvVars(services)
 	return held
-}
-
-// growAllocation adds svc's growth over its old allocation to base.
-func growAllocation(base capacity.NodeCapacity, svc, old config.ServiceConfig) capacity.NodeCapacity {
-	if svc.VCPUs > old.VCPUs {
-		base.VCPUs += svc.VCPUs - old.VCPUs
-	}
-	if svc.MemoryMB > old.MemoryMB {
-		base.MemoryMB += svc.MemoryMB - old.MemoryMB
-	}
-	return base
 }
 
 func (a *Agent) restartService(ctx context.Context, name string) error {

@@ -409,8 +409,9 @@ retained:
 
 - Recovery holds, caused by unresolved VM ownership (unknown claims, a resource
   retained by a `recovery_pending` owner directly or through a held VM, a guest
-  address an undesired quarantined VM keeps, or capacity that its resolution
-  would free): when every hold is one, the agent applies the revision with those holds
+  address or MAC an undesired quarantined VM, or one whose removal recovery
+  holds, keeps, or capacity that recovery keeps in use and its resolution would
+  free): when every hold is one, the agent applies the revision with those holds
   and reports `VMRecoveryReady=False`, so the node shows as degraded instead of
   progressing. Pending recovery keeps forcing reconciliation, so held work
   retries on an unchanged revision.
@@ -421,19 +422,25 @@ retained:
   is false with `capacity_exceeded` or `guest_addresses_exhausted`, and the node
   reports failed.
 - Transient holds: waiting on another start or stop, on a claim that a running
-  or retained VM still uses, on capacity still allocated to VMs that are
-  starting or stopping, or on a guest address an undesired VM keeps until the
-  plan removes it. The revision stays incomplete, `VMsReconciled` is
+  or retained VM still uses, on capacity still used by VMs that are starting,
+  stopping or kept by other holds, or on a guest address an undesired VM keeps
+  until the plan removes it. The revision stays incomplete, `VMsReconciled` is
   unknown with `resource_held`, and the next tick retries.
 
-Admission counts only allocations the tick's plan cannot release: VMs that are
-starting, stopping or quarantined. Running VMs count at their desired size and
-undesired running VMs not at all, because the plan resizes or removes them in
-the same apply. Counting their old size instead could make two updates wait on
-each other forever, for example a VM shrinking onto a port that a growing VM is
-leaving. The cost, as before this change, is a brief overcommit of CPU and
-memory while one apply creates or grows VMs before it removes or shrinks others.
-
+Admission decides by what the node runs once the tick's plan has finished. VMs
+that are starting, stopping or quarantined keep their current size, as does a
+running VM held for another reason, which also reserves its growth; an
+undesired running VM counts while its removal is held; a crashed or stopped VM
+uses nothing until it is recreated. An update that only shrinks always
+proceeds. Every other create or update is admitted by the change it makes, in
+service-name order, retrying what waits after each admission so a later
+shrink can make room; updates that fit only together, such as two VMs trading
+sizes, are admitted together. A service held for another reason is admitted
+too, because its hold can clear during the apply. Capacity and claim holds are
+computed together, starting every tick from no capacity holds, so each hold
+traces back to a cause outside admission. The node never ends a tick over
+capacity; one apply can briefly exceed it when it grows a VM before it shrinks
+another.
 Running guests retain their assigned addresses after a survivor clears.
 
 Each tick's Recover/Plan/Apply section and health-driven Stop/Start transactions
