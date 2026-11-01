@@ -698,9 +698,15 @@ func (r *Reconciler) applyRolling(ctx context.Context, actions []Action) error {
 			continue
 		}
 		// A health restart may have run during an earlier pause. Replace only
-		// a VM that still needs this update; a service it left without a VM
-		// is recreated by the reconciliation that restart forces.
-		if instance := r.vmManager.List()[action.Service.Name]; instance == nil || !needsUpdate(instance, action.Service) {
+		// a VM that still needs this update. One the restart left without a
+		// VM keeps the revision incomplete, so the next tick re-plans it from
+		// real state instead of the revision being applied without it.
+		instance := r.vmManager.List()[action.Service.Name]
+		if instance == nil {
+			errs = append(errs, Hold{Reason: "VM disappeared during the rolling update"}.err(action.Service.Name))
+			continue
+		}
+		if !needsUpdate(instance, action.Service) {
 			continue
 		}
 		r.logger.Info("updating service (stop + start)", "service", action.Service.Name)
