@@ -890,7 +890,7 @@ func (r *Reconciler) Reconcile(ctx context.Context, desired config.NodeConfig) e
 	//
 	// Deliberately not done by rolling the service back: a durable failure such
 	// as a host-port collision would then repeatedly destroy a running VM.
-	if err := r.commitInPlaceChanges(desired, r.holds(desired)); err != nil {
+	if err := r.commitInPlaceChanges(desired, held); err != nil {
 		errs = append(errs, err)
 	}
 	if err := r.syncPortForwards(desired); err != nil {

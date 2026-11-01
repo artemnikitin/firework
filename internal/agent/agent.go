@@ -521,6 +521,7 @@ func (a *Agent) tick(ctx context.Context) {
 	admissionCode, admissionMessage := admissionFailure(addressHolds, capacityHolds)
 	switch {
 	case admissionCode != "":
+		a.logger.Warn("desired services do not fit this node; holding those that do not fit", "reason", admissionCode, "detail", admissionMessage)
 		a.setStatusCondition("CapacityReady", statusmodel.ConditionFalse, admissionCode, admissionMessage)
 	case !hasCap:
 		a.setStatusCondition("CapacityReady", statusmodel.ConditionTrue, "not_configured", "")

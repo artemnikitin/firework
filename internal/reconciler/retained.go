@@ -205,6 +205,11 @@ func conflictingResource(service, owner config.ServiceConfig) string {
 // as a service whose update releasing that port comes later in a rolling
 // apply; the next tick creates it. A crashed or stopped VM counts too, because
 // its host rules stay installed until it is replaced.
+//
+// Each call recomputes the revision's holds against the current runtime, so a
+// tick costs on the order of actions × services² claim comparisons. That is
+// cheap at the tens of services a node runs; compute holds incrementally if
+// nodes grow far beyond that.
 func (r *Reconciler) actionHold(action Action) Hold {
 	actual := r.vmManager.List()
 	var hold Hold
