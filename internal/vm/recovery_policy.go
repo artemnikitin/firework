@@ -2,6 +2,7 @@ package vm
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -77,34 +78,73 @@ func (m *Manager) noClaimingUnitContext(ctx context.Context, f *instanceManifest
 	if run == nil {
 		run = commandOutput
 	}
-	out, err := run(ctx, m.recoverySystemctl(), "show", "firework-vm-*.service", "--property=Id,ActiveState,MainPID,Job,ExecStart")
+	out, err := run(ctx, m.recoverySystemctl(), "show", "firework-vm-*.service", "--property=Id,ActiveState,MainPID,Job")
 	if err != nil {
 		return fmt.Errorf("inspect systemd launches: %w", err)
 	}
 	for _, block := range strings.Split(string(out), "\n\n") {
 		fields := parseUnitProperties(block)
-		if fields["Id"] == "" || !unitArgvClaims(fields["ExecStart"], f.SocketPath, f.ConfigPath) {
+		if fields["Id"] == "" {
 			continue
 		}
 		inactive := fields["ActiveState"] == "inactive" || fields["ActiveState"] == "failed"
 		if inactive && (fields["MainPID"] == "" || fields["MainPID"] == "0") && fields["Job"] == "" {
 			continue
 		}
-		return fmt.Errorf("systemd unit %s may still run this service's VM", fields["Id"])
+		commands, err := recoveryUnitArguments(ctx, run, fields["Id"])
+		if err != nil {
+			return fmt.Errorf("inspect systemd unit %s arguments: %w", fields["Id"], err)
+		}
+		for _, args := range commands {
+			if hasExactArgument(args, "--api-sock", f.SocketPath) || hasExactArgument(args, "--config-file", f.ConfigPath) {
+				return fmt.Errorf("systemd unit %s may still run this service's VM", fields["Id"])
+			}
+		}
 	}
 	return nil
 }
 
-// unitArgvClaims reports whether a systemctl ExecStart value launches with
-// either VM path, e.g. "{ path=... ; argv[]=fc --api-sock /p ... ; ... }".
-func unitArgvClaims(execStart, socketPath, configPath string) bool {
-	_, argv, found := strings.Cut(execStart, "argv[]=")
-	if !found {
-		return false
+// recoveryUnitArguments reads the typed D-Bus ExecStart property. systemctl's
+// human rendering joins arguments with spaces and cannot distinguish a path
+// containing whitespace from several arguments. busctl JSON retains the
+// original argument array, including whitespace, quotes and backslashes.
+func recoveryUnitArguments(ctx context.Context, run func(context.Context, string, ...string) ([]byte, error), unit string) ([][]string, error) {
+	out, err := run(ctx, "busctl", "--json=short", "call", "org.freedesktop.systemd1", "/org/freedesktop/systemd1", "org.freedesktop.systemd1.Manager", "GetUnit", "s", unit)
+	if err != nil {
+		return nil, fmt.Errorf("get unit object: %w", err)
 	}
-	argv, _, _ = strings.Cut(argv, " ;")
-	args := strings.Fields(argv)
-	return hasExactArgument(args, "--api-sock", socketPath) || hasExactArgument(args, "--config-file", configPath)
+	var property struct {
+		Type string            `json:"type"`
+		Data []json.RawMessage `json:"data"`
+	}
+	if err := json.Unmarshal(out, &property); err != nil || property.Type != "o" || len(property.Data) != 1 {
+		return nil, fmt.Errorf("invalid systemd unit object response")
+	}
+	var path string
+	if err := json.Unmarshal(property.Data[0], &path); err != nil || !strings.HasPrefix(path, "/org/freedesktop/systemd1/unit/") {
+		return nil, fmt.Errorf("invalid systemd unit object path")
+	}
+	out, err = run(ctx, "busctl", "--json=short", "get-property", "org.freedesktop.systemd1", path, "org.freedesktop.systemd1.Service", "ExecStart")
+	if err != nil {
+		return nil, fmt.Errorf("get ExecStart property: %w", err)
+	}
+	property.Data = nil
+	if err := json.Unmarshal(out, &property); err != nil || property.Type != "a(sasbttttuii)" || len(property.Data) == 0 {
+		return nil, fmt.Errorf("invalid systemd ExecStart response")
+	}
+	commands := make([][]string, 0, len(property.Data))
+	for _, raw := range property.Data {
+		var command []json.RawMessage
+		if err := json.Unmarshal(raw, &command); err != nil || len(command) != 10 {
+			return nil, fmt.Errorf("invalid systemd ExecStart command")
+		}
+		var args []string
+		if err := json.Unmarshal(command[1], &args); err != nil || len(args) == 0 {
+			return nil, fmt.Errorf("invalid systemd ExecStart argument array")
+		}
+		commands = append(commands, args)
+	}
+	return commands, nil
 }
 
 func commandOutput(ctx context.Context, name string, args ...string) ([]byte, error) {

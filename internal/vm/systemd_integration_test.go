@@ -230,10 +230,22 @@ func main(){flag.String("id","","");p:=flag.String("api-sock","","");flag.String
 // the claimant scan to find. Untrusted metadata names no unit, so recovery
 // must find the queued unit by its launch paths before releasing claims.
 func TestSystemdIntegrationQueuedUnitBlocksUntrustedCleanup(t *testing.T) {
+	for _, pathSuffix := range []string{"state", "state with spaces", "state\twith\ttabs", "state\nwith\nnewlines", `state"with"quotes`, `state\with\backslashes`} {
+		for _, corrupt := range []bool{false, true} {
+			name := "missing manifest"
+			if corrupt {
+				name = "corrupt manifest"
+			}
+			t.Run(pathSuffix+"/"+name, func(t *testing.T) { testSystemdQueuedUnitBlocksUntrustedCleanup(t, pathSuffix, corrupt) })
+		}
+	}
+}
+
+func testSystemdQueuedUnitBlocksUntrustedCleanup(t *testing.T, pathSuffix string, corrupt bool) {
 	if os.Getenv("FIREWORK_REAL_SYSTEMD") != "1" {
 		t.Skip("requires isolated real systemd")
 	}
-	root := t.TempDir()
+	root := filepath.Join(t.TempDir(), pathSuffix)
 	m := NewManager("/bin/sh", root, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	if _, ok := m.launcher.(*systemdLauncher); !ok {
 		t.Fatalf("not using real systemd: %T", m.launcher)
@@ -242,8 +254,10 @@ func TestSystemdIntegrationQueuedUnitBlocksUntrustedCleanup(t *testing.T) {
 	if err := os.MkdirAll(vmDir, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(manifestPath(vmDir), []byte("{"), 0o600); err != nil {
-		t.Fatal(err)
+	if corrupt {
+		if err := os.WriteFile(manifestPath(vmDir), []byte("{"), 0o600); err != nil {
+			t.Fatal(err)
+		}
 	}
 	suffix := fmt.Sprintf("%d", time.Now().UnixNano())
 	blocker, unit := "fw-blocker-"+suffix+".service", "firework-vm-"+suffix+".service"
@@ -268,7 +282,7 @@ func TestSystemdIntegrationQueuedUnitBlocksUntrustedCleanup(t *testing.T) {
 	if result, err := m.ForgetRecoveryPending("queued"); err == nil || result.Outcome != RecoveryOutcomeAmbiguous {
 		t.Fatalf("queued launch was forgotten: %#v %v", result, err)
 	}
-	if _, err := os.Stat(manifestPath(vmDir)); err != nil {
+	if _, err := os.Stat(vmDir); err != nil {
 		t.Fatalf("queued launch state was removed: %v", err)
 	}
 
