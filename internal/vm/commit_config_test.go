@@ -66,3 +66,35 @@ func TestCommitConfigIgnoresNonRunningInstances(t *testing.T) {
 		t.Fatalf("untracked VM manifest changed: %v %#v", err, durable.Config)
 	}
 }
+
+// Committing the same configuration again, including one that went through
+// the manifest's JSON round trip, does not rewrite the manifest.
+func TestCommitConfigWritesOnlyOnChange(t *testing.T) {
+	m, f, inspector := recoveryFixture(t)
+	m.inspector = inspector
+	if _, err := m.Recover(context.Background(), config.NodeConfig{Services: []config.ServiceConfig{f.Config}}); err != nil {
+		t.Fatal(err)
+	}
+	writes := 0
+	m.recoveryManifestWriter = func(path string, manifest *instanceManifest) error {
+		writes++
+		return writeManifest(path, manifest)
+	}
+	committed := f.Config
+	committed.Metadata = map[string]string{"host": "new.example.com"}
+	for i := 0; i < 3; i++ {
+		if err := m.CommitConfig(f.Service, committed); err != nil {
+			t.Fatal(err)
+		}
+	}
+	durable, err := readManifest(manifestPath(f.VMDir))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := m.CommitConfig(f.Service, durable.Config); err != nil {
+		t.Fatal(err)
+	}
+	if writes != 1 {
+		t.Fatalf("manifest written %d times, want once", writes)
+	}
+}
