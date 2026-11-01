@@ -559,6 +559,19 @@ func (a *Agent) tick(ctx context.Context) {
 	if err == nil {
 		a.forceReconcile = false
 	}
+	// Publish routes from the VMs that exist after this apply, whatever it
+	// returned. Deletes and replacements run even while other work is held
+	// or failing, and a route must never outlive its guest or point at an
+	// address another service now owns. An error here means the local routes
+	// were not applied, so the revision must not advance. (Peer-side failures
+	// degrade inside syncTraefikConfigs without surfacing here.)
+	traefikErr := a.syncTraefikConfigs(ctx, merged.Services)
+	if traefikErr != nil {
+		a.logger.Error("traefik route sync failed; not advancing revision", "error", traefikErr)
+		a.setStatusCondition("LocalRoutesReady", statusmodel.ConditionFalse, "local_route_sync_failed", traefikErr.Error())
+	} else {
+		a.setStatusCondition("LocalRoutesReady", statusmodel.ConditionTrue, "", "")
+	}
 	if err != nil && reconciler.OnlyRecoveryHeld(err) && a.vmManager.HasPendingRecovery() {
 		// Every hold was caused by unresolved VM ownership, which
 		// VMRecoveryReady reports as degradation and held services report as
@@ -607,19 +620,11 @@ func (a *Agent) tick(ctx context.Context) {
 	a.setStatusCondition("NetworkReady", statusmodel.ConditionTrue, "", "")
 	a.setStatusCondition("VMsReconciled", statusmodel.ConditionTrue, "", "")
 	a.setStatusCondition("Reconciled", statusmodel.ConditionTrue, "", "")
-
-	// Sync Traefik dynamic config files with desired services. An error here
-	// means the local routes were not applied and must not advance the
-	// revision: leaving lastRevision unchanged lets the next tick retry
-	// instead of treating the unchanged revision as applied. (Peer-side
-	// failures degrade inside syncTraefikConfigs without surfacing here.)
-	if err := a.syncTraefikConfigs(ctx, merged.Services); err != nil {
-		a.logger.Error("traefik route sync failed; not advancing revision", "error", err)
-		a.failAgentStatus("LocalRoutesReady", "local_route_sync_failed", err.Error())
+	if traefikErr != nil {
+		a.failAgentStatus("LocalRoutesReady", "local_route_sync_failed", traefikErr.Error())
 		a.syncRegistryAfterTick(ctx, nodeCap, used)
 		return
 	}
-	a.setStatusCondition("LocalRoutesReady", statusmodel.ConditionTrue, "", "")
 
 	// Update the last known revision on success.
 	if rev != "" {
@@ -979,9 +984,9 @@ func envKernelArg(key, value string) string {
 	return fmt.Sprintf("firework.env.%s=%s", key, value)
 }
 
-// syncTraefikConfigs writes or removes Traefik dynamic config files to match
-// desired local names using only running VM backends. Held updates keep their
-// actual hostname/backend until replacement; held creates publish no route.
+// syncTraefikConfigs writes or removes Traefik dynamic config files for the
+// desired local services, each from the configuration of the VM that owns its
+// backend (see selectLocalRoutes); a service without a VM publishes no route.
 // When the store implements NodeConfigLister,
 // peer node configs are also fetched so that remote services can be proxied.
 // No-op when Traefik management is disabled.

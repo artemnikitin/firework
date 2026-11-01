@@ -104,7 +104,16 @@ func TestUnchangedRevisionKeepsPublishedHostnameWithEnvironmentAndLinks(t *testi
 	}
 }
 
-func TestPublishedRoutingMetadataSurvivesHeldReplacementAndAgentRestart(t *testing.T) {
+// commitInPlace runs reconciliation, which records in-place changes such as a
+// hostname or health-check port on the running VM, as a full tick does.
+func commitInPlace(t *testing.T, a *Agent, desired config.ServiceConfig) {
+	t.Helper()
+	if err := a.reconciler.Reconcile(context.Background(), config.NodeConfig{Services: []config.ServiceConfig{desired}}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestCommittedRoutingMetadataSurvivesHeldReplacementAndAgentRestart(t *testing.T) {
 	for _, restart := range []bool{false, true} {
 		t.Run(fmt.Sprintf("restart=%t", restart), func(t *testing.T) {
 			routeDir := t.TempDir()
@@ -113,13 +122,18 @@ func TestPublishedRoutingMetadataSurvivesHeldReplacementAndAgentRestart(t *testi
 			desired := original
 			desired.Metadata = map[string]string{"host": "current.example.com"}
 			desired.HealthCheck = &config.HealthCheckConfig{Port: 90}
+			commitInPlace(t, a, desired)
+			if len(manager.startCalls) != 0 || len(manager.removeCalls) != 0 {
+				t.Fatalf("in-place change replaced the VM: starts=%v removes=%v", manager.startCalls, manager.removeCalls)
+			}
 			if err := a.syncTraefikConfigs(context.Background(), []config.ServiceConfig{desired}); err != nil {
 				t.Fatal(err)
 			}
 			requirePublishedRoute(t, routeDir, "current.example.com", "172.16.0.3:90")
 			if restart {
-				// Adoption reconstructs launch-time Config, not the routing-only update.
-				a, manager = routingPersistenceAgent(t, routeDir, original, "owner-old")
+				// Adoption reads the ownership manifest, which holds the
+				// committed configuration.
+				a, manager = routingPersistenceAgent(t, routeDir, manager.instances["app"].Config, "owner-old")
 			}
 			desired.Image = "/new"
 			holdRoutingReplacement(manager)
@@ -134,18 +148,19 @@ func TestPublishedRoutingMetadataSurvivesHeldReplacementAndAgentRestart(t *testi
 func TestDisabledHostnameStaysDisabledDuringHeldReplacementAfterRestart(t *testing.T) {
 	routeDir := t.TempDir()
 	original := routingPersistenceService()
-	a, _ := routingPersistenceAgent(t, routeDir, original, "owner-old")
+	a, manager := routingPersistenceAgent(t, routeDir, original, "owner-old")
 	if err := a.syncTraefikConfigs(context.Background(), []config.ServiceConfig{original}); err != nil {
 		t.Fatal(err)
 	}
 	requirePublishedRoute(t, routeDir, "original.example.com", "172.16.0.3:80")
 	desired := original
 	desired.Metadata = nil
+	commitInPlace(t, a, desired)
 	if err := a.syncTraefikConfigs(context.Background(), []config.ServiceConfig{desired}); err != nil {
 		t.Fatal(err)
 	}
 	requireNoPublishedRoute(t, routeDir)
-	a, manager := routingPersistenceAgent(t, routeDir, original, "owner-old")
+	a, manager = routingPersistenceAgent(t, routeDir, manager.instances["app"].Config, "owner-old")
 	holdRoutingReplacement(manager)
 	desired.Image = "/new"
 	if err := a.syncTraefikConfigs(context.Background(), []config.ServiceConfig{desired}); err != nil {
@@ -154,59 +169,25 @@ func TestDisabledHostnameStaysDisabledDuringHeldReplacementAfterRestart(t *testi
 	requireNoPublishedRoute(t, routeDir)
 }
 
-func TestReplacementRuntimeCannotInheritPreviousOwnersPublishedRoute(t *testing.T) {
+// A replacement VM publishes from its own configuration, never from a file an
+// earlier owner of the service left behind.
+func TestReplacementRuntimePublishesItsOwnConfiguration(t *testing.T) {
 	routeDir := t.TempDir()
 	original := routingPersistenceService()
 	a, _ := routingPersistenceAgent(t, routeDir, original, "owner-old")
-	desired := original
-	desired.Metadata = map[string]string{"host": "current.example.com"}
-	if err := a.syncTraefikConfigs(context.Background(), []config.ServiceConfig{desired}); err != nil {
+	if err := a.syncTraefikConfigs(context.Background(), []config.ServiceConfig{original}); err != nil {
 		t.Fatal(err)
 	}
-	requirePublishedRoute(t, routeDir, "current.example.com", "172.16.0.3:80")
+	requirePublishedRoute(t, routeDir, "original.example.com", "172.16.0.3:80")
 	replacement := original
 	replacement.Image = "/replacement"
 	replacement.Network = &config.NetworkConfig{GuestIP: "172.16.0.4"}
 	a, manager := routingPersistenceAgent(t, routeDir, replacement, "owner-new")
 	holdRoutingReplacement(manager)
-	if err := a.syncTraefikConfigs(context.Background(), []config.ServiceConfig{desired}); err != nil {
-		t.Fatal(err)
-	}
-	requireNoPublishedRoute(t, routeDir)
-}
-
-func TestFailedRoutePublicationPreservesLastSuccessfulProjectionAfterRestart(t *testing.T) {
-	routeDir := t.TempDir()
-	original := routingPersistenceService()
-	a, _ := routingPersistenceAgent(t, routeDir, original, "owner-old")
 	desired := original
-	desired.Metadata = map[string]string{"host": "current.example.com"}
-	desired.HealthCheck = &config.HealthCheckConfig{Port: 90}
+	desired.Image = "/next"
 	if err := a.syncTraefikConfigs(context.Background(), []config.ServiceConfig{desired}); err != nil {
 		t.Fatal(err)
 	}
-	requirePublishedRoute(t, routeDir, "current.example.com", "172.16.0.3:90")
-	// A file at the staging-directory path forces publication to fail even
-	// when tests run with privileges that bypass directory permission bits.
-	blocker := filepath.Join(routeDir, ".firework-traefik-stage")
-	if err := os.WriteFile(blocker, []byte("publication unavailable"), 0600); err != nil {
-		t.Fatal(err)
-	}
-	failed := desired
-	failed.Metadata = map[string]string{"host": "unpublished.example.com"}
-	failed.HealthCheck = &config.HealthCheckConfig{Port: 100}
-	if err := a.syncTraefikConfigs(context.Background(), []config.ServiceConfig{failed}); err == nil {
-		t.Fatal("publication unexpectedly succeeded with its staging directory blocked")
-	}
-	requirePublishedRoute(t, routeDir, "current.example.com", "172.16.0.3:90")
-	if err := os.Remove(blocker); err != nil {
-		t.Fatal(err)
-	}
-	a, manager := routingPersistenceAgent(t, routeDir, original, "owner-old")
-	holdRoutingReplacement(manager)
-	failed.Image = "/new"
-	if err := a.syncTraefikConfigs(context.Background(), []config.ServiceConfig{failed}); err != nil {
-		t.Fatal(err)
-	}
-	requirePublishedRoute(t, routeDir, "current.example.com", "172.16.0.3:90")
+	requirePublishedRoute(t, routeDir, "original.example.com", "172.16.0.4:80")
 }

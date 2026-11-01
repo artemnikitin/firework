@@ -116,6 +116,14 @@ func (m *recoveryTestVMManager) Start(_ context.Context, service config.ServiceC
 	return nil
 }
 
+// CommitConfig mirrors vm.Manager: in-place changes land on running VMs only.
+func (m *recoveryTestVMManager) CommitConfig(name string, service config.ServiceConfig) error {
+	if instance := m.instances[name]; instance != nil && instance.State == vm.StateRunning {
+		instance.Config = service
+	}
+	return nil
+}
+
 func (m *recoveryTestVMManager) Remove(service string) error {
 	m.removeCalls = append(m.removeCalls, service)
 	delete(m.instances, service)

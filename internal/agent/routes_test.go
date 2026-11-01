@@ -93,7 +93,7 @@ func TestRuntimeRoutesApplyUnheldHostnameAndHealthPortWithoutVMReplacement(t *te
 	a.reconciler = reconciler.New(manager, testLogger(), nil, nil, "", 0)
 	routeDir := t.TempDir()
 	a.traefikMgr = traefik.NewManager(routeDir, "", testLogger())
-	// A held update retains the projection actually published for this owner.
+	// A held update keeps the configuration the running VM already has.
 	if err := a.syncTraefikConfigs(context.Background(), []config.ServiceConfig{old}); err != nil {
 		t.Fatal(err)
 	}
@@ -105,6 +105,11 @@ func TestRuntimeRoutesApplyUnheldHostnameAndHealthPortWithoutVMReplacement(t *te
 			a.reconciler.SetHeldServices(map[string]reconciler.Hold{old.Name: {Reason: "capacity retained by another VM", Recovery: true}})
 		} else {
 			a.reconciler.SetHeldServices(nil)
+		}
+		// Reconciliation commits unheld in-place changes to the running VM.
+		_ = a.reconciler.Reconcile(context.Background(), config.NodeConfig{Services: []config.ServiceConfig{desired}})
+		if len(manager.startCalls) != 0 || len(manager.removeCalls) != 0 {
+			t.Fatalf("in-place change replaced the VM: starts=%v removes=%v", manager.startCalls, manager.removeCalls)
 		}
 		if err := a.syncTraefikConfigs(context.Background(), []config.ServiceConfig{desired}); err != nil {
 			t.Fatal(err)
@@ -123,22 +128,32 @@ func TestRuntimeRoutesApplyUnheldHostnameAndHealthPortWithoutVMReplacement(t *te
 	}
 }
 
-func TestUnchangedRevisionDoesNotRouteAbsentOrNonRunningGuests(t *testing.T) {
-	for _, state := range []vm.State{"absent", vm.StateStarting, vm.StateStartAborting, vm.StateStopping, vm.StateStopped, vm.StateFailed, vm.StateRecoveryPending} {
+// Routes come from the tracked VM's own configuration, whatever its state:
+// its guest address stays reserved, so the route cannot reach another guest.
+// Nothing is published without a VM, or from a VM whose configuration is
+// unknown.
+func TestUnchangedRevisionRoutesFromTrackedVMConfiguration(t *testing.T) {
+	for _, state := range []vm.State{"absent", "unknown", vm.StateStarting, vm.StateStartAborting, vm.StateStopping, vm.StateStopped, vm.StateFailed, vm.StateRecoveryPending, vm.StateRunning} {
 		t.Run(string(state), func(t *testing.T) {
 			store := &fakeStore{revision: "same", data: map[string][]byte{"web": []byte("node: web\nservices:\n- name: app\n  image: /image\n  kernel: /kernel\n  network:\n    guest_ip: 172.16.0.2\n  port_forwards:\n  - host_port: 8080\n    vm_port: 80\n  metadata:\n    host: app.example.com\n")}}
 			a := New(testAgentConfig(t), store, testLogger())
 			manager := &recoveryTestVMManager{instances: map[string]*vm.Instance{}}
-			if state != "absent" {
-				manager.instances["app"] = &vm.Instance{Name: "app", State: state, Config: config.ServiceConfig{Name: "app", Network: &config.NetworkConfig{GuestIP: "172.16.0.2"}}}
+			actual := config.ServiceConfig{Name: "app", Network: &config.NetworkConfig{GuestIP: "172.16.0.2"}, PortForwards: []config.PortForward{{HostPort: 8080, VMPort: 80}}, Metadata: map[string]string{"host": "app.example.com"}}
+			switch state {
+			case "absent":
+			case "unknown":
+				manager.instances["app"] = &vm.Instance{Name: "app", State: vm.StateRecoveryPending, RecoveryConfigUnknown: true, Config: actual}
+			default:
+				manager.instances["app"] = &vm.Instance{Name: "app", State: state, Config: actual}
 			}
 			a.reconciler = reconciler.New(manager, testLogger(), nil, nil, "", 0)
 			routeDir := t.TempDir()
 			a.traefikMgr = traefik.NewManager(routeDir, "", testLogger())
 			a.lastRevision = "same"
 			a.tick(context.Background())
-			if _, err := os.Stat(filepath.Join(routeDir, "app.yaml")); !os.IsNotExist(err) {
-				t.Fatalf("non-running service published its desired route: %v", err)
+			_, err := os.Stat(filepath.Join(routeDir, "app.yaml"))
+			if want := state != "absent" && state != "unknown"; want != (err == nil) {
+				t.Fatalf("route published=%v, want %v", err == nil, want)
 			}
 		})
 	}
@@ -177,7 +192,7 @@ func TestRoutePublicationSnapshotsRuntimeAfterPeerDiscovery(t *testing.T) {
 			changed := make(chan struct{})
 			go func() {
 				a.lifecycleMu.Lock()
-				manager.instances[service.Name].State = vm.StateRecoveryPending
+				delete(manager.instances, service.Name)
 				a.lifecycleMu.Unlock()
 				close(changed)
 			}()

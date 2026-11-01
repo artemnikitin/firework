@@ -428,18 +428,32 @@ Linux process inspection and TAP ownership in a disposable container. It also
 confirms that recreating a same-name TAP cannot reconnect an old descriptor.
 See its README for prerequisites and the simulated-VMM validation boundary.
 
-Local Traefik publication uses running VM configurations, not unfulfilled
-allocations in desired state. Held creates publish no local route; held updates
-keep the running guest's previous hostname and backend. Unheld hostname and
-health-check port edits can apply without VM replacement. Peer discovery runs
-outside the lifecycle lock; selecting and publishing the local snapshot is
+Local Traefik routes are published from the configuration of the VM that
+actually owns each desired service's backend, never from an allocation a hold may
+still prevent. Every tracked VM keeps its reserved guest address whatever its
+state, so its route cannot reach another guest; a VM whose configuration is
+unknown, and a service with no VM, publish nothing. Routes are synced after
+every reconciliation, whatever it returned, because deletes and replacements
+run even while other work is held or failing: a route never outlives its guest
+or points at an address another service now owns. The unchanged-revision path
+refreshes them on every poll as before.
+
+Changes that apply without replacing the VM, such as `metadata.host`,
+`metadata.subdomain` or a health-check port, are committed to the running
+instance and its ownership manifest during reconciliation unless the service is
+held. Routes, health restarts and adoption after an agent restart therefore use
+them from the VM's own configuration, and route files carry no extra state. A
+held update keeps the previous hostname and backend until its VM is replaced,
+but only while desired state does not give that hostname to another service,
+local or on a peer: the desired owner always wins, and the stale route is
+dropped instead of failing publication for every other service. Peer discovery
+runs outside the lifecycle lock; selecting and publishing the local snapshot is
 serialized with replacement and health restarts on both tick paths.
 
-Admission combines constraints conservatively. A physical capacity or address
-failure cannot be relabeled as a recovery-only hold. Post-recovery capacity
-attribution includes every desired service, even one already held during the
-current admission pass.
-
+Peers build their routes for a service from its desired host port. While that
+service's update is held on its owner node, the owner still forwards only the
+running VM's actual port, so peer routes to a changed host port fail until the
+update lands, as they do during any update window.
 
 Queued-unit absence checks read every `firework-vm-*` unit's state and
 `ExecStart` with one `systemctl show` call, which reaches systemd over its
@@ -451,19 +465,3 @@ still match; an unrelated argument containing the path only keeps the entry
 quarantined. A state path containing a line break, a potential owner without
 `ExecStart`, or a failed systemctl call leaves absence unproved and recovery
 pending.
-
-
-Published local routes include a versioned comment header binding their resolved
-hostname and backend port to the VM instance ID and guest IP. The header and
-Traefik document are staged and renamed together. During a held update, the
-agent reuses this last published projection, including after an agent restart;
-it does not reconstruct routing metadata from the guest's launch configuration.
-A successfully disabled hostname is an owner-bound empty HTTP document, so a
-later hold cannot resurrect it. Per-file records reflect partial batch writes
-without a separate queue or second-file commit.
-
-A held service with no valid record for the current instance/address publishes
-no route. This includes legacy files without owner headers; an unheld sync
-refreshes them. Replacement VMs cannot inherit an earlier owner's projection.
-The unchanged-revision path performs the same link/environment normalization
-before comparing its desired configuration with the running VM.

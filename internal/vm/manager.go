@@ -11,6 +11,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"reflect"
 	"sort"
 	"strings"
 	"sync"
@@ -346,6 +347,36 @@ func (m *Manager) List() map[string]*Instance {
 		result[k] = &cp
 	}
 	return result
+}
+
+// CommitConfig records configuration that changes without replacing the VM,
+// such as routing metadata or a health-check port, on a running instance and
+// its ownership manifest. Routes and health restarts then use it, including
+// after an agent restart. The caller has established that every field that
+// requires a new VM already matches. The manifest is updated in place, so
+// every holder of it, such as an in-flight stop, writes the committed config.
+func (m *Manager) CommitConfig(name string, svc config.ServiceConfig) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	inst := m.instances[name]
+	if inst == nil || inst.State != StateRunning || inst.manifest == nil || svc.Name != name {
+		return nil // Ownership changed; the next reconciliation decides again.
+	}
+	if reflect.DeepEqual(inst.Config, svc) {
+		return nil
+	}
+	hash, err := serviceConfigHash(svc)
+	if err != nil {
+		return err
+	}
+	next := cloneInstanceManifest(inst.manifest)
+	next.Config, next.ConfigHash = svc, hash
+	if err := m.writeRecoveryManifest(manifestPath(next.VMDir), next); err != nil {
+		return err
+	}
+	inst.manifest.Config, inst.manifest.ConfigHash = svc, hash
+	inst.Config = svc
+	return nil
 }
 
 // Start launches a new Firecracker microVM for the given service config.

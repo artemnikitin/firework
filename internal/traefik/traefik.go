@@ -109,7 +109,7 @@ func (m *Manager) renderLocal(services []config.ServiceConfig) (map[string][]byt
 		if svc.Network == nil || svc.Network.GuestIP == "" {
 			return nil, nil, fmt.Errorf("service %s requests routing (host %q) but has no resolved guest network", svc.Name, host)
 		}
-		port := backendPort(svc)
+		port := BackendPort(svc)
 		if port == 0 {
 			return nil, nil, fmt.Errorf("service %s requests routing (host %q) but has no usable backend port", svc.Name, host)
 		}
@@ -302,9 +302,9 @@ func marshalConfig(name, host, guestIP string, port int) ([]byte, error) {
 	return yaml.Marshal(cfg)
 }
 
-// backendPort returns the VM-side port Traefik should proxy to.
+// BackendPort returns the VM-side port Traefik should proxy to.
 // Prefers the first port forward's VM port; falls back to the health check port.
-func backendPort(svc config.ServiceConfig) int {
+func BackendPort(svc config.ServiceConfig) int {
 	if len(svc.PortForwards) > 0 {
 		return svc.PortForwards[0].VMPort
 	}
