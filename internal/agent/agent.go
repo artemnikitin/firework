@@ -543,11 +543,15 @@ func (a *Agent) tick(ctx context.Context) {
 	// Reconcile desired vs actual state.
 	reconcileStart := time.Now()
 	// Serialize only Recover/Plan/Apply with health-driven Stop/Start, so a
-	// restart never waits behind config fetch, image sync or route refresh.
-	// assignNetworking already reserved addresses of every tracked VM,
-	// including one between a restart's Stop and Start.
+	// restart never waits behind config fetch, image sync, route refresh or
+	// the pauses of a rolling update. assignNetworking already reserved
+	// addresses of every tracked VM, including one between a restart's Stop
+	// and Start.
 	a.lifecycleMu.Lock()
-	err := a.reconciler.Reconcile(ctx, *merged)
+	err := a.reconciler.Reconcile(reconciler.WithPauseRelease(ctx, func() func() {
+		a.lifecycleMu.Unlock()
+		return a.lifecycleMu.Lock
+	}), *merged)
 	a.lifecycleMu.Unlock()
 	a.metrics.observeReconcile(time.Since(reconcileStart), err != nil)
 	if err == nil {

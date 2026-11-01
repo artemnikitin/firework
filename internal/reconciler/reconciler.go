@@ -684,6 +684,12 @@ func (r *Reconciler) applyRolling(ctx context.Context, actions []Action) error {
 			errs = append(errs, hold.err(action.Service.Name))
 			continue
 		}
+		// A health restart may have run during an earlier pause. Replace only
+		// a VM that still needs this update; a service it left without a VM
+		// is recreated by the reconciliation that restart forces.
+		if instance := r.vmManager.List()[action.Service.Name]; instance == nil || !needsUpdate(instance, action.Service) {
+			continue
+		}
 		r.logger.Info("updating service (stop + start)", "service", action.Service.Name)
 		rejections, err := r.preflight(ctx, action.Service)
 		if err != nil {
@@ -711,7 +717,7 @@ func (r *Reconciler) applyRolling(ctx context.Context, actions []Action) error {
 
 		// Sleep between updates, but not after the last one.
 		if i < len(updates)-1 && r.updateDelay > 0 {
-			if err := r.sleepFn(ctx, r.updateDelay); err != nil {
+			if err := r.pause(ctx); err != nil {
 				return stageError(FailureStageVM, fmt.Errorf("rolling update interrupted: %w", err))
 			}
 		}
@@ -788,6 +794,25 @@ func clampRejected(svc *config.ServiceConfig, rejections []volume.Rejection) boo
 		clamped = true
 	}
 	return clamped
+}
+
+type pauseReleaseKey struct{}
+
+// WithPauseRelease returns a context whose rolling-update pauses call release
+// before sleeping and the function it returns afterwards. A caller that
+// serializes reconciliation with health-driven restarts releases its lock this
+// way, so a restart waits for at most one update rather than the whole
+// rollout. Each update re-checks its hold and target after the pause.
+func WithPauseRelease(ctx context.Context, release func() (reacquire func())) context.Context {
+	return context.WithValue(ctx, pauseReleaseKey{}, release)
+}
+
+func (r *Reconciler) pause(ctx context.Context) error {
+	if release, ok := ctx.Value(pauseReleaseKey{}).(func() func()); ok && release != nil {
+		reacquire := release()
+		defer reacquire()
+	}
+	return r.sleepFn(ctx, r.updateDelay)
 }
 
 // Reconcile is a convenience method that plans and applies in one step.

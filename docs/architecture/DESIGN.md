@@ -424,8 +424,12 @@ retained:
 Running guests retain their assigned addresses after a survivor clears.
 
 Each tick's Recover/Plan/Apply section and health-driven Stop/Start transactions
-are serialized; config fetch, image sync and route refresh do not delay a
-restart. A failed
+are serialized; config fetch, image sync, route refresh and the pauses between
+rolling updates do not delay a restart. Each rolling update re-checks its hold
+and target after a pause, so a restart that ran meanwhile is neither undone nor
+repeated. A health restart of an existing VM reuses its prepared volumes and
+never runs mkfs or resize2fs; creating a new service's volume inside a tick can
+still delay a restart by that preparation. A failed
 start-time cleanup retains retryable quarantine instead of dropping the previous
 instance. A health restart whose Start fails later forces the next tick to
 reconcile, so an unchanged revision still recreates the service. Confirmed exited systemd owners use their unit's terminal state for
