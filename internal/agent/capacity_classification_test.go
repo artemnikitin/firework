@@ -142,4 +142,3 @@ func TestAddressKeptByUndesiredVMIsNotANodeFailure(t *testing.T) {
 		})
 	}
 }
-
