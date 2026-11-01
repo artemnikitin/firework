@@ -373,9 +373,11 @@ func (m *Manager) CommitConfig(name string, svc config.ServiceConfig) error {
 	next.Config, next.ConfigHash = svc, hash
 	if err := m.writeRecoveryManifest(manifestPath(next.VMDir), next); err != nil {
 		// The rename can land before a later step, such as the directory
-		// sync, fails. Memory must describe what is durable, so take the new
-		// config only if the manifest on disk already has it. Either way the
-		// next reconciliation compares again and retries.
+		// sync, fails. Memory must match the manifest every later identity
+		// check reads, so take the new config only if that manifest already
+		// has it. The rename may then not survive a host crash, which also
+		// ends the VM; adoption after it reads whichever manifest remained,
+		// and reconciliation commits the change again.
 		if durable, readErr := readManifest(manifestPath(next.VMDir)); readErr == nil &&
 			durable.InstanceID == next.InstanceID && durable.ConfigHash == hash {
 			inst.manifest.Config, inst.manifest.ConfigHash = svc, hash
