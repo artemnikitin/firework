@@ -33,9 +33,8 @@ func (m *Manager) Recover(ctx context.Context, desired config.NodeConfig) ([]str
 		// durable state it never got to inspect.
 		return nil, fmt.Errorf("read VM state directory: %w", err)
 	}
-	if errors.Is(err, os.ErrNotExist) {
-		return nil, nil
-	}
+	// A missing root lists nothing, but quarantines held in memory still need
+	// their absence proved, so fall through with no entries.
 	m.inventoryRecoveryEntries(root, entries)
 	// Visit every listed entry and every quarantined name. A quarantine whose
 	// directory disappeared (removed by an operator, or listed by an inventory

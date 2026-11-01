@@ -72,3 +72,33 @@ func TestRecoverRetriesQuarantineWhoseDirectoryWasRemoved(t *testing.T) {
 		t.Fatalf("missing-directory quarantine was not retried: %s %s", got.State, got.LastError)
 	}
 }
+
+// Removing the whole vms directory leaves only in-memory quarantines. They are
+// still retried and cleared once their absence is proved.
+func TestRecoverRetriesQuarantineWhenStateRootIsRemoved(t *testing.T) {
+	m, f, inspector := recoveryFixture(t)
+	m.inspector = inspector
+	inspector.errors[f.PID] = errors.New("transient inspection failure")
+	if _, err := m.Recover(context.Background(), config.NodeConfig{}); err != nil {
+		t.Fatal(err)
+	}
+	if got := m.List()[f.Service]; got == nil || got.State != StateRecoveryPending {
+		t.Fatalf("setup: not quarantined: %#v", got)
+	}
+	delete(inspector.errors, f.PID)
+	delete(inspector.identities, f.PID)
+	if err := os.RemoveAll(filepath.Join(m.stateDir, "vms")); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 3; i++ {
+		if err := m.DiscoverRecoveryState(); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := m.Recover(context.Background(), config.NodeConfig{}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if got := m.List()[f.Service]; got != nil {
+		t.Fatalf("quarantine survived removal of the vms directory: %s %s", got.State, got.LastError)
+	}
+}

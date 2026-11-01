@@ -22,6 +22,12 @@ type recoveryEntrySnapshot struct {
 func snapshotRecoveryEntry(vmDir string) (recoveryEntrySnapshot, error) {
 	var snapshot recoveryEntrySnapshot
 	parent, err := os.Lstat(filepath.Dir(vmDir))
+	if errors.Is(err, os.ErrNotExist) {
+		// Without the vms root there is no entry either; absence is still
+		// proved from the canonical paths before anything is cleared.
+		snapshot.kind = "missing"
+		return snapshot, nil
+	}
 	if err != nil {
 		return snapshot, fmt.Errorf("inspect VM state directory %s: %w", filepath.Dir(vmDir), err)
 	}
