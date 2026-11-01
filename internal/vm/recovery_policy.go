@@ -2,7 +2,6 @@ package vm
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -68,6 +67,13 @@ func (m *Manager) recoverySystemctl() string {
 // Firecracker for these paths. A queued --no-block unit has no process for the
 // claimant scan to find, and untrusted metadata may not name its unit. Hosts
 // whose agent cannot create system units and whose record names no unit skip it.
+//
+// One systemctl call reads every unit's ExecStart. systemctl renders argv
+// joined by spaces without quoting, so the canonical paths are matched as
+// substrings of a potential owner's whole property block: a path containing
+// whitespace or separators still matches, and an unrelated argument that
+// happens to contain a path only keeps the entry quarantined. systemctl reaches
+// systemd over its private socket as root, so no D-Bus daemon is required.
 func (m *Manager) noClaimingUnitContext(ctx context.Context, f *instanceManifest) error {
 	if _, ok := m.launcher.(*systemdLauncher); !ok && f.Launcher != "systemd" {
 		return nil
@@ -78,10 +84,13 @@ func (m *Manager) noClaimingUnitContext(ctx context.Context, f *instanceManifest
 	if run == nil {
 		run = commandOutput
 	}
-	out, err := run(ctx, m.recoverySystemctl(), "show", "firework-vm-*.service", "--property=Id,ActiveState,MainPID,Job")
+	out, err := run(ctx, m.recoverySystemctl(), "show", "firework-vm-*.service", "--property=Id,ActiveState,MainPID,Job,ExecStart")
 	if err != nil {
 		return fmt.Errorf("inspect systemd launches: %w", err)
 	}
+	// A blank line separates units, so a path containing one could split a
+	// unit's ExecStart from its state. Such paths fail closed.
+	ambiguousPaths := strings.ContainsAny(f.SocketPath+f.ConfigPath, "\r\n")
 	for _, block := range strings.Split(string(out), "\n\n") {
 		fields := parseUnitProperties(block)
 		if fields["Id"] == "" {
@@ -91,60 +100,17 @@ func (m *Manager) noClaimingUnitContext(ctx context.Context, f *instanceManifest
 		if inactive && (fields["MainPID"] == "" || fields["MainPID"] == "0") && fields["Job"] == "" {
 			continue
 		}
-		commands, err := recoveryUnitArguments(ctx, run, fields["Id"])
-		if err != nil {
-			return fmt.Errorf("inspect systemd unit %s arguments: %w", fields["Id"], err)
+		if ambiguousPaths {
+			return fmt.Errorf("systemd unit %s may still run this service's VM: its state path contains a line break", fields["Id"])
 		}
-		for _, args := range commands {
-			if hasExactArgument(args, "--api-sock", f.SocketPath) || hasExactArgument(args, "--config-file", f.ConfigPath) {
-				return fmt.Errorf("systemd unit %s may still run this service's VM", fields["Id"])
-			}
+		if !strings.Contains(block, "ExecStart=") {
+			return fmt.Errorf("systemd unit %s reported no ExecStart", fields["Id"])
+		}
+		if (f.SocketPath != "" && strings.Contains(block, f.SocketPath)) || (f.ConfigPath != "" && strings.Contains(block, f.ConfigPath)) {
+			return fmt.Errorf("systemd unit %s may still run this service's VM", fields["Id"])
 		}
 	}
 	return nil
-}
-
-// recoveryUnitArguments reads the typed D-Bus ExecStart property. systemctl's
-// human rendering joins arguments with spaces and cannot distinguish a path
-// containing whitespace from several arguments. busctl JSON retains the
-// original argument array, including whitespace, quotes and backslashes.
-func recoveryUnitArguments(ctx context.Context, run func(context.Context, string, ...string) ([]byte, error), unit string) ([][]string, error) {
-	out, err := run(ctx, "busctl", "--json=short", "call", "org.freedesktop.systemd1", "/org/freedesktop/systemd1", "org.freedesktop.systemd1.Manager", "GetUnit", "s", unit)
-	if err != nil {
-		return nil, fmt.Errorf("get unit object: %w", err)
-	}
-	var property struct {
-		Type string            `json:"type"`
-		Data []json.RawMessage `json:"data"`
-	}
-	if err := json.Unmarshal(out, &property); err != nil || property.Type != "o" || len(property.Data) != 1 {
-		return nil, fmt.Errorf("invalid systemd unit object response")
-	}
-	var path string
-	if err := json.Unmarshal(property.Data[0], &path); err != nil || !strings.HasPrefix(path, "/org/freedesktop/systemd1/unit/") {
-		return nil, fmt.Errorf("invalid systemd unit object path")
-	}
-	out, err = run(ctx, "busctl", "--json=short", "get-property", "org.freedesktop.systemd1", path, "org.freedesktop.systemd1.Service", "ExecStart")
-	if err != nil {
-		return nil, fmt.Errorf("get ExecStart property: %w", err)
-	}
-	property.Data = nil
-	if err := json.Unmarshal(out, &property); err != nil || property.Type != "a(sasbttttuii)" || len(property.Data) == 0 {
-		return nil, fmt.Errorf("invalid systemd ExecStart response")
-	}
-	commands := make([][]string, 0, len(property.Data))
-	for _, raw := range property.Data {
-		var command []json.RawMessage
-		if err := json.Unmarshal(raw, &command); err != nil || len(command) != 10 {
-			return nil, fmt.Errorf("invalid systemd ExecStart command")
-		}
-		var args []string
-		if err := json.Unmarshal(command[1], &args); err != nil || len(args) == 0 {
-			return nil, fmt.Errorf("invalid systemd ExecStart argument array")
-		}
-		commands = append(commands, args)
-	}
-	return commands, nil
 }
 
 func commandOutput(ctx context.Context, name string, args ...string) ([]byte, error) {

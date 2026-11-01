@@ -2,9 +2,7 @@ package vm
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
-	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -193,72 +191,48 @@ func withoutSystemdLaunches(m *Manager) {
 	m.recoveryCommandOutput = func(context.Context, string, ...string) ([]byte, error) { return nil, nil }
 }
 
+// systemdShowBlock renders one unit the way systemd 257 prints it for
+// "systemctl show --property=Id,ActiveState,MainPID,Job,ExecStart": properties
+// in unit order, argv joined by spaces without quoting.
+func systemdShowBlock(id, state, pid, job string, argv []string) string {
+	execStart := ""
+	if argv != nil {
+		execStart = "ExecStart={ path=" + argv[0] + " ; argv[]=" + strings.Join(argv, " ") + " ; ignore_errors=no ; start_time=[n/a] ; stop_time=[n/a] ; pid=0 ; code=(null) ; status=0/0 }\n"
+	}
+	return "MainPID=" + pid + "\n" + execStart + "Id=" + id + "\nActiveState=" + state + "\nJob=" + job + "\n"
+}
+
 func TestSystemdLaunchScanFindsQueuedAndLiveClaimants(t *testing.T) {
-	for _, path := range []string{"/var/lib/fw/vms/app", "/var/lib/fw state/vms/app", "/var/lib/fw\tstate/vms/app", "/var/lib/fw\nstate/vms/app", `/var/lib/fw"state/vms/app`, `/var/lib/fw\state/vms/app`, "/var/lib/fw ; argv[]=state/vms/app"} {
+	for _, path := range []string{"/var/lib/fw/vms/app", "/var/lib/fw state/vms/app", "/var/lib/fw\tstate/vms/app", `/var/lib/fw"state/vms/app`, `/var/lib/fw\state/vms/app`, "/var/lib/fw ; argv[]=state/vms/app", "/var/lib/fw'state/vms/app"} {
 		t.Run(path, func(t *testing.T) {
 			socket, config := path+"/firecracker.sock", path+"/vm-config.json"
-			type unit struct {
-				id, state, pid, job string
-				argv                []string
-			}
-			own := unit{"firework-vm-x.service", "active", "77", "", []string{"/bin/fc", "--id", "x", "--api-sock", socket, "--config-file", config}}
-			other := unit{"firework-vm-y.service", "active", "78", "", []string{"/bin/fc", "--api-sock", "/other/firecracker.sock"}}
-			queued := own
-			queued.state = "inactive"
-			queued.pid = "0"
-			queued.job = "145"
-			terminal := own
-			terminal.state = "inactive"
-			terminal.pid = "0"
-			failed := terminal
-			failed.state = "failed"
-			deactivating := own
-			deactivating.state = "deactivating"
-			equals := own
-			equals.argv = []string{"/bin/fc", "--api-sock=" + socket}
+			own := []string{"/bin/fc", "--id", "x", "--api-sock", socket, "--config-file", config}
+			other := systemdShowBlock("firework-vm-y.service", "active", "78", "", []string{"/bin/fc", "--api-sock", "/other/firecracker.sock"})
 			for _, tc := range []struct {
 				name   string
-				units  []unit
+				units  []string
 				claims bool
 			}{
-				{"queued start job", []unit{queued}, true}, {"active", []unit{own}, true}, {"deactivating", []unit{deactivating}, true}, {"equals form", []unit{equals}, true},
-				{"inactive without job", []unit{terminal}, false}, {"failed without job", []unit{failed}, false}, {"other service", []unit{other}, false}, {"second unit queued", []unit{other, queued}, true}, {"no units", nil, false},
+				{"queued start job", []string{systemdShowBlock("firework-vm-x.service", "inactive", "0", "145", own)}, true},
+				{"active", []string{systemdShowBlock("firework-vm-x.service", "active", "77", "", own)}, true},
+				{"activating", []string{systemdShowBlock("firework-vm-x.service", "activating", "0", "", own)}, true},
+				{"deactivating", []string{systemdShowBlock("firework-vm-x.service", "deactivating", "77", "", own)}, true},
+				{"equals form", []string{systemdShowBlock("firework-vm-x.service", "active", "77", "", []string{"/bin/fc", "--api-sock=" + socket})}, true},
+				{"config path only", []string{systemdShowBlock("firework-vm-x.service", "active", "77", "", []string{"/bin/fc", "--config-file", config})}, true},
+				{"inactive without job", []string{systemdShowBlock("firework-vm-x.service", "inactive", "0", "", own)}, false},
+				{"failed without job", []string{systemdShowBlock("firework-vm-x.service", "failed", "0", "", own)}, false},
+				{"other service", []string{other}, false},
+				{"second unit queued", []string{other, systemdShowBlock("firework-vm-x.service", "inactive", "0", "9", own)}, true},
+				{"no units", nil, false},
 			} {
 				t.Run(tc.name, func(t *testing.T) {
 					m, _, _ := recoveryFixture(t)
 					m.launcher = &systemdLauncher{systemctl: "/usr/bin/systemctl"}
 					m.recoveryCommandOutput = func(_ context.Context, name string, args ...string) ([]byte, error) {
-						if name == "/usr/bin/systemctl" {
-							if len(args) != 3 || args[0] != "show" || args[1] != "firework-vm-*.service" || args[2] != "--property=Id,ActiveState,MainPID,Job" {
-								t.Fatalf("unexpected launch query: %s %v", name, args)
-							}
-							var out string
-							for _, u := range tc.units {
-								out += fmt.Sprintf("Id=%s\nActiveState=%s\nMainPID=%s\nJob=%s\n\n", u.id, u.state, u.pid, u.job)
-							}
-							return []byte(out), nil
+						if name != "/usr/bin/systemctl" || strings.Join(args, " ") != "show firework-vm-*.service --property=Id,ActiveState,MainPID,Job,ExecStart" {
+							t.Fatalf("unexpected launch query: %s %v", name, args)
 						}
-						if name != "busctl" || len(args) < 3 || args[0] != "--json=short" {
-							t.Fatalf("unexpected argument query: %s %v", name, args)
-						}
-						if args[1] == "call" {
-							for index, u := range tc.units {
-								if args[len(args)-1] == u.id {
-									out, _ := json.Marshal(map[string]any{"type": "o", "data": []string{fmt.Sprintf("/org/freedesktop/systemd1/unit/test%d", index)}})
-									return out, nil
-								}
-							}
-						}
-						if args[1] == "get-property" {
-							for index, u := range tc.units {
-								if args[3] == fmt.Sprintf("/org/freedesktop/systemd1/unit/test%d", index) {
-									out, _ := json.Marshal(map[string]any{"type": "a(sasbttttuii)", "data": []any{[]any{"/bin/fc", u.argv, false, 0, 0, 0, 0, 0, 0, 0}}})
-									return out, nil
-								}
-							}
-						}
-						t.Fatalf("unexpected argument query: %s %v", name, args)
-						return nil, nil
+						return []byte(strings.Join(tc.units, "\n")), nil
 					}
 					err := m.noClaimingUnitContext(context.Background(), &instanceManifest{SocketPath: socket, ConfigPath: config})
 					if (err != nil) != tc.claims {
@@ -270,42 +244,29 @@ func TestSystemdLaunchScanFindsQueuedAndLiveClaimants(t *testing.T) {
 	}
 }
 
-func TestSystemdLaunchScanFailsClosedOnUnreadableArguments(t *testing.T) {
+func TestSystemdLaunchScanFailsClosed(t *testing.T) {
+	own := []string{"/bin/fc", "--api-sock", "/a/firecracker.sock"}
 	for _, tc := range []struct {
-		name, object, property string
-		failure                bool
+		name   string
+		output string
+		err    error
+		probe  *instanceManifest
 	}{
-		{name: "busctl unavailable", failure: true},
-		{name: "malformed object", object: "{"},
-		{name: "wrong object type", object: `{"type":"s","data":["/org/freedesktop/systemd1/unit/x"]}`},
-		{name: "missing object", object: `{"type":"o","data":[]}`},
-		{name: "invalid object path", object: `{"type":"o","data":["/elsewhere"]}`},
-		{name: "malformed property", property: "{"},
-		{name: "wrong property type", property: `{"type":"s","data":["fc --api-sock /other"]}`},
-		{name: "empty command array", property: `{"type":"a(sasbttttuii)","data":[]}`},
-		{name: "malformed command", property: `{"type":"a(sasbttttuii)","data":[["/fc",["/fc"]]]}`},
-		{name: "flattened arguments", property: `{"type":"a(sasbttttuii)","data":[["/fc","/fc --api-sock /other",false,0,0,0,0,0,0,0]]}`},
+		{name: "systemctl unavailable", err: errors.New("systemctl failed")},
+		{name: "potential owner without ExecStart", output: systemdShowBlock("firework-vm-x.service", "activating", "0", "", nil)},
+		{name: "line break in state path", output: systemdShowBlock("firework-vm-y.service", "active", "78", "", own),
+			probe: &instanceManifest{SocketPath: "/var/lib/fw\nstate/vms/app/firecracker.sock", ConfigPath: "/var/lib/fw\nstate/vms/app/vm-config.json"}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			m, _, _ := recoveryFixture(t)
 			m.launcher = &systemdLauncher{systemctl: "systemctl"}
-			m.recoveryCommandOutput = func(_ context.Context, name string, args ...string) ([]byte, error) {
-				if name == "systemctl" {
-					return []byte("Id=firework-vm-x.service\nActiveState=inactive\nMainPID=0\nJob=145\n"), nil
-				}
-				if tc.failure {
-					return nil, errors.New("busctl unavailable")
-				}
-				if args[1] == "call" {
-					if tc.object != "" {
-						return []byte(tc.object), nil
-					}
-					return []byte(`{"type":"o","data":["/org/freedesktop/systemd1/unit/x"]}`), nil
-				}
-				return []byte(tc.property), nil
+			m.recoveryCommandOutput = func(context.Context, string, ...string) ([]byte, error) { return []byte(tc.output), tc.err }
+			probe := tc.probe
+			if probe == nil {
+				probe = &instanceManifest{SocketPath: "/b/firecracker.sock", ConfigPath: "/b/vm-config.json"}
 			}
-			if err := m.noClaimingUnitContext(context.Background(), &instanceManifest{SocketPath: "/a", ConfigPath: "/b"}); err == nil {
-				t.Fatal("unreadable unit arguments authorized absence")
+			if err := m.noClaimingUnitContext(context.Background(), probe); err == nil {
+				t.Fatal("unreadable launch state authorized absence")
 			}
 		})
 	}

@@ -436,12 +436,16 @@ attribution includes every desired service, even one already held during the
 current admission pass.
 
 
-Queued-unit absence checks read typed `ExecStart` argument arrays through
-`busctl --json=short`; they do not split `systemctl`'s human-readable command
-line. This requires JSON-capable busctl (systemd 240 or newer) on systemd hosts.
-Missing busctl or an unreadable/malformed D-Bus response leaves absence unproved
-and recovery pending. Whitespace, quotes and backslashes in state paths preserve
-their original argument boundaries.
+Queued-unit absence checks read every `firework-vm-*` unit's state and
+`ExecStart` with one `systemctl show` call, which reaches systemd over its
+private socket as root and needs no D-Bus daemon. systemctl prints argv joined
+by spaces without quoting, so a unit that is not inactive, or has a queued job,
+is treated as a potential owner whenever either canonical path appears anywhere
+in its properties. Whitespace, quotes and separators in state paths therefore
+still match; an unrelated argument containing the path only keeps the entry
+quarantined. A state path containing a line break, a potential owner without
+`ExecStart`, or a failed systemctl call leaves absence unproved and recovery
+pending.
 
 
 Published local routes include a versioned comment header binding their resolved

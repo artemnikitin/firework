@@ -302,3 +302,41 @@ func testSystemdQueuedUnitBlocksUntrustedCleanup(t *testing.T, pathSuffix string
 	}
 	t.Log("queued systemd launch blocked untrusted cleanup until it was gone")
 }
+
+// Absence proofs must not depend on the D-Bus system bus: systemctl and
+// systemd-run reach systemd over its private socket as root. With dbus
+// stopped and an unrelated Firework unit active, an orphaned directory is
+// still proven absent and cleared.
+func TestSystemdIntegrationAbsenceProofWithoutDBus(t *testing.T) {
+	if os.Getenv("FIREWORK_REAL_SYSTEMD") != "1" {
+		t.Skip("requires isolated real systemd")
+	}
+	if out, err := exec.Command("systemctl", "stop", "dbus.socket", "dbus.service").CombinedOutput(); err != nil {
+		t.Fatalf("stop dbus: %v %s", err, out)
+	}
+	t.Cleanup(func() { _ = exec.Command("systemctl", "start", "dbus.socket").Run() })
+	root := t.TempDir()
+	m := NewManager("/bin/sh", root, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	if _, ok := m.launcher.(*systemdLauncher); !ok {
+		t.Fatalf("not using real systemd: %T", m.launcher)
+	}
+	unit := fmt.Sprintf("firework-vm-nodbus%d.service", time.Now().UnixNano())
+	defer exec.Command("systemctl", "stop", unit).Run()
+	if out, err := exec.Command("systemd-run", "--unit="+unit, "--service-type=exec", "--collect",
+		"--", "/bin/sh", "-c", "sleep 300", "fc", "--api-sock", "/other/firecracker.sock").CombinedOutput(); err != nil {
+		t.Fatalf("systemd-run without dbus: %v %s", err, out)
+	}
+	vmDir := filepath.Join(root, "vms", "orphan")
+	if err := os.MkdirAll(vmDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := m.Recover(context.Background(), config.NodeConfig{}); err != nil {
+		t.Fatal(err)
+	}
+	if got := m.List()["orphan"]; got != nil {
+		t.Fatalf("orphan stayed %s without dbus: %s", got.State, got.LastError)
+	}
+	if _, err := os.Stat(vmDir); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("orphan state was not removed: %v", err)
+	}
+}

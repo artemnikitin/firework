@@ -148,9 +148,16 @@ func TestUntrustedRecoveryWaitsForQueuedSystemdLaunch(t *testing.T) {
 	if err := os.WriteFile(manifestPath(f.VMDir), []byte("{"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	queued := "Id=firework-vm-lost.service\nActiveState=inactive\nMainPID=0\nJob=145\nExecStart={ path=/fc ; argv[]=/fc --id lost --api-sock " + f.SocketPath + " ; ignore_errors=no }\n"
-	units := queued
-	m.recoveryCommandOutput = func(context.Context, string, ...string) ([]byte, error) { return []byte(units), nil }
+	units := systemdShowBlock("firework-vm-lost.service", "inactive", "0", "145", []string{"/fc", "--id", "lost", "--api-sock", f.SocketPath})
+	m.recoveryCommandOutput = func(_ context.Context, name string, args ...string) ([]byte, error) {
+		if name != "systemctl" || len(args) == 0 || args[0] != "show" {
+			t.Fatalf("unexpected systemd query: %s %v", name, args)
+		}
+		if args[1] == "firework-vm-*.service" {
+			return []byte(units), nil
+		}
+		return []byte("LoadState=not-found\nActiveState=inactive\nMainPID=0\nJob=\n"), nil
+	}
 	if _, err := m.Recover(context.Background(), config.NodeConfig{}); err != nil {
 		t.Fatal(err)
 	}
