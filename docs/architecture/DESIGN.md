@@ -394,7 +394,12 @@ allocations (creates and updates) until its record is forgotten or replaced by
 a trusted one. Deletes still proceed, but leave their host cleanup in the
 journal until then. Running services that need no change keep their networking, health
 checks and port forwards. Conflicting desired services are
-held with `resource_held`; independent actions continue. When every hold was
+held with `resource_held`; independent actions continue. A running VM whose
+update is held keeps its actual guest IP, MAC, host ports and devices, and its
+DNAT rules are re-asserted every tick; other services that need any of those
+claims are held too. A new service also waits while a running VM still uses one
+of its claims, for example until a later rolling update moves that VM off the
+port. When every hold was
 caused by unresolved VM ownership (unknown claims, a resource retained by a
 `recovery_pending` owner, or capacity that its resolution would free), the agent
 applies the revision with those holds and reports `VMRecoveryReady=False`, so

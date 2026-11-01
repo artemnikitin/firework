@@ -79,57 +79,80 @@ func (r *Reconciler) HeldServices(desired config.NodeConfig) map[string]string {
 }
 
 func (r *Reconciler) holds(desired config.NodeConfig) map[string]Hold {
-	held := make(map[string]Hold)
-	retained := r.retainedInstances()
 	actual := r.vmManager.List()
-	unknown := unknownRuntimeOwner(actual)
 	r.heldMu.RLock()
-	capacityHolds := maps.Clone(r.heldServices)
+	external := maps.Clone(r.heldServices)
 	r.heldMu.RUnlock()
-	for _, service := range desired.Services {
-		// Independent admission failures remain blockers even when another VM's
-		// unknown claims or this service's quarantine also prevent its update.
-		if hold, ok := capacityHolds[service.Name]; ok && !hold.Recovery {
-			held[service.Name] = hold
-			continue
-		}
-		if instance := actual[service.Name]; instance != nil && instance.State == vm.StateRecoveryPending {
-			continue // Its quarantine already reports why no desired work applies.
-		}
-		if unknown != "" {
-			// Unknown claims can collide only with new allocations. A running
-			// service that needs no change keeps its network, health and
-			// port forwards.
-			if instance := actual[service.Name]; instance == nil || needsUpdate(instance, service) {
-				held[service.Name] = Hold{Reason: "runtime resource claims are unknown for " + unknown, Recovery: true}
-			}
-			continue
-		}
-		if instance := actual[service.Name]; instance != nil && retainsRuntime(instance.State) && instance.State != vm.StateRecoveryPending {
-			held[service.Name] = Hold{Reason: "runtime lifecycle is in progress"}
-			continue
-		}
-		if hold, ok := capacityHolds[service.Name]; ok {
-			held[service.Name] = hold
-			continue
-		}
-		for _, owner := range retained {
-			if owner.Config.Name == service.Name {
+	unknown := unknownRuntimeOwner(actual)
+	owners := r.retainedInstances()
+	held := make(map[string]Hold)
+	// A running VM whose update is held keeps its actual guest IP, MAC, host
+	// ports and devices, so it is an owner for every other service. Holding
+	// one service can therefore hold another; iterate until nothing changes.
+	for changed := true; changed; {
+		changed = false
+		for _, service := range desired.Services {
+			if _, done := held[service.Name]; done {
 				continue
 			}
-			resource := conflictingResource(service, owner.Config)
-			// An update also removes the old runtime's host resources. Protect
-			// shared claims even when its desired config no longer names them.
-			if resource == "" && actual[service.Name] != nil {
-				resource = conflictingResource(actual[service.Name].Config, owner.Config)
+			hold := serviceHold(service, actual, owners, unknown, external)
+			if hold.Reason == "" {
+				continue
 			}
-			if resource != "" {
-				held[service.Name] = Hold{Reason: fmt.Sprintf("%s retained by %s", resource, owner.Config.Name), Recovery: owner.State == vm.StateRecoveryPending}
-				break
+			held[service.Name] = hold
+			changed = true
+			if instance := actual[service.Name]; instance != nil && instance.State == vm.StateRunning {
+				owners = append(owners, instance)
 			}
 		}
 	}
 	return held
+}
+
+func serviceHold(service config.ServiceConfig, actual map[string]*vm.Instance, owners []*vm.Instance, unknown string, external map[string]Hold) Hold {
+	instance := actual[service.Name]
+	// Independent admission failures remain blockers even when another VM's
+	// unknown claims or this service's quarantine also prevent its update.
+	if hold, ok := external[service.Name]; ok && !hold.Recovery {
+		return hold
+	}
+	if instance != nil && instance.State == vm.StateRecoveryPending {
+		return Hold{} // Its quarantine already reports why no desired work applies.
+	}
+	if instance != nil && retainsRuntime(instance.State) {
+		return Hold{Reason: "runtime lifecycle is in progress"}
+	}
+	changes := instance == nil || needsUpdate(instance, service)
+	if unknown != "" {
+		// Unknown claims can collide only with new allocations. A running
+		// service that needs no change keeps its network, health and port
+		// forwards.
+		if changes {
+			return Hold{Reason: "runtime resource claims are unknown for " + unknown, Recovery: true}
+		}
+		return Hold{}
+	}
+	if hold, ok := external[service.Name]; ok {
+		return hold
+	}
+	if !changes {
+		return Hold{} // Nothing new is allocated.
+	}
+	for _, owner := range owners {
+		if owner.Config.Name == service.Name {
+			continue
+		}
+		resource := conflictingResource(service, owner.Config)
+		// An update also removes the old runtime's host resources. Protect
+		// shared claims even when its desired config no longer names them.
+		if resource == "" && instance != nil {
+			resource = conflictingResource(instance.Config, owner.Config)
+		}
+		if resource != "" {
+			return Hold{Reason: fmt.Sprintf("%s retained by %s", resource, owner.Config.Name), Recovery: owner.State == vm.StateRecoveryPending}
+		}
+	}
+	return Hold{}
 }
 
 func conflictingResource(service, owner config.ServiceConfig) string {
@@ -164,17 +187,45 @@ func conflictingResource(service, owner config.ServiceConfig) string {
 	return ""
 }
 
+// actionHold re-checks one planned action against the runtime as it is now,
+// after earlier actions of this tick. Holds are evaluated across the whole
+// planned revision, so a held running owner protects its claims here too. A
+// create also waits for any running VM that still uses one of its claims, such
+// as a service whose update releasing that port comes later in a rolling
+// apply; the next tick creates it.
 func (r *Reconciler) actionHold(action Action) Hold {
 	actual := r.vmManager.List()
 	var hold Hold
 	if action.Type != ActionDelete {
-		hold = r.holds(config.NodeConfig{Services: []config.ServiceConfig{action.Service}})[action.Service.Name]
+		planned := config.NodeConfig{Services: []config.ServiceConfig{action.Service}}
+		if r.planned != nil {
+			planned = *r.planned
+			planned.Services = slices.Clone(planned.Services)
+			for i := range planned.Services {
+				if planned.Services[i].Name == action.Service.Name {
+					planned.Services[i] = action.Service
+				}
+			}
+		}
+		hold = r.holds(planned)[action.Service.Name]
 		if hold.Reason != "" && !hold.Recovery {
 			return hold
 		}
 	}
 	if instance := actual[action.Service.Name]; instance != nil && retainsRuntime(instance.State) {
 		return Hold{Reason: "runtime ownership or lifecycle is unresolved", Recovery: instance.State == vm.StateRecoveryPending}
+	}
+	if action.Type == ActionCreate && hold.Reason == "" {
+		names := slices.Sorted(maps.Keys(actual))
+		for _, name := range names {
+			owner := actual[name]
+			if name == action.Service.Name || owner.State != vm.StateRunning {
+				continue
+			}
+			if resource := conflictingResource(action.Service, owner.Config); resource != "" {
+				return Hold{Reason: fmt.Sprintf("%s still used by %s", resource, name)}
+			}
+		}
 	}
 	if action.Type != ActionDelete {
 		return hold

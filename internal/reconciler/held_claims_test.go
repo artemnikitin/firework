@@ -1,0 +1,160 @@
+package reconciler
+
+import (
+	"context"
+	"fmt"
+	"io"
+	"log/slog"
+	"strings"
+	"testing"
+
+	"github.com/artemnikitin/firework/internal/config"
+	"github.com/artemnikitin/firework/internal/vm"
+)
+
+// forwardRecorder records the guest each host port is forwarded to.
+type forwardRecorder struct{ forwards []string }
+
+func (n *forwardRecorder) Setup(config.ServiceConfig) error { return nil }
+func (n *forwardRecorder) DeleteTAP(string) error           { return nil }
+func (n *forwardRecorder) DeleteBridge(string) error        { return nil }
+func (n *forwardRecorder) SetupPortForward(hostPort int, guestIP string, vmPort int) error {
+	n.forwards = append(n.forwards, fmt.Sprintf("%d->%s:%d", hostPort, guestIP, vmPort))
+	return nil
+}
+func (n *forwardRecorder) TeardownPortForward(int, string, int) error { return nil }
+
+func heldClaimsLogger() *slog.Logger { return slog.New(slog.NewTextHandler(io.Discard, nil)) }
+
+// A running VM whose update is held still owns its host rules. They are
+// re-asserted every tick, as for any running service, until the update lands.
+func TestHeldRunningServiceKeepsDNATReasserted(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		setup func(*Reconciler, *fakeVMManager)
+	}{
+		{"capacity hold", func(r *Reconciler, _ *fakeVMManager) {
+			r.SetHeldServices(map[string]Hold{"app": {Reason: "desired services exceed node capacity"}})
+		}},
+		{"unknown claims", func(_ *Reconciler, m *fakeVMManager) {
+			m.instances["corrupt"] = &vm.Instance{Name: "corrupt", Config: config.ServiceConfig{Name: "corrupt"}, State: vm.StateRecoveryPending, RecoveryConfigUnknown: true}
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			net := &forwardRecorder{}
+			m := newFakeVMManager()
+			r := NewWithNetworkManager(m, heldClaimsLogger(), nil, net, "", 0)
+			running := config.ServiceConfig{Name: "app", VCPUs: 1, Network: &config.NetworkConfig{GuestIP: "172.16.0.2"}, PortForwards: []config.PortForward{{HostPort: 8080, VMPort: 80}}}
+			m.instances["app"] = &vm.Instance{Name: "app", Config: running, State: vm.StateRunning}
+			tc.setup(r, m)
+			desired := running
+			desired.VCPUs = 2
+			desired.PortForwards = []config.PortForward{{HostPort: 9090, VMPort: 80}}
+			if err := r.SyncPortForwards(config.NodeConfig{Services: []config.ServiceConfig{desired}}); err != nil {
+				t.Fatal(err)
+			}
+			if strings.Join(net.forwards, ",") != "8080->172.16.0.2:80" {
+				t.Fatalf("forwards = %v, want the running VM's own 8080 rule", net.forwards)
+			}
+		})
+	}
+}
+
+// A running VM whose update is held keeps its actual host port, guest IP and
+// devices. A new service asking for that port waits instead of getting a second
+// DNAT rule that the older one shadows.
+func TestHeldRunningOwnerClaimsHoldNewService(t *testing.T) {
+	net := &forwardRecorder{}
+	m := newFakeVMManager()
+	r := NewWithNetworkManager(m, heldClaimsLogger(), nil, net, "", 0)
+	s := config.ServiceConfig{Name: "s", VCPUs: 1, Network: &config.NetworkConfig{GuestIP: "172.16.0.2"}, PortForwards: []config.PortForward{{HostPort: 8080, VMPort: 80}}}
+	m.instances["s"] = &vm.Instance{Name: "s", Config: s, State: vm.StateRunning}
+	desiredS := s
+	desiredS.VCPUs = 4
+	desiredS.PortForwards = []config.PortForward{{HostPort: 9090, VMPort: 80}}
+	newT := config.ServiceConfig{Name: "t", VCPUs: 1, Network: &config.NetworkConfig{GuestIP: "172.16.0.3"}, PortForwards: []config.PortForward{{HostPort: 8080, VMPort: 80}}}
+	desired := config.NodeConfig{Services: []config.ServiceConfig{desiredS, newT}}
+	if err := config.ValidateNodePortClaims(desired); err != nil {
+		t.Fatalf("agent preflight rejects the revision: %v", err)
+	}
+	r.SetHeldServices(map[string]Hold{"s": {Reason: "desired services exceed node capacity"}})
+	err := r.Reconcile(context.Background(), desired)
+	if !IsIncomplete(err) {
+		t.Fatalf("Reconcile error = %v, want holds only", err)
+	}
+	if _, created := m.instances["t"]; created {
+		t.Fatalf("t was created while held s still owns host port 8080; forwards=%v", net.forwards)
+	}
+	for _, forward := range net.forwards {
+		if strings.HasPrefix(forward, "8080->172.16.0.3") {
+			t.Fatalf("second DNAT rule for 8080 installed: %v", net.forwards)
+		}
+	}
+	if reason := r.HeldServices(desired)["t"]; !strings.Contains(reason, "host port 8080") || !strings.Contains(reason, "s") {
+		t.Fatalf("t hold reason = %q", reason)
+	}
+	// Once the owner's update is no longer held, both converge.
+	r.SetHeldServices(nil)
+	if err := r.Reconcile(context.Background(), desired); err != nil && !IsIncomplete(err) {
+		t.Fatal(err)
+	}
+	if err := r.Reconcile(context.Background(), desired); err != nil {
+		t.Fatalf("second reconcile after the hold cleared: %v", err)
+	}
+	if m.instances["t"] == nil || m.instances["s"].Config.PortForwards[0].HostPort != 9090 {
+		t.Fatalf("services did not converge: t=%v s=%v", m.instances["t"], m.instances["s"].Config.PortForwards)
+	}
+}
+
+// Two running services swapping host ports, with nothing held, converge
+// instead of waiting on each other forever.
+func TestUnheldPortSwapConverges(t *testing.T) {
+	m := newFakeVMManager()
+	r := NewWithNetworkManager(m, heldClaimsLogger(), nil, &forwardRecorder{}, "", 0)
+	a := config.ServiceConfig{Name: "a", VCPUs: 1, Network: &config.NetworkConfig{GuestIP: "172.16.0.2"}, PortForwards: []config.PortForward{{HostPort: 8080, VMPort: 80}}}
+	b := config.ServiceConfig{Name: "b", VCPUs: 1, Network: &config.NetworkConfig{GuestIP: "172.16.0.3"}, PortForwards: []config.PortForward{{HostPort: 9090, VMPort: 80}}}
+	m.instances["a"] = &vm.Instance{Name: "a", Config: a, State: vm.StateRunning}
+	m.instances["b"] = &vm.Instance{Name: "b", Config: b, State: vm.StateRunning}
+	a.PortForwards, b.PortForwards = b.PortForwards, a.PortForwards
+	desired := config.NodeConfig{Services: []config.ServiceConfig{a, b}}
+	if err := r.Reconcile(context.Background(), desired); err != nil {
+		t.Fatalf("swap: %v", err)
+	}
+	if m.instances["a"].Config.PortForwards[0].HostPort != 9090 || m.instances["b"].Config.PortForwards[0].HostPort != 8080 {
+		t.Fatal("swap did not converge")
+	}
+}
+
+// Identical state yields identical hold messages, so status does not churn.
+func TestHoldErrorOrderIsStable(t *testing.T) {
+	m := newFakeVMManager()
+	r := NewWithNetworkManager(m, heldClaimsLogger(), nil, nil, "", 0)
+	holds := map[string]Hold{}
+	var services []config.ServiceConfig
+	for i := 0; i < 8; i++ {
+		name := fmt.Sprintf("s%d", i)
+		holds[name] = Hold{Reason: "cap"}
+		services = append(services, config.ServiceConfig{Name: name})
+	}
+	r.SetHeldServices(holds)
+	first := r.Reconcile(context.Background(), config.NodeConfig{Services: services}).Error()
+	for i := 0; i < 20; i++ {
+		if got := r.Reconcile(context.Background(), config.NodeConfig{Services: services}).Error(); got != first {
+			t.Fatalf("hold message changed between identical reconciles:\n%s\n%s", first, got)
+		}
+	}
+}
+
+// A service whose own start or stop is in flight reports that, rather than a
+// recovery hold, even while unknown claims fence new allocations.
+func TestLifecycleHoldTakesPrecedenceOverUnknownClaims(t *testing.T) {
+	m := newFakeVMManager()
+	r := NewWithNetworkManager(m, heldClaimsLogger(), nil, nil, "", 0)
+	m.instances["corrupt"] = &vm.Instance{Name: "corrupt", Config: config.ServiceConfig{Name: "corrupt"}, State: vm.StateRecoveryPending, RecoveryConfigUnknown: true}
+	app := config.ServiceConfig{Name: "app", VCPUs: 1}
+	m.instances["app"] = &vm.Instance{Name: "app", Config: app, State: vm.StateStopping}
+	desired := config.NodeConfig{Services: []config.ServiceConfig{app}}
+	if got := r.holds(desired)["app"]; got.Recovery || got.Reason != "runtime lifecycle is in progress" {
+		t.Fatalf("hold = %#v", got)
+	}
+}

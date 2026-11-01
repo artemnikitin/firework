@@ -11,6 +11,7 @@ import (
 	"maps"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"sync"
 	"time"
@@ -87,6 +88,9 @@ type Reconciler struct {
 	pendingRecovery map[string]struct{}
 	heldMu          sync.RWMutex
 	heldServices    map[string]Hold
+	// planned is the revision Reconcile is applying, so a per-action hold
+	// check sees held running owners across the whole revision.
+	planned *config.NodeConfig
 	// pendingPortForwards holds every DNAT rule whose teardown has failed,
 	// keyed by the rule's own (hostPort, guestIP, vmPort) identity — not by
 	// service name. A service can pass through several configs in a row
@@ -810,8 +814,11 @@ func (r *Reconciler) Reconcile(ctx context.Context, desired config.NodeConfig) e
 	if err := r.restoreRecovered(ctx, desired); err != nil {
 		errs = append(errs, err)
 	}
-	for name, hold := range r.holds(desired) {
-		errs = append(errs, hold.err(name))
+	r.planned = &desired
+	defer func() { r.planned = nil }()
+	held := r.holds(desired)
+	for _, name := range slices.Sorted(maps.Keys(held)) {
+		errs = append(errs, held[name].err(name))
 	}
 	actions := r.Plan(desired)
 
@@ -874,13 +881,10 @@ func (r *Reconciler) syncPortForwards(desired config.NodeConfig) error {
 		return nil
 	}
 	running := r.vmManager.List()
-	held := r.HeldServices(desired)
 	var errs []error
 	for _, svc := range desired.Services {
-		if _, blocked := held[svc.Name]; blocked {
-			continue
-		}
 		// A service still waiting to be created has no guest to forward to.
+		// A held update keeps its running VM, which still owns these rules.
 		if running[svc.Name] == nil || running[svc.Name].State != vm.StateRunning {
 			continue
 		}
