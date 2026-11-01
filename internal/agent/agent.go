@@ -1224,21 +1224,25 @@ func (a *Agent) syncImages(ctx context.Context, services []config.ServiceConfig,
 const (
 	capacityExceededReason  = "desired services exceed node capacity"
 	capacityRecoveryReason  = "capacity retained by unresolved VM ownership"
-	capacityTransientReason = "capacity is still allocated to VMs being stopped, started or removed"
+	capacityTransientReason = "capacity is still allocated to VMs being started or stopped"
 )
 
-// reserveCapacity admits desired growth service by service. Every tracked VM's
-// allocation stays counted until it is released, including retained,
-// quarantined and not yet deleted ones, so converging never overcommits the
-// node. A service that does not fit is held, and the reason names the cause:
+// reserveCapacity admits desired growth service by service. Only allocations
+// this tick's plan cannot release stay counted: VMs that are starting,
+// stopping or quarantined. Running VMs count at their desired size, and
+// undesired running VMs not at all, because the plan resizes or removes them;
+// counting their old size could make two updates wait on each other forever.
+// The price is the same brief overcommit as before while one apply replaces
+// VMs. A service that does not fit is held, and the reason names the cause:
 // desired state that does not fit at all, capacity that resolving quarantined
-// VMs would free, or capacity still allocated to VMs on their way out. The
+// VMs would free, or capacity still allocated to VMs starting or stopping. The
 // first is the same failure whether or not anything happens to be retained.
 func (a *Agent) reserveCapacity(services []config.ServiceConfig, cap capacity.NodeCapacity, known bool) (capacity.NodeCapacity, map[string]reconciler.Hold) {
 	allocations := make(map[string]config.ServiceConfig)
 	pending := make(map[string]bool)
 	for name, inst := range a.reconciler.Instances() {
-		if inst.State != vm.StateStopped && inst.State != vm.StateFailed {
+		switch inst.State {
+		case vm.StateStarting, vm.StateStartAborting, vm.StateStopping, vm.StateRecoveryPending:
 			allocations[name] = inst.Config
 			pending[name] = inst.State == vm.StateRecoveryPending
 		}

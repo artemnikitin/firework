@@ -412,14 +412,22 @@ retained:
   retries on an unchanged revision.
 - Admission failures, which waiting cannot resolve: desired services whose
   combined CPU or memory exceeds node capacity, or a subnet with no free guest
-  address. Services that fit still converge, in service-name order after the
-  allocations of existing VMs, but the revision is not applied: `CapacityReady`
+  address. Services that fit still converge, in service-name order after VMs
+  that are starting, stopping or quarantined, but the revision is not applied: `CapacityReady`
   is false with `capacity_exceeded` or `guest_addresses_exhausted`, and the node
   reports failed.
 - Transient holds: waiting on another start or stop, on a claim that a running
-  or retained VM still uses, or on capacity still allocated to VMs being
-  stopped, started or removed. The revision stays incomplete, `VMsReconciled`
-  is unknown with `resource_held`, and the next tick retries.
+  or retained VM still uses, or on capacity still allocated to VMs that are
+  starting or stopping. The revision stays incomplete, `VMsReconciled` is
+  unknown with `resource_held`, and the next tick retries.
+
+Admission counts only allocations the tick's plan cannot release: VMs that are
+starting, stopping or quarantined. Running VMs count at their desired size and
+undesired running VMs not at all, because the plan resizes or removes them in
+the same apply. Counting their old size instead could make two updates wait on
+each other forever, for example a VM shrinking onto a port that a growing VM is
+leaving. The cost, as before this change, is a brief overcommit of CPU and
+memory while one apply creates or grows VMs before it removes or shrinks others.
 
 Running guests retain their assigned addresses after a survivor clears.
 

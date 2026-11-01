@@ -62,20 +62,34 @@ func TestOverCapacityFailsRevisionWhateverIsRetained(t *testing.T) {
 	}
 }
 
-// Capacity still allocated to a VM being removed is a transient hold: the
-// revision keeps reconciling, then applies once the old VM is gone.
-func TestCapacityOfDepartingVMIsATransientHold(t *testing.T) {
+// A running VM the plan removes does not keep its allocation: replacing a
+// service on a full node happens within one tick, as on main.
+func TestReplacementOnFullNodeConvergesInOneTick(t *testing.T) {
 	yaml := "node: web\nservices:\n- name: next\n  image: /n\n  kernel: /k\n  vcpus: 4\n  memory_mb: 64\n"
 	old := config.ServiceConfig{Name: "old", Image: "/o", Kernel: "/k", VCPUs: 4, MemoryMB: 64}
 	a, manager := classificationAgent(t, yaml, map[string]*vm.Instance{"old": {Name: "old", Config: old, State: vm.StateRunning}}, 4)
 	a.tick(context.Background())
+	if manager.instances["old"] != nil || manager.instances["next"] == nil || a.lastRevision != "r1" {
+		t.Fatalf("old=%v next=%v lastRevision=%q", manager.instances["old"], manager.instances["next"], a.lastRevision)
+	}
+}
+
+// Capacity still allocated to a VM that is stopping is a transient hold: the
+// revision keeps reconciling, then applies once the VM is gone.
+func TestCapacityOfStoppingVMIsATransientHold(t *testing.T) {
+	yaml := "node: web\nservices:\n- name: next\n  image: /n\n  kernel: /k\n  vcpus: 4\n  memory_mb: 64\n"
+	old := config.ServiceConfig{Name: "old", Image: "/o", Kernel: "/k", VCPUs: 4, MemoryMB: 64}
+	a, manager := classificationAgent(t, yaml, map[string]*vm.Instance{"old": {Name: "old", Config: old, State: vm.StateStopping}}, 4)
+	a.tick(context.Background())
 	status := a.agentStatusSnapshot()
-	if manager.instances["old"] != nil || manager.instances["next"] != nil {
-		t.Fatalf("first tick: old=%v next=%v", manager.instances["old"], manager.instances["next"])
+	if manager.instances["next"] != nil {
+		t.Fatal("next started while the stopping VM still holds the capacity")
 	}
-	if status.Phase != statusmodel.PhaseReconciling || conditionOf(status, "CapacityReady").Status != statusmodel.ConditionTrue {
-		t.Fatalf("transient hold reported phase=%s reason=%s capacity=%#v", status.Phase, status.ReasonCode, conditionOf(status, "CapacityReady"))
+	if status.Phase != statusmodel.PhaseReconciling || conditionOf(status, "CapacityReady").Status != statusmodel.ConditionTrue ||
+		conditionOf(status, "VMsReconciled").ReasonCode != "resource_held" {
+		t.Fatalf("transient hold reported phase=%s capacity=%#v vms=%#v", status.Phase, conditionOf(status, "CapacityReady"), conditionOf(status, "VMsReconciled"))
 	}
+	delete(manager.instances, "old") // the stop completed
 	a.tick(context.Background())
 	if manager.instances["next"] == nil || a.lastRevision != "r1" {
 		t.Fatalf("second tick: next=%v lastRevision=%q", manager.instances["next"], a.lastRevision)
