@@ -37,26 +37,44 @@ func (m *Manager) Recover(ctx context.Context, desired config.NodeConfig) ([]str
 		return nil, nil
 	}
 	m.inventoryRecoveryEntries(root, entries)
-	sort.Slice(entries, func(i, j int) bool { return entries[i].Name() < entries[j].Name() })
+	// Visit every listed entry and every quarantined name. A quarantine whose
+	// directory disappeared (removed by an operator, or listed by an inventory
+	// that raced its removal) has no entry left, but it still fences the node
+	// until its absence is proved from the canonical paths.
+	listed := make(map[string]bool, len(entries))
+	for _, entry := range entries {
+		if entry.IsDir() || entry.Type()&os.ModeSymlink != 0 {
+			listed[entry.Name()] = true
+		}
+	}
+	names := make([]string, 0, len(listed))
+	for name := range listed {
+		names = append(names, name)
+	}
+	m.mu.Lock()
+	for name, instance := range m.instances {
+		if instance.State == StateRecoveryPending && !listed[name] {
+			names = append(names, name)
+		}
+	}
+	cursor := m.recoveryCursor
+	m.mu.Unlock()
+	sort.Strings(names)
 	desiredByName := make(map[string]config.ServiceConfig, len(desired.Services))
 	for _, service := range desired.Services {
 		desiredByName[service.Name] = service
 	}
 	seenIDs := make(map[string]string)
 	var adopted []string
-	m.mu.Lock()
-	cursor := m.recoveryCursor
-	m.mu.Unlock()
-	start := sort.Search(len(entries), func(i int) bool { return entries[i].Name() > cursor })
-	for offset := range entries {
+	start := sort.SearchStrings(names, cursor)
+	if start < len(names) && names[start] == cursor {
+		start++
+	}
+	for offset := range names {
 		if ctx.Err() != nil {
 			return adopted, caller.Err()
 		}
-		entry := entries[(start+offset)%len(entries)]
-		if !entry.IsDir() && entry.Type()&os.ModeSymlink == 0 {
-			continue
-		}
-		name := entry.Name()
+		name := names[(start+offset)%len(names)]
 		m.mu.Lock()
 		m.recoveryCursor = name
 		m.mu.Unlock()
@@ -70,8 +88,11 @@ func (m *Manager) Recover(ctx context.Context, desired config.NodeConfig) ([]str
 			m.mu.Lock()
 			current, owned := m.instances[name]
 			discoveryPending := owned && current.recoveryDiscoveryPending
-			pendingRecovery := owned && current.State == StateRecoveryPending && !discoveryPending
+			pendingRecovery := owned && current.State == StateRecoveryPending && (!discoveryPending || !listed[name])
 			m.mu.Unlock()
+			if !owned && !listed[name] {
+				return // Resolved since the snapshot.
+			}
 			if pendingRecovery {
 				result, err := m.resolveRecovery(ctx, name)
 				if err == nil && (result.Outcome == RecoveryOutcomeReadopted || result.Outcome == RecoveryOutcomeCleared) {
