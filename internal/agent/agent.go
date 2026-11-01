@@ -416,6 +416,10 @@ func (a *Agent) tick(ctx context.Context) {
 			// sync and reconcile work. assignNetworking is needed because fetched
 			// node configs do not persist the agent-assigned guest IPs.
 			a.assignNetworking(merged.Services)
+			// Route eligibility compares against prepared VM configuration.
+			// Include the same link/environment arguments as a full tick.
+			a.resolveLinks(merged.Services)
+			a.injectEnvVars(merged.Services)
 			a.setStatusServices(*merged, rev)
 
 			// Host DNAT can be flushed by anything else on the box — a

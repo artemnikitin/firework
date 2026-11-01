@@ -442,3 +442,19 @@ line. This requires JSON-capable busctl (systemd 240 or newer) on systemd hosts.
 Missing busctl or an unreadable/malformed D-Bus response leaves absence unproved
 and recovery pending. Whitespace, quotes and backslashes in state paths preserve
 their original argument boundaries.
+
+
+Published local routes include a versioned comment header binding their resolved
+hostname and backend port to the VM instance ID and guest IP. The header and
+Traefik document are staged and renamed together. During a held update, the
+agent reuses this last published projection, including after an agent restart;
+it does not reconstruct routing metadata from the guest's launch configuration.
+A successfully disabled hostname is an owner-bound empty HTTP document, so a
+later hold cannot resurrect it. Per-file records reflect partial batch writes
+without a separate queue or second-file commit.
+
+A held service with no valid record for the current instance/address publishes
+no route. This includes legacy files without owner headers; an unheld sync
+refreshes them. Replacement VMs cannot inherit an earlier owner's projection.
+The unchanged-revision path performs the same link/environment normalization
+before comparing its desired configuration with the running VM.

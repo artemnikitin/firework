@@ -87,6 +87,8 @@ func IsStartRace(err error) bool {
 type Instance struct {
 	// Name is the service name from the config.
 	Name string
+	// InstanceID identifies this runtime in snapshots, without changing status JSON.
+	InstanceID string `json:"-"`
 	// Config is the desired service configuration.
 	Config config.ServiceConfig
 	// State is the current lifecycle state.
@@ -340,6 +342,7 @@ func (m *Manager) List() map[string]*Instance {
 	result := make(map[string]*Instance, len(m.instances))
 	for k, v := range m.instances {
 		cp := *v
+		cp.InstanceID = v.instanceID
 		result[k] = &cp
 	}
 	return result

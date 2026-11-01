@@ -3,6 +3,7 @@ package agent
 import (
 	"context"
 	"errors"
+	"fmt"
 	"testing"
 	"time"
 
@@ -100,7 +101,11 @@ type recoveryTestVMManager struct {
 func (m *recoveryTestVMManager) List() map[string]*vm.Instance {
 	instances := make(map[string]*vm.Instance, len(m.instances))
 	for name, instance := range m.instances {
-		instances[name] = instance
+		copy := *instance
+		if copy.InstanceID == "" {
+			copy.InstanceID = fmt.Sprintf("fake-runtime-%p", instance)
+		}
+		instances[name] = &copy
 	}
 	return instances
 }

@@ -93,6 +93,10 @@ func TestRuntimeRoutesApplyUnheldHostnameAndHealthPortWithoutVMReplacement(t *te
 	a.reconciler = reconciler.New(manager, testLogger(), nil, nil, "", 0)
 	routeDir := t.TempDir()
 	a.traefikMgr = traefik.NewManager(routeDir, "", testLogger())
+	// A held update retains the projection actually published for this owner.
+	if err := a.syncTraefikConfigs(context.Background(), []config.ServiceConfig{old}); err != nil {
+		t.Fatal(err)
+	}
 	desired := old
 	desired.Metadata = map[string]string{"host": "new.example.com"}
 	desired.HealthCheck = &config.HealthCheckConfig{Port: 90}
