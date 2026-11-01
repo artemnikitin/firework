@@ -490,7 +490,9 @@ func (a *Agent) tick(ctx context.Context) {
 	// lets finishTickStatus finalize it as unknown, which is what the per-tick
 	// condition contract says an unreached stage should be.
 
-	// Check node capacity before reconciling; skip if resources are exceeded.
+	// Admit desired growth against node capacity service by service. A
+	// service that does not fit is held while independent work, including
+	// recovery, still runs; genuine over-capacity fails the revision below.
 	used, capacityHolds := a.reserveCapacity(merged.Services, nodeCap, hasCap)
 	holds := make(map[string]reconciler.Hold, len(capacityHolds)+len(addressHolds))
 	for name, reason := range addressHolds {
@@ -510,25 +512,17 @@ func (a *Agent) tick(ctx context.Context) {
 	// scheduling intent while downloads are in progress.
 	if hasCap {
 		a.setHeartbeatResources(nodeCap, used)
+		a.metrics.setCapacity(nodeCap, used)
 	}
-	if len(capacityHolds) == 0 && !a.checkCapacity(nodeCap, used, hasCap) {
-		a.failAgentStatus("CapacityReady", "capacity_exceeded", "desired services exceed node capacity")
-		a.syncRegistryAfterTick(ctx, nodeCap, used)
-		return
+	admissionCode, admissionMessage := admissionFailure(addressHolds, capacityHolds)
+	switch {
+	case admissionCode != "":
+		a.setStatusCondition("CapacityReady", statusmodel.ConditionFalse, admissionCode, admissionMessage)
+	case !hasCap:
+		a.setStatusCondition("CapacityReady", statusmodel.ConditionTrue, "not_configured", "")
+	default:
+		a.setStatusCondition("CapacityReady", statusmodel.ConditionTrue, "", "")
 	}
-	capacityReason := ""
-	if !hasCap {
-		capacityReason = "not_configured"
-	}
-	capacityStatus := statusmodel.ConditionTrue
-	for _, hold := range capacityHolds {
-		if !hold.Recovery {
-			capacityStatus = statusmodel.ConditionFalse
-			capacityReason = "capacity_exceeded"
-			break
-		}
-	}
-	a.setStatusCondition("CapacityReady", capacityStatus, capacityReason, "")
 
 	// Sync images from S3 before reconciling (ensures rootfs/kernels are present).
 	if a.imageSyncer != nil {
@@ -572,7 +566,7 @@ func (a *Agent) tick(ctx context.Context) {
 	} else {
 		a.setStatusCondition("LocalRoutesReady", statusmodel.ConditionTrue, "", "")
 	}
-	if err != nil && reconciler.OnlyRecoveryHeld(err) && a.vmManager.HasPendingRecovery() {
+	if err != nil && admissionCode == "" && reconciler.OnlyRecoveryHeld(err) && a.vmManager.HasPendingRecovery() {
 		// Every hold was caused by unresolved VM ownership, which
 		// VMRecoveryReady reports as degradation and held services report as
 		// resource_held. Freezing the revision would hide both behind
@@ -584,17 +578,29 @@ func (a *Agent) tick(ctx context.Context) {
 		err = nil
 	}
 	if err != nil && reconciler.IsIncomplete(err) {
-		// Every collected error was a benign start race: a stop or remove
-		// arrived while a start was preparing volumes, or two starts
-		// collided. Nothing failed, but nothing converged either, so the
-		// revision must not advance and the node must not be reported as
+		// Every collected error was a hold or a benign start race: a stop or
+		// remove arrived while a start was preparing volumes, or two starts
+		// collided. Nothing failed, but not everything converged either, so
+		// the revision must not advance and the node must not be reported as
 		// having reconciled. Returning here leaves lastRevision unchanged, so
 		// the next tick re-plans from real state instead of taking the
 		// unchanged-revision shortcut.
 		a.logger.Info("reconciliation incomplete; retrying on the next tick", "error", err)
+		reason := "start_aborted"
+		if errors.Is(err, reconciler.ErrServiceHeld) || errors.Is(err, reconciler.ErrRecoveryHeld) {
+			reason = "resource_held"
+		}
 		a.setStatusCondition("NetworkReady", statusmodel.ConditionTrue, "", "")
-		a.setStatusCondition("VMsReconciled", statusmodel.ConditionUnknown, "start_aborted", err.Error())
-		a.incompleteAgentStatus("Reconciled", "reconcile_incomplete", err.Error())
+		a.setStatusCondition("VMsReconciled", statusmodel.ConditionUnknown, reason, err.Error())
+		if admissionCode != "" {
+			// Genuine over-capacity or an exhausted subnet. What fits still
+			// converged, but the revision cannot be applied as requested,
+			// whether or not any other VM happens to be retained.
+			a.setStatusCondition("Reconciled", statusmodel.ConditionUnknown, "reconcile_incomplete", err.Error())
+			a.failAgentStatus("CapacityReady", admissionCode, admissionMessage)
+		} else {
+			a.incompleteAgentStatus("Reconciled", "reconcile_incomplete", err.Error())
+		}
 		a.refreshRuntimeMetrics()
 		a.syncRegistryAfterTick(ctx, nodeCap, used)
 		return
@@ -1060,25 +1066,6 @@ func (a *Agent) preflightRouting(services []config.ServiceConfig) error {
 	return nil
 }
 
-// checkCapacity compares desired usage against host capacity. Returns false
-// (skip reconcile) if resources would be exceeded.
-func (a *Agent) checkCapacity(cap, used capacity.NodeCapacity, hasCap bool) bool {
-	if !hasCap {
-		return true
-	}
-	a.metrics.setCapacity(cap, used)
-
-	if used.VCPUs > cap.VCPUs || used.MemoryMB > cap.MemoryMB {
-		a.logger.Warn("desired services exceed node capacity, skipping reconciliation",
-			"cap_vcpus", cap.VCPUs, "used_vcpus", used.VCPUs,
-			"cap_memory_mb", cap.MemoryMB, "used_memory_mb", used.MemoryMB,
-		)
-		return false
-	}
-
-	return true
-}
-
 func (a *Agent) readNodeCapacity() (capacity.NodeCapacity, bool) {
 	cap, err := a.capacityReader.Read()
 	if err == nil {
@@ -1230,18 +1217,23 @@ func (a *Agent) syncImages(ctx context.Context, services []config.ServiceConfig,
 	return nil
 }
 
-// Count retained runtime allocations before admitting desired services. Their
-// old config can differ from desired and remains authoritative until resolved.
-// A hold is attributed to recovery only if the service would fit once every
-// recovery_pending owner resolved; otherwise the node is genuinely full.
+const (
+	capacityExceededReason  = "desired services exceed node capacity"
+	capacityRecoveryReason  = "capacity retained by unresolved VM ownership"
+	capacityTransientReason = "capacity is still allocated to VMs being stopped, started or removed"
+)
+
+// reserveCapacity admits desired growth service by service. Every tracked VM's
+// allocation stays counted until it is released, including retained,
+// quarantined and not yet deleted ones, so converging never overcommits the
+// node. A service that does not fit is held, and the reason names the cause:
+// desired state that does not fit at all, capacity that resolving quarantined
+// VMs would free, or capacity still allocated to VMs on their way out. The
+// first is the same failure whether or not anything happens to be retained.
 func (a *Agent) reserveCapacity(services []config.ServiceConfig, cap capacity.NodeCapacity, known bool) (capacity.NodeCapacity, map[string]reconciler.Hold) {
-	retained := a.reconciler.RetainedServices()
-	if len(retained) == 0 {
-		return sumResources(services), nil
-	}
 	allocations := make(map[string]config.ServiceConfig)
 	pending := make(map[string]bool)
-	for name, inst := range a.vmManager.List() {
+	for name, inst := range a.reconciler.Instances() {
 		if inst.State != vm.StateStopped && inst.State != vm.StateFailed {
 			allocations[name] = inst.Config
 			pending[name] = inst.State == vm.StateRecoveryPending
@@ -1264,20 +1256,51 @@ func (a *Agent) reserveCapacity(services []config.ServiceConfig, cap capacity.No
 		settled = growAllocation(settled, svc, old)
 	}
 	exceeds := func(c capacity.NodeCapacity) bool { return c.VCPUs > cap.VCPUs || c.MemoryMB > cap.MemoryMB }
+	desiredExceeds := exceeds(sumResources(services))
 	holds := map[string]reconciler.Hold{}
 	for _, svc := range services {
 		next := growAllocation(used, svc, allocations[svc.Name])
 		if known && exceeds(next) {
-			if exceeds(settled) {
-				holds[svc.Name] = reconciler.Hold{Reason: "desired services exceed node capacity"}
-			} else {
-				holds[svc.Name] = reconciler.Hold{Reason: "capacity retained by unresolved VM ownership", Recovery: true}
+			switch {
+			case desiredExceeds:
+				holds[svc.Name] = reconciler.Hold{Reason: capacityExceededReason}
+			case !exceeds(settled):
+				holds[svc.Name] = reconciler.Hold{Reason: capacityRecoveryReason, Recovery: true}
+			default:
+				holds[svc.Name] = reconciler.Hold{Reason: capacityTransientReason}
 			}
 			continue
 		}
 		used = next
 	}
 	return used, holds
+}
+
+// admissionFailure reports holds that no amount of waiting resolves: desired
+// services that exceed node capacity, or a subnet without a free address.
+// They fail the revision instead of leaving it reconciling.
+func admissionFailure(addressHolds map[string]string, capacityHolds map[string]reconciler.Hold) (string, string) {
+	var names []string
+	for name, hold := range capacityHolds {
+		if hold.Reason == capacityExceededReason {
+			names = append(names, name)
+		}
+	}
+	if len(names) > 0 {
+		sort.Strings(names)
+		return "capacity_exceeded", capacityExceededReason + "; held: " + strings.Join(names, ", ")
+	}
+	if len(addressHolds) == 0 {
+		return "", ""
+	}
+	names = names[:0]
+	var reason string
+	for name, held := range addressHolds {
+		names = append(names, name)
+		reason = held
+	}
+	sort.Strings(names)
+	return "guest_addresses_exhausted", reason + "; held: " + strings.Join(names, ", ")
 }
 
 // prepareDesired completes desired state for this node: guest addresses,

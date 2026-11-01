@@ -166,6 +166,9 @@ func TestRoutesFollowVMsWhileOtherWorkIsHeld(t *testing.T) {
 	if body, ok := readRoute(t, routeDir, "k.yaml"); !ok || !strings.Contains(body, "Host(`k.example.com`)") {
 		t.Fatalf("k has no route:\n%s", body)
 	}
+	if status := a.agentStatusSnapshot(); status.Phase != "failed" || status.ReasonCode != "capacity_exceeded" {
+		t.Fatalf("over-capacity revision reported %s/%s", status.Phase, status.ReasonCode)
+	}
 }
 
 // A hostname changed without replacing the VM stays published on the

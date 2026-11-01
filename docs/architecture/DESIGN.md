@@ -399,15 +399,29 @@ update is held keeps its actual guest IP, MAC, host ports and devices, and its
 DNAT rules are re-asserted every tick; other services that need any of those
 claims are held too. A new service also waits while a running VM still uses one
 of its claims, for example until a later rolling update moves that VM off the
-port. When every hold was
-caused by unresolved VM ownership (unknown claims, a resource retained by a
-`recovery_pending` owner, or capacity that its resolution would free), the agent
-applies the revision with those holds and reports `VMRecoveryReady=False`, so
-the node shows as degraded instead of progressing. Pending recovery keeps
-forcing reconciliation, so held work retries on an unchanged revision. Any
-other hold, such as genuine over-capacity, an exhausted subnet, or waiting on
-another start or stop, leaves the revision incomplete. Running guests retain
-their assigned addresses after a survivor clears.
+port.
+
+Holds are classified the same way whether or not any other VM happens to be
+retained:
+
+- Recovery holds, caused by unresolved VM ownership (unknown claims, a resource
+  retained by a `recovery_pending` owner, or capacity that its resolution would
+  free): when every hold is one, the agent applies the revision with those holds
+  and reports `VMRecoveryReady=False`, so the node shows as degraded instead of
+  progressing. Pending recovery keeps forcing reconciliation, so held work
+  retries on an unchanged revision.
+- Admission failures, which waiting cannot resolve: desired services whose
+  combined CPU or memory exceeds node capacity, or a subnet with no free guest
+  address. Services that fit still converge, in service-name order after the
+  allocations of existing VMs, but the revision is not applied: `CapacityReady`
+  is false with `capacity_exceeded` or `guest_addresses_exhausted`, and the node
+  reports failed.
+- Transient holds: waiting on another start or stop, on a claim that a running
+  or retained VM still uses, or on capacity still allocated to VMs being
+  stopped, started or removed. The revision stays incomplete, `VMsReconciled`
+  is unknown with `resource_held`, and the next tick retries.
+
+Running guests retain their assigned addresses after a survivor clears.
 
 Each tick's Recover/Plan/Apply section and health-driven Stop/Start transactions
 are serialized; config fetch, image sync and route refresh do not delay a

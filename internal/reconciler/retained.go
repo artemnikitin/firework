@@ -38,6 +38,12 @@ func retainsRuntime(state vm.State) bool {
 	return state == vm.StateRecoveryPending || state == vm.StateStarting || state == vm.StateStartAborting || state == vm.StateStopping
 }
 
+// Instances returns the runtime inventory the reconciler plans against, so
+// admission decisions read the same view as holds.
+func (r *Reconciler) Instances() map[string]*vm.Instance {
+	return r.vmManager.List()
+}
+
 // RetainedServices returns the actual configurations whose resources cannot
 // safely be reused yet. Desired configuration may differ from these claims.
 func (r *Reconciler) RetainedServices() []config.ServiceConfig {

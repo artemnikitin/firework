@@ -63,7 +63,7 @@ Examples:
 | `vm_gateway` | no | `172.16.0.1` | Bridge gateway IP |
 | `vm_bridge` | no | `br-firework` | Shared bridge name |
 | `out_interface` | no | empty | Outbound NIC for masquerade |
-| `enable_capacity_check` | no | `true` | Skip reconcile when desired > node capacity |
+| `enable_capacity_check` | no | `true` | Hold services whose desired CPU or memory does not fit node capacity; the rest still reconcile and the node reports `capacity_exceeded` |
 | `update_strategy` | no | `all-at-once` | `all-at-once` or `rolling` |
 | `update_delay` | no | `0s` | Delay between updates in rolling mode |
 | `traefik_config_dir` | no | empty | Enables Traefik dynamic config management for local and remote service routes |
