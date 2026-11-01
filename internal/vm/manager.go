@@ -889,10 +889,11 @@ func (m *Manager) stopInstance(name string, expected *Instance) error {
 	pid := manifest.PID
 	socketPath := manifest.SocketPath
 	previousLifecycle := manifest.Lifecycle
+	previousState := inst.State
 	inst.State = StateStopping
 	manifest.Lifecycle = lifecycleStopping
 	if err := m.writeRecoveryManifest(manifestPath(manifest.VMDir), manifest); err != nil {
-		inst.State = StateRunning
+		inst.State = previousState
 		if durable, readErr := readManifest(manifestPath(manifest.VMDir)); readErr == nil && durable.InstanceID == manifest.InstanceID {
 			inst.manifest = durable
 		} else {
