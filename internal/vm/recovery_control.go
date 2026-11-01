@@ -109,7 +109,7 @@ func (m *Manager) resolveRecoveryAttempt(ctx context.Context, service string, fo
 			if !errors.Is(err, os.ErrNotExist) {
 				return recoveryAmbiguous(result, fmt.Sprintf("invalid durable runtime state: %v", err))
 			}
-			manifest = &instanceManifest{Service: service, VMDir: vmDir, SocketPath: filepath.Join(vmDir, "firecracker.sock"), ConfigPath: filepath.Join(vmDir, "vm-config.json")}
+			manifest = canonicalManifest(service, vmDir)
 
 		}
 		if err := m.lockRecovery(ctx); err != nil {
@@ -438,8 +438,8 @@ func (m *Manager) recoveryManifestPath(service string) (vmDir, path string) {
 
 func verifyRecoveryManifestPaths(service, vmDir string, manifest *instanceManifest) error {
 	if manifest.Service != service || manifest.VMDir != vmDir ||
-		manifest.SocketPath != filepath.Join(vmDir, "firecracker.sock") ||
-		manifest.ConfigPath != filepath.Join(vmDir, "vm-config.json") {
+		manifest.SocketPath != filepath.Join(vmDir, firecrackerSocketName) ||
+		manifest.ConfigPath != filepath.Join(vmDir, vmConfigName) {
 		return fmt.Errorf("ownership manifest paths do not match the named service state directory")
 	}
 	return nil

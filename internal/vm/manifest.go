@@ -17,6 +17,8 @@ const (
 	manifestSchemaVersion = 1
 	manifestFileName      = "instance.json"
 	firecrackerLogName    = "firecracker.log"
+	firecrackerSocketName = "firecracker.sock"
+	vmConfigName          = "vm-config.json"
 )
 
 type manifestLifecycle string
@@ -63,6 +65,14 @@ func serviceConfigHash(svc config.ServiceConfig) (string, error) {
 	}
 	sum := sha256.Sum256(data)
 	return hex.EncodeToString(sum[:]), nil
+}
+
+// canonicalManifest names a service's runtime paths under vmDir before anything
+// about its process is known. Placeholders and absence proofs use these paths,
+// never ones read from metadata that may be untrusted.
+func canonicalManifest(service, vmDir string) *instanceManifest {
+	return &instanceManifest{SchemaVersion: manifestSchemaVersion, Service: service, VMDir: vmDir,
+		SocketPath: filepath.Join(vmDir, firecrackerSocketName), ConfigPath: filepath.Join(vmDir, vmConfigName)}
 }
 
 func manifestPath(vmDir string) string {

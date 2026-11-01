@@ -133,7 +133,7 @@ func validateOwnedSocket(inspector processInspector, manifest *instanceManifest)
 	if err != nil {
 		return err
 	}
-	if socketPath != filepath.Join(vmDir, "firecracker.sock") || !strings.HasPrefix(socketPath, vmDir+string(os.PathSeparator)) {
+	if socketPath != filepath.Join(vmDir, firecrackerSocketName) || !strings.HasPrefix(socketPath, vmDir+string(os.PathSeparator)) {
 		return fmt.Errorf("API socket is outside the VM state directory")
 	}
 	return inspector.SocketReady(socketPath)

@@ -456,7 +456,7 @@ func (m *Manager) beginStartContext(ctx context.Context, svc config.ServiceConfi
 	m.logger.Info("starting microVM", "service", svc.Name, "vcpus", svc.VCPUs, "memory_mb", svc.MemoryMB)
 
 	vmDir = filepath.Join(m.stateDir, "vms", svc.Name)
-	socketPath = filepath.Join(vmDir, "firecracker.sock")
+	socketPath = filepath.Join(vmDir, firecrackerSocketName)
 	startID, err = newInstanceID()
 	if err != nil {
 		return "", "", "", err
@@ -542,8 +542,7 @@ func (m *Manager) retainFailedReclaim(service, startID, vmDir string, previous *
 		(!sameRecoveryIdentity(manifest, previous.manifest) && (previous.exitedOwner == nil || !sameRecoveryIdentity(manifest, previous.exitedOwner)))) {
 		manifest = cloneInstanceManifest(previous.manifest)
 	} else if err != nil {
-		manifest = &instanceManifest{Service: service, VMDir: vmDir,
-			SocketPath: filepath.Join(vmDir, "firecracker.sock"), ConfigPath: filepath.Join(vmDir, "vm-config.json")}
+		manifest = canonicalManifest(service, vmDir)
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -737,8 +736,7 @@ func (m *Manager) reclaimUnownedStateContext(ctx context.Context, service, vmDir
 		}
 		// Interrupted preparation may leave a directory before its first
 		// manifest. Use the same absence proof now instead of wasting a tick.
-		partial := &instanceManifest{Service: service, VMDir: vmDir,
-			SocketPath: filepath.Join(vmDir, "firecracker.sock"), ConfigPath: filepath.Join(vmDir, "vm-config.json")}
+		partial := canonicalManifest(service, vmDir)
 		return m.removeRecoveryStateContext(ctx, partial)
 	}
 	if err == nil {
@@ -1249,7 +1247,7 @@ func (m *Manager) writeVMConfig(vmDir string, svc config.ServiceConfig, prepared
 		return "", fmt.Errorf("marshal firecracker config: %w", err)
 	}
 
-	configPath := filepath.Join(vmDir, "vm-config.json")
+	configPath := filepath.Join(vmDir, vmConfigName)
 	if err := os.WriteFile(configPath, append(configJSON, '\n'), 0o644); err != nil {
 		return "", err
 	}

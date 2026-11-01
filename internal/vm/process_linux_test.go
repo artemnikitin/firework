@@ -3,6 +3,7 @@
 package vm
 
 import (
+	"context"
 	"errors"
 	"math"
 	"os"
@@ -223,4 +224,18 @@ func TestHidepidExemptions(t *testing.T) {
 	if err := verifyProcessVisibilityFor(mounts, 1000, []int{1000}); err == nil {
 		t.Fatal("nonexempt viewer accepted")
 	}
+}
+
+func findByVMArgumentsWith(
+	entries []os.DirEntry,
+	procRoot, socketPath, configPath string,
+	matchEither, failOnUnreadable bool,
+	readCommandLine func(string) ([]string, error),
+	inspect func(int) (processIdentity, error),
+) ([]processIdentity, error) {
+	return findByVMArgumentsContext(context.Background(), entries, procRoot, socketPath, configPath, matchEither, failOnUnreadable, readCommandLine, inspect)
+}
+
+func procExitedWithin(procDir string, timeout time.Duration) bool {
+	return procExitedWithinContext(context.Background(), procDir, timeout)
 }

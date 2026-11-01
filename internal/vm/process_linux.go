@@ -126,16 +126,6 @@ func (inspector osProcessInspector) FindByAnyArgumentContext(ctx context.Context
 		readProcessCommandLine, func(pid int) (processIdentity, error) { return inspector.InspectContext(ctx, pid) })
 }
 
-func findByVMArgumentsWith(
-	entries []os.DirEntry,
-	procRoot, socketPath, configPath string,
-	matchEither, failOnUnreadable bool,
-	readCommandLine func(string) ([]string, error),
-	inspect func(int) (processIdentity, error),
-) ([]processIdentity, error) {
-	return findByVMArgumentsContext(context.Background(), entries, procRoot, socketPath, configPath, matchEither, failOnUnreadable, readCommandLine, inspect)
-}
-
 func findByVMArgumentsContext(
 	ctx context.Context, entries []os.DirEntry,
 	procRoot, socketPath, configPath string,
@@ -209,16 +199,12 @@ func readProcessCommandLineWith(procDir string, readFile func(string) ([]byte, e
 // process itself, so a live process never stays unreadable for this long.
 const procExitConfirmTimeout = time.Second
 
-// procExitedWithin reports whether a process whose /proc entry became partially
-// unreadable has gone away. The kernel releases the address space, and with it
-// `exe` and `cmdline`, before the task reaches the zombie state, so a single
-// state read can still show a running task. Only a missing /proc entry or a
-// dead state counts as an exit, which keeps a live process — including one
+// procExitedWithinContext reports whether a process whose /proc entry became
+// partially unreadable has gone away. The kernel releases the address space,
+// and with it `exe` and `cmdline`, before the task reaches the zombie state, so
+// a single state read can still show a running task. Only a missing /proc entry
+// or a dead state counts as an exit, which keeps a live process — including one
 // whose PID was recycled during the wait — from ever being reported as gone.
-func procExitedWithin(procDir string, timeout time.Duration) bool {
-	return procExitedWithinContext(context.Background(), procDir, timeout)
-}
-
 func procExitedWithinContext(ctx context.Context, procDir string, timeout time.Duration) bool {
 	deadline := time.Now().Add(timeout)
 	for {

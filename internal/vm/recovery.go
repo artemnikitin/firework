@@ -122,10 +122,7 @@ func (m *Manager) Recover(ctx context.Context, desired config.NodeConfig) ([]str
 						return
 					}
 				} else {
-					m.addRecoveryPending(name, &instanceManifest{
-						SchemaVersion: manifestSchemaVersion, Service: name, VMDir: vmDir,
-						SocketPath: filepath.Join(vmDir, "firecracker.sock"), ConfigPath: filepath.Join(vmDir, "vm-config.json"),
-					}, fmt.Sprintf("cannot read ownership manifest: %v", readErr))
+					m.addRecoveryPending(name, canonicalManifest(name, vmDir), fmt.Sprintf("cannot read ownership manifest: %v", readErr))
 					return
 				}
 			}
@@ -200,8 +197,7 @@ func (m *Manager) inventoryRecoveryEntries(root string, entries []os.DirEntry) {
 			continue
 		}
 		vmDir := filepath.Join(root, name)
-		partial := &instanceManifest{Service: name, VMDir: vmDir,
-			SocketPath: filepath.Join(vmDir, "firecracker.sock"), ConfigPath: filepath.Join(vmDir, "vm-config.json")}
+		partial := canonicalManifest(name, vmDir)
 		instance := m.recoveryInstanceForService(name, partial, "recovery discovery pending")
 		instance.recoveryDiscoveryPending = true
 		m.instances[name] = instance
@@ -278,10 +274,7 @@ func cloneInstanceManifest(manifest *instanceManifest) *instanceManifest {
 
 func (m *Manager) recoverLegacy(ctx context.Context, name, vmDir string, desired map[string]config.ServiceConfig) (*instanceManifest, bool, error) {
 	service, wanted := desired[name]
-	partial := &instanceManifest{
-		SchemaVersion: manifestSchemaVersion, Service: name, VMDir: vmDir,
-		SocketPath: filepath.Join(vmDir, "firecracker.sock"), ConfigPath: filepath.Join(vmDir, "vm-config.json"),
-	}
+	partial := canonicalManifest(name, vmDir)
 	var matches []processIdentity
 	var err error
 	if scanner, ok := m.inspector.(interface {

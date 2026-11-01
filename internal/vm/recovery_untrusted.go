@@ -70,10 +70,7 @@ func recoveryAbsenceProbe(service, vmDir string, recorded *instanceManifest, unt
 	if !untrusted {
 		return cloneInstanceManifest(recorded)
 	}
-	probe := &instanceManifest{
-		SchemaVersion: manifestSchemaVersion, Service: service, VMDir: vmDir,
-		SocketPath: filepath.Join(vmDir, "firecracker.sock"), ConfigPath: filepath.Join(vmDir, "vm-config.json"),
-	}
+	probe := canonicalManifest(service, vmDir)
 	probe.Config.Name = service
 	// A PID without its start time could name any later process.
 	if recorded.PID > 0 && recorded.ProcessStart != 0 {
