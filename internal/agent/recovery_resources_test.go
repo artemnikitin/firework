@@ -255,12 +255,26 @@ func TestAddressExhaustionHoldsNewServiceAndKeepsExistingAssignments(t *testing.
 			}
 		}
 		// The desired services fit the subnet; only the quarantined VM keeps
-		// the address. That is not a node failure.
+		// the address. That is not a node failure. Where recovery cannot
+		// prove the VM gone (no process inspection) the revision applies as
+		// degraded; where it clears the VM during the tick, the freed address
+		// is assigned and the revision applies on the next tick.
 		if status.Phase == "failed" {
 			t.Fatalf("address held by a quarantined VM failed the node: %s %s", status.ReasonCode, status.Message)
 		}
 		if status.AppliedRevision != "one" {
-			t.Fatalf("recovery-caused address hold did not apply as degraded: %s %s", status.ReasonCode, status.Message)
+			a.tick(context.Background())
+			status = a.agentStatusSnapshot()
+			for _, service := range status.Services {
+				if service.Name == "a" && service.ReasonCode == "resource_held" {
+					t.Fatalf("a is still held after the quarantine resolved: %s", service.Message)
+				}
+			}
+			for _, condition := range status.Conditions {
+				if condition.Type == "CapacityReady" && condition.Status != "true" {
+					t.Fatalf("CapacityReady = %#v", condition)
+				}
+			}
 		}
 	}()
 	if desired[0].Network.GuestIP != "" {
