@@ -16,6 +16,12 @@ import (
 type Hold struct {
 	Reason   string
 	Recovery bool
+	// Admission is the reason code of a hold waiting cannot resolve, such as
+	// desired services that exceed node capacity. It fails the revision.
+	Admission string
+	// Capacity marks a hold made by capacity admission, which re-evaluates
+	// the service on every admission pass.
+	Capacity bool
 }
 
 func (h Hold) err(service string) error {
@@ -34,9 +40,13 @@ func (r *Reconciler) SetHeldServices(held map[string]Hold) {
 	r.heldServices = maps.Clone(held)
 }
 
-func retainsRuntime(state vm.State) bool {
+// RetainsRuntime reports whether a VM in this state keeps its resources until
+// its lifecycle or ownership resolves, whatever this tick's plan says.
+func RetainsRuntime(state vm.State) bool {
 	return state == vm.StateRecoveryPending || state == vm.StateStarting || state == vm.StateStartAborting || state == vm.StateStopping
 }
+
+func retainsRuntime(state vm.State) bool { return RetainsRuntime(state) }
 
 // Instances returns the runtime inventory the reconciler plans against, so
 // admission decisions read the same view as holds.
@@ -71,6 +81,45 @@ func (r *Reconciler) retainedInstances() []*vm.Instance {
 		return 0
 	})
 	return retained
+}
+
+// Holds returns the holds of the desired services, including those set by
+// SetHeldServices and every hold they cause.
+func (r *Reconciler) Holds(desired config.NodeConfig) map[string]Hold {
+	return r.holds(desired)
+}
+
+// DeleteHolds returns, for tracked VMs that desired state no longer names,
+// why their removal must wait: a host claim a retained VM shares with them.
+// Such a VM keeps running, and keeps its resources, until the hold clears.
+func (r *Reconciler) DeleteHolds(desired config.NodeConfig) map[string]Hold {
+	wanted := make(map[string]bool, len(desired.Services))
+	for _, service := range desired.Services {
+		wanted[service.Name] = true
+	}
+	held := make(map[string]Hold)
+	retained := r.retainedInstances()
+	for name, instance := range r.vmManager.List() {
+		if wanted[name] || retainsRuntime(instance.State) {
+			continue
+		}
+		if hold := deleteHold(instance, retained); hold.Reason != "" {
+			held[name] = hold
+		}
+	}
+	return held
+}
+
+func deleteHold(instance *vm.Instance, retained []*vm.Instance) Hold {
+	for _, owner := range retained {
+		if owner.Config.Name == instance.Config.Name {
+			continue
+		}
+		if resource := conflictingResource(instance.Config, owner.Config); resource != "" {
+			return Hold{Reason: fmt.Sprintf("%s retained by %s", resource, owner.Config.Name), Recovery: owner.State == vm.StateRecoveryPending}
+		}
+	}
+	return Hold{}
 }
 
 // HeldServices identifies desired services whose work must wait for retained
@@ -213,6 +262,7 @@ func conflictingResource(service, owner config.ServiceConfig) string {
 func (r *Reconciler) actionHold(action Action) Hold {
 	actual := r.vmManager.List()
 	var hold Hold
+	var plannedHolds map[string]Hold
 	if action.Type != ActionDelete {
 		planned := config.NodeConfig{Services: []config.ServiceConfig{action.Service}}
 		if r.planned != nil {
@@ -224,7 +274,8 @@ func (r *Reconciler) actionHold(action Action) Hold {
 				}
 			}
 		}
-		hold = r.holds(planned)[action.Service.Name]
+		plannedHolds = r.holds(planned)
+		hold = plannedHolds[action.Service.Name]
 		if hold.Reason != "" && !hold.Recovery {
 			return hold
 		}
@@ -233,6 +284,7 @@ func (r *Reconciler) actionHold(action Action) Hold {
 		return Hold{Reason: "runtime ownership or lifecycle is unresolved", Recovery: instance.State == vm.StateRecoveryPending}
 	}
 	if action.Type == ActionCreate && hold.Reason == "" {
+		retained := r.retainedInstances()
 		names := slices.Sorted(maps.Keys(actual))
 		for _, name := range names {
 			owner := actual[name]
@@ -240,21 +292,21 @@ func (r *Reconciler) actionHold(action Action) Hold {
 				continue
 			}
 			if resource := conflictingResource(action.Service, owner.Config); resource != "" {
-				return Hold{Reason: fmt.Sprintf("%s still used by %s", resource, name)}
+				// The owner stays for whatever holds it, so a create waiting
+				// on it inherits that cause.
+				ownerHold, desiredOwner := plannedHolds[name]
+				if !desiredOwner && r.planned != nil && !slices.ContainsFunc(r.planned.Services, func(s config.ServiceConfig) bool { return s.Name == name }) {
+					ownerHold = deleteHold(owner, retained)
+				}
+				recovery := owner.State == vm.StateRecoveryPending || ownerHold.Recovery
+				return Hold{Reason: fmt.Sprintf("%s still used by %s", resource, name), Recovery: recovery}
 			}
 		}
 	}
 	if action.Type != ActionDelete {
 		return hold
 	}
-	for _, owner := range r.retainedInstances() {
-		if owner.Config.Name != action.Service.Name {
-			if resource := conflictingResource(action.Service, owner.Config); resource != "" {
-				return Hold{Reason: fmt.Sprintf("%s retained by %s", resource, owner.Config.Name), Recovery: owner.State == vm.StateRecoveryPending}
-			}
-		}
-	}
-	return Hold{}
+	return deleteHold(&vm.Instance{Config: action.Service}, r.retainedInstances())
 }
 
 func unknownRuntimeOwner(actual map[string]*vm.Instance) string {

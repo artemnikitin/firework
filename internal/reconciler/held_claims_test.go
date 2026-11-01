@@ -226,3 +226,21 @@ func TestReplacementOnSamePortConvergesInOneApply(t *testing.T) {
 		t.Fatalf("d=%v k=%v", m.instances["d"], m.instances["k"])
 	}
 }
+
+// A create waiting on a VM whose removal recovery holds inherits the
+// recovery cause, so the revision can apply as degraded.
+func TestCreateWaitingOnRecoveryHeldRemovalIsRecoveryHold(t *testing.T) {
+	m := newFakeVMManager()
+	r := NewWithNetworkManager(m, heldClaimsLogger(), nil, &forwardRecorder{}, "", 0)
+	m.instances["x"] = &vm.Instance{Name: "x", Config: config.ServiceConfig{Name: "x", Network: &config.NetworkConfig{GuestIP: "172.16.0.9"}}, State: vm.StateRecoveryPending}
+	m.instances["d"] = &vm.Instance{Name: "d", Config: config.ServiceConfig{Name: "d", Network: &config.NetworkConfig{GuestIP: "172.16.0.9"}, PortForwards: []config.PortForward{{HostPort: 8080, VMPort: 80}}}, State: vm.StateRunning}
+	desired := config.NodeConfig{Services: []config.ServiceConfig{{Name: "k", PortForwards: []config.PortForward{{HostPort: 8080, VMPort: 80}}}}}
+	for i := 0; i < 2; i++ {
+		if err := r.Reconcile(context.Background(), desired); !OnlyRecoveryHeld(err) {
+			t.Fatalf("reconcile %d: %v", i, err)
+		}
+	}
+	if m.instances["k"] != nil {
+		t.Fatal("k created on the port d still uses")
+	}
+}
