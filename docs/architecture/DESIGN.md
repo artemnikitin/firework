@@ -438,9 +438,13 @@ shrink can make room; updates that fit only together, such as two VMs trading
 sizes, are admitted together. A service held for another reason is admitted
 too, because its hold can clear during the apply. Capacity and claim holds are
 computed together, starting every tick from no capacity holds, so each hold
-traces back to a cause outside admission. The node never ends a tick over
-capacity; one apply can briefly exceed it when it grows a VM before it shrinks
-another.
+traces back to a cause outside admission. When the apply's updates succeed,
+the node does not end a tick over capacity. It can exceed capacity while an
+apply grows a VM before it shrinks another, which in a rolling apply, where
+creates run before updates, lasts until the rollout reaches the shrink. An
+update that fails after admission credited its shrink leaves its VM at the old
+size, and the node stays over capacity until that update succeeds. `main` had
+the same exposure.
 Running guests retain their assigned addresses after a survivor clears.
 
 Each tick's Recover/Plan/Apply section and health-driven Stop/Start transactions

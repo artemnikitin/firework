@@ -1344,10 +1344,13 @@ func mergeHolds(addressHolds, capacityHolds map[string]reconciler.Hold) map[stri
 //     service-name order. Updates that fit only together, such as two VMs
 //     trading sizes, are admitted together. A held one keeps its current size.
 //
-// The node never ends a tick over capacity, while one apply can briefly
-// exceed it when it grows a VM before it shrinks another. A service held for
-// another reason is admitted too, because its hold can clear during the apply
-// once an earlier action releases its claim.
+// When the apply's updates succeed, the node does not end a tick over
+// capacity. It can exceed capacity while an apply grows a VM before it
+// shrinks another, for a rolling apply until the rollout reaches the shrink,
+// and an update that fails after its shrink was credited keeps its old size
+// until it succeeds. A service held for another reason is admitted too,
+// because its hold can clear during the apply once an earlier action releases
+// its claim.
 //
 // A service that does not fit is held, and the reason names the cause:
 // desired state that does not fit at all, capacity that resolving every
