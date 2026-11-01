@@ -241,8 +241,8 @@ func TestAddressExhaustionHoldsNewServiceAndKeepsExistingAssignments(t *testing.
 		desired = append(desired, config.ServiceConfig{Name: name, Network: &config.NetworkConfig{}})
 	}
 	held := a.assignNetworking(desired)
-	if len(held) != 1 || held["a"] == "" {
-		t.Fatalf("exhausted new service was not held: %v", held)
+	if len(held) != 1 || !held["a"].Recovery || held["a"].Reason != addressRecoveryReason {
+		t.Fatalf("new service was not held for the quarantined VM's address: %v", held)
 	}
 	defer func() {
 		// A full tick turns the address hold into a reconciler hold with a reason.
@@ -250,14 +250,17 @@ func TestAddressExhaustionHoldsNewServiceAndKeepsExistingAssignments(t *testing.
 		a.tick(context.Background())
 		status := a.agentStatusSnapshot()
 		for _, service := range status.Services {
-			if service.Name == "a" && (service.ReasonCode != "resource_held" || !strings.Contains(service.Message, "no free guest address")) {
-				t.Fatalf("exhausted service was not reported as held: %#v", service)
+			if service.Name == "a" && service.ReasonCode != "resource_held" {
+				t.Fatalf("service without an address was not reported as held: %#v", service)
 			}
 		}
-		// An exhausted subnet is not explained by pending recovery, so the
-		// revision stays incomplete instead of being applied as degraded.
-		if status.AppliedRevision == "one" {
-			t.Fatal("address hold was applied as if recovery caused it")
+		// The desired services fit the subnet; only the quarantined VM keeps
+		// the address. That is not a node failure.
+		if status.Phase == "failed" {
+			t.Fatalf("address held by a quarantined VM failed the node: %s %s", status.ReasonCode, status.Message)
+		}
+		if status.AppliedRevision != "one" {
+			t.Fatalf("recovery-caused address hold did not apply as degraded: %s %s", status.ReasonCode, status.Message)
 		}
 	}()
 	if desired[0].Network.GuestIP != "" {

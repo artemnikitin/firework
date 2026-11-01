@@ -405,20 +405,22 @@ Holds are classified the same way whether or not any other VM happens to be
 retained:
 
 - Recovery holds, caused by unresolved VM ownership (unknown claims, a resource
-  retained by a `recovery_pending` owner, or capacity that its resolution would
-  free): when every hold is one, the agent applies the revision with those holds
+  retained by a `recovery_pending` owner directly or through a held VM, a guest
+  address an undesired quarantined VM keeps, or capacity that its resolution
+  would free): when every hold is one, the agent applies the revision with those holds
   and reports `VMRecoveryReady=False`, so the node shows as degraded instead of
   progressing. Pending recovery keeps forcing reconciliation, so held work
   retries on an unchanged revision.
 - Admission failures, which waiting cannot resolve: desired services whose
-  combined CPU or memory exceeds node capacity, or a subnet with no free guest
-  address. Services that fit still converge, in service-name order after VMs
+  combined CPU or memory exceeds node capacity, or more networked desired
+  services than `vm_subnet` has guest addresses. Services that fit still converge, in service-name order after VMs
   that are starting, stopping or quarantined, but the revision is not applied: `CapacityReady`
   is false with `capacity_exceeded` or `guest_addresses_exhausted`, and the node
   reports failed.
 - Transient holds: waiting on another start or stop, on a claim that a running
-  or retained VM still uses, or on capacity still allocated to VMs that are
-  starting or stopping. The revision stays incomplete, `VMsReconciled` is
+  or retained VM still uses, on capacity still allocated to VMs that are
+  starting or stopping, or on a guest address an undesired VM keeps until the
+  plan removes it. The revision stays incomplete, `VMsReconciled` is
   unknown with `resource_held`, and the next tick retries.
 
 Admission counts only allocations the tick's plan cannot release: VMs that are

@@ -329,13 +329,15 @@ the hold clears.
 Other holds do not let the revision apply. `VMsReconciled` reports
 `resource_held` and names every held service in its message:
 
-- Desired services whose combined CPU or memory exceeds node capacity, or a
-  `vm_subnet` with no free guest address, fail the node with
+- Desired services whose combined CPU or memory exceeds node capacity, or more
+  networked desired services than `vm_subnet` has guest addresses, fail the node with
   `capacity_exceeded` or `guest_addresses_exhausted` on `CapacityReady`. The
   services that fit still converge.
 - A service waiting on another VM's start or stop, on a host port, address or
-  device another VM still uses, or on capacity still allocated to VMs that are
-  starting or stopping keeps the node reconciling, and the next poll retries it.
+  device another VM still uses, or on capacity or a guest address still held by
+  VMs that are starting, stopping or being removed keeps the node reconciling,
+  and the next poll retries it. A guest address kept by a quarantined VM is a
+  recovery hold.
 
 The agent reports the nonblocking `VMRecoveryReady` condition from its complete
 runtime inventory. A false value carries `vm_recovery_pending`, including when

@@ -477,7 +477,7 @@ func TestAssignNetworking_StopsWhenSubnetExhausted(t *testing.T) {
 	}
 
 	held := a.assignNetworking(services)
-	if len(held) != 1 || held["second"] == "" {
+	if len(held) != 1 || !strings.HasPrefix(held["second"].Reason, addressExhaustedReason) {
 		t.Fatalf("expected only the second service to be held, got %v", held)
 	}
 

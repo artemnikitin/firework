@@ -495,11 +495,11 @@ func (a *Agent) tick(ctx context.Context) {
 	// recovery, still runs; genuine over-capacity fails the revision below.
 	used, capacityHolds := a.reserveCapacity(merged.Services, nodeCap, hasCap)
 	holds := make(map[string]reconciler.Hold, len(capacityHolds)+len(addressHolds))
-	for name, reason := range addressHolds {
-		holds[name] = reconciler.Hold{Reason: reason}
+	for name, hold := range addressHolds {
+		holds[name] = hold
 	}
-	// An address failure is independent of recovery. Do not replace it with
-	// a weaker recovery-only capacity hold for the same service.
+	// Do not replace an address hold that recovery does not explain with a
+	// weaker recovery-only capacity hold for the same service.
 	for name, hold := range capacityHolds {
 		if existing, ok := holds[name]; ok && !existing.Recovery {
 			continue
@@ -768,11 +768,19 @@ func usableRevisionMetadata(revision string) string {
 	return revision
 }
 
+const (
+	addressExhaustedReason = "no free guest address in vm_subnet "
+	addressRecoveryReason  = "guest address retained by unresolved VM ownership"
+	addressTransientReason = "guest addresses are still reserved by VMs being stopped or removed"
+)
+
 // assignNetworking fills in IP, MAC, and kernel IP boot args for services
 // that have networking enabled. Services must be sorted by name for
 // deterministic IP allocation. It returns the services that could not get an
-// address, as holds with their reason.
-func (a *Agent) assignNetworking(services []config.ServiceConfig) map[string]string {
+// address, as holds classified like capacity: the desired services alone
+// exceed the subnet, an undesired quarantined VM keeps the address, or an
+// undesired VM the plan removes keeps it for one more tick.
+func (a *Agent) assignNetworking(services []config.ServiceConfig) map[string]reconciler.Hold {
 	if a.cfg.VMSubnet == "" {
 		return nil
 	}
@@ -795,26 +803,54 @@ func (a *Agent) assignNetworking(services []config.ServiceConfig) map[string]str
 
 	reservedIP, reservedMAC := map[string]string{}, map[string]string{}
 	retained := map[string]config.ServiceConfig{}
-	var retainedServices []config.ServiceConfig
+	desired := make(map[string]bool, len(services))
+	networked := 0
+	for _, svc := range services {
+		desired[svc.Name] = true
+		if svc.Network != nil {
+			networked++
+		}
+	}
+	// Why an undesired VM keeps an address: quarantine, or a removal this
+	// tick's plan performs.
+	var quarantinedReserves, departingReserves bool
 	if a.reconciler != nil {
-		retainedServices = a.reconciler.RetainedServices()
 		// Every tracked VM keeps its address: a route-only tick must not shift
 		// a running guest to a freed IP, and a crashed or restarting service
-		// must not lose its IP to first-fit reallocation.
-		if a.vmManager != nil {
-			for _, inst := range a.vmManager.List() {
-				if inst.Config.Network != nil && ipNet.Contains(net.ParseIP(inst.Config.Network.GuestIP)) {
-					retainedServices = append(retainedServices, inst.Config)
+		// must not lose its IP to first-fit reallocation. Retained VMs keep
+		// theirs even outside the current subnet.
+		retainedNames := make(map[string]bool)
+		for _, svc := range a.reconciler.RetainedServices() {
+			retainedNames[svc.Name] = true
+		}
+		for name, inst := range a.reconciler.Instances() {
+			svc := inst.Config
+			inSubnet := svc.Network != nil && ipNet.Contains(net.ParseIP(svc.Network.GuestIP))
+			if !retainedNames[name] && !inSubnet {
+				continue
+			}
+			retained[name] = svc
+			if svc.Network == nil {
+				continue
+			}
+			reservedIP[svc.Network.GuestIP] = name
+			reservedMAC[strings.ToLower(svc.Network.GuestMAC)] = name
+			if inSubnet && !desired[name] {
+				if inst.State == vm.StateRecoveryPending {
+					quarantinedReserves = true
+				} else {
+					departingReserves = true
 				}
 			}
 		}
 	}
-	for _, svc := range retainedServices {
-		retained[svc.Name] = svc
-		if svc.Network != nil {
-			reservedIP[svc.Network.GuestIP] = svc.Name
-			reservedMAC[strings.ToLower(svc.Network.GuestMAC)] = svc.Name
-		}
+	exhausted := reconciler.Hold{Reason: addressExhaustedReason + a.cfg.VMSubnet}
+	switch {
+	case networked > guestAddressCount(ipNet):
+	case departingReserves:
+		exhausted = reconciler.Hold{Reason: addressTransientReason}
+	case quarantinedReserves:
+		exhausted = reconciler.Hold{Reason: addressRecoveryReason, Recovery: true}
 	}
 	// Restore every existing assignment before allocating any new one, so a
 	// new service that exhausts the subnet can never leave an existing VM's
@@ -828,7 +864,7 @@ func (a *Agent) assignNetworking(services []config.ServiceConfig) map[string]str
 			}
 		}
 	}
-	var held map[string]string
+	var held map[string]reconciler.Hold
 	idx := 0
 	for i := range services {
 		svc := &services[i]
@@ -854,10 +890,10 @@ func (a *Agent) assignNetworking(services []config.ServiceConfig) map[string]str
 		if !ok {
 			// Hold the service instead of reconciling it without an address.
 			if held == nil {
-				held = make(map[string]string)
+				held = make(map[string]reconciler.Hold)
 			}
-			held[svc.Name] = "no free guest address in vm_subnet " + a.cfg.VMSubnet
-			a.logger.Error("vm_subnet has no available guest IPs", "subnet", a.cfg.VMSubnet, "service", svc.Name)
+			held[svc.Name] = exhausted
+			a.logger.Warn("vm_subnet has no available guest IP for service", "subnet", a.cfg.VMSubnet, "service", svc.Name, "reason", exhausted.Reason)
 			continue
 		}
 		mac := guestMACForIndex(idx)
@@ -875,6 +911,20 @@ func (a *Agent) assignNetworking(services []config.ServiceConfig) map[string]str
 		idx++
 	}
 	return held
+}
+
+// guestAddressCount is the number of guest addresses guestIPv4ForIndex can
+// produce: every host address except the network, the gateway (.1) and the
+// broadcast address.
+func guestAddressCount(ipNet *net.IPNet) int {
+	if ipNet == nil || ipNet.IP.To4() == nil {
+		return 0
+	}
+	ones, bits := ipNet.Mask.Size()
+	if bits != 32 || ones > 30 {
+		return 0
+	}
+	return 1<<uint(32-ones) - 3
 }
 
 func guestIPv4ForIndex(ipNet *net.IPNet, idx int) (string, bool) {
@@ -1287,7 +1337,7 @@ func (a *Agent) reserveCapacity(services []config.ServiceConfig, cap capacity.No
 // admissionFailure reports holds that no amount of waiting resolves: desired
 // services that exceed node capacity, or a subnet without a free address.
 // They fail the revision instead of leaving it reconciling.
-func admissionFailure(addressHolds map[string]string, capacityHolds map[string]reconciler.Hold) (string, string) {
+func admissionFailure(addressHolds, capacityHolds map[string]reconciler.Hold) (string, string) {
 	var names []string
 	for name, hold := range capacityHolds {
 		if hold.Reason == capacityExceededReason {
@@ -1298,14 +1348,15 @@ func admissionFailure(addressHolds map[string]string, capacityHolds map[string]r
 		sort.Strings(names)
 		return "capacity_exceeded", capacityExceededReason + "; held: " + strings.Join(names, ", ")
 	}
-	if len(addressHolds) == 0 {
-		return "", ""
-	}
-	names = names[:0]
 	var reason string
-	for name, held := range addressHolds {
-		names = append(names, name)
-		reason = held
+	for name, hold := range addressHolds {
+		if strings.HasPrefix(hold.Reason, addressExhaustedReason) {
+			names = append(names, name)
+			reason = hold.Reason
+		}
+	}
+	if len(names) == 0 {
+		return "", ""
 	}
 	sort.Strings(names)
 	return "guest_addresses_exhausted", reason + "; held: " + strings.Join(names, ", ")
@@ -1313,9 +1364,8 @@ func admissionFailure(addressHolds map[string]string, capacityHolds map[string]r
 
 // prepareDesired completes desired state for this node: guest addresses,
 // same-node link URLs, then environment kernel arguments, which carry the
-// link URLs. It returns the services held because the subnet has no free
-// address.
-func (a *Agent) prepareDesired(services []config.ServiceConfig) map[string]string {
+// link URLs. It returns the services held because no guest address is free.
+func (a *Agent) prepareDesired(services []config.ServiceConfig) map[string]reconciler.Hold {
 	held := a.assignNetworking(services)
 	a.resolveLinks(services)
 	a.injectEnvVars(services)

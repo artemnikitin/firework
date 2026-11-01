@@ -110,3 +110,36 @@ func TestExhaustedSubnetFailsRevision(t *testing.T) {
 		t.Fatalf("phase=%s reason=%s", status.Phase, status.ReasonCode)
 	}
 }
+
+// An undesired VM keeps its address until it is gone. That is transient while
+// the VM is on its way out and a recovery cause while it is quarantined;
+// neither fails the node.
+func TestAddressKeptByUndesiredVMIsNotANodeFailure(t *testing.T) {
+	for _, state := range []vm.State{vm.StateStopping, vm.StateRunning, vm.StateRecoveryPending} {
+		t.Run(string(state), func(t *testing.T) {
+			yaml := "node: web\nservices:\n- name: k\n  image: /k\n  kernel: /k\n  network: {}\n"
+			d := config.ServiceConfig{Name: "d", Network: &config.NetworkConfig{GuestIP: "172.16.0.2", GuestMAC: guestMACForIndex(0)}}
+			a, manager := classificationAgent(t, yaml, map[string]*vm.Instance{"d": {Name: "d", Config: d, State: state}}, 8)
+			a.cfg.VMSubnet, a.cfg.VMGateway = "172.16.0.0/30", "172.16.0.1/30"
+			a.tick(context.Background())
+			status := a.agentStatusSnapshot()
+			if manager.instances["k"] != nil {
+				t.Fatal("k started on the address d still holds")
+			}
+			if status.Phase == statusmodel.PhaseFailed || conditionOf(status, "CapacityReady").Status != statusmodel.ConditionTrue {
+				t.Fatalf("phase=%s reason=%s capacity=%#v", status.Phase, status.ReasonCode, conditionOf(status, "CapacityReady"))
+			}
+			if state == vm.StateStopping {
+				delete(manager.instances, "d")
+			}
+			if state == vm.StateRunning {
+				// The first tick already removed the undesired running VM.
+				a.tick(context.Background())
+				if manager.instances["k"] == nil || a.lastRevision != "r1" {
+					t.Fatalf("k did not take the freed address: k=%v lastRevision=%q", manager.instances["k"], a.lastRevision)
+				}
+			}
+		})
+	}
+}
+
