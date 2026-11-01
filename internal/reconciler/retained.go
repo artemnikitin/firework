@@ -92,9 +92,11 @@ func (r *Reconciler) holds(desired config.NodeConfig) map[string]Hold {
 	unknown := unknownRuntimeOwner(actual)
 	owners := r.retainedInstances()
 	held := make(map[string]Hold)
-	// A running VM whose update is held keeps its actual guest IP, MAC, host
-	// ports and devices, so it is an owner for every other service. Holding
-	// one service can therefore hold another; iterate until nothing changes.
+	// A tracked VM whose update is held keeps its actual guest IP, MAC, host
+	// ports and devices, so it is an owner for every other service. That
+	// includes a crashed or stopped VM, whose DNAT rules stay installed until
+	// it is replaced. Holding one service can therefore hold another; iterate
+	// until nothing changes.
 	for changed := true; changed; {
 		changed = false
 		for _, service := range desired.Services {
@@ -107,8 +109,8 @@ func (r *Reconciler) holds(desired config.NodeConfig) map[string]Hold {
 			}
 			held[service.Name] = hold
 			changed = true
-			if instance := actual[service.Name]; instance != nil && instance.State == vm.StateRunning {
-				owners = append(owners, instance)
+			if instance := actual[service.Name]; instance != nil && !retainsRuntime(instance.State) {
+				owners = append(owners, instance) // Retained VMs already are.
 			}
 		}
 	}
@@ -199,9 +201,10 @@ func conflictingResource(service, owner config.ServiceConfig) string {
 // actionHold re-checks one planned action against the runtime as it is now,
 // after earlier actions of this tick. Holds are evaluated across the whole
 // planned revision, so a held running owner protects its claims here too. A
-// create also waits for any running VM that still uses one of its claims, such
+// create also waits for any other tracked VM that still uses one of its claims, such
 // as a service whose update releasing that port comes later in a rolling
-// apply; the next tick creates it.
+// apply; the next tick creates it. A crashed or stopped VM counts too, because
+// its host rules stay installed until it is replaced.
 func (r *Reconciler) actionHold(action Action) Hold {
 	actual := r.vmManager.List()
 	var hold Hold
@@ -228,7 +231,7 @@ func (r *Reconciler) actionHold(action Action) Hold {
 		names := slices.Sorted(maps.Keys(actual))
 		for _, name := range names {
 			owner := actual[name]
-			if name == action.Service.Name || owner.State != vm.StateRunning {
+			if name == action.Service.Name {
 				continue
 			}
 			if resource := conflictingResource(action.Service, owner.Config); resource != "" {

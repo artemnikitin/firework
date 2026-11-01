@@ -394,10 +394,12 @@ allocations (creates and updates) until its record is forgotten or replaced by
 a trusted one. Deletes still proceed, but leave their host cleanup in the
 journal until then. Running services that need no change keep their networking, health
 checks and port forwards. Conflicting desired services are
-held with `resource_held`; independent actions continue. A running VM whose
-update is held keeps its actual guest IP, MAC, host ports and devices, and its
-DNAT rules are re-asserted every tick; other services that need any of those
-claims are held too. A new service also waits while a running VM still uses one
+held with `resource_held`; independent actions continue. A VM whose update is
+held keeps its actual guest IP, MAC, host ports and devices, whether it is
+running or has crashed or stopped, since its DNAT rules stay installed until it
+is replaced; a running one's rules are re-asserted every tick. Other services
+that need any of those claims are held too, and inherit the cause of the
+owner's hold. A new service also waits while another tracked VM still uses one
 of its claims, for example until a later rolling update moves that VM off the
 port.
 

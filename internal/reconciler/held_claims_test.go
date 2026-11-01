@@ -184,3 +184,27 @@ func TestHoldThroughHeldOwnerKeepsRecoveryCause(t *testing.T) {
 		t.Fatalf("b=%+v", held["b"])
 	}
 }
+
+// A crashed VM's DNAT rules stay installed until it is replaced. While its
+// update is held, it keeps its claims: a new service asking for its port waits
+// instead of getting a second rule that the crashed VM's rule shadows.
+func TestHeldFailedVMKeepsItsClaims(t *testing.T) {
+	m := newFakeVMManager()
+	net := &forwardRecorder{}
+	r := NewWithNetworkManager(m, heldClaimsLogger(), nil, net, "", 0)
+	svc := func(name, ip string, port int) config.ServiceConfig {
+		return config.ServiceConfig{Name: name, VCPUs: 1, Network: &config.NetworkConfig{GuestIP: ip}, PortForwards: []config.PortForward{{HostPort: port, VMPort: 80}}}
+	}
+	m.instances["x"] = &vm.Instance{Name: "x", Config: svc("x", "172.16.0.2", 8080), State: vm.StateFailed}
+	desiredX := svc("x", "172.16.0.2", 9090)
+	desiredX.VCPUs = 4
+	desired := config.NodeConfig{Services: []config.ServiceConfig{svc("k", "172.16.0.3", 8080), desiredX}}
+	r.SetHeldServices(map[string]Hold{"x": {Reason: "desired services exceed node capacity"}})
+	_ = r.Reconcile(context.Background(), desired)
+	if m.instances["k"] != nil {
+		t.Fatalf("k was created on the port held failed x still forwards: %v", net.forwards)
+	}
+	if reason := r.HeldServices(desired)["k"]; !strings.Contains(reason, "host port 8080 retained by x") {
+		t.Fatalf("k hold = %q", reason)
+	}
+}
