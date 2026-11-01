@@ -2,6 +2,7 @@ package agent
 
 import (
 	"context"
+	"os"
 	"strings"
 	"testing"
 
@@ -119,5 +120,38 @@ func TestAddressKeptThroughRecoveryIsARecoveryHold(t *testing.T) {
 				t.Fatalf("node failed: %s %s", status.ReasonCode, status.Message)
 			}
 		})
+	}
+}
+
+// After an agent restart, remote route files from the previous process stay
+// on disk while the first peer listing fails. A held service's stale
+// hostname is not published beside them: no listing proves it free.
+func TestStaleRouteAfterRestartWhilePeersUnavailable(t *testing.T) {
+	routeDir := t.TempDir()
+	original := routingPersistenceService()
+	store := &fakeStore{listResult: []config.NodeConfig{{Node: "peer", HostIP: "10.0.0.9", Services: []config.ServiceConfig{
+		{Name: "other", Metadata: map[string]string{"host": "original.example.com"}, PortForwards: []config.PortForward{{HostPort: 8080, VMPort: 80}}},
+	}}}}
+	a, manager := routingPersistenceAgent(t, routeDir, original, "owner-old")
+	a.store = store
+	desired := original
+	desired.Image = "/new"
+	desired.Metadata = map[string]string{"host": "moved.example.com"}
+	holdRoutingReplacement(manager)
+	if err := a.syncTraefikConfigs(context.Background(), []config.ServiceConfig{desired}); err != nil {
+		t.Fatal(err)
+	}
+	restarted, restartedManager := routingPersistenceAgent(t, routeDir, original, "owner-old")
+	restarted.store = store
+	holdRoutingReplacement(restartedManager)
+	store.listErr = os.ErrPermission
+	if err := restarted.syncTraefikConfigs(context.Background(), []config.ServiceConfig{desired}); err != nil {
+		t.Fatal(err)
+	}
+	if body, ok := readRoute(t, routeDir, "app.yaml"); ok {
+		t.Fatalf("restarted agent republished a stale hostname while peers are unknown:\n%s", body)
+	}
+	if _, ok := readRoute(t, routeDir, "remote-other.yaml"); !ok {
+		t.Fatal("preserved peer route was removed")
 	}
 }

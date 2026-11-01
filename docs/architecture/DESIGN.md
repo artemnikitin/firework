@@ -484,7 +484,11 @@ them from the VM's own configuration, and route files carry no extra state. A
 held update keeps the previous hostname and backend until its VM is replaced,
 but only while desired state does not give that hostname to another service,
 local or on a peer: the desired owner always wins, and the stale route is
-dropped instead of failing publication for every other service. Peer discovery
+dropped instead of failing publication for every other service. While the peer
+list cannot be fetched, peer claims come from the last successful listing, the
+one the preserved remote route files came from; before an agent's first
+successful listing, stale routes are dropped because nothing proves their
+hostnames free. Peer discovery
 runs outside the lifecycle lock; selecting and publishing the local snapshot is
 serialized with replacement and health restarts on both tick paths.
 

@@ -15,7 +15,10 @@ import (
 func (a *Agent) syncRuntimeRoutes(services []config.ServiceConfig, remoteNodes []config.NodeConfig, localOnly bool) error {
 	a.lifecycleMu.Lock()
 	defer a.lifecycleMu.Unlock()
-	selected := a.selectLocalRoutes(a.reconciler.LocalRoutes(services), services, remoteNodes)
+	// Remote files written before this process started stay on disk while
+	// listing fails, but their claims are unknown until a listing succeeds.
+	peersKnown := !localOnly || a.peersListed
+	selected := a.selectLocalRoutes(a.reconciler.LocalRoutes(services), services, remoteNodes, peersKnown)
 	if localOnly {
 		return a.traefikMgr.SyncLocal(selected)
 	}
@@ -25,9 +28,10 @@ func (a *Agent) syncRuntimeRoutes(services []config.ServiceConfig, remoteNodes [
 // selectLocalRoutes publishes each tracked VM from its own configuration. A
 // held update keeps its previous hostname only while desired state does not
 // give that hostname to another service, local or on a peer: the desired owner
-// always wins. A stale route is dropped rather than failing publication, so
-// one held service can never freeze every other route on the node.
-func (a *Agent) selectLocalRoutes(routes []reconciler.LocalRoute, desired []config.ServiceConfig, remoteNodes []config.NodeConfig) []config.ServiceConfig {
+// always wins, and with no peer listing yet nothing proves the hostname free.
+// A stale route is dropped rather than failing publication, so one held
+// service can never freeze every other route on the node.
+func (a *Agent) selectLocalRoutes(routes []reconciler.LocalRoute, desired []config.ServiceConfig, remoteNodes []config.NodeConfig, peersKnown bool) []config.ServiceConfig {
 	resolve := func(svc config.ServiceConfig) (string, error) {
 		return ingress.Resolve(svc.Name, svc.Metadata, a.cfg.IngressDomain)
 	}
@@ -53,6 +57,9 @@ func (a *Agent) selectLocalRoutes(routes []reconciler.LocalRoute, desired []conf
 		if route.Current {
 			selected = append(selected, svc)
 			continue
+		}
+		if !peersKnown {
+			continue // A peer may own the hostname now; nothing says otherwise.
 		}
 		host, err := resolve(svc)
 		if err != nil {

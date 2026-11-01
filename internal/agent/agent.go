@@ -71,10 +71,12 @@ type Agent struct {
 	recoveryMu      sync.Mutex
 	recoveryQueue   map[string]bool
 	forceReconcile  bool
-	// lastPeerNodes is the last complete peer listing. While listing fails,
-	// its remote route files are preserved, and local routes resolve hostname
-	// claims against it. Only the tick goroutine uses it.
+	// lastPeerNodes is the last complete peer listing, and peersListed says
+	// whether this process has one. While listing fails, its remote route
+	// files are preserved, and local routes resolve hostname claims against
+	// it. Only the tick goroutine uses them.
 	lastPeerNodes []config.NodeConfig
+	peersListed   bool
 	lifecycleMu   sync.Mutex
 	// restartNeedsReconcile is set by a health restart that left its service
 	// without a running VM; the next tick then skips the unchanged-revision
@@ -1086,7 +1088,7 @@ func (a *Agent) syncTraefikConfigs(ctx context.Context, services []config.Servic
 				remoteNodes = append(remoteNodes, nc)
 			}
 		}
-		a.lastPeerNodes = remoteNodes
+		a.lastPeerNodes, a.peersListed = remoteNodes, true
 	} else {
 		a.setStatusCondition("PeerRoutesReady", statusmodel.ConditionTrue, "not_configured", "")
 	}
