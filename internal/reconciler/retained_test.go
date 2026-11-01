@@ -274,3 +274,26 @@ func TestOnlyRecoveryCausedHoldsAreRecoveryHolds(t *testing.T) {
 		t.Fatalf("capacity hold was treated as recovery-caused: %v", err)
 	}
 }
+
+func TestIndependentAdmissionHoldSurvivesRecoveryHolds(t *testing.T) {
+	for _, unknown := range []bool{false, true} {
+		for _, state := range []vm.State{"", vm.StateRunning, vm.StateRecoveryPending} {
+			r := newTestReconciler("", 0)
+			manager := r.vmManager.(*fakeVMManager)
+			manager.instances["owner"] = &vm.Instance{Name: "owner", Config: config.ServiceConfig{Name: "owner"}, State: vm.StateRecoveryPending, RecoveryConfigUnknown: unknown}
+			service := config.ServiceConfig{Name: "work", Image: "new"}
+			if state != "" {
+				manager.instances[service.Name] = &vm.Instance{Name: service.Name, Config: config.ServiceConfig{Name: service.Name, Image: "old"}, State: state}
+			}
+			r.SetHeldServices(map[string]Hold{service.Name: {Reason: "no free address or physical capacity"}})
+			err := r.Reconcile(context.Background(), config.NodeConfig{Services: []config.ServiceConfig{service}})
+			if !IsIncomplete(err) || OnlyRecoveryHeld(err) {
+				t.Fatalf("unknown=%v state=%s: independent admission failure lost: %v", unknown, state, err)
+			}
+			hold := r.actionHold(Action{Type: ActionCreate, Service: service})
+			if hold.Recovery || hold.Reason != "no free address or physical capacity" {
+				t.Fatalf("action lost independent hold: %#v", hold)
+			}
+		}
+	}
+}

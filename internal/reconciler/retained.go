@@ -87,6 +87,12 @@ func (r *Reconciler) holds(desired config.NodeConfig) map[string]Hold {
 	capacityHolds := maps.Clone(r.heldServices)
 	r.heldMu.RUnlock()
 	for _, service := range desired.Services {
+		// Independent admission failures remain blockers even when another VM's
+		// unknown claims or this service's quarantine also prevent its update.
+		if hold, ok := capacityHolds[service.Name]; ok && !hold.Recovery {
+			held[service.Name] = hold
+			continue
+		}
 		if instance := actual[service.Name]; instance != nil && instance.State == vm.StateRecoveryPending {
 			continue // Its quarantine already reports why no desired work applies.
 		}
@@ -160,16 +166,18 @@ func conflictingResource(service, owner config.ServiceConfig) string {
 
 func (r *Reconciler) actionHold(action Action) Hold {
 	actual := r.vmManager.List()
-	// A delete releases resources; deleteService defers its host cleanup to
-	// the journal while unknown claims remain.
-	if unknown := unknownRuntimeOwner(actual); unknown != "" && action.Type != ActionDelete {
-		return Hold{Reason: "runtime resource claims are unknown for " + unknown, Recovery: true}
+	var hold Hold
+	if action.Type != ActionDelete {
+		hold = r.holds(config.NodeConfig{Services: []config.ServiceConfig{action.Service}})[action.Service.Name]
+		if hold.Reason != "" && !hold.Recovery {
+			return hold
+		}
 	}
 	if instance := actual[action.Service.Name]; instance != nil && retainsRuntime(instance.State) {
 		return Hold{Reason: "runtime ownership or lifecycle is unresolved", Recovery: instance.State == vm.StateRecoveryPending}
 	}
 	if action.Type != ActionDelete {
-		return r.holds(config.NodeConfig{Services: []config.ServiceConfig{action.Service}})[action.Service.Name]
+		return hold
 	}
 	for _, owner := range r.retainedInstances() {
 		if owner.Config.Name != action.Service.Name {

@@ -237,6 +237,12 @@ services:
 	a := New(cfg, s, testLogger())
 	rs := &fakeRouteSyncer{}
 	a.traefikMgr = rs
+	local, err := config.ParseNodeConfig(s.data["web"])
+	if err != nil {
+		t.Fatal(err)
+	}
+	a.assignNetworking(local.Services)
+	a.reconciler = reconciler.New(&runningVMManager{names: []string{"local"}, configs: map[string]config.ServiceConfig{"local": local.Services[0]}}, testLogger(), nil, nil, "", 0)
 	a.lastRevision = "rev-1"
 
 	a.tick(context.Background())

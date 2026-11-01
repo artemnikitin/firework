@@ -8,7 +8,6 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"maps"
 	"net"
 	"sort"
 	"strings"
@@ -505,7 +504,14 @@ func (a *Agent) tick(ctx context.Context) {
 	for name, reason := range addressHolds {
 		holds[name] = reconciler.Hold{Reason: reason}
 	}
-	maps.Copy(holds, capacityHolds)
+	// An address failure is independent of recovery. Do not replace it with
+	// a weaker recovery-only capacity hold for the same service.
+	for name, hold := range capacityHolds {
+		if existing, ok := holds[name]; ok && !existing.Recovery {
+			continue
+		}
+		holds[name] = hold
+	}
 	a.reconciler.SetHeldServices(holds)
 	// Update the heartbeat goroutine with the latest used resources now, before
 	// the potentially long-running image sync, so heartbeats reflect current
@@ -522,7 +528,15 @@ func (a *Agent) tick(ctx context.Context) {
 	if !hasCap {
 		capacityReason = "not_configured"
 	}
-	a.setStatusCondition("CapacityReady", statusmodel.ConditionTrue, capacityReason, "")
+	capacityStatus := statusmodel.ConditionTrue
+	for _, hold := range capacityHolds {
+		if !hold.Recovery {
+			capacityStatus = statusmodel.ConditionFalse
+			capacityReason = "capacity_exceeded"
+			break
+		}
+	}
+	a.setStatusCondition("CapacityReady", capacityStatus, capacityReason, "")
 
 	// Sync images from S3 before reconciling (ensures rootfs/kernels are present).
 	if a.imageSyncer != nil {
@@ -974,7 +988,9 @@ func envKernelArg(key, value string) string {
 }
 
 // syncTraefikConfigs writes or removes Traefik dynamic config files to match
-// the desired set of services. When the store implements NodeConfigLister,
+// desired local names using only running VM backends. Held updates keep their
+// actual hostname/backend until replacement; held creates publish no route.
+// When the store implements NodeConfigLister,
 // peer node configs are also fetched so that remote services can be proxied.
 // No-op when Traefik management is disabled.
 //
@@ -1001,7 +1017,7 @@ func (a *Agent) syncTraefikConfigs(ctx context.Context, services []config.Servic
 				"error", err)
 			a.metrics.setRemoteRouteSyncDegraded(true)
 			a.setStatusCondition("PeerRoutesReady", statusmodel.ConditionFalse, "peer_route_sync_degraded", err.Error())
-			if err := a.traefikMgr.SyncLocal(services); err != nil {
+			if err := a.syncRuntimeRoutes(services, nil, true); err != nil {
 				return fmt.Errorf("syncing local traefik configs: %w", err)
 			}
 			return nil
@@ -1021,7 +1037,7 @@ func (a *Agent) syncTraefikConfigs(ctx context.Context, services []config.Servic
 		a.setStatusCondition("PeerRoutesReady", statusmodel.ConditionTrue, "not_configured", "")
 	}
 
-	if err := a.traefikMgr.Sync(services, remoteNodes); err != nil {
+	if err := a.syncRuntimeRoutes(services, remoteNodes, false); err != nil {
 		return fmt.Errorf("syncing traefik configs: %w", err)
 	}
 	return nil
@@ -1234,7 +1250,8 @@ func (a *Agent) reserveCapacity(services []config.ServiceConfig, cap capacity.No
 			pending[name] = inst.State == vm.StateRecoveryPending
 		}
 	}
-	// settled is the allocation without unresolved owners.
+	// Compute the complete post-recovery demand independently of admission:
+	// held services still consume desired capacity once their ownership resolves.
 	var used, settled capacity.NodeCapacity
 	for name, svc := range allocations {
 		used = growAllocation(used, svc, config.ServiceConfig{})
@@ -1242,23 +1259,26 @@ func (a *Agent) reserveCapacity(services []config.ServiceConfig, cap capacity.No
 			settled = growAllocation(settled, svc, config.ServiceConfig{})
 		}
 	}
+	for _, svc := range services {
+		old := allocations[svc.Name]
+		if pending[svc.Name] {
+			old = config.ServiceConfig{}
+		}
+		settled = growAllocation(settled, svc, old)
+	}
 	exceeds := func(c capacity.NodeCapacity) bool { return c.VCPUs > cap.VCPUs || c.MemoryMB > cap.MemoryMB }
 	holds := map[string]reconciler.Hold{}
 	for _, svc := range services {
-		old, settledOld := allocations[svc.Name], allocations[svc.Name]
-		if pending[svc.Name] {
-			settledOld = config.ServiceConfig{}
-		}
-		next, nextSettled := growAllocation(used, svc, old), growAllocation(settled, svc, settledOld)
+		next := growAllocation(used, svc, allocations[svc.Name])
 		if known && exceeds(next) {
-			if exceeds(nextSettled) {
+			if exceeds(settled) {
 				holds[svc.Name] = reconciler.Hold{Reason: "desired services exceed node capacity"}
 			} else {
 				holds[svc.Name] = reconciler.Hold{Reason: "capacity retained by unresolved VM ownership", Recovery: true}
 			}
 			continue
 		}
-		used, settled = next, nextSettled
+		used = next
 	}
 	return used, holds
 }

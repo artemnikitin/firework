@@ -422,3 +422,16 @@ The opt-in `scripts/systemd-recovery/run.sh` validation runs real systemd units,
 Linux process inspection and TAP ownership in a disposable container. It also
 confirms that recreating a same-name TAP cannot reconnect an old descriptor.
 See its README for prerequisites and the simulated-VMM validation boundary.
+
+Local Traefik publication uses running VM configurations, not unfulfilled
+allocations in desired state. Held creates publish no local route; held updates
+keep the running guest's previous hostname and backend. Unheld hostname and
+health-check port edits can apply without VM replacement. Peer discovery runs
+outside the lifecycle lock; selecting and publishing the local snapshot is
+serialized with replacement and health restarts on both tick paths.
+
+Admission combines constraints conservatively. A physical capacity or address
+failure cannot be relabeled as a recovery-only hold. Post-recovery capacity
+attribution includes every desired service, even one already held during the
+current admission pass.
+
