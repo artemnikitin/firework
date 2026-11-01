@@ -480,7 +480,28 @@ func (m *Manager) reclaimStartState(ctx context.Context, service, vmDir string, 
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	return os.RemoveAll(vmDir)
+	return removeVMStateKeepingLog(vmDir)
+}
+
+// removeVMStateKeepingLog clears a confirmed-exited owner's state before its
+// replacement starts. The launcher appends to firecracker.log, so a crashed
+// run's output survives a health restart, as it did before manifests existed.
+// The next manifest write follows immediately; a directory left with only the
+// log is absence-proven and removed like any other manifest-less directory.
+func removeVMStateKeepingLog(vmDir string) error {
+	entries, err := os.ReadDir(vmDir)
+	if err != nil {
+		return err
+	}
+	for _, entry := range entries {
+		if entry.Name() == firecrackerLogName && entry.Type().IsRegular() {
+			continue
+		}
+		if err := os.RemoveAll(filepath.Join(vmDir, entry.Name())); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // retainFailedReclaim keeps durable ownership visible to the periodic resolver.
@@ -595,7 +616,7 @@ func (m *Manager) finishStart(ctx context.Context, svc config.ServiceConfig, sta
 	launchAttempted = true
 	launched, err := m.launcher.Launch(ctx, launchSpec{
 		InstanceID: instanceID, SocketPath: socketPath, ConfigPath: configPath,
-		LogPath: filepath.Join(vmDir, "firecracker.log"),
+		LogPath: filepath.Join(vmDir, firecrackerLogName),
 	})
 	if err != nil {
 		manifest.Lifecycle = lifecycleFailed

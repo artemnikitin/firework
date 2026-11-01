@@ -16,6 +16,7 @@ import (
 const (
 	manifestSchemaVersion = 1
 	manifestFileName      = "instance.json"
+	firecrackerLogName    = "firecracker.log"
 )
 
 type manifestLifecycle string
