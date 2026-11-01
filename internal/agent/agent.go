@@ -392,6 +392,13 @@ func (a *Agent) tick(ctx context.Context) {
 	a.vmManager.NormalizeVolumes(merged.Services)
 	a.reportVolumeSizeConvergence()
 
+	// Prepare desired state once per tick: assigned addresses (fetched node
+	// configs do not persist them), resolved links and injected environment.
+	// Status, holds, routes, port forwards and Reconcile all read this same
+	// configuration, so they cannot disagree about whether a running VM
+	// matches it.
+	addressHolds := a.prepareDesired(merged.Services)
+
 	// Check revision only after fetch, so stores that update revision state
 	// during Fetch (Git pull, object write token) are evaluated against fresh data.
 	// For multi-label nodes we skip this optimization because revision is
@@ -413,14 +420,7 @@ func (a *Agent) tick(ctx context.Context) {
 			// A local revision does not describe the peer node configs used for
 			// remote Traefik routes. Refresh routes on every poll even when the
 			// local VM configuration is unchanged, but avoid the expensive image
-			// sync and reconcile work. assignNetworking is needed because fetched
-			// node configs do not persist the agent-assigned guest IPs.
-			a.assignNetworking(merged.Services)
-			// Route eligibility compares against prepared VM configuration.
-			// Include the same link/environment arguments as a full tick.
-			a.resolveLinks(merged.Services)
-			a.injectEnvVars(merged.Services)
-			a.setStatusServices(*merged, rev)
+			// sync and reconcile work.
 
 			// Host DNAT can be flushed by anything else on the box — a
 			// firewalld reload, a container runtime restart — without the
@@ -489,18 +489,6 @@ func (a *Agent) tick(ctx context.Context) {
 	// or image sync and never touch the network at all. Leaving it unevaluated
 	// lets finishTickStatus finalize it as unknown, which is what the per-tick
 	// condition contract says an unreached stage should be.
-
-	// Assign networking (IPs, MACs, kernel args) to services that need it.
-	addressHolds := a.assignNetworking(merged.Services)
-	a.setStatusServices(*merged, rev)
-
-	// Resolve service links: look up each linked service's guest IP and
-	// inject the composed URL into the dependent service's Env map.
-	a.resolveLinks(merged.Services)
-
-	// Inject environment variables into kernel boot args so fc-init can
-	// parse them from /proc/cmdline and export them inside the guest.
-	a.injectEnvVars(merged.Services)
 
 	// Check node capacity before reconciling; skip if resources are exceeded.
 	used, capacityHolds := a.reserveCapacity(merged.Services, nodeCap, hasCap)
@@ -1285,6 +1273,17 @@ func (a *Agent) reserveCapacity(services []config.ServiceConfig, cap capacity.No
 		used = next
 	}
 	return used, holds
+}
+
+// prepareDesired completes desired state for this node: guest addresses,
+// same-node link URLs, then environment kernel arguments, which carry the
+// link URLs. It returns the services held because the subnet has no free
+// address.
+func (a *Agent) prepareDesired(services []config.ServiceConfig) map[string]string {
+	held := a.assignNetworking(services)
+	a.resolveLinks(services)
+	a.injectEnvVars(services)
+	return held
 }
 
 // growAllocation adds svc's growth over its old allocation to base.
