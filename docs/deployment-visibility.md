@@ -326,6 +326,17 @@ A desired service waiting on resources retained by an unresolved VM reports
 `resource_held` on the applied revision, and fleet status stays degraded until
 the hold clears.
 
+Other holds do not let the revision apply. `VMsReconciled` reports
+`resource_held` and names every held service in its message:
+
+- Desired services whose combined CPU or memory exceeds node capacity, or a
+  `vm_subnet` with no free guest address, fail the node with
+  `capacity_exceeded` or `guest_addresses_exhausted` on `CapacityReady`. The
+  services that fit still converge.
+- A service waiting on another VM's start or stop, on a host port, address or
+  device another VM still uses, or on capacity still allocated to VMs being
+  removed keeps the node reconciling, and the next poll retries it.
+
 The agent reports the nonblocking `VMRecoveryReady` condition from its complete
 runtime inventory. A false value carries `vm_recovery_pending`, including when
 survivor summaries exceed the status limit. Desired services take priority in
