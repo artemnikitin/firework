@@ -208,3 +208,21 @@ func TestHeldFailedVMKeepsItsClaims(t *testing.T) {
 		t.Fatalf("k hold = %q", reason)
 	}
 }
+
+// Replacing a service with one that takes its host port converges in one
+// all-at-once apply: the delete releases the port before the create.
+func TestReplacementOnSamePortConvergesInOneApply(t *testing.T) {
+	m := newFakeVMManager()
+	r := NewWithNetworkManager(m, heldClaimsLogger(), nil, &forwardRecorder{}, "", 0)
+	svc := func(name, ip string) config.ServiceConfig {
+		return config.ServiceConfig{Name: name, VCPUs: 1, Network: &config.NetworkConfig{GuestIP: ip}, PortForwards: []config.PortForward{{HostPort: 8080, VMPort: 80}}}
+	}
+	m.instances["d"] = &vm.Instance{Name: "d", Config: svc("d", "172.16.0.2"), State: vm.StateRunning}
+	desired := config.NodeConfig{Services: []config.ServiceConfig{svc("k", "172.16.0.3")}}
+	if err := r.Reconcile(context.Background(), desired); err != nil {
+		t.Fatal(err)
+	}
+	if m.instances["d"] != nil || m.instances["k"] == nil {
+		t.Fatalf("d=%v k=%v", m.instances["d"], m.instances["k"])
+	}
+}

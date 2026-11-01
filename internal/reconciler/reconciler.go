@@ -579,11 +579,24 @@ func (r *Reconciler) Apply(ctx context.Context, actions []Action) error {
 	return r.applyAllAtOnce(ctx, actions)
 }
 
-// applyAllAtOnce applies all actions without rolling-update delays.
+// applyAllAtOnce applies all actions without rolling-update delays. Deletes
+// run first, as in a rolling apply, so a create can take the port, address or
+// capacity a removed service released in the same tick.
 func (r *Reconciler) applyAllAtOnce(ctx context.Context, actions []Action) error {
 	var errs []error
 
+	ordered := make([]Action, 0, len(actions))
 	for _, action := range actions {
+		if action.Type == ActionDelete {
+			ordered = append(ordered, action)
+		}
+	}
+	for _, action := range actions {
+		if action.Type != ActionDelete {
+			ordered = append(ordered, action)
+		}
+	}
+	for _, action := range ordered {
 		if hold := r.actionHold(action); hold.Reason != "" {
 			errs = append(errs, hold.err(action.Service.Name))
 			continue

@@ -401,7 +401,8 @@ is replaced; a running one's rules are re-asserted every tick. Other services
 that need any of those claims are held too, and inherit the cause of the
 owner's hold. A new service also waits while another tracked VM still uses one
 of its claims, for example until a later rolling update moves that VM off the
-port.
+port. Both update strategies run deletes before creates and updates, so a
+service replaced by one that takes its port moves in a single tick.
 
 Holds are classified the same way whether or not any other VM happens to be
 retained:
