@@ -9,10 +9,12 @@ func (r *Reconciler) MarkRecovered(service string) {
 }
 
 // ForgetRecovered retires health state for a VM whose dead runtime was cleared.
-// Main-loop ownership keeps this serialized with normal reconciliation.
+// Main-loop ownership keeps this serialized with normal reconciliation. A tick
+// that ran after the clear may already have recreated the service; its health
+// check belongs to the new VM and stays registered.
 func (r *Reconciler) ForgetRecovered(service string) {
 	delete(r.pendingRecovery, service)
-	if r.healthMon != nil {
+	if r.healthMon != nil && r.vmManager.List()[service] == nil {
 		r.healthMon.Deregister(service)
 	}
 }
