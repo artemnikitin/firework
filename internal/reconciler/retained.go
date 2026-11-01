@@ -101,7 +101,7 @@ func (r *Reconciler) holds(desired config.NodeConfig) map[string]Hold {
 			if _, done := held[service.Name]; done {
 				continue
 			}
-			hold := serviceHold(service, actual, owners, unknown, external)
+			hold := serviceHold(service, actual, owners, unknown, external, held)
 			if hold.Reason == "" {
 				continue
 			}
@@ -115,7 +115,7 @@ func (r *Reconciler) holds(desired config.NodeConfig) map[string]Hold {
 	return held
 }
 
-func serviceHold(service config.ServiceConfig, actual map[string]*vm.Instance, owners []*vm.Instance, unknown string, external map[string]Hold) Hold {
+func serviceHold(service config.ServiceConfig, actual map[string]*vm.Instance, owners []*vm.Instance, unknown string, external, held map[string]Hold) Hold {
 	instance := actual[service.Name]
 	// Independent admission failures remain blockers even when another VM's
 	// unknown claims or this service's quarantine also prevent its update.
@@ -155,7 +155,10 @@ func serviceHold(service config.ServiceConfig, actual map[string]*vm.Instance, o
 			resource = conflictingResource(instance.Config, owner.Config)
 		}
 		if resource != "" {
-			return Hold{Reason: fmt.Sprintf("%s retained by %s", resource, owner.Config.Name), Recovery: owner.State == vm.StateRecoveryPending}
+			// A held owner passes on the cause of its own hold, so a chain
+			// that starts at a quarantined VM stays a recovery hold.
+			recovery := owner.State == vm.StateRecoveryPending || held[owner.Config.Name].Recovery
+			return Hold{Reason: fmt.Sprintf("%s retained by %s", resource, owner.Config.Name), Recovery: recovery}
 		}
 	}
 	return Hold{}

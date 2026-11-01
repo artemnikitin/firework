@@ -158,3 +158,29 @@ func TestLifecycleHoldTakesPrecedenceOverUnknownClaims(t *testing.T) {
 		t.Fatalf("hold = %#v", got)
 	}
 }
+
+// A service held only because a held running VM keeps its claim inherits that
+// VM's cause. When the chain starts at a quarantined VM, every link is a
+// recovery hold, so the revision can apply as degraded.
+func TestHoldThroughHeldOwnerKeepsRecoveryCause(t *testing.T) {
+	m := newFakeVMManager()
+	r := NewWithNetworkManager(m, heldClaimsLogger(), nil, &forwardRecorder{}, "", 0)
+	svc := func(name, ip string, port int) config.ServiceConfig {
+		return config.ServiceConfig{Name: name, VCPUs: 1, Network: &config.NetworkConfig{GuestIP: ip}, PortForwards: []config.PortForward{{HostPort: port, VMPort: 80}}}
+	}
+	m.instances["x"] = &vm.Instance{Name: "x", Config: svc("x", "172.16.0.9", 7070), State: vm.StateRecoveryPending}
+	m.instances["a"] = &vm.Instance{Name: "a", Config: svc("a", "172.16.0.2", 8080), State: vm.StateRunning}
+	m.instances["b"] = &vm.Instance{Name: "b", Config: svc("b", "172.16.0.3", 9090), State: vm.StateRunning}
+	desired := config.NodeConfig{Services: []config.ServiceConfig{svc("a", "172.16.0.2", 7070), svc("b", "172.16.0.3", 8080)}}
+	err := r.Reconcile(context.Background(), desired)
+	held := r.holds(desired)
+	if !held["a"].Recovery || !held["b"].Recovery || !OnlyRecoveryHeld(err) {
+		t.Fatalf("a=%+v b=%+v onlyRecovery=%v err=%v", held["a"], held["b"], OnlyRecoveryHeld(err), err)
+	}
+	// A chain that starts at an ordinary hold stays ordinary.
+	r.SetHeldServices(map[string]Hold{"a": {Reason: "desired services exceed node capacity"}})
+	delete(m.instances, "x")
+	if held := r.holds(desired); held["b"].Reason == "" || held["b"].Recovery {
+		t.Fatalf("b=%+v", held["b"])
+	}
+}
