@@ -78,6 +78,37 @@ func TestHeldShrinkDoesNotOvercommit(t *testing.T) {
 	}
 }
 
+// A capacity hold keeps its VM's host port, which holds another VM's shrink
+// moving onto that port, which changes what fits. Admission used to flip
+// between holding c and holding a and installed holds it never counted, so a
+// grew while y kept its size. The tick must end within capacity, and the
+// revision must converge once the starting VM settles.
+func TestCapacityHoldThroughClaimsEndsTickWithinCapacity(t *testing.T) {
+	yaml := "node: web\nservices:\n" +
+		"- name: a\n  image: /a\n  kernel: /k\n  vcpus: 4\n  memory_mb: 64\n" +
+		"- name: c\n  image: /c\n  kernel: /k\n  vcpus: 2\n  memory_mb: 64\n  port_forwards:\n  - host_port: 9090\n    vm_port: 80\n" +
+		"- name: s\n  image: /s\n  kernel: /k\n  vcpus: 1\n  memory_mb: 64\n" +
+		"- name: y\n  image: /y\n  kernel: /k\n  vcpus: 1\n  memory_mb: 64\n  port_forwards:\n  - host_port: 8080\n    vm_port: 80\n"
+	a, m := admissionAgent(t, yaml, capacity.NodeCapacity{VCPUs: 8, MemoryMB: 4096}, map[string]*vm.Instance{
+		"a": {Name: "a", Config: admissionService("a", 1, 64, 0, ""), State: vm.StateRunning},
+		"c": {Name: "c", Config: admissionService("c", 1, 64, 8080, ""), State: vm.StateRunning},
+		"s": {Name: "s", Config: admissionService("s", 2, 64, 0, ""), State: vm.StateStarting},
+		"y": {Name: "y", Config: admissionService("y", 2, 64, 7070, ""), State: vm.StateRunning},
+	}, "")
+	for tick := 0; tick < 3; tick++ {
+		a.tick(context.Background())
+		if vcpus, _ := runtimeUsage(m); vcpus > 8 {
+			t.Fatalf("tick %d runs %d vCPUs on 8: %s", tick, vcpus, conditionOf(a.agentStatusSnapshot(), "VMsReconciled").Message)
+		}
+		m.instances["s"].State = vm.StateRunning
+	}
+	for name, vcpus := range map[string]int{"a": 4, "c": 2, "s": 1, "y": 1} {
+		if got := m.instances[name]; got.State != vm.StateRunning || got.Config.VCPUs != vcpus {
+			t.Fatalf("%s did not converge: %+v", name, got)
+		}
+	}
+}
+
 // An undesired VM whose removal is held keeps running and keeps its size.
 func TestHeldRemovalKeepsCapacity(t *testing.T) {
 	yaml := "node: web\nservices:\n- name: k\n  image: /k\n  kernel: /k\n  vcpus: 3\n  memory_mb: 64\n  port_forwards:\n  - host_port: 9090\n    vm_port: 80\n"

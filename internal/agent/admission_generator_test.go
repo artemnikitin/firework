@@ -57,8 +57,9 @@ func generatedRevision(r *rand.Rand) []generatedService {
 	}
 }
 
-// Random revisions over both update strategies, with crashed and stopped VMs
-// and a quarantined survivor that resolves after a few ticks, must converge
+// Random revisions over both update strategies, with crashed and stopped VMs,
+// a VM still starting or stopping, and a quarantined survivor, each resolving
+// after a few ticks, must converge
 // within a bounded number of ticks, never run more than the node holds between
 // ticks, and never report a hold that recovery does not explain while only the
 // quarantine stands in the way.
@@ -98,6 +99,15 @@ func TestRandomRevisionsConvergeWithinCapacity(t *testing.T) {
 				}
 			}
 		}
+		// A desired VM can still be starting or stopping when the revision
+		// arrives. It keeps its size, and its claims, until that resolves.
+		lifecycle, lifecycleTicks := "", 0
+		for _, name := range []string{"a", "b", "c", "d"} {
+			if inst := m.instances[name]; inst != nil && inst.State == vm.StateRunning && lifecycle == "" && r.Intn(3) == 0 {
+				inst.State = []vm.State{vm.StateStarting, vm.StateStopping}[r.Intn(2)]
+				lifecycle, lifecycleTicks = name, 1+r.Intn(3)
+			}
+		}
 		// The survivor fits beside what already runs: the agent cannot evict a
 		// live VM, so an overcommit present before the revision is not its doing.
 		quarantineTicks := -1
@@ -113,15 +123,22 @@ func TestRandomRevisionsConvergeWithinCapacity(t *testing.T) {
 		store.revision = "r2"
 		store.data["web"] = generatedYAML(to)
 		var problem string
-		for tick := 0; tick < len(from)+len(to)+3 && problem == ""; tick++ {
+		for tick := 0; tick < len(from)+len(to)+3+lifecycleTicks && problem == ""; tick++ {
 			if tick == quarantineTicks {
 				delete(m.instances, "q")
+			}
+			if inst := m.instances[lifecycle]; inst != nil && tick == lifecycleTicks {
+				if inst.State == vm.StateStarting {
+					inst.State = vm.StateRunning
+				} else {
+					inst.State = vm.StateStopped
+				}
 			}
 			a.tick(context.Background())
 			if vcpus, mem := runtimeUsage(m); vcpus > generatedVCPUs || mem > generatedMemoryMB {
 				problem = fmt.Sprintf("tick %d runs %d vCPUs and %d MB", tick, vcpus, mem)
 			}
-			if _, quarantined := m.instances["q"]; quarantined && tick >= 1 {
+			if _, quarantined := m.instances["q"]; quarantined && tick > lifecycleTicks {
 				vms := conditionOf(a.agentStatusSnapshot(), "VMsReconciled")
 				if strings.Contains(vms.Message, reconciler.ErrServiceHeld.Error()) {
 					problem = fmt.Sprintf("tick %d reports a hold recovery does not explain: %s", tick, vms.Message)
@@ -142,7 +159,67 @@ func TestRandomRevisionsConvergeWithinCapacity(t *testing.T) {
 		}
 		if problem != "" {
 			failures++
-			t.Errorf("seed %d strategy=%q quarantine=%d from=%v to=%v: %s", seed, strategy, quarantineTicks, from, to, problem)
+			t.Errorf("seed %d strategy=%q quarantine=%d lifecycle=%s/%d from=%v to=%v: %s", seed, strategy, quarantineTicks, lifecycle, lifecycleTicks, from, to, problem)
 		}
 	}
+}
+
+// One tick from any mix of running, starting, stopping, crashed and
+// quarantined VMs, with sizes and host ports moving between services, ends
+// within capacity whenever the node started within it and the apply succeeds.
+// Holds feed back into admission through the claims of held VMs, so this
+// checks that admission settles on the holds it installs.
+func TestRandomTickEndsWithinCapacity(t *testing.T) {
+	const capVCPUs, capMemoryMB = 8, 768
+	seeds := int64(20000)
+	if testing.Short() {
+		seeds = 2000
+	}
+	states := []vm.State{vm.StateRunning, vm.StateRunning, vm.StateRunning, vm.StateStarting, vm.StateStopping, vm.StateFailed, vm.StateRecoveryPending}
+	failures := 0
+	for seed := int64(0); seed < seeds && failures < 5; seed++ {
+		r := rand.New(rand.NewSource(seed))
+		ports := []int{5050, 6060, 7070, 8080, 9090}
+		instances := map[string]*vm.Instance{}
+		r.Shuffle(len(ports), func(i, j int) { ports[i], ports[j] = ports[j], ports[i] })
+		for i, name := range []string{"a", "b", "c", "d", "e"} {
+			if r.Intn(4) != 0 {
+				instances[name] = &vm.Instance{Name: name, State: states[r.Intn(len(states))], Config: admissionService(name, 1+r.Intn(3), 64*(1+r.Intn(4)), ports[i], "")}
+			}
+		}
+		manager := &recoveryTestVMManager{instances: instances}
+		if vcpus, mem := runtimeUsage(manager); vcpus > capVCPUs || mem > capMemoryMB {
+			continue
+		}
+		r.Shuffle(len(ports), func(i, j int) { ports[i], ports[j] = ports[j], ports[i] })
+		var b strings.Builder
+		b.WriteString("node: web\nservices:\n")
+		for i, name := range []string{"a", "b", "c", "d", "e"} {
+			if r.Intn(4) != 0 {
+				fmt.Fprintf(&b, "- name: %s\n  image: /%s\n  kernel: /k\n  vcpus: %d\n  memory_mb: %d\n  port_forwards:\n  - host_port: %d\n    vm_port: 80\n", name, name, 1+r.Intn(3), 64*(1+r.Intn(4)), ports[i])
+			}
+		}
+		strategy := ""
+		if r.Intn(2) == 0 {
+			strategy = "rolling"
+		}
+		before := fmt.Sprint(describeInstances(instances))
+		a, _ := admissionAgent(t, b.String(), capacity.NodeCapacity{VCPUs: capVCPUs, MemoryMB: capMemoryMB}, instances, "")
+		a.reconciler = reconciler.NewWithNetworkManager(manager, testLogger(), nil, &recoveryTestNetworkManager{}, strategy, time.Microsecond)
+		a.tick(context.Background())
+		if vcpus, mem := runtimeUsage(manager); vcpus > capVCPUs || mem > capMemoryMB {
+			failures++
+			t.Errorf("seed %d strategy=%q: %d vCPUs and %d MB after one tick\nbefore: %s\ndesired:\n%s", seed, strategy, vcpus, mem, before, b.String())
+		}
+	}
+}
+
+func describeInstances(instances map[string]*vm.Instance) []string {
+	var out []string
+	for _, name := range []string{"a", "b", "c", "d", "e"} {
+		if inst := instances[name]; inst != nil {
+			out = append(out, fmt.Sprintf("%s:%s:%d/%d:%d", name, inst.State, inst.Config.VCPUs, inst.Config.MemoryMB, inst.Config.PortForwards[0].HostPort))
+		}
+	}
+	return out
 }
