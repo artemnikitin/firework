@@ -67,8 +67,20 @@ func TestC2SameEvidenceSameClassificationAtEveryEntryPoint(t *testing.T) {
 					t.Fatalf("classified %s, want %s (err=%v)", got, ev.want, err)
 				}
 				_, statErr := os.Stat(f.VMDir)
-				if ev.want == "quarantined" && statErr != nil {
-					t.Fatalf("quarantine lost its state: %v", statErr)
+				switch ev.want {
+				case "quarantined":
+					if statErr != nil {
+						t.Fatalf("quarantine lost its state: %v", statErr)
+					}
+				case "absent":
+					// Proven absence lets every entry point finish cleanup.
+					if err != nil || !errors.Is(statErr, os.ErrNotExist) {
+						t.Fatalf("absent VM not cleaned up: err=%v state=%v", err, statErr)
+					}
+				case "adopted":
+					if err != nil || statErr != nil {
+						t.Fatalf("adoption: err=%v state=%v", err, statErr)
+					}
 				}
 			})
 		}

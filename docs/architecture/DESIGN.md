@@ -417,7 +417,9 @@ retained:
   retries on an unchanged revision. Recovery explains capacity holds only if
   the same admission, run as though every quarantined VM had resolved and gone,
   would hold nothing, or only until that tick's removals, shrinks and starts or
-  stops complete.
+  stops complete. A service recovery holds that would wait for capacity even
+  then is held for capacity as well, so its recovery hold cannot let the
+  revision apply.
 - Admission failures, which waiting cannot resolve: desired services whose
   combined CPU or memory exceeds node capacity, or more networked desired
   services than `vm_subnet` has guest addresses. The other services still
@@ -463,8 +465,10 @@ quarantined while the tick runs therefore cannot make room for a start that
 admission did not count; such a start waits with a transient hold. A health
 restart of a failed or stopped VM takes its resources again and passes the same
 check; one that does not fit is skipped, and the next tick reconciles the
-service. Restarting a running VM keeps its size. With capacity checks disabled,
-or before the node's capacity has been read, nothing is checked.
+service. Restarting a running VM keeps its size. While a quarantined VM's
+configuration is unknown, its size is too, so no start may grow anything. With
+capacity checks disabled, or before the node's capacity has been read, nothing
+is checked.
 Running guests retain their assigned addresses after a survivor clears.
 
 Each tick's Recover/Plan/Apply section and health-driven Stop/Start transactions

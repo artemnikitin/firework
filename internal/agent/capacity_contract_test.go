@@ -409,3 +409,69 @@ func TestC6AdmissionWaitRecoveryWouldNotEndIsNotRecovery(t *testing.T) {
 		}
 	}
 }
+
+// C6: two VMs trading sizes on a full node wait for headroom whatever happens
+// to recovery. A quarantined VM with unknown claims also holds both, but that
+// hold must not let the revision apply as degraded over a wait that
+// resolving the quarantine would not end.
+func TestC6RecoveryHoldDoesNotHideCapacityWait(t *testing.T) {
+	desired := []c7Service{{"a", 2, 256, 0}, {"b", 1, 512, 0}}
+	a, m := c7Agent(t, "", 0, capacity.NodeCapacity{VCPUs: 3, MemoryMB: 768}, map[string]*vm.Instance{
+		"a": c7Running("a", 1, 512, 0),
+		"b": c7Running("b", 2, 256, 0),
+		"q": {Name: "q", Config: config.ServiceConfig{Name: "q"}, State: vm.StateRecoveryPending, RecoveryConfigUnknown: true},
+	}, desired...)
+	for tick := 0; tick < 2; tick++ {
+		if tick == 1 {
+			delete(m.instances, "q")
+		}
+		a.tick(context.Background())
+		vms := conditionOf(a.agentStatusSnapshot(), "VMsReconciled")
+		if a.lastRevision == "r2" || !strings.Contains(vms.Message, "no pending change frees") || len(m.startCalls) != 0 {
+			t.Fatalf("tick %d: lastRevision=%q starts=%v status=%s", tick, a.lastRevision, m.startCalls, vms.Message)
+		}
+	}
+}
+
+// C7 and L1: a quarantined VM whose configuration is unknown may still use
+// any amount of capacity, so a health restart of a failed VM must not start
+// into capacity it is presumed not to use.
+func TestC7UnknownQuarantineCapacityIsNotFree(t *testing.T) {
+	a, m := c7Agent(t, "", 0, capacity.NodeCapacity{VCPUs: 4, MemoryMB: 1024}, map[string]*vm.Instance{
+		"f": {Name: "f", Config: admissionService("f", 4, 1024, 0, ""), State: vm.StateFailed},
+		"q": {Name: "q", Config: config.ServiceConfig{Name: "q"}, State: vm.StateRecoveryPending, RecoveryConfigUnknown: true},
+	}, c7Service{"f", 4, 1024, 0})
+	a.tick(context.Background())
+	if err := a.restartService(context.Background(), "f"); err == nil || m.instances["f"].State != vm.StateFailed {
+		t.Fatalf("restart started f beside a VM of unknown size: err=%v f=%+v", err, m.instances["f"])
+	}
+}
+
+// C7: a health restart waits for capacity under a desired state that fits,
+// here behind a shrink whose stop keeps failing, and the service converges
+// once the shrink succeeds.
+func TestC7HealthRestartWaitsForFailingShrink(t *testing.T) {
+	desired := []c7Service{{"f", 2, 64, 0}, {"s", 2, 64, 0}}
+	a, m := c7Agent(t, "", 0, capacity.NodeCapacity{VCPUs: 4, MemoryMB: 4096}, map[string]*vm.Instance{
+		"f": {Name: "f", Config: admissionService("f", 2, 64, 0, ""), State: vm.StateFailed},
+		"s": c7Running("s", 4, 64, 0),
+	}, desired...)
+	failing := true
+	m.removeHook = func(name string) error {
+		if failing && name == "s" {
+			return errors.New("injected stop failure")
+		}
+		return nil
+	}
+	a.tick(context.Background())
+	if err := a.restartService(context.Background(), "f"); err == nil || m.instances["f"].State != vm.StateFailed {
+		t.Fatalf("restart took capacity s still uses: err=%v f=%+v", err, m.instances["f"])
+	}
+	failing = false
+	for tick := 0; tick < 3; tick++ {
+		a.tick(context.Background())
+	}
+	if problem := c7Converged(m, desired...); problem != "" || len(m.overcommits) != 0 || a.lastRevision != "r2" {
+		t.Fatalf("%s; overcommits=%v; %s", problem, m.overcommits, a.agentStatusSnapshot().Message)
+	}
+}

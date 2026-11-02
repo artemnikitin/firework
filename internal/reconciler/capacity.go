@@ -50,17 +50,26 @@ func (r *Reconciler) CapacityHold(svc config.ServiceConfig) Hold {
 
 // capacityHold checks a start against the runtime as it is now, not as
 // admission expected it: a create or growth may take only capacity that is
-// free at this moment. Every other VM counts at what it uses, or at the size
-// admission allowed it if larger, so work admitted earlier keeps its share and
-// a shrink or removal frees capacity only once it has happened. svc's own VM
-// counts at what it uses now. Only a resource svc would grow is checked, so a
-// shrink or a same-size restart proceeds even on a node already over capacity.
+// free at this moment, and none while a quarantined VM's size is unknown.
+// Every other VM counts at what it uses, or at the size admission allowed it
+// if larger, so work admitted earlier keeps its share and a shrink or removal
+// frees capacity only once it has happened. svc's own VM counts at what it
+// uses now. Only a resource svc would grow is checked, so a shrink or a
+// same-size restart proceeds even on a node already over capacity.
 func (r *Reconciler) capacityHold(svc config.ServiceConfig, actual map[string]*vm.Instance) Hold {
 	r.heldMu.RLock()
 	limit := r.capacity
 	r.heldMu.RUnlock()
 	if limit == nil {
 		return Hold{}
+	}
+	if unknown := unknownRuntimeOwner(actual); unknown != "" && unknown != svc.Name {
+		// A quarantined VM whose configuration is unknown may still use any
+		// amount of capacity; nothing it might use can be presumed free.
+		if instance := actual[svc.Name]; instance == nil || !UsesCapacity(instance.State) ||
+			svc.VCPUs > instance.Config.VCPUs || svc.MemoryMB > instance.Config.MemoryMB {
+			return Hold{Reason: "capacity used by " + unknown + " is unknown", Recovery: true, Capacity: true}
+		}
 	}
 	var own, others capacity.NodeCapacity
 	occupy := func(name string, size capacity.NodeCapacity) {
