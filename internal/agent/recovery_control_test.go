@@ -299,8 +299,10 @@ func TestRecoveryControlClientHonorsTimeout(t *testing.T) {
 	}
 	select {
 	case err := <-result:
-		if err == nil {
-			t.Fatal("timed-out recovery request succeeded")
+		// C3: the agent may still apply the request, so a lost response is
+		// an unknown outcome, not a failure.
+		if err == nil || !strings.Contains(err.Error(), "outcome is unknown") {
+			t.Fatalf("timed-out recovery request: %v", err)
 		}
 	case <-time.After(time.Second):
 		t.Fatal("client did not honor its request deadline")
