@@ -325,6 +325,17 @@ func unknownRuntimeOwner(actual map[string]*vm.Instance) string {
 	return ""
 }
 
+// HasPendingRecovery reports whether a tracked VM awaits ownership recovery,
+// from the same inventory that holds and admission read.
+func (r *Reconciler) HasPendingRecovery() bool {
+	for _, instance := range r.vmManager.List() {
+		if instance.State == vm.StateRecoveryPending {
+			return true
+		}
+	}
+	return false
+}
+
 // HasPendingCleanup keeps retained write-ahead cleanup eligible for retry even
 // when its owner temporarily prevented teardown and the revision was applied.
 func (r *Reconciler) HasPendingCleanup() bool {

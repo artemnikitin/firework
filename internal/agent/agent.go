@@ -421,7 +421,7 @@ func (a *Agent) tick(ctx context.Context) {
 		a.setStatusServices(*merged, rev)
 		// A health restart that could not restore its VM leaves the revision
 		// unchanged; only a full tick recreates the service.
-		if a.vmManager.HasPendingRecovery() || a.reconciler.HasPendingCleanup() || a.restartNeedsReconcile.Swap(false) {
+		if a.reconciler.HasPendingRecovery() || a.reconciler.HasPendingCleanup() || a.restartNeedsReconcile.Swap(false) {
 			a.forceReconcile = true
 		}
 		if rev != "" && rev == a.lastRevision && !a.forceReconcile {
@@ -567,7 +567,7 @@ func (a *Agent) tick(ctx context.Context) {
 	} else {
 		a.setStatusCondition("LocalRoutesReady", statusmodel.ConditionTrue, "", "")
 	}
-	if err != nil && admissionCode == "" && reconciler.OnlyRecoveryHeld(err) && a.vmManager.HasPendingRecovery() {
+	if err != nil && admissionCode == "" && reconciler.OnlyRecoveryHeld(err) && a.reconciler.HasPendingRecovery() {
 		// Every hold was caused by unresolved VM ownership, which
 		// VMRecoveryReady reports as degradation and held services report as
 		// resource_held. Freezing the revision would hide both behind

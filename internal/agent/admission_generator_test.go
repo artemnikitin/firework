@@ -61,8 +61,8 @@ func generatedRevision(r *rand.Rand) []generatedService {
 // a VM still starting or stopping, and a quarantined survivor, each resolving
 // after a few ticks, must converge
 // within a bounded number of ticks, never run more than the node holds between
-// ticks, and never report a hold that recovery does not explain while only the
-// quarantine stands in the way.
+// ticks, and, while only the quarantine stands in the way, never report a hold
+// that recovery does not explain and apply the revision as degraded.
 func TestRandomRevisionsConvergeWithinCapacity(t *testing.T) {
 	seeds := int64(600)
 	if testing.Short() {
@@ -142,6 +142,8 @@ func TestRandomRevisionsConvergeWithinCapacity(t *testing.T) {
 				vms := conditionOf(a.agentStatusSnapshot(), "VMsReconciled")
 				if strings.Contains(vms.Message, reconciler.ErrServiceHeld.Error()) {
 					problem = fmt.Sprintf("tick %d reports a hold recovery does not explain: %s", tick, vms.Message)
+				} else if a.lastRevision != "r2" {
+					problem = fmt.Sprintf("tick %d holds only for recovery but did not apply the revision as degraded: %s", tick, vms.Message)
 				}
 			}
 		}
