@@ -502,6 +502,7 @@ func (a *Agent) tick(ctx context.Context) {
 	// service that does not fit is held while independent work, including
 	// recovery, still runs; genuine over-capacity fails the revision below.
 	used, capacityHolds := a.admit(merged.Services, nodeCap, hasCap, addressHolds)
+	a.reconciler.SetHeldServices(mergeHolds(addressHolds, capacityHolds))
 	// Update the heartbeat goroutine with the latest used resources now, before
 	// the potentially long-running image sync, so heartbeats reflect current
 	// scheduling intent while downloads are in progress.
@@ -1276,10 +1277,11 @@ const (
 	capacityTransientReason = "capacity is still used by VMs that are starting, stopping or held"
 )
 
-// reserveCapacity admits the desired services against node capacity and
-// returns what the node uses once this tick's plan has run, with the capacity
-// holds. Address holds from prepareDesired are given as well, because they
-// can hold other services through the claims of held VMs.
+// admit admits the desired services against node capacity and returns what
+// the node uses once this tick's plan has run, with the capacity holds.
+// Address holds from prepareDesired are given as well, because they can hold
+// other services through the claims of held VMs. It installs nothing; the
+// caller installs both kinds of hold.
 //
 // Admission and holds depend on each other: a held VM keeps its current size,
 // which can hold others for capacity, and a capacity-held VM owns its claims,
@@ -1290,18 +1292,14 @@ const (
 // another service's growth in the same tick and two such updates never wait
 // on each other; the price is a brief overcommit while one apply grows a VM
 // before it shrinks another.
-func (a *Agent) reserveCapacity(services []config.ServiceConfig, cap capacity.NodeCapacity, known bool) (capacity.NodeCapacity, map[string]reconciler.Hold) {
-	return a.admit(services, cap, known, nil)
-}
-
 func (a *Agent) admit(services []config.ServiceConfig, cap capacity.NodeCapacity, known bool, addressHolds map[string]reconciler.Hold) (capacity.NodeCapacity, map[string]reconciler.Hold) {
 	desired := config.NodeConfig{Services: services}
+	deleteHeld := a.reconciler.DeleteHolds(desired)
 	var used capacity.NodeCapacity
 	var capacityHolds map[string]reconciler.Hold
 	for pass := 0; pass <= len(services); pass++ {
-		a.reconciler.SetHeldServices(mergeHolds(addressHolds, capacityHolds))
 		var next map[string]reconciler.Hold
-		used, next = a.admitPass(services, cap, known, a.reconciler.Holds(desired), a.reconciler.DeleteHolds(desired))
+		used, next = a.admitPass(services, cap, known, a.reconciler.Holds(desired, mergeHolds(addressHolds, capacityHolds)), deleteHeld)
 		settled := len(next) == len(capacityHolds)
 		for name := range next {
 			if _, ok := capacityHolds[name]; !ok {
@@ -1313,7 +1311,6 @@ func (a *Agent) admit(services []config.ServiceConfig, cap capacity.NodeCapacity
 			break
 		}
 	}
-	a.reconciler.SetHeldServices(mergeHolds(addressHolds, capacityHolds))
 	return used, capacityHolds
 }
 

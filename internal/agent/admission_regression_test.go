@@ -52,7 +52,7 @@ func TestHeldGrowthKeepsCurrentSize(t *testing.T) {
 		t.Fatalf("node runs %d vCPUs on 4; starts=%v", vcpus, m.startCalls)
 	}
 	desired := []config.ServiceConfig{admissionService("a", 3, 64, 0, ""), admissionService("b", 1, 64, 0, "")}
-	if used, _ := a.reserveCapacity(desired, capacity.NodeCapacity{VCPUs: 4, MemoryMB: 4096}, true); used.VCPUs < 4 {
+	if used, _ := a.admit(desired, capacity.NodeCapacity{VCPUs: 4, MemoryMB: 4096}, true, nil); used.VCPUs < 4 {
 		t.Fatalf("heartbeat used %d vCPUs, below the 4 that run", used.VCPUs)
 	}
 }

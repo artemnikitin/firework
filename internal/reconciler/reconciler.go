@@ -532,7 +532,7 @@ func (r *Reconciler) Plan(desired config.NodeConfig) []Action {
 			actions = append(actions, Action{Type: ActionCreate, Service: svc})
 			continue
 		}
-		if retainsRuntime(inst.State) {
+		if RetainsRuntime(inst.State) {
 			continue
 		}
 		if needsUpdate(inst, svc) {
@@ -549,7 +549,7 @@ func (r *Reconciler) Plan(desired config.NodeConfig) []Action {
 	// Use inst.Config so the delete handler has full config for teardown
 	// (needed for network teardown and port forward cleanup).
 	for name, inst := range actual {
-		if retainsRuntime(inst.State) {
+		if RetainsRuntime(inst.State) {
 			continue
 		}
 		if _, desired := desiredSet[name]; !desired {
@@ -1373,7 +1373,7 @@ func (r *Reconciler) retryPendingPortForwards() error {
 	for name, inst := range actual {
 		for key := range portForwardKeys(inst.Config) {
 			claimed[key] = name
-			retained[key] = retained[key] || retainsRuntime(inst.State)
+			retained[key] = retained[key] || RetainsRuntime(inst.State)
 		}
 	}
 	keys := make([]portForwardKey, 0, len(r.pendingPortForwards))
@@ -1454,7 +1454,7 @@ func (r *Reconciler) retryPendingNetworkDevices() error {
 	for name, inst := range actual {
 		for _, dev := range networkDevicesForService(inst.Config) {
 			claimed[dev.name] = name
-			retained[dev.name] = retained[dev.name] || retainsRuntime(inst.State)
+			retained[dev.name] = retained[dev.name] || RetainsRuntime(inst.State)
 		}
 	}
 

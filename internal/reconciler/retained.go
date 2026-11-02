@@ -46,8 +46,6 @@ func RetainsRuntime(state vm.State) bool {
 	return state == vm.StateRecoveryPending || state == vm.StateStarting || state == vm.StateStartAborting || state == vm.StateStopping
 }
 
-func retainsRuntime(state vm.State) bool { return RetainsRuntime(state) }
-
 // Instances returns the runtime inventory the reconciler plans against, so
 // admission decisions read the same view as holds.
 func (r *Reconciler) Instances() map[string]*vm.Instance {
@@ -67,7 +65,7 @@ func (r *Reconciler) RetainedServices() []config.ServiceConfig {
 func (r *Reconciler) retainedInstances() []*vm.Instance {
 	var retained []*vm.Instance
 	for _, instance := range r.vmManager.List() {
-		if retainsRuntime(instance.State) {
+		if RetainsRuntime(instance.State) {
 			retained = append(retained, instance)
 		}
 	}
@@ -83,10 +81,38 @@ func (r *Reconciler) retainedInstances() []*vm.Instance {
 	return retained
 }
 
-// Holds returns the holds of the desired services, including those set by
-// SetHeldServices and every hold they cause.
-func (r *Reconciler) Holds(desired config.NodeConfig) map[string]Hold {
-	return r.holds(desired)
+// Holds returns the holds of the desired services if external were the
+// caller's capacity and address holds, with every hold they cause. It ignores
+// what SetHeldServices installed, so admission can weigh a hold set without
+// publishing it.
+func (r *Reconciler) Holds(desired config.NodeConfig, external map[string]Hold) map[string]Hold {
+	actual := r.vmManager.List()
+	unknown := unknownRuntimeOwner(actual)
+	owners := r.retainedInstances()
+	held := make(map[string]Hold)
+	// A tracked VM whose update is held keeps its actual guest IP, MAC, host
+	// ports and devices, so it is an owner for every other service. That
+	// includes a crashed or stopped VM, whose DNAT rules stay installed until
+	// it is replaced. Holding one service can therefore hold another; iterate
+	// until nothing changes.
+	for changed := true; changed; {
+		changed = false
+		for _, service := range desired.Services {
+			if _, done := held[service.Name]; done {
+				continue
+			}
+			hold := serviceHold(service, actual, owners, unknown, external, held)
+			if hold.Reason == "" {
+				continue
+			}
+			held[service.Name] = hold
+			changed = true
+			if instance := actual[service.Name]; instance != nil && !RetainsRuntime(instance.State) {
+				owners = append(owners, instance) // Retained VMs already are.
+			}
+		}
+	}
+	return held
 }
 
 // DeleteHolds returns, for tracked VMs that desired state no longer names,
@@ -100,7 +126,7 @@ func (r *Reconciler) DeleteHolds(desired config.NodeConfig) map[string]Hold {
 	held := make(map[string]Hold)
 	retained := r.retainedInstances()
 	for name, instance := range r.vmManager.List() {
-		if wanted[name] || retainsRuntime(instance.State) {
+		if wanted[name] || RetainsRuntime(instance.State) {
 			continue
 		}
 		if hold := deleteHold(instance, retained); hold.Reason != "" {
@@ -133,37 +159,13 @@ func (r *Reconciler) HeldServices(desired config.NodeConfig) map[string]string {
 	return reasons
 }
 
+// holds returns the holds of the desired services under the installed
+// capacity and address holds.
 func (r *Reconciler) holds(desired config.NodeConfig) map[string]Hold {
-	actual := r.vmManager.List()
 	r.heldMu.RLock()
 	external := maps.Clone(r.heldServices)
 	r.heldMu.RUnlock()
-	unknown := unknownRuntimeOwner(actual)
-	owners := r.retainedInstances()
-	held := make(map[string]Hold)
-	// A tracked VM whose update is held keeps its actual guest IP, MAC, host
-	// ports and devices, so it is an owner for every other service. That
-	// includes a crashed or stopped VM, whose DNAT rules stay installed until
-	// it is replaced. Holding one service can therefore hold another; iterate
-	// until nothing changes.
-	for changed := true; changed; {
-		changed = false
-		for _, service := range desired.Services {
-			if _, done := held[service.Name]; done {
-				continue
-			}
-			hold := serviceHold(service, actual, owners, unknown, external, held)
-			if hold.Reason == "" {
-				continue
-			}
-			held[service.Name] = hold
-			changed = true
-			if instance := actual[service.Name]; instance != nil && !retainsRuntime(instance.State) {
-				owners = append(owners, instance) // Retained VMs already are.
-			}
-		}
-	}
-	return held
+	return r.Holds(desired, external)
 }
 
 func serviceHold(service config.ServiceConfig, actual map[string]*vm.Instance, owners []*vm.Instance, unknown string, external, held map[string]Hold) Hold {
@@ -176,7 +178,7 @@ func serviceHold(service config.ServiceConfig, actual map[string]*vm.Instance, o
 	if instance != nil && instance.State == vm.StateRecoveryPending {
 		return Hold{} // Its quarantine already reports why no desired work applies.
 	}
-	if instance != nil && retainsRuntime(instance.State) {
+	if instance != nil && RetainsRuntime(instance.State) {
 		return Hold{Reason: "runtime lifecycle is in progress"}
 	}
 	changes := instance == nil || needsUpdate(instance, service)
@@ -280,7 +282,7 @@ func (r *Reconciler) actionHold(action Action) Hold {
 			return hold
 		}
 	}
-	if instance := actual[action.Service.Name]; instance != nil && retainsRuntime(instance.State) {
+	if instance := actual[action.Service.Name]; instance != nil && RetainsRuntime(instance.State) {
 		return Hold{Reason: "runtime ownership or lifecycle is unresolved", Recovery: instance.State == vm.StateRecoveryPending}
 	}
 	if action.Type == ActionCreate && hold.Reason == "" {
@@ -294,8 +296,8 @@ func (r *Reconciler) actionHold(action Action) Hold {
 			if resource := conflictingResource(action.Service, owner.Config); resource != "" {
 				// The owner stays for whatever holds it, so a create waiting
 				// on it inherits that cause.
-				ownerHold, desiredOwner := plannedHolds[name]
-				if !desiredOwner && r.planned != nil && !slices.ContainsFunc(r.planned.Services, func(s config.ServiceConfig) bool { return s.Name == name }) {
+				ownerHold, ownerHeld := plannedHolds[name]
+				if !ownerHeld && r.planned != nil && !slices.ContainsFunc(r.planned.Services, func(s config.ServiceConfig) bool { return s.Name == name }) {
 					ownerHold = deleteHold(owner, retained)
 				}
 				recovery := owner.State == vm.StateRecoveryPending || ownerHold.Recovery
