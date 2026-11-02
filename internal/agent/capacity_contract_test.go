@@ -571,6 +571,24 @@ func TestC6RecoveryHoldDoesNotHideWaitThatOutlastsRecovery(t *testing.T) {
 				}
 			},
 		},
+		"desired quarantine of unknown size needs the shrink it blocks": {
+			limit: capacity.NodeCapacity{VCPUs: 4, MemoryMB: 4096},
+			instances: func() map[string]*vm.Instance {
+				return map[string]*vm.Instance{
+					"s": c7Running("s", 3, 64, 7070),
+					"q": {Name: "q", Config: admissionService("q", 1, 64, 8080, ""), State: vm.StateRecoveryPending, RecoveryConfigUnknown: true},
+				}
+			},
+			desired: []c7Service{{"q", 3, 64, 9090}, {"s", 1, 64, 8080}},
+			resolve: func(m *recoveryTestVMManager, tick int) {
+				switch tick {
+				case 1:
+					m.instances["q"].RecoveryConfigUnknown = false
+				case 2:
+					m.instances["q"].State = vm.StateRunning
+				}
+			},
+		},
 		"same-tick growth takes the headroom": {
 			limit: capacity.NodeCapacity{VCPUs: 5, MemoryMB: 1088},
 			instances: func() map[string]*vm.Instance {

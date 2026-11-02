@@ -1319,12 +1319,14 @@ func hasRecoveryPending(instances map[string]*vm.Instance) bool {
 // or not, and a desired one keeps its current size. No shrink is credited,
 // so no admission order, claim held among the waiting services or way of
 // resolving recovery can turn such a wait into one that outlasts recovery.
-// A desired quarantined VM whose size is unknown leaves room for no growth.
-// When it holds, every remaining wait is recovery's alone.
+// A desired quarantined VM whose size is unknown leaves room for no other
+// growth, and its whole desired size must fit beside what the node uses: then
+// it fits whether it is adopted at whatever size it has and resized, or
+// recreated. When this holds, every remaining wait is recovery's alone.
 func recoveryFits(services []config.ServiceConfig, cap capacity.NodeCapacity, instances map[string]*vm.Instance) bool {
-	wanted := make(map[string]bool, len(services))
+	wanted := make(map[string]capacity.NodeCapacity, len(services))
 	for _, svc := range services {
-		wanted[svc.Name] = true
+		wanted[svc.Name] = capacity.NodeCapacity{VCPUs: svc.VCPUs, MemoryMB: svc.MemoryMB}
 	}
 	uses := func(inst *vm.Instance) capacity.NodeCapacity {
 		if inst == nil || !reconciler.UsesCapacity(inst.State) {
@@ -1332,15 +1334,16 @@ func recoveryFits(services []config.ServiceConfig, cap capacity.NodeCapacity, in
 		}
 		return capacity.NodeCapacity{VCPUs: inst.Config.VCPUs, MemoryMB: inst.Config.MemoryMB}
 	}
-	var used, growth capacity.NodeCapacity
-	unknown := false
+	var used, growth, unknown capacity.NodeCapacity
 	for name, inst := range instances {
+		size, desired := wanted[name]
 		switch {
 		case inst.State != vm.StateRecoveryPending:
-		case !wanted[name]:
+		case !desired:
 			continue
 		case inst.RecoveryConfigUnknown:
-			unknown = true
+			unknown.VCPUs += size.VCPUs
+			unknown.MemoryMB += size.MemoryMB
 			continue
 		}
 		used.VCPUs += uses(inst).VCPUs
@@ -1355,8 +1358,11 @@ func recoveryFits(services []config.ServiceConfig, cap capacity.NodeCapacity, in
 		growth.VCPUs += max(svc.VCPUs-current.VCPUs, 0)
 		growth.MemoryMB += max(svc.MemoryMB-current.MemoryMB, 0)
 	}
-	if unknown && growth != (capacity.NodeCapacity{}) {
-		return false
+	if unknown != (capacity.NodeCapacity{}) {
+		if growth != (capacity.NodeCapacity{}) {
+			return false
+		}
+		growth = unknown
 	}
 	return (growth.VCPUs == 0 || used.VCPUs+growth.VCPUs <= cap.VCPUs) && (growth.MemoryMB == 0 || used.MemoryMB+growth.MemoryMB <= cap.MemoryMB)
 }

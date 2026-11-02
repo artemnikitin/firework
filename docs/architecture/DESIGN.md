@@ -418,9 +418,10 @@ retained:
   on the runtime the apply left, every desired service could take all the
   capacity it still needs at once beside what the node uses, with undesired
   quarantined VMs gone, desired ones at their current size, and no shrink
-  credited; a desired quarantined VM whose configuration is unknown allows no
-  growth at all. No admission order, claim among the waiting services or way
-  of resolving recovery can then turn a wait into one that outlasts recovery.
+  credited. A desired quarantined VM whose configuration is unknown allows no
+  other growth, and its whole desired size must fit beside what the node uses.
+  No admission order, claim among the waiting services or way of resolving
+  recovery can then turn a wait into one that outlasts recovery.
   Otherwise the capacity holds, and recovery holds on services that need
   capacity, report that the wait needs both resolved ownership and more room
   than the node has free, and the revision stays incomplete.
