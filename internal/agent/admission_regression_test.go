@@ -155,3 +155,23 @@ func TestStaleRouteAfterRestartWhilePeersUnavailable(t *testing.T) {
 		t.Fatal("preserved peer route was removed")
 	}
 }
+
+// Before the first peer listing, a held service keeps its route when its
+// hostname is unchanged: desired state gives that hostname to this very
+// service, and a local claim wins over any peer's.
+func TestHeldRouteWithUnchangedHostnameSurvivesUnknownPeers(t *testing.T) {
+	routeDir := t.TempDir()
+	original := routingPersistenceService()
+	a, manager := routingPersistenceAgent(t, routeDir, original, "owner-old")
+	a.store = &fakeStore{listErr: os.ErrPermission}
+	desired := original
+	desired.Image = "/new"
+	desired.Metadata = map[string]string{"host": "original.example.com", "team": "payments"}
+	holdRoutingReplacement(manager)
+	if err := a.syncTraefikConfigs(context.Background(), []config.ServiceConfig{desired}); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := readRoute(t, routeDir, "app.yaml"); !ok {
+		t.Fatal("a held running service lost the route its unchanged hostname still gives it")
+	}
+}

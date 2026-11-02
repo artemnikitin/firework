@@ -28,9 +28,10 @@ func (a *Agent) syncRuntimeRoutes(services []config.ServiceConfig, remoteNodes [
 // selectLocalRoutes publishes each tracked VM from its own configuration. A
 // held update keeps its previous hostname only while desired state does not
 // give that hostname to another service, local or on a peer: the desired owner
-// always wins, and with no peer listing yet nothing proves the hostname free.
-// A stale route is dropped rather than failing publication, so one held
-// service can never freeze every other route on the node.
+// always wins. With no peer listing yet, only this service's own local desired
+// claim proves the hostname is still its own, because a local claim wins over
+// any peer's. A stale route is dropped rather than failing publication, so one
+// held service can never freeze every other route on the node.
 func (a *Agent) selectLocalRoutes(routes []reconciler.LocalRoute, desired []config.ServiceConfig, remoteNodes []config.NodeConfig, peersKnown bool) []config.ServiceConfig {
 	resolve := func(svc config.ServiceConfig) (string, error) {
 		return ingress.Resolve(svc.Name, svc.Metadata, a.cfg.IngressDomain)
@@ -58,9 +59,6 @@ func (a *Agent) selectLocalRoutes(routes []reconciler.LocalRoute, desired []conf
 			selected = append(selected, svc)
 			continue
 		}
-		if !peersKnown {
-			continue // A peer may own the hostname now; nothing says otherwise.
-		}
 		host, err := resolve(svc)
 		if err != nil {
 			a.logger.Warn("dropping held route whose previous metadata no longer resolves", "service", svc.Name, "error", err)
@@ -70,9 +68,13 @@ func (a *Agent) selectLocalRoutes(routes []reconciler.LocalRoute, desired []conf
 			continue
 		}
 		// Peer claims are recorded with no local owner, so they always win.
-		if owner, taken := claimed[host]; taken && owner != svc.Name {
+		owner, taken := claimed[host]
+		if taken && owner != svc.Name {
 			a.logger.Info("dropping held route; desired state gives its hostname to another service", "service", svc.Name, "host", host)
 			continue
+		}
+		if !peersKnown && owner != svc.Name {
+			continue // A peer may own the hostname now; nothing says otherwise.
 		}
 		kept[host] = true
 		selected = append(selected, svc)
