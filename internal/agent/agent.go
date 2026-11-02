@@ -1354,8 +1354,9 @@ func mergeHolds(addressHolds, capacityHolds map[string]reconciler.Hold) map[stri
 //   - a crashed or stopped VM uses nothing until it is recreated;
 //   - an update that only shrinks always proceeds;
 //   - every other create or update is admitted by the change it makes, in
-//     service-name order. Updates that fit only together, such as two VMs
-//     trading sizes, are admitted together. A held one keeps its current size.
+//     service-name order. Waiting updates that free one resource while taking
+//     another, such as two VMs trading sizes, are admitted together when
+//     they fit together. A held one keeps its current size.
 //
 // When the apply's updates succeed, the node does not end a tick over
 // capacity. It can exceed capacity while an apply grows a VM before it
@@ -1482,6 +1483,11 @@ func (a *Agent) admitPass(services []config.ServiceConfig, cap capacity.NodeCapa
 	}
 	// Admit in service-name order, retrying what waits after every admission:
 	// a later update's shrink can make room for an earlier service's growth.
+	// Updates that free one resource while taking another can fit only
+	// together, such as two VMs trading sizes, so once nothing fits alone the
+	// waiting ones are tried as one group. A create or a growth takes from
+	// every resource and never helps such a group fit, so it is left out of
+	// the group and retried after it.
 	waiting := candidates
 	for admitted := true; admitted; {
 		admitted = false
@@ -1494,14 +1500,20 @@ func (a *Agent) admitPass(services []config.ServiceConfig, cap capacity.NodeCapa
 			still = append(still, c)
 		}
 		waiting = still
-	}
-	if len(waiting) > 1 {
-		together := used
-		for _, c := range waiting {
-			together = plus(together, c.delta)
+		if admitted {
+			continue
 		}
-		if !exceeds(together) {
-			used, waiting = together, nil
+		group, members := used, 0
+		var rest []candidate
+		for _, c := range waiting {
+			if c.delta.VCPUs < 0 || c.delta.MemoryMB < 0 {
+				group, members = plus(group, c.delta), members+1
+			} else {
+				rest = append(rest, c)
+			}
+		}
+		if members > 1 && !exceeds(group) {
+			used, waiting, admitted = group, rest, true
 		}
 	}
 	var cause reconciler.Hold
