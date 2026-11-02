@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"maps"
 	"net"
+	"reflect"
 	"slices"
 	"sort"
 	"strings"
@@ -1287,31 +1288,84 @@ const (
 // the holds and the allowances, against which the reconciler checks every
 // start again when it happens.
 //
-// Recovery explains the capacity holds only if the same admission, run as
-// though every quarantined VM had resolved and gone, would hold nothing, or
-// hold only until that tick's removals, shrinks and lifecycle transitions
-// complete. A hold that admission would keep anyway is not recovery's to
-// report, so it cannot let the revision apply as degraded. Nor can a recovery
-// hold on a service that would wait for capacity anyway: such a service is
-// held for capacity too, with the cause that is not recovery.
+// Recovery explains the capacity holds only if, once every quarantined VM
+// resolved, admission would hold nothing after the work it then admits has
+// run; see recoveryExplains. A hold that admission would keep anyway is not
+// recovery's to report, so it cannot let the revision apply as degraded. Nor
+// can a recovery hold on a service that would still wait for capacity then:
+// such a service is held for capacity too, with the cause that is not
+// recovery.
 func (a *Agent) admit(services []config.ServiceConfig, cap capacity.NodeCapacity, known bool, addressHolds map[string]reconciler.Hold) (capacity.NodeCapacity, map[string]reconciler.Hold, map[string]capacity.NodeCapacity) {
 	instances := a.reconciler.Instances()
-	resolved := maps.Clone(instances)
-	maps.DeleteFunc(resolved, func(_ string, inst *vm.Instance) bool { return inst.State == vm.StateRecoveryPending })
-	explained := false
-	var waitsAnyway map[string]reconciler.Hold
-	if known && len(resolved) < len(instances) {
-		withoutRecovery := maps.Clone(addressHolds)
-		maps.DeleteFunc(withoutRecovery, func(_ string, hold reconciler.Hold) bool { return hold.Recovery })
-		_, held, _ := a.admitIn(services, cap, known, resolved, withoutRecovery, false, nil)
-		explained = true
-		for _, hold := range held {
-			if hold.Reason == capacityBlockedReason {
-				explained, waitsAnyway = false, held
-			}
-		}
+	explained, waitsAnyway := false, map[string]reconciler.Hold(nil)
+	if known && slices.ContainsFunc(slices.Collect(maps.Values(instances)), func(inst *vm.Instance) bool { return inst.State == vm.StateRecoveryPending }) {
+		explained, waitsAnyway = a.recoveryExplains(services, cap, instances, addressHolds)
 	}
 	return a.admitIn(services, cap, known, instances, addressHolds, explained, waitsAnyway)
+}
+
+// recoveryExplains plays admission forward from the runtime as it would be
+// once recovery resolved, assuming the work each tick admits succeeds, under
+// both ways a quarantine can resolve: the VM gone, and the VM adopted at its
+// current size when its configuration is known. Recovery explains the holds
+// only if both reach a tick that holds nothing. Otherwise it returns the
+// services still held when a tick changes nothing more.
+func (a *Agent) recoveryExplains(services []config.ServiceConfig, cap capacity.NodeCapacity, instances map[string]*vm.Instance, addressHolds map[string]reconciler.Hold) (bool, map[string]reconciler.Hold) {
+	withoutRecovery := maps.Clone(addressHolds)
+	maps.DeleteFunc(withoutRecovery, func(_ string, hold reconciler.Hold) bool { return hold.Recovery })
+	gone, adopted := maps.Clone(instances), maps.Clone(instances)
+	for name, inst := range instances {
+		if inst.State != vm.StateRecoveryPending {
+			continue
+		}
+		delete(gone, name)
+		if inst.RecoveryConfigUnknown {
+			delete(adopted, name)
+		} else {
+			running := *inst
+			running.State = vm.StateRunning
+			adopted[name] = &running
+		}
+	}
+	desired := config.NodeConfig{Services: services}
+	for _, runtime := range []map[string]*vm.Instance{gone, adopted} {
+		for range len(services) + len(runtime) + 2 {
+			_, held, allowance := a.admitIn(services, cap, true, runtime, withoutRecovery, false, nil)
+			if len(held) == 0 {
+				break
+			}
+			next := appliedRuntime(services, runtime, allowance, reconciler.DeleteHoldsIn(runtime, desired))
+			if maps.EqualFunc(next, runtime, func(x, y *vm.Instance) bool {
+				return x.State == y.State && reflect.DeepEqual(x.Config, y.Config)
+			}) {
+				return false, held
+			}
+			runtime = next
+		}
+	}
+	return true, nil
+}
+
+// appliedRuntime is the runtime after a tick in which every admitted service
+// converged, every lifecycle transition completed and every removal that is
+// not held ran.
+func appliedRuntime(services []config.ServiceConfig, runtime map[string]*vm.Instance, allowance map[string]capacity.NodeCapacity, deleteHeld map[string]reconciler.Hold) map[string]*vm.Instance {
+	next := make(map[string]*vm.Instance, len(runtime))
+	wanted := make(map[string]bool, len(services))
+	for _, svc := range services {
+		wanted[svc.Name] = true
+		if _, admitted := allowance[svc.Name]; admitted {
+			next[svc.Name] = &vm.Instance{Name: svc.Name, Config: svc, State: vm.StateRunning}
+		} else if inst := runtime[svc.Name]; inst != nil {
+			next[svc.Name] = inst
+		}
+	}
+	for name, inst := range runtime {
+		if _, held := deleteHeld[name]; !wanted[name] && held {
+			next[name] = inst
+		}
+	}
+	return next
 }
 
 // admitIn admits against one inventory snapshot, so no pass sees a VM change

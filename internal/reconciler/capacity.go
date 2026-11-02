@@ -63,7 +63,9 @@ func (r *Reconciler) capacityHold(svc config.ServiceConfig, actual map[string]*v
 	if limit == nil {
 		return Hold{}
 	}
-	if unknown := unknownRuntimeOwner(actual); unknown != "" && unknown != svc.Name {
+	others := maps.Clone(actual)
+	delete(others, svc.Name)
+	if unknown := unknownRuntimeOwner(others); unknown != "" {
 		// A quarantined VM whose configuration is unknown may still use any
 		// amount of capacity; nothing it might use can be presumed free.
 		if instance := actual[svc.Name]; instance == nil || !UsesCapacity(instance.State) ||
@@ -71,15 +73,15 @@ func (r *Reconciler) capacityHold(svc config.ServiceConfig, actual map[string]*v
 			return Hold{Reason: "capacity used by " + unknown + " is unknown", Recovery: true, Capacity: true}
 		}
 	}
-	var own, others capacity.NodeCapacity
+	var own, used capacity.NodeCapacity
 	occupy := func(name string, size capacity.NodeCapacity) {
 		if name == svc.Name {
 			own = size
 			return
 		}
 		allowed := limit.allowance[name]
-		others.VCPUs += max(size.VCPUs, allowed.VCPUs)
-		others.MemoryMB += max(size.MemoryMB, allowed.MemoryMB)
+		used.VCPUs += max(size.VCPUs, allowed.VCPUs)
+		used.MemoryMB += max(size.MemoryMB, allowed.MemoryMB)
 	}
 	for name, instance := range actual {
 		var size capacity.NodeCapacity
@@ -93,14 +95,14 @@ func (r *Reconciler) capacityHold(svc config.ServiceConfig, actual map[string]*v
 			occupy(name, capacity.NodeCapacity{})
 		}
 	}
-	growsVCPUs := svc.VCPUs > own.VCPUs && others.VCPUs+svc.VCPUs > limit.node.VCPUs
-	growsMemory := svc.MemoryMB > own.MemoryMB && others.MemoryMB+svc.MemoryMB > limit.node.MemoryMB
+	growsVCPUs := svc.VCPUs > own.VCPUs && used.VCPUs+svc.VCPUs > limit.node.VCPUs
+	growsMemory := svc.MemoryMB > own.MemoryMB && used.MemoryMB+svc.MemoryMB > limit.node.MemoryMB
 	if !growsVCPUs && !growsMemory {
 		return Hold{}
 	}
 	return Hold{
 		Reason: fmt.Sprintf("needs %d vCPUs and %d MB while other VMs use or were admitted %d vCPUs and %d MB of %d vCPUs and %d MB",
-			svc.VCPUs, svc.MemoryMB, others.VCPUs, others.MemoryMB, limit.node.VCPUs, limit.node.MemoryMB),
+			svc.VCPUs, svc.MemoryMB, used.VCPUs, used.MemoryMB, limit.node.VCPUs, limit.node.MemoryMB),
 		Capacity: true,
 	}
 }

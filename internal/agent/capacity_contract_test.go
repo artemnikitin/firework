@@ -445,11 +445,17 @@ func TestC7UnknownQuarantineCapacityIsNotFree(t *testing.T) {
 	if err := a.restartService(context.Background(), "f"); err == nil || m.instances["f"].State != vm.StateFailed {
 		t.Fatalf("restart started f beside a VM of unknown size: err=%v f=%+v", err, m.instances["f"])
 	}
+	// Once the quarantine resolves, the unchanged revision recreates f.
+	delete(m.instances, "q")
+	a.tick(context.Background())
+	if problem := c7Converged(m, c7Service{"f", 4, 1024, 0}); problem != "" || len(m.overcommits) != 0 {
+		t.Fatalf("f did not recover: %s overcommits=%v", problem, m.overcommits)
+	}
 }
 
 // C7: a health restart waits for capacity under a desired state that fits,
 // here behind a shrink whose stop keeps failing, and the service converges
-// once the shrink succeeds.
+// once the shrink succeeds. Regression coverage for the start-time check.
 func TestC7HealthRestartWaitsForFailingShrink(t *testing.T) {
 	desired := []c7Service{{"f", 2, 64, 0}, {"s", 2, 64, 0}}
 	a, m := c7Agent(t, "", 0, capacity.NodeCapacity{VCPUs: 4, MemoryMB: 4096}, map[string]*vm.Instance{
@@ -473,5 +479,60 @@ func TestC7HealthRestartWaitsForFailingShrink(t *testing.T) {
 	}
 	if problem := c7Converged(m, desired...); problem != "" || len(m.overcommits) != 0 || a.lastRevision != "r2" {
 		t.Fatalf("%s; overcommits=%v; %s", problem, m.overcommits, a.agentStatusSnapshot().Message)
+	}
+}
+
+// C6: two VMs trading sizes on a full node wait for headroom however the
+// quarantine resolves: when another change frees an unrelated resource
+// meanwhile, and when the quarantined VM is adopted at its current size
+// rather than removed. Recovery therefore does not explain the wait, and
+// the revision must not apply as degraded, before or after it resolves.
+func TestC6RecoveryHoldDoesNotHideWaitThatOutlastsRecovery(t *testing.T) {
+	cases := map[string]struct {
+		limit     capacity.NodeCapacity
+		instances func() map[string]*vm.Instance
+		desired   []c7Service
+		resolve   func(m *recoveryTestVMManager)
+	}{
+		"another shrink frees memory meanwhile": {
+			limit: capacity.NodeCapacity{VCPUs: 4, MemoryMB: 896},
+			instances: func() map[string]*vm.Instance {
+				return map[string]*vm.Instance{
+					"a": c7Running("a", 1, 512, 0),
+					"b": c7Running("b", 2, 256, 0),
+					"c": c7Running("c", 1, 128, 0),
+					"q": {Name: "q", Config: config.ServiceConfig{Name: "q"}, State: vm.StateRecoveryPending, RecoveryConfigUnknown: true},
+				}
+			},
+			desired: []c7Service{{"a", 2, 256, 0}, {"b", 1, 512, 0}, {"c", 1, 64, 0}},
+			resolve: func(m *recoveryTestVMManager) { delete(m.instances, "q") },
+		},
+		"quarantined VM is adopted": {
+			limit: capacity.NodeCapacity{VCPUs: 3, MemoryMB: 768},
+			instances: func() map[string]*vm.Instance {
+				return map[string]*vm.Instance{
+					"b": c7Running("b", 2, 256, 0),
+					"q": {Name: "q", Config: admissionService("q", 1, 512, 0, ""), State: vm.StateRecoveryPending},
+				}
+			},
+			desired: []c7Service{{"b", 1, 512, 0}, {"q", 2, 256, 0}},
+			resolve: func(m *recoveryTestVMManager) { m.instances["q"].State = vm.StateRunning },
+		},
+	}
+	for name, tc := range cases {
+		for _, strategy := range c7Strategies {
+			t.Run(name+"/"+strategy, func(t *testing.T) {
+				a, m := c7Agent(t, strategy, 0, tc.limit, tc.instances(), tc.desired...)
+				for tick := 0; tick < 4; tick++ {
+					if tick == 1 {
+						tc.resolve(m)
+					}
+					a.tick(context.Background())
+					if a.lastRevision == "r2" || len(m.overcommits) != 0 {
+						t.Fatalf("tick %d: lastRevision=%q overcommits=%v status=%s", tick, a.lastRevision, m.overcommits, conditionOf(a.agentStatusSnapshot(), "VMsReconciled").Message)
+					}
+				}
+			})
+		}
 	}
 }

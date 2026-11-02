@@ -415,11 +415,12 @@ retained:
   `VMRecoveryReady=False`, so the node shows as degraded instead of
   progressing. Pending recovery keeps forcing reconciliation, so held work
   retries on an unchanged revision. Recovery explains capacity holds only if
-  the same admission, run as though every quarantined VM had resolved and gone,
-  would hold nothing, or only until that tick's removals, shrinks and starts or
-  stops complete. A service recovery holds that would wait for capacity even
-  then is held for capacity as well, so its recovery hold cannot let the
-  revision apply.
+  admission, played forward from the runtime as it would be once recovery
+  resolved and assuming the work each tick admits succeeds, reaches a tick
+  that holds nothing, both when every quarantined VM is gone and when each one
+  whose configuration is known is adopted at its current size. A service that
+  would still wait for capacity then is held for capacity as well, so a
+  recovery hold on it cannot let the revision apply.
 - Admission failures, which waiting cannot resolve: desired services whose
   combined CPU or memory exceeds node capacity, or more networked desired
   services than `vm_subnet` has guest addresses. The other services still

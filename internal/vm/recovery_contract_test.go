@@ -57,11 +57,14 @@ func TestC2SameEvidenceSameClassificationAtEveryEntryPoint(t *testing.T) {
 				}
 				got := "absent"
 				switch instance := m.List()[f.Service]; {
-				case instance != nil && instance.State == StateRecoveryPending:
+				case instance == nil:
+				case instance.State == StateRecoveryPending:
 					got = "quarantined"
-				case instance != nil && instance.State == StateRunning:
+				case instance.State == StateRunning:
 					got = "adopted"
 					stopAdoptedMonitors(t, m)
+				default:
+					got = "left " + string(instance.State)
 				}
 				if got != ev.want {
 					t.Fatalf("classified %s, want %s (err=%v)", got, ev.want, err)
@@ -71,6 +74,10 @@ func TestC2SameEvidenceSameClassificationAtEveryEntryPoint(t *testing.T) {
 				case "quarantined":
 					if statErr != nil {
 						t.Fatalf("quarantine lost its state: %v", statErr)
+					}
+					// The command refuses, so the operator learns why.
+					if entry == "command" && err == nil {
+						t.Fatal("command reported success for an unproven owner")
 					}
 				case "absent":
 					// Proven absence lets every entry point finish cleanup.
