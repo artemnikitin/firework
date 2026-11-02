@@ -63,8 +63,12 @@ func (r *Reconciler) RetainedServices() []config.ServiceConfig {
 }
 
 func (r *Reconciler) retainedInstances() []*vm.Instance {
+	return retainedIn(r.vmManager.List())
+}
+
+func retainedIn(actual map[string]*vm.Instance) []*vm.Instance {
 	var retained []*vm.Instance
-	for _, instance := range r.vmManager.List() {
+	for _, instance := range actual {
 		if RetainsRuntime(instance.State) {
 			retained = append(retained, instance)
 		}
@@ -86,9 +90,15 @@ func (r *Reconciler) retainedInstances() []*vm.Instance {
 // what SetHeldServices installed, so admission can weigh a hold set without
 // publishing it.
 func (r *Reconciler) Holds(desired config.NodeConfig, external map[string]Hold) map[string]Hold {
-	actual := r.vmManager.List()
+	return HoldsIn(r.vmManager.List(), desired, external)
+}
+
+// HoldsIn is Holds over the given inventory instead of the current one, so
+// admission can read one snapshot throughout, or weigh what would hold if
+// part of the runtime were gone.
+func HoldsIn(actual map[string]*vm.Instance, desired config.NodeConfig, external map[string]Hold) map[string]Hold {
 	unknown := unknownRuntimeOwner(actual)
-	owners := r.retainedInstances()
+	owners := retainedIn(actual)
 	held := make(map[string]Hold)
 	// A tracked VM whose update is held keeps its actual guest IP, MAC, host
 	// ports and devices, so it is an owner for every other service. That
@@ -119,13 +129,18 @@ func (r *Reconciler) Holds(desired config.NodeConfig, external map[string]Hold) 
 // why their removal must wait: a host claim a retained VM shares with them.
 // Such a VM keeps running, and keeps its resources, until the hold clears.
 func (r *Reconciler) DeleteHolds(desired config.NodeConfig) map[string]Hold {
+	return DeleteHoldsIn(r.vmManager.List(), desired)
+}
+
+// DeleteHoldsIn is DeleteHolds over the given inventory.
+func DeleteHoldsIn(actual map[string]*vm.Instance, desired config.NodeConfig) map[string]Hold {
 	wanted := make(map[string]bool, len(desired.Services))
 	for _, service := range desired.Services {
 		wanted[service.Name] = true
 	}
 	held := make(map[string]Hold)
-	retained := r.retainedInstances()
-	for name, instance := range r.vmManager.List() {
+	retained := retainedIn(actual)
+	for name, instance := range actual {
 		if wanted[name] || RetainsRuntime(instance.State) {
 			continue
 		}
@@ -255,7 +270,9 @@ func conflictingResource(service, owner config.ServiceConfig) string {
 // create also waits for any other tracked VM that still uses one of its claims, such
 // as a service whose update releasing that port comes later in a rolling
 // apply; the next tick creates it. A crashed or stopped VM counts too, because
-// its host rules stay installed until it is replaced.
+// its host rules stay installed until it is replaced. A create or update that
+// would grow its VM also waits unless the capacity is free now; see
+// capacityHold.
 //
 // Each call recomputes the revision's holds against the current runtime, so a
 // tick costs on the order of actions × services² claim comparisons. That is
@@ -306,6 +323,9 @@ func (r *Reconciler) actionHold(action Action) Hold {
 		}
 	}
 	if action.Type != ActionDelete {
+		if hold.Reason == "" {
+			hold = r.capacityHold(action.Service, actual)
+		}
 		return hold
 	}
 	return deleteHold(&vm.Instance{Config: action.Service}, r.retainedInstances())

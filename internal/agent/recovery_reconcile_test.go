@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/artemnikitin/firework/internal/capacity"
 	"github.com/artemnikitin/firework/internal/config"
 	"github.com/artemnikitin/firework/internal/healthcheck"
 	"github.com/artemnikitin/firework/internal/reconciler"
@@ -96,6 +97,43 @@ type recoveryTestVMManager struct {
 	instances   map[string]*vm.Instance
 	startCalls  []string
 	removeCalls []string
+	// limit, when set, makes every start check C7: a VM may start only into
+	// capacity free at that moment. overcommits records each start that left
+	// a resource above the limit and above what the node used before the
+	// operation began, so excess the node already had is not blamed on it.
+	limit       *capacity.NodeCapacity
+	overcommits []string
+	// pending is the usage before the last Remove or Stop. A replacement or
+	// restart starts the same service right after, completing that operation.
+	pending *pendingStart
+	// startHook runs before a start takes effect, to change the runtime
+	// mid-tick as a health restart or a lifecycle transition would. An error
+	// fails the start. removeHook does the same for a removal, which keeps
+	// its VM when it fails.
+	startHook  func(name string) error
+	removeHook func(name string) error
+}
+
+func (m *recoveryTestVMManager) usage() capacity.NodeCapacity {
+	vcpus, memoryMB := runtimeUsage(m)
+	return capacity.NodeCapacity{VCPUs: vcpus, MemoryMB: memoryMB}
+}
+
+type pendingStart struct {
+	name  string
+	usage capacity.NodeCapacity
+}
+
+func (m *recoveryTestVMManager) beginReplacement(name string) {
+	m.pending = &pendingStart{name, m.usage()}
+}
+
+func (m *recoveryTestVMManager) Stop(name string) error {
+	m.beginReplacement(name)
+	if instance := m.instances[name]; instance != nil {
+		instance.State = vm.StateStopped
+	}
+	return nil
 }
 
 func (m *recoveryTestVMManager) List() map[string]*vm.Instance {
@@ -111,8 +149,25 @@ func (m *recoveryTestVMManager) List() map[string]*vm.Instance {
 }
 
 func (m *recoveryTestVMManager) Start(_ context.Context, service config.ServiceConfig) error {
+	if m.startHook != nil {
+		if err := m.startHook(service.Name); err != nil {
+			return err
+		}
+	}
+	before := m.usage()
+	if m.pending != nil && m.pending.name == service.Name {
+		before = m.pending.usage
+	}
+	m.pending = nil
 	m.startCalls = append(m.startCalls, service.Name)
 	m.instances[service.Name] = &vm.Instance{Name: service.Name, Config: service, State: vm.StateRunning}
+	if m.limit != nil {
+		after := m.usage()
+		if after.VCPUs > m.limit.VCPUs && after.VCPUs > before.VCPUs || after.MemoryMB > m.limit.MemoryMB && after.MemoryMB > before.MemoryMB {
+			m.overcommits = append(m.overcommits, fmt.Sprintf("start %s: %d vCPUs/%d MB, was %d/%d, limit %d/%d",
+				service.Name, after.VCPUs, after.MemoryMB, before.VCPUs, before.MemoryMB, m.limit.VCPUs, m.limit.MemoryMB))
+		}
+	}
 	return nil
 }
 
@@ -125,6 +180,12 @@ func (m *recoveryTestVMManager) CommitConfig(name string, service config.Service
 }
 
 func (m *recoveryTestVMManager) Remove(service string) error {
+	m.beginReplacement(service)
+	if m.removeHook != nil {
+		if err := m.removeHook(service); err != nil {
+			return err
+		}
+	}
 	m.removeCalls = append(m.removeCalls, service)
 	delete(m.instances, service)
 	return nil

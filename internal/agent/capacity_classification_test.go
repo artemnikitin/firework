@@ -18,8 +18,9 @@ func classificationAgent(t *testing.T, yaml string, instances map[string]*vm.Ins
 	enabled := true
 	cfg.EnableCapacityCheck = &enabled
 	a := New(cfg, &fakeStore{revision: "r1", data: map[string][]byte{"web": []byte(yaml)}}, testLogger())
-	a.capacityReader = &fakeCapacityReader{cap: capacity.NodeCapacity{VCPUs: vcpus, MemoryMB: 4096}}
-	manager := &recoveryTestVMManager{instances: instances}
+	limit := capacity.NodeCapacity{VCPUs: vcpus, MemoryMB: 4096}
+	a.capacityReader = &fakeCapacityReader{cap: limit}
+	manager := &recoveryTestVMManager{instances: instances, limit: &limit}
 	a.reconciler = reconciler.NewWithNetworkManager(manager, testLogger(), nil, &recoveryTestNetworkManager{}, "", 0)
 	return a, manager
 }
@@ -59,18 +60,6 @@ func TestOverCapacityFailsRevisionWhateverIsRetained(t *testing.T) {
 				t.Fatalf("VMsReconciled = %#v", c)
 			}
 		})
-	}
-}
-
-// A running VM the plan removes does not keep its allocation: replacing a
-// service on a full node happens within one tick, as on main.
-func TestReplacementOnFullNodeConvergesInOneTick(t *testing.T) {
-	yaml := "node: web\nservices:\n- name: next\n  image: /n\n  kernel: /k\n  vcpus: 4\n  memory_mb: 64\n"
-	old := config.ServiceConfig{Name: "old", Image: "/o", Kernel: "/k", VCPUs: 4, MemoryMB: 64}
-	a, manager := classificationAgent(t, yaml, map[string]*vm.Instance{"old": {Name: "old", Config: old, State: vm.StateRunning}}, 4)
-	a.tick(context.Background())
-	if manager.instances["old"] != nil || manager.instances["next"] == nil || a.lastRevision != "r1" {
-		t.Fatalf("old=%v next=%v lastRevision=%q", manager.instances["old"], manager.instances["next"], a.lastRevision)
 	}
 }
 

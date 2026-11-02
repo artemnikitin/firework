@@ -88,6 +88,7 @@ type Reconciler struct {
 	pendingRecovery map[string]struct{}
 	heldMu          sync.RWMutex
 	heldServices    map[string]Hold
+	capacity        *capacityLimit
 	// planned is the revision Reconcile is applying, so a per-action hold
 	// check sees held running owners across the whole revision.
 	planned *config.NodeConfig

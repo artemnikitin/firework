@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"math/rand"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -59,19 +60,39 @@ func generatedRevision(r *rand.Rand) []generatedService {
 
 // Random revisions over both update strategies, with crashed and stopped VMs,
 // a VM still starting or stopping, and a quarantined survivor, each resolving
-// after a few ticks, must converge
-// within a bounded number of ticks, never run more than the node holds between
-// ticks, and, while only the quarantine stands in the way, never report a hold
-// that recovery does not explain and apply the revision as degraded.
+// after a few ticks, on a tight node and on one with headroom. No start may
+// take capacity that is not free at that moment (C7). A revision with
+// transition headroom, where every service fits at the larger of its old and
+// new size, must converge within a bounded number of ticks once the
+// quarantine resolves (C5); without headroom it may wait (L2), but must not
+// report itself reconciled. While the quarantine
+// stands, a tick that changes nothing must apply the revision as degraded,
+// and only when recovery explains every hold (C6).
 func TestRandomRevisionsConvergeWithinCapacity(t *testing.T) {
 	seeds := int64(600)
 	if testing.Short() {
 		seeds = 100
 	}
 	failures := 0
-	for seed := int64(0); seed < seeds && failures < 5; seed++ {
-		r := rand.New(rand.NewSource(seed))
+	for seed := int64(0); seed < seeds*2 && failures < 5; seed++ {
+		// Every seed runs on the node the revisions were drawn for, then
+		// again on one with headroom for the transition and the survivor.
+		roomy := seed >= seeds
+		r := rand.New(rand.NewSource(seed % seeds))
 		from, to := generatedRevision(r), generatedRevision(r)
+		need := map[string][2]int{}
+		for _, s := range append(slices.Clone(from), to...) {
+			need[s.name] = [2]int{max(need[s.name][0], s.vcpus), max(need[s.name][1], s.mem)}
+		}
+		var needVCPUs, needMemory int
+		for _, n := range need {
+			needVCPUs, needMemory = needVCPUs+n[0], needMemory+n[1]
+		}
+		capVCPUs, capMemoryMB := generatedVCPUs, generatedMemoryMB
+		if roomy {
+			capVCPUs, capMemoryMB = max(capVCPUs, needVCPUs+2), max(capMemoryMB, needMemory+256)
+		}
+		headroom := needVCPUs <= capVCPUs && needMemory <= capMemoryMB
 		strategy := ""
 		if r.Intn(2) == 0 {
 			strategy = "rolling"
@@ -82,12 +103,13 @@ func TestRandomRevisionsConvergeWithinCapacity(t *testing.T) {
 		cfg.VMSubnet, cfg.VMGateway = "172.16.0.0/29", "172.16.0.1"
 		store := &fakeStore{revision: "r1", data: map[string][]byte{"web": generatedYAML(from)}}
 		a := New(cfg, store, testLogger())
-		a.capacityReader = &fakeCapacityReader{cap: capacity.NodeCapacity{VCPUs: generatedVCPUs, MemoryMB: generatedMemoryMB}}
-		m := &recoveryTestVMManager{instances: map[string]*vm.Instance{}}
+		limit := capacity.NodeCapacity{VCPUs: capVCPUs, MemoryMB: capMemoryMB}
+		a.capacityReader = &fakeCapacityReader{cap: limit}
+		m := &recoveryTestVMManager{instances: map[string]*vm.Instance{}, limit: &limit}
 		a.reconciler = reconciler.NewWithNetworkManager(m, testLogger(), nil, &recoveryTestNetworkManager{}, strategy, time.Microsecond)
 		a.tick(context.Background())
 		if a.lastRevision != "r1" {
-			t.Fatalf("seed %d: setup did not apply: %s", seed, a.agentStatusSnapshot().Message)
+			t.Fatalf("seed %d: setup did not apply: %s", seed%seeds, a.agentStatusSnapshot().Message)
 		}
 		for _, name := range []string{"a", "b", "c", "d"} {
 			if inst := m.instances[name]; inst != nil {
@@ -112,10 +134,10 @@ func TestRandomRevisionsConvergeWithinCapacity(t *testing.T) {
 		// live VM, so an overcommit present before the revision is not its doing.
 		quarantineTicks := -1
 		usedVCPUs, usedMemory := runtimeUsage(m)
-		if r.Intn(3) == 0 && usedVCPUs < generatedVCPUs && usedMemory+256 <= generatedMemoryMB {
+		if r.Intn(3) == 0 && usedVCPUs < capVCPUs && usedMemory+256 <= capMemoryMB {
 			quarantineTicks = 1 + r.Intn(3)
 			m.instances["q"] = &vm.Instance{Name: "q", State: vm.StateRecoveryPending, Config: config.ServiceConfig{
-				Name: "q", VCPUs: min(1+r.Intn(2), generatedVCPUs-usedVCPUs), MemoryMB: 256,
+				Name: "q", VCPUs: min(1+r.Intn(2), capVCPUs-usedVCPUs), MemoryMB: 256,
 				PortForwards: []config.PortForward{{HostPort: []int{5050, 6060, 7070, 8080, 9090, 1111}[r.Intn(6)], VMPort: 80}},
 				Network:      &config.NetworkConfig{GuestIP: "172.16.0.6", GuestMAC: guestMACForIndex(4)},
 			}}
@@ -123,6 +145,7 @@ func TestRandomRevisionsConvergeWithinCapacity(t *testing.T) {
 		store.revision = "r2"
 		store.data["web"] = generatedYAML(to)
 		var problem string
+		appliedAt := -1 // the tick that applied the revision while quarantined
 		for tick := 0; tick < len(from)+len(to)+3+lifecycleTicks && problem == ""; tick++ {
 			if tick == quarantineTicks {
 				delete(m.instances, "q")
@@ -134,21 +157,33 @@ func TestRandomRevisionsConvergeWithinCapacity(t *testing.T) {
 					inst.State = vm.StateStopped
 				}
 			}
+			actions := len(m.startCalls) + len(m.removeCalls)
 			a.tick(context.Background())
-			if vcpus, mem := runtimeUsage(m); vcpus > generatedVCPUs || mem > generatedMemoryMB {
+			if vcpus, mem := runtimeUsage(m); vcpus > capVCPUs || mem > capMemoryMB {
 				problem = fmt.Sprintf("tick %d runs %d vCPUs and %d MB", tick, vcpus, mem)
 			}
-			if _, quarantined := m.instances["q"]; quarantined && tick > lifecycleTicks {
-				vms := conditionOf(a.agentStatusSnapshot(), "VMsReconciled")
-				if strings.Contains(vms.Message, reconciler.ErrServiceHeld.Error()) {
-					problem = fmt.Sprintf("tick %d reports a hold recovery does not explain: %s", tick, vms.Message)
-				} else if a.lastRevision != "r2" {
+			if len(m.overcommits) != 0 {
+				problem = fmt.Sprintf("tick %d: %v", tick, m.overcommits)
+			}
+			vms := conditionOf(a.agentStatusSnapshot(), "VMsReconciled")
+			_, quarantined := m.instances["q"]
+			idle := actions == len(m.startCalls)+len(m.removeCalls)
+			if problem == "" && quarantined && tick > lifecycleTicks {
+				switch {
+				case appliedAt >= 0 && !idle:
+					problem = fmt.Sprintf("tick %d still changes VMs after tick %d applied the revision as degraded", tick, appliedAt)
+				case idle && headroom && strings.Contains(vms.Message, reconciler.ErrServiceHeld.Error()):
+					problem = fmt.Sprintf("tick %d changes nothing but reports a hold recovery does not explain: %s", tick, vms.Message)
+				case idle && headroom && a.lastRevision != "r2":
 					problem = fmt.Sprintf("tick %d holds only for recovery but did not apply the revision as degraded: %s", tick, vms.Message)
+				}
+				if appliedAt < 0 && a.lastRevision == "r2" {
+					appliedAt = tick
 				}
 			}
 		}
 		for _, want := range to {
-			if problem != "" {
+			if problem != "" || !headroom {
 				break
 			}
 			got := m.instances[want.name]
@@ -156,12 +191,22 @@ func TestRandomRevisionsConvergeWithinCapacity(t *testing.T) {
 				problem = fmt.Sprintf("%s did not converge: %+v", want.name, got)
 			}
 		}
-		if problem == "" && a.lastRevision != "r2" {
+		if problem == "" && headroom && a.lastRevision != "r2" {
 			problem = "revision not applied: " + a.agentStatusSnapshot().Message
+		}
+		// Without headroom the transition may wait for good. A revision
+		// applied as degraded while only recovery held stays applied, but
+		// once recovery resolved the node must not report it reconciled.
+		if vms := conditionOf(a.agentStatusSnapshot(), "VMsReconciled"); problem == "" && !headroom && vms.Status == "true" {
+			for _, want := range to {
+				if got := m.instances[want.name]; got == nil || got.Config.VCPUs != want.vcpus || got.Config.MemoryMB != want.mem {
+					problem = fmt.Sprintf("reports VMs reconciled while %s did not converge: %+v", want.name, got)
+				}
+			}
 		}
 		if problem != "" {
 			failures++
-			t.Errorf("seed %d strategy=%q quarantine=%d lifecycle=%s/%d from=%v to=%v: %s", seed, strategy, quarantineTicks, lifecycle, lifecycleTicks, from, to, problem)
+			t.Errorf("seed %d roomy=%v strategy=%q quarantine=%d lifecycle=%s/%d from=%v to=%v: %s", seed%seeds, roomy, strategy, quarantineTicks, lifecycle, lifecycleTicks, from, to, problem)
 		}
 	}
 }
@@ -189,7 +234,7 @@ func TestRandomTickEndsWithinCapacity(t *testing.T) {
 				instances[name] = &vm.Instance{Name: name, State: states[r.Intn(len(states))], Config: admissionService(name, 1+r.Intn(3), 64*(1+r.Intn(4)), ports[i], "")}
 			}
 		}
-		manager := &recoveryTestVMManager{instances: instances}
+		manager := &recoveryTestVMManager{instances: instances, limit: &capacity.NodeCapacity{VCPUs: capVCPUs, MemoryMB: capMemoryMB}}
 		if vcpus, mem := runtimeUsage(manager); vcpus > capVCPUs || mem > capMemoryMB {
 			continue
 		}
@@ -209,9 +254,9 @@ func TestRandomTickEndsWithinCapacity(t *testing.T) {
 		a, _ := admissionAgent(t, b.String(), capacity.NodeCapacity{VCPUs: capVCPUs, MemoryMB: capMemoryMB}, instances, "")
 		a.reconciler = reconciler.NewWithNetworkManager(manager, testLogger(), nil, &recoveryTestNetworkManager{}, strategy, time.Microsecond)
 		a.tick(context.Background())
-		if vcpus, mem := runtimeUsage(manager); vcpus > capVCPUs || mem > capMemoryMB {
+		if vcpus, mem := runtimeUsage(manager); vcpus > capVCPUs || mem > capMemoryMB || len(manager.overcommits) != 0 {
 			failures++
-			t.Errorf("seed %d strategy=%q: %d vCPUs and %d MB after one tick\nbefore: %s\ndesired:\n%s", seed, strategy, vcpus, mem, before, b.String())
+			t.Errorf("seed %d strategy=%q: %d vCPUs and %d MB after one tick, %v\nbefore: %s\ndesired:\n%s", seed, strategy, vcpus, mem, manager.overcommits, before, b.String())
 		}
 	}
 }

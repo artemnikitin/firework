@@ -410,11 +410,14 @@ retained:
 - Recovery holds, caused by unresolved VM ownership (unknown claims, a resource
   retained by a `recovery_pending` owner directly or through a held VM, a guest
   address or MAC an undesired quarantined VM, or one whose removal recovery
-  holds, keeps, or capacity that recovery keeps in use and its resolution would
-  free): when every hold is one, the agent applies the revision with those holds
-  and reports `VMRecoveryReady=False`, so the node shows as degraded instead of
+  holds, keeps, or capacity that recovery keeps in use): when every hold is one,
+  the agent applies the revision with those holds and reports
+  `VMRecoveryReady=False`, so the node shows as degraded instead of
   progressing. Pending recovery keeps forcing reconciliation, so held work
-  retries on an unchanged revision.
+  retries on an unchanged revision. Recovery explains capacity holds only if
+  the same admission, run as though every quarantined VM had resolved and gone,
+  would hold nothing, or only until that tick's removals, shrinks and starts or
+  stops complete.
 - Admission failures, which waiting cannot resolve: desired services whose
   combined CPU or memory exceeds node capacity, or more networked desired
   services than `vm_subnet` has guest addresses. The other services still
@@ -424,42 +427,44 @@ retained:
   is false with `capacity_exceeded` or `guest_addresses_exhausted`, and the node
   reports failed.
 - Transient holds: waiting on another start or stop, on a claim that a running
-  or retained VM still uses, on capacity still used by VMs that are starting,
-  stopping or kept by other holds, or on a guest address an undesired VM keeps
-  until the plan removes it. The revision stays incomplete, `VMsReconciled` is
-  unknown with `resource_held`, and the next tick retries.
+  or retained VM still uses, on capacity that a removal or shrink this tick, or
+  a VM starting or stopping, will free, or on a guest address an undesired VM
+  keeps until the plan removes it. The revision stays incomplete,
+  `VMsReconciled` is unknown with `resource_held`, and the next tick retries.
+- Capacity that nothing pending frees and recovery does not explain, such as
+  two VMs trading sizes on a full node, or a growth waiting for a shrink that
+  another hold keeps from running. The revision stays incomplete in the same
+  way, and the hold's reason asks for headroom or a staged change: admission
+  does not search for an update order that avoids the wait.
 
-Admission decides by what the node runs once the tick's plan has finished. VMs
-that are starting, stopping or quarantined keep their current size, as does a
-running VM held for another reason, which also reserves its growth; an
-undesired running VM counts while its removal is held; a crashed or stopped VM
-uses nothing until it is recreated. An update that only shrinks always
-proceeds. Every other create or update is admitted by the change it makes, in
-service-name order, retrying what waits after each admission so a later
-shrink can make room. Once nothing fits alone, the waiting updates that free
-one resource while taking another, such as two VMs trading sizes, are admitted
-together if they fit together, and the rest are retried; when several such
-updates cannot all fit together, they all wait. A service held for another
-reason is admitted too, because its hold can clear during the apply. Capacity
-and claim holds are computed together, starting every tick from no capacity
-holds, so each hold traces back to a cause outside admission. Within a tick a
-capacity hold is never released, because the held VM keeps its claims and
-can hold others: later passes count it at its current size, so admission
-settles on exactly the holds the tick installs.
+Capacity admission never counts on a change before it succeeds: a create or
+growth may take only capacity that is free when it runs. Every VM that still
+uses its resources (running, starting, stopping or quarantined) counts at its
+current size, including one the plan removes or shrinks and one held for any
+reason; a failed or stopped VM uses nothing. In service-name order, each create
+or update is admitted by what it adds to each resource, and only the resources
+it grows are checked, so a shrink, a change that keeps the size, and growth of a
+resource the node is not over in proceed even on a node already over capacity.
+The agent does not evict anything to repair such excess. A removal or shrink
+frees its capacity for the next tick: replacing a service on a full node takes
+two ticks, and two VMs trading sizes on a full node need headroom, or a desired
+configuration staged so that one shrinks first. Capacity and claim holds are
+computed together, from one snapshot of the runtime, starting every tick from no
+capacity holds. Within a tick a capacity hold is never released, because the
+held VM keeps its claims and can hold others: later passes keep it and admit the
+rest around it, which can hold more than the node needs until the next tick.
 
-When the apply's updates succeed and no hold appears after admission, the node
-does not end a tick over capacity. It can exceed capacity while an apply grows
-a VM before it shrinks another, which in a rolling apply, where creates run
-before updates, lasts until the rollout reaches the shrink. A rolling apply
-stops at the first update whose preflight, stop or start fails, so while that
-update keeps failing, a later shrink admission counted on never runs and the
-node stays over capacity. An update that fails after admission credited its
-shrink leaves its VM at the old size until it succeeds. `main` had the same
-exposure. A hold that appears after admission can also skip a shrink that
-admission counted on while the growth it paid for still applies: a VM
-quarantined while the tick runs, by Recover inside the apply or by an adopted
-process exiting, or a health restart during image sync or a rolling pause. The
-node is then over capacity until the next tick admits against the new state.
+The reconciler checks every start again when it runs, against the runtime as it
+is then: each other VM counts at what it uses, or at the size admission allowed
+it if larger, so work admitted earlier keeps its share. A hold that clears
+during the apply, a VM that changes state after admission, a rolling apply that
+stops at a failing update, an update whose stop or start fails, or a VM
+quarantined while the tick runs therefore cannot make room for a start that
+admission did not count; such a start waits with a transient hold. A health
+restart of a failed or stopped VM takes its resources again and passes the same
+check; one that does not fit is skipped, and the next tick reconciles the
+service. Restarting a running VM keeps its size. With capacity checks disabled,
+or before the node's capacity has been read, nothing is checked.
 Running guests retain their assigned addresses after a survivor clears.
 
 Each tick's Recover/Plan/Apply section and health-driven Stop/Start transactions
@@ -477,8 +482,9 @@ journal work also triggers reconciliation on an unchanged revision.
 
 Capacity admission reserves desired growth for retained service names as well
 as new services: ownership may resolve between admission and planning in the
-same tick. Capacity holds persist through that transition, so adoption or
-cleanup cannot authorize an allocation that skipped the capacity check.
+same tick. Capacity holds persist through that transition, and the start is
+checked again when it runs, so adoption or cleanup cannot authorize an
+allocation that skipped the capacity check.
 
 The opt-in `scripts/systemd-recovery/run.sh` validation runs real systemd units,
 Linux process inspection and TAP ownership in a disposable container. It also

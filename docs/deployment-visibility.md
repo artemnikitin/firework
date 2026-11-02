@@ -340,6 +340,11 @@ Other holds do not let the revision apply. `VMsReconciled` reports
   the node reconciling,
   and the next poll retries it. A guest address kept by a quarantined VM is a
   recovery hold.
+- A create or growth takes only capacity that is free when it runs: a VM
+  being removed or shrunk keeps its capacity until that succeeds, so the
+  growth waits for a later poll. When nothing pending frees the capacity, as
+  when two VMs trade sizes on a full node, the hold's reason asks for headroom
+  or a desired configuration staged so that one service shrinks first.
 
 The agent reports the nonblocking `VMRecoveryReady` condition from its complete
 runtime inventory. A false value carries `vm_recovery_pending`, including when

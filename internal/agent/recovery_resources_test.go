@@ -60,7 +60,7 @@ func TestNetworkAndCapacityReserveRemovedQuarantine(t *testing.T) {
 	if desired[0].Network.GuestIP == "172.16.0.2" || desired[0].Network.GuestMAC == guestMACForIndex(0) {
 		t.Fatal("reused retained VM IP/MAC")
 	}
-	used, held := a.admit(desired, capacity.NodeCapacity{VCPUs: 4, MemoryMB: 1024}, true, nil)
+	used, held, _ := a.admit(desired, capacity.NodeCapacity{VCPUs: 4, MemoryMB: 1024}, true, nil)
 	if held["new"].Reason == "" || used.VCPUs != 2 {
 		t.Fatalf("retained VM capacity forgotten: used=%#v held=%v", used, held)
 	}
@@ -131,7 +131,7 @@ func TestCapacityHoldsSurviveSameTickRecovery(t *testing.T) {
 			limit := capacity.NodeCapacity{VCPUs: 4, MemoryMB: 1024}
 			independent := config.ServiceConfig{Name: "independent", VCPUs: 1, MemoryMB: 64}
 			services := []config.ServiceConfig{desired, independent}
-			_, held := a.admit(services, limit, true, nil)
+			_, held, _ := a.admit(services, limit, true, nil)
 			if held[desired.Name].Reason == "" {
 				t.Fatalf("clear=%v memory=%v: desired growth escaped capacity admission", clear, memory)
 			}
@@ -153,7 +153,7 @@ func TestCapacityReservesRetainedDesiredGrowthBeforeNewServices(t *testing.T) {
 	desired := a.vmManager.List()["removed"].Config
 	desired.VCPUs = 4
 	next := config.ServiceConfig{Name: "new", VCPUs: 1, MemoryMB: 64}
-	used, held := a.admit([]config.ServiceConfig{desired, next}, capacity.NodeCapacity{VCPUs: 4, MemoryMB: 1024}, true, nil)
+	used, held, _ := a.admit([]config.ServiceConfig{desired, next}, capacity.NodeCapacity{VCPUs: 4, MemoryMB: 1024}, true, nil)
 	if used.VCPUs != 4 || held["new"].Reason == "" {
 		t.Fatalf("growth not reserved: used=%#v held=%v", used, held)
 	}
@@ -166,7 +166,7 @@ func TestCapacityIncludesRemovedOwnerWhenDesiredFitsAlone(t *testing.T) {
 	desired := old
 	desired.VCPUs = 3
 	limit := capacity.NodeCapacity{VCPUs: 4, MemoryMB: 1024}
-	used, held := a.admit([]config.ServiceConfig{desired}, limit, true, nil)
+	used, held, _ := a.admit([]config.ServiceConfig{desired}, limit, true, nil)
 	if held[old.Name].Reason == "" || used.VCPUs != 4 {
 		t.Fatalf("desired fits alone but overcommits retained owners: used=%#v holds=%v", used, held)
 	}
@@ -295,7 +295,7 @@ func TestCapacityHoldIsAttributedToRecoveryOnlyWhenResolutionWouldFit(t *testing
 		recovery bool
 	}{{3, true}, {6, false}} {
 		a := retainedResourceAgent(t) // a removed 2-vCPU VM is recovery_pending
-		_, held := a.admit([]config.ServiceConfig{{Name: "new", VCPUs: tc.vcpus, MemoryMB: 64}}, limit, true, nil)
+		_, held, _ := a.admit([]config.ServiceConfig{{Name: "new", VCPUs: tc.vcpus, MemoryMB: 64}}, limit, true, nil)
 		hold, ok := held["new"]
 		if !ok || hold.Recovery != tc.recovery {
 			t.Fatalf("%d vCPUs: hold=%#v, want recovery=%v", tc.vcpus, hold, tc.recovery)

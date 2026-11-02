@@ -3,6 +3,7 @@ package agent
 import (
 	"context"
 	"fmt"
+	"slices"
 	"strings"
 	"testing"
 
@@ -40,18 +41,21 @@ func convergenceYAML(services []convergenceService) []byte {
 	return []byte(b.String())
 }
 
-// converge applies from, then switches to to, and reports why to has not
-// converged within three ticks, or "" once every VM runs its desired size and
-// port and the revision is applied.
-func converge(t *testing.T, cap int, from, to []convergenceService) string {
+// converge applies from, then switches to to. With transition headroom it
+// reports why to has not converged within three ticks, or "" once every VM
+// runs its desired size and port and the revision is applied. Without it, a
+// transition may need to wait for headroom (L2), and converge reports only a
+// start that took capacity not free (C7) or a revision applied unconverged.
+func converge(t *testing.T, cap int, from, to []convergenceService, headroom bool) string {
 	t.Helper()
 	cfg := testAgentConfig(t)
 	enabled := true
 	cfg.EnableCapacityCheck = &enabled
 	store := &fakeStore{revision: "r1", data: map[string][]byte{"web": convergenceYAML(from)}}
 	a := New(cfg, store, testLogger())
-	a.capacityReader = &fakeCapacityReader{cap: capacity.NodeCapacity{VCPUs: cap, MemoryMB: 4096}}
-	manager := &recoveryTestVMManager{instances: map[string]*vm.Instance{}}
+	limit := capacity.NodeCapacity{VCPUs: cap, MemoryMB: 4096}
+	a.capacityReader = &fakeCapacityReader{cap: limit}
+	manager := &recoveryTestVMManager{instances: map[string]*vm.Instance{}, limit: &limit}
 	a.reconciler = reconciler.NewWithNetworkManager(manager, testLogger(), nil, &recoveryTestNetworkManager{}, "", 0)
 	a.tick(context.Background())
 	if a.lastRevision != "r1" {
@@ -64,6 +68,19 @@ func converge(t *testing.T, cap int, from, to []convergenceService) string {
 		if used, _ := runtimeUsage(manager); used > cap {
 			return fmt.Sprintf("tick %d runs %d vCPUs on a %d vCPU node", tick, used, cap)
 		}
+		if len(manager.overcommits) != 0 {
+			return fmt.Sprintf("tick %d: %v", tick, manager.overcommits)
+		}
+	}
+	if !headroom {
+		if a.lastRevision == "r2" {
+			for _, want := range to {
+				if got := manager.instances[want.name]; got == nil || got.Config.VCPUs != want.vcpus {
+					return fmt.Sprintf("revision applied while %s did not converge: %+v", want.name, got)
+				}
+			}
+		}
+		return ""
 	}
 	for _, want := range to {
 		got := manager.instances[want.name]
@@ -78,25 +95,41 @@ func converge(t *testing.T, cap int, from, to []convergenceService) string {
 }
 
 // Any revision whose services fit the node and claim distinct host ports
-// converges, whatever sizes and ports the running VMs move from: holds may
-// order work across ticks, but no combination of capacity and claim holds may
-// wait on itself.
+// converges, whatever sizes and ports the running VMs move from, provided
+// the transition has headroom (C5): every service fits at the larger of its
+// old and new size, so no growth waits for another service's shrink. Holds
+// may order work across ticks, but no combination of capacity and claim
+// holds may wait on itself. Without headroom, two VMs trading sizes and
+// ports can wait on each other for good (L2); no start may then take
+// capacity that is not free (C7).
 func TestFittingRevisionsConverge(t *testing.T) {
 	const capVCPUs = 4
 	ports := []int{7070, 8080, 9090}
 	sizes := []int{1, 2, 3}
-	failures := 0
-	check := func(from, to []convergenceService) {
+	failures, withHeadroom := 0, 0
+	check := func(cap int, from, to []convergenceService) {
 		if failures >= 5 {
 			return
 		}
-		if reason := converge(t, capVCPUs, from, to); reason != "" {
+		need := map[string]int{}
+		for _, s := range append(slices.Clone(from), to...) {
+			need[s.name] = max(need[s.name], s.vcpus)
+		}
+		total := 0
+		for _, vcpus := range need {
+			total += vcpus
+		}
+		if total <= cap {
+			withHeadroom++
+		}
+		if reason := converge(t, cap, from, to, total <= cap); reason != "" {
 			failures++
-			t.Errorf("%+v -> %+v: %s", from, to, reason)
+			t.Errorf("cap %d: %+v -> %+v: %s", cap, from, to, reason)
 		}
 	}
 	// Two services: every size and every pair of distinct ports, before and
-	// after, including revisions whose old sizes together exceed the node.
+	// after, including revisions whose old sizes together exceed the node,
+	// on the tight node and on one with headroom for every transition.
 	for _, oldA := range sizes {
 		for _, oldB := range sizes {
 			for _, newA := range sizes {
@@ -106,25 +139,33 @@ func TestFittingRevisionsConverge(t *testing.T) {
 					}
 					for _, oldPorts := range [][2]int{{ports[0], ports[1]}, {ports[1], ports[0]}, {ports[1], ports[2]}, {ports[2], ports[1]}} {
 						for _, newPorts := range [][2]int{{ports[0], ports[1]}, {ports[1], ports[0]}, {ports[0], ports[2]}, {ports[2], ports[0]}, {ports[1], ports[2]}, {ports[2], ports[1]}} {
-							check(
-								[]convergenceService{{"a", oldA, oldPorts[0], 2}, {"b", oldB, oldPorts[1], 3}},
-								[]convergenceService{{"a", newA, newPorts[0], 2}, {"b", newB, newPorts[1], 3}},
-							)
+							for _, cap := range []int{capVCPUs, 6} {
+								check(cap,
+									[]convergenceService{{"a", oldA, oldPorts[0], 2}, {"b", oldB, oldPorts[1], 3}},
+									[]convergenceService{{"a", newA, newPorts[0], 2}, {"b", newB, newPorts[1], 3}},
+								)
+							}
 						}
 					}
 				}
 			}
 		}
 	}
-	// Three services rotating their ports while capacity moves between them.
+	// Three services rotating their ports while capacity moves between them;
+	// five vCPUs give every rotation headroom.
 	for _, sizesBefore := range [][3]int{{2, 1, 1}, {1, 2, 1}, {1, 1, 2}} {
 		for _, sizesAfter := range [][3]int{{2, 1, 1}, {1, 2, 1}, {1, 1, 2}} {
 			for _, rotation := range [][3]int{{8080, 9090, 7070}, {9090, 7070, 8080}} {
-				check(
-					[]convergenceService{{"a", sizesBefore[0], 7070, 2}, {"b", sizesBefore[1], 8080, 3}, {"c", sizesBefore[2], 9090, 4}},
-					[]convergenceService{{"a", sizesAfter[0], rotation[0], 2}, {"b", sizesAfter[1], rotation[1], 3}, {"c", sizesAfter[2], rotation[2], 4}},
-				)
+				for _, cap := range []int{capVCPUs, 5} {
+					check(cap,
+						[]convergenceService{{"a", sizesBefore[0], 7070, 2}, {"b", sizesBefore[1], 8080, 3}, {"c", sizesBefore[2], 9090, 4}},
+						[]convergenceService{{"a", sizesAfter[0], rotation[0], 2}, {"b", sizesAfter[1], rotation[1], 3}, {"c", sizesAfter[2], rotation[2], 4}},
+					)
+				}
 			}
 		}
+	}
+	if withHeadroom < 300 {
+		t.Fatalf("only %d transitions had headroom", withHeadroom)
 	}
 }

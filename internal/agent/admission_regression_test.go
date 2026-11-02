@@ -2,7 +2,6 @@ package agent
 
 import (
 	"context"
-	"maps"
 	"os"
 	"strings"
 	"testing"
@@ -24,7 +23,7 @@ func admissionAgent(t *testing.T, yaml string, limit capacity.NodeCapacity, inst
 	}
 	a := New(cfg, &fakeStore{revision: "r2", data: map[string][]byte{"web": []byte(yaml)}}, testLogger())
 	a.capacityReader = &fakeCapacityReader{cap: limit}
-	m := &recoveryTestVMManager{instances: instances}
+	m := &recoveryTestVMManager{instances: instances, limit: &limit}
 	a.reconciler = reconciler.NewWithNetworkManager(m, testLogger(), nil, &recoveryTestNetworkManager{}, "", 0)
 	return a, m
 }
@@ -53,7 +52,7 @@ func TestHeldGrowthKeepsCurrentSize(t *testing.T) {
 		t.Fatalf("node runs %d vCPUs on 4; starts=%v", vcpus, m.startCalls)
 	}
 	desired := []config.ServiceConfig{admissionService("a", 3, 64, 0, ""), admissionService("b", 1, 64, 0, "")}
-	if used, _ := a.admit(desired, capacity.NodeCapacity{VCPUs: 4, MemoryMB: 4096}, true, nil); used.VCPUs < 4 {
+	if used, _, _ := a.admit(desired, capacity.NodeCapacity{VCPUs: 4, MemoryMB: 4096}, true, nil); used.VCPUs < 4 {
 		t.Fatalf("heartbeat used %d vCPUs, below the 4 that run", used.VCPUs)
 	}
 }
@@ -107,48 +106,6 @@ func TestCapacityHoldThroughClaimsEndsTickWithinCapacity(t *testing.T) {
 		if got := m.instances[name]; got.State != vm.StateRunning || got.Config.VCPUs != vcpus {
 			t.Fatalf("%s did not converge: %+v", name, got)
 		}
-	}
-}
-
-// Two VMs trading sizes fit only together. A service that can never fit, or
-// a quarantined VM's growth that waits for recovery, must not hold the swap.
-func TestSizeSwapIsNotHeldByAnotherWaitingService(t *testing.T) {
-	for name, tc := range map[string]struct {
-		third     string
-		limit     capacity.NodeCapacity
-		instances map[string]*vm.Instance
-	}{
-		"third service exceeds the node": {
-			third: "- name: c\n  image: /c\n  kernel: /k\n  vcpus: 4\n  memory_mb: 64\n",
-			limit: capacity.NodeCapacity{VCPUs: 3, MemoryMB: 768},
-		},
-		"third service waits for recovery": {
-			third:     "- name: c\n  image: /c\n  kernel: /k\n  vcpus: 1\n  memory_mb: 256\n",
-			limit:     capacity.NodeCapacity{VCPUs: 4, MemoryMB: 1024},
-			instances: map[string]*vm.Instance{"q": {Name: "q", Config: admissionService("q", 1, 256, 0, ""), State: vm.StateRecoveryPending}},
-		},
-	} {
-		t.Run(name, func(t *testing.T) {
-			instances := map[string]*vm.Instance{
-				"a": {Name: "a", Config: admissionService("a", 1, 512, 0, ""), State: vm.StateRunning},
-				"b": {Name: "b", Config: admissionService("b", 2, 256, 0, ""), State: vm.StateRunning},
-			}
-			maps.Copy(instances, tc.instances)
-			yaml := "node: web\nservices:\n" +
-				"- name: a\n  image: /a\n  kernel: /k\n  vcpus: 2\n  memory_mb: 256\n" +
-				"- name: b\n  image: /b\n  kernel: /k\n  vcpus: 1\n  memory_mb: 512\n" + tc.third
-			a, m := admissionAgent(t, yaml, tc.limit, instances, "")
-			a.tick(context.Background())
-			if got := m.instances["a"].Config; got.VCPUs != 2 || got.MemoryMB != 256 {
-				t.Fatalf("a was not updated: %+v; %s", got, conditionOf(a.agentStatusSnapshot(), "VMsReconciled").Message)
-			}
-			if got := m.instances["b"].Config; got.VCPUs != 1 || got.MemoryMB != 512 {
-				t.Fatalf("b was not updated: %+v", got)
-			}
-			if vcpus, mem := runtimeUsage(m); vcpus > tc.limit.VCPUs || mem > tc.limit.MemoryMB {
-				t.Fatalf("node runs %d vCPUs and %d MB", vcpus, mem)
-			}
-		})
 	}
 }
 

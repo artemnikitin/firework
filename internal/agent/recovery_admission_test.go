@@ -43,7 +43,7 @@ func TestAdmissionUnknownOwnerMustNotMaskTrueCapacityHold(t *testing.T) {
 func TestAdmissionRecoveryOnlyCapacityMustIncludeAllDesired(t *testing.T) {
 	a := retainedResourceAgent(t)
 	services := []config.ServiceConfig{{Name: "a", VCPUs: 3, MemoryMB: 128}, {Name: "b", VCPUs: 3, MemoryMB: 128}}
-	used, holds := a.admit(services, capacity.NodeCapacity{VCPUs: 4, MemoryMB: 4096}, true, nil)
+	used, holds, _ := a.admit(services, capacity.NodeCapacity{VCPUs: 4, MemoryMB: 4096}, true, nil)
 	t.Logf("used=%#v holds=%#v", used, holds)
 	for _, h := range holds {
 		if !h.Recovery {
