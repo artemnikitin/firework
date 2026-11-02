@@ -332,7 +332,8 @@ Other holds do not let the revision apply. `VMsReconciled` reports
 - Desired services whose combined CPU or memory exceeds node capacity, or more
   networked desired services than `vm_subnet` has guest addresses, fail the node with
   `capacity_exceeded` or `guest_addresses_exhausted` on `CapacityReady`. The
-  services that fit still converge.
+  other services still converge as far as admission in service-name order and
+  the claims of held VMs allow.
 - A service waiting on another VM's start or stop, on a host port, address or
   device another VM still uses, or on capacity or a guest address still held by
   VMs that are starting, stopping, being removed or kept by other holds keeps

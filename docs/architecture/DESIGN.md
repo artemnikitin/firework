@@ -417,8 +417,10 @@ retained:
   retries on an unchanged revision.
 - Admission failures, which waiting cannot resolve: desired services whose
   combined CPU or memory exceeds node capacity, or more networked desired
-  services than `vm_subnet` has guest addresses. Services that fit still converge, in service-name order after VMs
-  that are starting, stopping or quarantined, but the revision is not applied: `CapacityReady`
+  services than `vm_subnet` has guest addresses. The other services still
+  converge as far as admission in service-name order, after VMs that are
+  starting, stopping or quarantined, and the claims of held VMs allow, but the
+  revision is not applied: `CapacityReady`
   is false with `capacity_exceeded` or `guest_addresses_exhausted`, and the node
   reports failed.
 - Transient holds: waiting on another start or stop, on a claim that a running
@@ -434,17 +436,30 @@ undesired running VM counts while its removal is held; a crashed or stopped VM
 uses nothing until it is recreated. An update that only shrinks always
 proceeds. Every other create or update is admitted by the change it makes, in
 service-name order, retrying what waits after each admission so a later
-shrink can make room; updates that fit only together, such as two VMs trading
-sizes, are admitted together. A service held for another reason is admitted
-too, because its hold can clear during the apply. Capacity and claim holds are
-computed together, starting every tick from no capacity holds, so each hold
-traces back to a cause outside admission. When the apply's updates succeed,
-the node does not end a tick over capacity. It can exceed capacity while an
-apply grows a VM before it shrinks another, which in a rolling apply, where
-creates run before updates, lasts until the rollout reaches the shrink. An
-update that fails after admission credited its shrink leaves its VM at the old
-size, and the node stays over capacity until that update succeeds. `main` had
-the same exposure.
+shrink can make room. Once nothing fits alone, the waiting updates that free
+one resource while taking another, such as two VMs trading sizes, are admitted
+together if they fit together, and the rest are retried; when several such
+updates cannot all fit together, they all wait. A service held for another
+reason is admitted too, because its hold can clear during the apply. Capacity
+and claim holds are computed together, starting every tick from no capacity
+holds, so each hold traces back to a cause outside admission. Within a tick a
+capacity hold is never released, because the held VM keeps its claims and
+can hold others: later passes count it at its current size, so admission
+settles on exactly the holds the tick installs.
+
+When the apply's updates succeed and no hold appears after admission, the node
+does not end a tick over capacity. It can exceed capacity while an apply grows
+a VM before it shrinks another, which in a rolling apply, where creates run
+before updates, lasts until the rollout reaches the shrink. A rolling apply
+stops at the first update whose preflight, stop or start fails, so while that
+update keeps failing, a later shrink admission counted on never runs and the
+node stays over capacity. An update that fails after admission credited its
+shrink leaves its VM at the old size until it succeeds. `main` had the same
+exposure. A hold that appears after admission can also skip a shrink that
+admission counted on while the growth it paid for still applies: a VM
+quarantined while the tick runs, by Recover inside the apply or by an adopted
+process exiting, or a health restart during image sync or a rolling pause. The
+node is then over capacity until the next tick admits against the new state.
 Running guests retain their assigned addresses after a survivor clears.
 
 Each tick's Recover/Plan/Apply section and health-driven Stop/Start transactions
