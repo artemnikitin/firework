@@ -404,7 +404,11 @@ func TestC6AdmissionWaitRecoveryWouldNotEndIsNotRecovery(t *testing.T) {
 		}
 		a.tick(context.Background())
 		vms := conditionOf(a.agentStatusSnapshot(), "VMsReconciled")
-		if a.lastRevision == "r2" || !strings.Contains(vms.Message, "hold d (capacity is used by VMs no pending change frees") || len(m.overcommits) != 0 {
+		want := "hold d (capacity is used by VMs no pending change frees"
+		if tick == 0 {
+			want = "hold d (capacity waits on unresolved VM ownership"
+		}
+		if a.lastRevision == "r2" || !strings.Contains(vms.Message, want) || len(m.overcommits) != 0 {
 			t.Fatalf("tick %d: lastRevision=%q overcommits=%v status=%s", tick, a.lastRevision, m.overcommits, vms.Message)
 		}
 	}
@@ -427,7 +431,11 @@ func TestC6RecoveryHoldDoesNotHideCapacityWait(t *testing.T) {
 		}
 		a.tick(context.Background())
 		vms := conditionOf(a.agentStatusSnapshot(), "VMsReconciled")
-		if a.lastRevision == "r2" || !strings.Contains(vms.Message, "no pending change frees") || len(m.startCalls) != 0 {
+		want := "no pending change frees"
+		if tick == 0 {
+			want = "capacity waits on unresolved VM ownership"
+		}
+		if a.lastRevision == "r2" || !strings.Contains(vms.Message, want) || len(m.startCalls) != 0 {
 			t.Fatalf("tick %d: lastRevision=%q starts=%v status=%s", tick, a.lastRevision, m.startCalls, vms.Message)
 		}
 	}
@@ -547,6 +555,22 @@ func TestC6RecoveryHoldDoesNotHideWaitThatOutlastsRecovery(t *testing.T) {
 				}
 			},
 		},
+		"undesired quarantine restored, adopted and removed": {
+			limit: capacity.NodeCapacity{VCPUs: 7, MemoryMB: 1536},
+			instances: func() map[string]*vm.Instance {
+				return map[string]*vm.Instance{
+					"a": c7Running("a", 3, 256, 0),
+					"d": c7Running("d", 1, 768, 0),
+					"q": {Name: "q", Config: admissionService("q", 1, 256, 0, ""), State: vm.StateRecoveryPending, RecoveryConfigUnknown: true},
+				}
+			},
+			desired: []c7Service{{"a", 2, 768, 0}, {"b", 2, 256, 0}, {"c", 1, 256, 0}, {"d", 2, 256, 0}},
+			resolve: func(m *recoveryTestVMManager, tick int) {
+				if q := m.instances["q"]; tick == 1 && q != nil {
+					q.RecoveryConfigUnknown, q.State = false, vm.StateRunning
+				}
+			},
+		},
 		"same-tick growth takes the headroom": {
 			limit: capacity.NodeCapacity{VCPUs: 5, MemoryMB: 1088},
 			instances: func() map[string]*vm.Instance {
@@ -575,5 +599,19 @@ func TestC6RecoveryHoldDoesNotHideWaitThatOutlastsRecovery(t *testing.T) {
 				}
 			})
 		}
+	}
+}
+
+// C6: a hold that only recovery causes and that needs no capacity, here a
+// port change held by the unknown claims of a quarantined desired VM, still
+// lets the revision apply as degraded.
+func TestC6RecoveryOnlyClaimHoldAppliesAsDegraded(t *testing.T) {
+	a, m := c7Agent(t, "", 0, capacity.NodeCapacity{VCPUs: 8, MemoryMB: 4096}, map[string]*vm.Instance{
+		"b": c7Running("b", 1, 64, 0),
+		"q": {Name: "q", Config: config.ServiceConfig{Name: "q"}, State: vm.StateRecoveryPending, RecoveryConfigUnknown: true},
+	}, c7Service{"b", 1, 64, 8080}, c7Service{"q", 1, 64, 0})
+	a.tick(context.Background())
+	if applied := a.agentStatusSnapshot().AppliedRevision; applied != "r2" || len(m.startCalls) != 0 {
+		t.Fatalf("applied=%q starts=%v status=%s", applied, m.startCalls, conditionOf(a.agentStatusSnapshot(), "VMsReconciled").Message)
 	}
 }

@@ -72,9 +72,17 @@ func TestHeldShrinkDoesNotOvercommit(t *testing.T) {
 			t.Fatalf("tick %d runs %d vCPUs and %d MB on 5 vCPUs and 4096 MB", tick, vcpus, mem)
 		}
 	}
-	// Every hold traces back to the quarantine.
-	if vms := conditionOf(a.agentStatusSnapshot(), "VMsReconciled"); strings.Contains(vms.Message, reconciler.ErrServiceHeld.Error()) {
-		t.Fatalf("a hold the quarantine causes is not attributed to recovery: %s", vms.Message)
+	// b waits on the quarantine, then on a's shrink, so resolving recovery is
+	// not all it needs: the revision stays incomplete and says why (C6).
+	if vms := conditionOf(a.agentStatusSnapshot(), "VMsReconciled"); a.lastRevision == "r2" || !strings.Contains(vms.Message, "hold b (capacity waits on unresolved VM ownership") {
+		t.Fatalf("lastRevision=%q status=%s", a.lastRevision, vms.Message)
+	}
+	delete(m.instances, "x")
+	for tick := 0; tick < 2; tick++ {
+		a.tick(context.Background())
+	}
+	if got := m.instances["b"].Config; got.VCPUs != 3 || a.lastRevision != "r2" || len(m.overcommits) != 0 {
+		t.Fatalf("b did not converge once x resolved: %+v overcommits=%v", got, m.overcommits)
 	}
 }
 

@@ -10,7 +10,6 @@ import (
 	"log/slog"
 	"maps"
 	"net"
-	"reflect"
 	"slices"
 	"sort"
 	"strings"
@@ -570,15 +569,15 @@ func (a *Agent) tick(ctx context.Context) {
 		a.setStatusCondition("LocalRoutesReady", statusmodel.ConditionTrue, "", "")
 	}
 	if err != nil && admissionCode == "" && reconciler.OnlyRecoveryHeld(err) && a.reconciler.HasPendingRecovery() &&
-		(!hasCap || a.recoveryExplainsNow(merged.Services, nodeCap, addressHolds)) {
+		(!hasCap || recoveryFits(merged.Services, nodeCap, a.reconciler.Instances())) {
 		// Every hold was caused by unresolved VM ownership, which
 		// VMRecoveryReady reports as degradation and held services report as
 		// resource_held. Freezing the revision would hide both behind
 		// "progressing". Pending recovery keeps forcing reconciliation, so the
 		// holds still retry. Any other hold, such as genuine over-capacity or
-		// an exhausted subnet, leaves the revision incomplete, and so does a
-		// capacity wait that would outlast recovery from the runtime this apply
-		// left, however recovery resolves.
+		// an exhausted subnet, leaves the revision incomplete, and so does any
+		// capacity the remaining work needs that recoveryFits, judged on the
+		// runtime this apply left, does not vouch for.
 		a.logger.Info("applying revision with services held for VM recovery", "error", err)
 		a.forceReconcile = true
 		err = nil
@@ -1281,6 +1280,9 @@ const (
 	capacityRecoveryReason  = "capacity retained by unresolved VM ownership"
 	capacityTransientReason = "capacity is still used by VMs that are starting, stopping, shrinking or being removed"
 	capacityBlockedReason   = "capacity is used by VMs no pending change frees; add headroom or stage the change"
+	// capacityBesideRecoveryReason is a wait that resolving recovery alone
+	// may not end: what the waiting services need does not all fit at once.
+	capacityBesideRecoveryReason = "capacity waits on unresolved VM ownership and on more room than the node has free"
 )
 
 // admit admits the desired services against node capacity and returns what
@@ -1291,26 +1293,15 @@ const (
 // the holds and the allowances, against which the reconciler checks every
 // start again when it happens.
 //
-// Recovery explains the capacity holds only if, once every quarantined VM
-// resolved, admission would hold nothing after the work it then admits has
-// run; see recoveryExplains. A hold that admission would keep anyway is not
-// recovery's to report, so it cannot let the revision apply as degraded. Nor
-// can a recovery hold on a service that would still wait for capacity then:
-// such a service is held for capacity too, with the cause that is not
-// recovery.
+// While a VM is quarantined, the capacity holds are recovery holds only if
+// recoveryFits says resolving recovery is all they need. A recovery hold on a
+// service that needs capacity recoveryFits does not vouch for is joined by a
+// capacity hold whose cause is not recovery, so neither can let the revision
+// apply as degraded.
 func (a *Agent) admit(services []config.ServiceConfig, cap capacity.NodeCapacity, known bool, addressHolds map[string]reconciler.Hold) (capacity.NodeCapacity, map[string]reconciler.Hold, map[string]capacity.NodeCapacity) {
 	instances := a.reconciler.Instances()
-	explained, waitsAnyway := false, map[string]reconciler.Hold(nil)
-	if known && hasRecoveryPending(instances) {
-		explained, waitsAnyway = a.recoveryExplains(services, cap, instances, addressHolds)
-	}
-	return a.admitIn(services, cap, known, instances, addressHolds, explained, waitsAnyway)
-}
-
-// recoveryExplainsNow plays recoveryExplains from the runtime as it is now.
-func (a *Agent) recoveryExplainsNow(services []config.ServiceConfig, cap capacity.NodeCapacity, addressHolds map[string]reconciler.Hold) bool {
-	explained, _ := a.recoveryExplains(services, cap, a.reconciler.Instances(), addressHolds)
-	return explained
+	pending := hasRecoveryPending(instances)
+	return a.admitIn(services, cap, known, instances, addressHolds, pending, pending && recoveryFits(services, cap, instances))
 }
 
 func hasRecoveryPending(instances map[string]*vm.Instance) bool {
@@ -1322,96 +1313,52 @@ func hasRecoveryPending(instances map[string]*vm.Instance) bool {
 	return false
 }
 
-// maxModelledQuarantines bounds the resolutions recoveryExplains plays out,
-// two for each quarantined VM; beyond it recovery explains no capacity wait.
-const maxModelledQuarantines = 4
-
-// recoveryExplains plays admission forward from the given runtime as it would
-// be once recovery resolved, assuming the work each tick admits succeeds.
-// Each quarantined VM whose configuration is known may resolve either way,
-// gone or adopted at its current size, and every combination is played; one
-// whose configuration is unknown is played as gone if undesired, but if
-// desired it would be adopted at a size nobody knows. Recovery explains the
-// capacity waits only if every combination reaches a tick that holds nothing.
-// Otherwise it returns the services still held when a tick changed nothing,
-// if known.
-func (a *Agent) recoveryExplains(services []config.ServiceConfig, cap capacity.NodeCapacity, instances map[string]*vm.Instance, addressHolds map[string]reconciler.Hold) (bool, map[string]reconciler.Hold) {
-	withoutRecovery := maps.Clone(addressHolds)
-	maps.DeleteFunc(withoutRecovery, func(_ string, hold reconciler.Hold) bool { return hold.Recovery })
+// recoveryFits reports whether every desired service could take all the
+// capacity it still needs at once, beside what the node uses now, once each
+// quarantined VM resolved: an undesired one is removed whether it is adopted
+// or not, and a desired one keeps its current size. No shrink is credited,
+// so no admission order, claim held among the waiting services or way of
+// resolving recovery can turn such a wait into one that outlasts recovery.
+// A desired quarantined VM whose size is unknown leaves room for no growth.
+// When it holds, every remaining wait is recovery's alone.
+func recoveryFits(services []config.ServiceConfig, cap capacity.NodeCapacity, instances map[string]*vm.Instance) bool {
 	wanted := make(map[string]bool, len(services))
 	for _, svc := range services {
 		wanted[svc.Name] = true
 	}
-	resolved := maps.Clone(instances)
-	var either []string
+	uses := func(inst *vm.Instance) capacity.NodeCapacity {
+		if inst == nil || !reconciler.UsesCapacity(inst.State) {
+			return capacity.NodeCapacity{}
+		}
+		return capacity.NodeCapacity{VCPUs: inst.Config.VCPUs, MemoryMB: inst.Config.MemoryMB}
+	}
+	var used, growth capacity.NodeCapacity
+	unknown := false
 	for name, inst := range instances {
-		if inst.State != vm.StateRecoveryPending {
+		switch {
+		case inst.State != vm.StateRecoveryPending:
+		case !wanted[name]:
+			continue
+		case inst.RecoveryConfigUnknown:
+			unknown = true
 			continue
 		}
-		delete(resolved, name)
-		switch {
-		case !inst.RecoveryConfigUnknown:
-			either = append(either, name)
-		case wanted[name]:
-			return false, nil
-		}
+		used.VCPUs += uses(inst).VCPUs
+		used.MemoryMB += uses(inst).MemoryMB
 	}
-	if len(either) > maxModelledQuarantines {
-		return false, nil
-	}
-	slices.Sort(either)
-	desired := config.NodeConfig{Services: services}
-	for adopt := 0; adopt < 1<<len(either); adopt++ {
-		runtime := maps.Clone(resolved)
-		for i, name := range either {
-			if adopt&(1<<i) != 0 {
-				running := *instances[name]
-				running.State = vm.StateRunning
-				runtime[name] = &running
-			}
-		}
-		settled := false
-		for range len(services) + len(runtime) + 2 {
-			_, held, allowance := a.admitIn(services, cap, true, runtime, withoutRecovery, false, nil)
-			if len(held) == 0 {
-				settled = true
-				break
-			}
-			next := appliedRuntime(services, runtime, allowance, reconciler.DeleteHoldsIn(runtime, desired))
-			if maps.EqualFunc(next, runtime, func(x, y *vm.Instance) bool {
-				return x.State == y.State && reflect.DeepEqual(x.Config, y.Config)
-			}) {
-				return false, held
-			}
-			runtime = next
-		}
-		if !settled {
-			return false, nil
-		}
-	}
-	return true, nil
-}
-
-// appliedRuntime is the runtime after a tick in which every admitted service
-// converged and every removal that is not held ran. A service held for any
-// reason, including a VM still starting or stopping, stays as it is.
-func appliedRuntime(services []config.ServiceConfig, runtime map[string]*vm.Instance, allowance map[string]capacity.NodeCapacity, deleteHeld map[string]reconciler.Hold) map[string]*vm.Instance {
-	next := make(map[string]*vm.Instance, len(runtime))
-	wanted := make(map[string]bool, len(services))
 	for _, svc := range services {
-		wanted[svc.Name] = true
-		if _, admitted := allowance[svc.Name]; admitted {
-			next[svc.Name] = &vm.Instance{Name: svc.Name, Config: svc, State: vm.StateRunning}
-		} else if inst := runtime[svc.Name]; inst != nil {
-			next[svc.Name] = inst
+		inst := instances[svc.Name]
+		if inst != nil && inst.State == vm.StateRecoveryPending && inst.RecoveryConfigUnknown {
+			continue
 		}
+		current := uses(inst)
+		growth.VCPUs += max(svc.VCPUs-current.VCPUs, 0)
+		growth.MemoryMB += max(svc.MemoryMB-current.MemoryMB, 0)
 	}
-	for name, inst := range runtime {
-		if _, held := deleteHeld[name]; !wanted[name] && held {
-			next[name] = inst
-		}
+	if unknown && growth != (capacity.NodeCapacity{}) {
+		return false
 	}
-	return next
+	return (growth.VCPUs == 0 || used.VCPUs+growth.VCPUs <= cap.VCPUs) && (growth.MemoryMB == 0 || used.MemoryMB+growth.MemoryMB <= cap.MemoryMB)
 }
 
 // admitIn admits against one inventory snapshot, so no pass sees a VM change
@@ -1422,13 +1369,13 @@ func appliedRuntime(services []config.ServiceConfig, runtime map[string]*vm.Inst
 // pass keeps it and admits the rest around it. The held names therefore only
 // grow, admission ends by construction, and its last pass counted the holds
 // the tick installs.
-func (a *Agent) admitIn(services []config.ServiceConfig, cap capacity.NodeCapacity, known bool, instances map[string]*vm.Instance, addressHolds map[string]reconciler.Hold, explained bool, waitsAnyway map[string]reconciler.Hold) (capacity.NodeCapacity, map[string]reconciler.Hold, map[string]capacity.NodeCapacity) {
+func (a *Agent) admitIn(services []config.ServiceConfig, cap capacity.NodeCapacity, known bool, instances map[string]*vm.Instance, addressHolds map[string]reconciler.Hold, pending, explained bool) (capacity.NodeCapacity, map[string]reconciler.Hold, map[string]capacity.NodeCapacity) {
 	desired := config.NodeConfig{Services: services}
 	deleteHeld := reconciler.DeleteHoldsIn(instances, desired)
 	capacityHolds := map[string]reconciler.Hold{}
 	pass := func() (capacity.NodeCapacity, map[string]reconciler.Hold, map[string]capacity.NodeCapacity) {
 		held := reconciler.HoldsIn(instances, desired, mergeHolds(addressHolds, capacityHolds))
-		return admitPass(services, cap, known, instances, held, deleteHeld, capacityHolds, explained, waitsAnyway)
+		return admitPass(services, cap, known, instances, held, deleteHeld, capacityHolds, pending, explained)
 	}
 	// A pass keeps every hold it is given, so a longer result means new names.
 	used, next, allowance := pass()
@@ -1476,15 +1423,19 @@ func mergeHolds(addressHolds, capacityHolds map[string]reconciler.Hold) map[stri
 // capacityHeld. The reason names the cause: desired state that does not fit
 // at all; capacity that this tick's removals and shrinks, or a VM starting or
 // stopping, frees for a later tick; capacity that only resolving recovery
-// frees, when explained says so; or capacity nothing pending frees, such as
-// two VMs trading sizes. The first is the same failure whether or not
-// anything happens to be retained. A service held for another reason is held
-// for capacity too when desired state cannot fit, or when waitsAnyway names
-// it, so that its other hold cannot hide the wait.
-func admitPass(services []config.ServiceConfig, cap capacity.NodeCapacity, known bool, instances map[string]*vm.Instance, held, deleteHeld, capacityHeld map[string]reconciler.Hold, explained bool, waitsAnyway map[string]reconciler.Hold) (capacity.NodeCapacity, map[string]reconciler.Hold, map[string]capacity.NodeCapacity) {
+// frees, when explained says so; capacity it may not be enough to free while
+// a VM is quarantined; or capacity nothing pending frees, such as two VMs
+// trading sizes. The first is the same failure whether or not anything
+// happens to be retained. A service held for another reason is held for
+// capacity too when desired state cannot fit, and a service held for
+// recovery when it needs capacity recovery does not vouch for, so that its
+// other hold cannot hide the wait.
+func admitPass(services []config.ServiceConfig, cap capacity.NodeCapacity, known bool, instances map[string]*vm.Instance, held, deleteHeld, capacityHeld map[string]reconciler.Hold, pending, explained bool) (capacity.NodeCapacity, map[string]reconciler.Hold, map[string]capacity.NodeCapacity) {
 	type candidate struct {
 		svc    config.ServiceConfig
 		growth capacity.NodeCapacity
+		// recovery marks a service held for unresolved VM ownership.
+		recovery bool
 	}
 	plus := func(a, b capacity.NodeCapacity) capacity.NodeCapacity {
 		return capacity.NodeCapacity{VCPUs: a.VCPUs + b.VCPUs, MemoryMB: a.MemoryMB + b.MemoryMB}
@@ -1504,9 +1455,9 @@ func admitPass(services []config.ServiceConfig, cap capacity.NodeCapacity, known
 	fits := func(used, growth capacity.NodeCapacity) bool {
 		return (growth.VCPUs == 0 || used.VCPUs+growth.VCPUs <= cap.VCPUs) && (growth.MemoryMB == 0 || used.MemoryMB+growth.MemoryMB <= cap.MemoryMB)
 	}
-	heldOtherwise := func(name string) bool {
+	heldOtherwise := func(name string) (reconciler.Hold, bool) {
 		hold, ok := held[name]
-		return ok && hold.Reason != "" && !hold.Capacity
+		return hold, ok && hold.Reason != "" && !hold.Capacity
 	}
 	byName := make(map[string]bool, len(services))
 	for _, svc := range services {
@@ -1533,8 +1484,8 @@ func admitPass(services []config.ServiceConfig, cap capacity.NodeCapacity, known
 		inst := instances[svc.Name]
 		current := uses(inst)
 		growth := capacity.NodeCapacity{VCPUs: max(svc.VCPUs-current.VCPUs, 0), MemoryMB: max(svc.MemoryMB-current.MemoryMB, 0)}
-		other := heldOtherwise(svc.Name)
-		c := candidate{svc: svc, growth: growth}
+		hold, other := heldOtherwise(svc.Name)
+		c := candidate{svc: svc, growth: growth, recovery: other && hold.Recovery}
 		if inst != nil && reconciler.RetainsRuntime(inst.State) && inst.State != vm.StateRecoveryPending {
 			freeing = true
 		}
@@ -1572,9 +1523,10 @@ func admitPass(services []config.ServiceConfig, cap capacity.NodeCapacity, known
 	}
 	exceeded := exceeds(sumResources(services))
 	for _, c := range heldElsewhere {
-		// Desired state that cannot fit fails whatever else holds a service.
-		_, anyway := waitsAnyway[c.svc.Name]
-		if anyway || exceeded && c.growth != (capacity.NodeCapacity{}) && !fits(used, c.growth) {
+		// Desired state that cannot fit fails whatever else holds a service,
+		// and recovery explains only the capacity waits recoveryFits vouches for.
+		grows := c.growth != (capacity.NodeCapacity{})
+		if grows && (exceeded && !fits(used, c.growth) || pending && !explained && c.recovery) {
 			waiting = append(waiting, c)
 		}
 	}
@@ -1586,6 +1538,8 @@ func admitPass(services []config.ServiceConfig, cap capacity.NodeCapacity, known
 		cause = reconciler.Hold{Reason: capacityTransientReason, Capacity: true}
 	case explained:
 		cause = reconciler.Hold{Reason: capacityRecoveryReason, Recovery: true, Capacity: true}
+	case pending:
+		cause = reconciler.Hold{Reason: capacityBesideRecoveryReason, Capacity: true}
 	default:
 		cause = reconciler.Hold{Reason: capacityBlockedReason, Capacity: true}
 	}
