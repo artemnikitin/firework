@@ -569,13 +569,16 @@ func (a *Agent) tick(ctx context.Context) {
 	} else {
 		a.setStatusCondition("LocalRoutesReady", statusmodel.ConditionTrue, "", "")
 	}
-	if err != nil && admissionCode == "" && reconciler.OnlyRecoveryHeld(err) && a.reconciler.HasPendingRecovery() {
+	if err != nil && admissionCode == "" && reconciler.OnlyRecoveryHeld(err) && a.reconciler.HasPendingRecovery() &&
+		(!hasCap || a.recoveryExplainsNow(merged.Services, nodeCap, addressHolds)) {
 		// Every hold was caused by unresolved VM ownership, which
 		// VMRecoveryReady reports as degradation and held services report as
 		// resource_held. Freezing the revision would hide both behind
 		// "progressing". Pending recovery keeps forcing reconciliation, so the
 		// holds still retry. Any other hold, such as genuine over-capacity or
-		// an exhausted subnet, leaves the revision incomplete.
+		// an exhausted subnet, leaves the revision incomplete, and so does a
+		// capacity wait that would outlast recovery from the runtime this apply
+		// left, however recovery resolves.
 		a.logger.Info("applying revision with services held for VM recovery", "error", err)
 		a.forceReconcile = true
 		err = nil
@@ -1298,40 +1301,80 @@ const (
 func (a *Agent) admit(services []config.ServiceConfig, cap capacity.NodeCapacity, known bool, addressHolds map[string]reconciler.Hold) (capacity.NodeCapacity, map[string]reconciler.Hold, map[string]capacity.NodeCapacity) {
 	instances := a.reconciler.Instances()
 	explained, waitsAnyway := false, map[string]reconciler.Hold(nil)
-	if known && slices.ContainsFunc(slices.Collect(maps.Values(instances)), func(inst *vm.Instance) bool { return inst.State == vm.StateRecoveryPending }) {
+	if known && hasRecoveryPending(instances) {
 		explained, waitsAnyway = a.recoveryExplains(services, cap, instances, addressHolds)
 	}
 	return a.admitIn(services, cap, known, instances, addressHolds, explained, waitsAnyway)
 }
 
-// recoveryExplains plays admission forward from the runtime as it would be
-// once recovery resolved, assuming the work each tick admits succeeds, under
-// both ways a quarantine can resolve: the VM gone, and the VM adopted at its
-// current size when its configuration is known. Recovery explains the holds
-// only if both reach a tick that holds nothing. Otherwise it returns the
-// services still held when a tick changes nothing more.
+// recoveryExplainsNow plays recoveryExplains from the runtime as it is now.
+func (a *Agent) recoveryExplainsNow(services []config.ServiceConfig, cap capacity.NodeCapacity, addressHolds map[string]reconciler.Hold) bool {
+	explained, _ := a.recoveryExplains(services, cap, a.reconciler.Instances(), addressHolds)
+	return explained
+}
+
+func hasRecoveryPending(instances map[string]*vm.Instance) bool {
+	for _, inst := range instances {
+		if inst.State == vm.StateRecoveryPending {
+			return true
+		}
+	}
+	return false
+}
+
+// maxModelledQuarantines bounds the resolutions recoveryExplains plays out,
+// two for each quarantined VM; beyond it recovery explains no capacity wait.
+const maxModelledQuarantines = 4
+
+// recoveryExplains plays admission forward from the given runtime as it would
+// be once recovery resolved, assuming the work each tick admits succeeds.
+// Each quarantined VM whose configuration is known may resolve either way,
+// gone or adopted at its current size, and every combination is played; one
+// whose configuration is unknown is played as gone if undesired, but if
+// desired it would be adopted at a size nobody knows. Recovery explains the
+// capacity waits only if every combination reaches a tick that holds nothing.
+// Otherwise it returns the services still held when a tick changed nothing,
+// if known.
 func (a *Agent) recoveryExplains(services []config.ServiceConfig, cap capacity.NodeCapacity, instances map[string]*vm.Instance, addressHolds map[string]reconciler.Hold) (bool, map[string]reconciler.Hold) {
 	withoutRecovery := maps.Clone(addressHolds)
 	maps.DeleteFunc(withoutRecovery, func(_ string, hold reconciler.Hold) bool { return hold.Recovery })
-	gone, adopted := maps.Clone(instances), maps.Clone(instances)
+	wanted := make(map[string]bool, len(services))
+	for _, svc := range services {
+		wanted[svc.Name] = true
+	}
+	resolved := maps.Clone(instances)
+	var either []string
 	for name, inst := range instances {
 		if inst.State != vm.StateRecoveryPending {
 			continue
 		}
-		delete(gone, name)
-		if inst.RecoveryConfigUnknown {
-			delete(adopted, name)
-		} else {
-			running := *inst
-			running.State = vm.StateRunning
-			adopted[name] = &running
+		delete(resolved, name)
+		switch {
+		case !inst.RecoveryConfigUnknown:
+			either = append(either, name)
+		case wanted[name]:
+			return false, nil
 		}
 	}
+	if len(either) > maxModelledQuarantines {
+		return false, nil
+	}
+	slices.Sort(either)
 	desired := config.NodeConfig{Services: services}
-	for _, runtime := range []map[string]*vm.Instance{gone, adopted} {
+	for adopt := 0; adopt < 1<<len(either); adopt++ {
+		runtime := maps.Clone(resolved)
+		for i, name := range either {
+			if adopt&(1<<i) != 0 {
+				running := *instances[name]
+				running.State = vm.StateRunning
+				runtime[name] = &running
+			}
+		}
+		settled := false
 		for range len(services) + len(runtime) + 2 {
 			_, held, allowance := a.admitIn(services, cap, true, runtime, withoutRecovery, false, nil)
 			if len(held) == 0 {
+				settled = true
 				break
 			}
 			next := appliedRuntime(services, runtime, allowance, reconciler.DeleteHoldsIn(runtime, desired))
@@ -1342,13 +1385,16 @@ func (a *Agent) recoveryExplains(services []config.ServiceConfig, cap capacity.N
 			}
 			runtime = next
 		}
+		if !settled {
+			return false, nil
+		}
 	}
 	return true, nil
 }
 
 // appliedRuntime is the runtime after a tick in which every admitted service
-// converged, every lifecycle transition completed and every removal that is
-// not held ran.
+// converged and every removal that is not held ran. A service held for any
+// reason, including a VM still starting or stopping, stays as it is.
 func appliedRuntime(services []config.ServiceConfig, runtime map[string]*vm.Instance, allowance map[string]capacity.NodeCapacity, deleteHeld map[string]reconciler.Hold) map[string]*vm.Instance {
 	next := make(map[string]*vm.Instance, len(runtime))
 	wanted := make(map[string]bool, len(services))

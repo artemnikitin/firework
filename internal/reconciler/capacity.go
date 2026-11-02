@@ -63,14 +63,15 @@ func (r *Reconciler) capacityHold(svc config.ServiceConfig, actual map[string]*v
 	if limit == nil {
 		return Hold{}
 	}
-	others := maps.Clone(actual)
-	delete(others, svc.Name)
-	if unknown := unknownRuntimeOwner(others); unknown != "" {
+	for name, instance := range actual {
 		// A quarantined VM whose configuration is unknown may still use any
 		// amount of capacity; nothing it might use can be presumed free.
-		if instance := actual[svc.Name]; instance == nil || !UsesCapacity(instance.State) ||
-			svc.VCPUs > instance.Config.VCPUs || svc.MemoryMB > instance.Config.MemoryMB {
-			return Hold{Reason: "capacity used by " + unknown + " is unknown", Recovery: true, Capacity: true}
+		if name == svc.Name || instance.State != vm.StateRecoveryPending || !instance.RecoveryConfigUnknown {
+			continue
+		}
+		if own := actual[svc.Name]; own == nil || !UsesCapacity(own.State) ||
+			svc.VCPUs > own.Config.VCPUs || svc.MemoryMB > own.Config.MemoryMB {
+			return Hold{Reason: "capacity used by " + name + " is unknown", Recovery: true, Capacity: true}
 		}
 	}
 	var own, used capacity.NodeCapacity

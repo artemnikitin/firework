@@ -484,15 +484,22 @@ func TestC7HealthRestartWaitsForFailingShrink(t *testing.T) {
 
 // C6: two VMs trading sizes on a full node wait for headroom however the
 // quarantine resolves: when another change frees an unrelated resource
-// meanwhile, and when the quarantined VM is adopted at its current size
-// rather than removed. Recovery therefore does not explain the wait, and
-// the revision must not apply as degraded, before or after it resolves.
+// meanwhile, when the quarantined VM is adopted at its current size rather
+// than removed, also after its unknown configuration is restored, and when
+// the same tick's growth of an unrelated service takes the headroom the swap
+// would have had. Recovery therefore does not explain the wait, and the
+// revision must not apply as degraded, before or after it resolves.
 func TestC6RecoveryHoldDoesNotHideWaitThatOutlastsRecovery(t *testing.T) {
+	adopt := func(m *recoveryTestVMManager, tick int) {
+		if tick == 1 {
+			m.instances["q"].State = vm.StateRunning
+		}
+	}
 	cases := map[string]struct {
 		limit     capacity.NodeCapacity
 		instances func() map[string]*vm.Instance
 		desired   []c7Service
-		resolve   func(m *recoveryTestVMManager)
+		resolve   func(m *recoveryTestVMManager, tick int)
 	}{
 		"another shrink frees memory meanwhile": {
 			limit: capacity.NodeCapacity{VCPUs: 4, MemoryMB: 896},
@@ -505,7 +512,11 @@ func TestC6RecoveryHoldDoesNotHideWaitThatOutlastsRecovery(t *testing.T) {
 				}
 			},
 			desired: []c7Service{{"a", 2, 256, 0}, {"b", 1, 512, 0}, {"c", 1, 64, 0}},
-			resolve: func(m *recoveryTestVMManager) { delete(m.instances, "q") },
+			resolve: func(m *recoveryTestVMManager, tick int) {
+				if tick == 1 {
+					delete(m.instances, "q")
+				}
+			},
 		},
 		"quarantined VM is adopted": {
 			limit: capacity.NodeCapacity{VCPUs: 3, MemoryMB: 768},
@@ -516,7 +527,39 @@ func TestC6RecoveryHoldDoesNotHideWaitThatOutlastsRecovery(t *testing.T) {
 				}
 			},
 			desired: []c7Service{{"b", 1, 512, 0}, {"q", 2, 256, 0}},
-			resolve: func(m *recoveryTestVMManager) { m.instances["q"].State = vm.StateRunning },
+			resolve: adopt,
+		},
+		"configuration restored, then adopted": {
+			limit: capacity.NodeCapacity{VCPUs: 3, MemoryMB: 768},
+			instances: func() map[string]*vm.Instance {
+				return map[string]*vm.Instance{
+					"b": c7Running("b", 2, 256, 0),
+					"q": {Name: "q", Config: admissionService("q", 1, 512, 0, ""), State: vm.StateRecoveryPending, RecoveryConfigUnknown: true},
+				}
+			},
+			desired: []c7Service{{"b", 1, 512, 0}, {"q", 2, 256, 0}},
+			resolve: func(m *recoveryTestVMManager, tick int) {
+				switch tick {
+				case 1:
+					m.instances["q"].RecoveryConfigUnknown = false
+				case 2:
+					m.instances["q"].State = vm.StateRunning
+				}
+			},
+		},
+		"same-tick growth takes the headroom": {
+			limit: capacity.NodeCapacity{VCPUs: 5, MemoryMB: 1088},
+			instances: func() map[string]*vm.Instance {
+				q := admissionService("q", 1, 64, 0, "")
+				q.PortForwards = []config.PortForward{{HostPort: 80, VMPort: 80}, {HostPort: 81, VMPort: 80}}
+				return map[string]*vm.Instance{
+					"a": c7Running("a", 1, 512, 0),
+					"b": c7Running("b", 2, 256, 0),
+					"q": {Name: "q", Config: q, State: vm.StateRecoveryPending},
+				}
+			},
+			desired: []c7Service{{"a", 2, 256, 80}, {"b", 1, 512, 81}, {"q", 1, 64, 0}, {"x", 1, 256, 0}},
+			resolve: adopt,
 		},
 	}
 	for name, tc := range cases {
@@ -524,12 +567,10 @@ func TestC6RecoveryHoldDoesNotHideWaitThatOutlastsRecovery(t *testing.T) {
 			t.Run(name+"/"+strategy, func(t *testing.T) {
 				a, m := c7Agent(t, strategy, 0, tc.limit, tc.instances(), tc.desired...)
 				for tick := 0; tick < 4; tick++ {
-					if tick == 1 {
-						tc.resolve(m)
-					}
+					tc.resolve(m, tick)
 					a.tick(context.Background())
-					if a.lastRevision == "r2" || len(m.overcommits) != 0 {
-						t.Fatalf("tick %d: lastRevision=%q overcommits=%v status=%s", tick, a.lastRevision, m.overcommits, conditionOf(a.agentStatusSnapshot(), "VMsReconciled").Message)
+					if applied := a.agentStatusSnapshot().AppliedRevision; a.lastRevision == "r2" || applied == "r2" || len(m.overcommits) != 0 {
+						t.Fatalf("tick %d: lastRevision=%q applied=%q overcommits=%v status=%s", tick, a.lastRevision, applied, m.overcommits, conditionOf(a.agentStatusSnapshot(), "VMsReconciled").Message)
 					}
 				}
 			})
