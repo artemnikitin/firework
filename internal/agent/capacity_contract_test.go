@@ -305,9 +305,10 @@ func TestC7PreExistingExcessAllowsOnlyWhatDoesNotGrowIt(t *testing.T) {
 	if m.instances["c"] != nil || len(m.overcommits) != 0 {
 		t.Fatalf("c=%+v overcommits=%v", m.instances["c"], m.overcommits)
 	}
-	// Only the quarantine keeps c waiting now.
-	if vms := conditionOf(a.agentStatusSnapshot(), "VMsReconciled"); strings.Contains(vms.Message, reconciler.ErrServiceHeld.Error()) || a.lastRevision != "r2" {
-		t.Fatalf("recovery-only wait not applied as degraded: %s", vms.Message)
+	// Only the quarantine keeps c waiting now; a capacity wait keeps the
+	// revision reconciling and names the quarantine (C6).
+	if vms := conditionOf(a.agentStatusSnapshot(), "VMsReconciled"); !strings.Contains(vms.Message, "hold c ("+capacityOwnershipReason) || a.lastRevision == "r2" {
+		t.Fatalf("lastRevision=%q status=%s", a.lastRevision, vms.Message)
 	}
 }
 
@@ -404,11 +405,7 @@ func TestC6AdmissionWaitRecoveryWouldNotEndIsNotRecovery(t *testing.T) {
 		}
 		a.tick(context.Background())
 		vms := conditionOf(a.agentStatusSnapshot(), "VMsReconciled")
-		want := "hold d (capacity is used by VMs no pending change frees"
-		if tick == 0 {
-			want = "hold d (capacity waits on unresolved VM ownership"
-		}
-		if a.lastRevision == "r2" || !strings.Contains(vms.Message, want) || len(m.overcommits) != 0 {
+		if a.lastRevision == "r2" || !strings.Contains(vms.Message, "hold d (capacity is used by VMs no pending change frees") || len(m.overcommits) != 0 {
 			t.Fatalf("tick %d: lastRevision=%q overcommits=%v status=%s", tick, a.lastRevision, m.overcommits, vms.Message)
 		}
 	}
@@ -431,11 +428,7 @@ func TestC6RecoveryHoldDoesNotHideCapacityWait(t *testing.T) {
 		}
 		a.tick(context.Background())
 		vms := conditionOf(a.agentStatusSnapshot(), "VMsReconciled")
-		want := "no pending change frees"
-		if tick == 0 {
-			want = "capacity waits on unresolved VM ownership"
-		}
-		if a.lastRevision == "r2" || !strings.Contains(vms.Message, want) || len(m.startCalls) != 0 {
+		if a.lastRevision == "r2" || !strings.Contains(vms.Message, "no pending change frees") || len(m.startCalls) != 0 {
 			t.Fatalf("tick %d: lastRevision=%q starts=%v status=%s", tick, a.lastRevision, m.startCalls, vms.Message)
 		}
 	}
@@ -589,6 +582,26 @@ func TestC6RecoveryHoldDoesNotHideWaitThatOutlastsRecovery(t *testing.T) {
 				}
 			},
 		},
+		"two desired quarantines of unknown size trade sizes": {
+			limit: capacity.NodeCapacity{VCPUs: 4, MemoryMB: 4096},
+			instances: func() map[string]*vm.Instance {
+				return map[string]*vm.Instance{
+					"q1": {Name: "q1", Config: admissionService("q1", 3, 64, 7070, ""), State: vm.StateRecoveryPending, RecoveryConfigUnknown: true},
+					"q2": {Name: "q2", Config: admissionService("q2", 1, 64, 8080, ""), State: vm.StateRecoveryPending, RecoveryConfigUnknown: true},
+				}
+			},
+			desired: []c7Service{{"q1", 1, 64, 8080}, {"q2", 3, 64, 0}},
+			resolve: func(m *recoveryTestVMManager, tick int) {
+				for _, name := range []string{"q1", "q2"} {
+					switch tick {
+					case 1:
+						m.instances[name].RecoveryConfigUnknown = false
+					case 2:
+						m.instances[name].State = vm.StateRunning
+					}
+				}
+			},
+		},
 		"same-tick growth takes the headroom": {
 			limit: capacity.NodeCapacity{VCPUs: 5, MemoryMB: 1088},
 			instances: func() map[string]*vm.Instance {
@@ -631,5 +644,46 @@ func TestC6RecoveryOnlyClaimHoldAppliesAsDegraded(t *testing.T) {
 	a.tick(context.Background())
 	if applied := a.agentStatusSnapshot().AppliedRevision; applied != "r2" || len(m.startCalls) != 0 {
 		t.Fatalf("applied=%q starts=%v status=%s", applied, m.startCalls, conditionOf(a.agentStatusSnapshot(), "VMsReconciled").Message)
+	}
+}
+
+// C6 honest status: a capacity wait names the quarantine only when it would
+// end with it. Two VMs trading sizes beside an unrelated quarantine still ask
+// for headroom, and a growth that has room but waits only because a
+// quarantined VM's size is unknown names the quarantine, not a lack of room.
+func TestC6CapacityWaitNamesItsCause(t *testing.T) {
+	for name, tc := range map[string]struct {
+		limit     capacity.NodeCapacity
+		instances map[string]*vm.Instance
+		desired   []c7Service
+		want      string
+	}{
+		"swap beside an unrelated quarantine": {
+			limit: capacity.NodeCapacity{VCPUs: 4, MemoryMB: 1024},
+			instances: map[string]*vm.Instance{
+				"a": c7Running("a", 1, 512, 0),
+				"b": c7Running("b", 2, 256, 0),
+				"q": {Name: "q", Config: admissionService("q", 1, 256, 0, ""), State: vm.StateRecoveryPending},
+			},
+			desired: []c7Service{{"a", 2, 256, 0}, {"b", 1, 512, 0}, {"q", 1, 256, 0}},
+			want:    "hold a (" + capacityBlockedReason,
+		},
+		"room left beside a quarantine of unknown size": {
+			limit: capacity.NodeCapacity{VCPUs: 16, MemoryMB: 8192},
+			instances: map[string]*vm.Instance{
+				"b": c7Running("b", 1, 64, 0),
+				"q": {Name: "q", Config: config.ServiceConfig{Name: "q"}, State: vm.StateRecoveryPending, RecoveryConfigUnknown: true},
+			},
+			desired: []c7Service{{"b", 2, 64, 0}, {"q", 1, 64, 0}},
+			want:    "hold b (" + capacityOwnershipReason,
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			a, _ := c7Agent(t, "", 0, tc.limit, tc.instances, tc.desired...)
+			a.tick(context.Background())
+			if vms := conditionOf(a.agentStatusSnapshot(), "VMsReconciled"); a.lastRevision == "r2" || !strings.Contains(vms.Message, tc.want) {
+				t.Fatalf("lastRevision=%q status=%s", a.lastRevision, vms.Message)
+			}
+		})
 	}
 }

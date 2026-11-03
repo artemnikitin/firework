@@ -32,11 +32,14 @@ func TestAdmissionUnknownOwnerMustNotMaskTrueCapacityHold(t *testing.T) {
 	if condition, ok := agentCondition(status, "CapacityReady"); !ok || condition.Status != "false" {
 		t.Fatal("genuine capacity failure reported ready")
 	}
-	// Once demand fits, the remaining hold is genuinely caused by recovery.
+	// Once demand fits, heavy waits for the capacity and claims the
+	// quarantine keeps: no longer a failure, but a capacity wait, which keeps
+	// the revision reconciling rather than applied as degraded (C6).
 	s.data["web"] = []byte(strings.ReplaceAll(string(s.data["web"]), "vcpus: 6", "vcpus: 3"))
 	a.tick(context.Background())
-	if got := a.agentStatusSnapshot(); got.AppliedRevision != "one" {
-		t.Fatalf("fitting recovery hold did not become degraded apply: %#v", got)
+	got := a.agentStatusSnapshot()
+	if condition, _ := agentCondition(got, "CapacityReady"); got.AppliedRevision == "one" || got.Phase == "failed" || condition.Status != "true" {
+		t.Fatalf("fitting wait beside an unknown quarantine: %#v", got)
 	}
 }
 

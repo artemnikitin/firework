@@ -324,10 +324,10 @@ Quarantined survivors removed from desired configuration remain reported until
 their runtime ownership is resolved. Independent services continue reconciling.
 A desired service waiting on resources retained by an unresolved VM reports
 `resource_held` on the applied revision, and fleet status stays degraded until
-the hold clears. The revision applies this way only if everything still
-waiting could take the capacity it needs at once once recovery resolved;
-otherwise it stays reconciling and the hold reports that the wait needs both
-resolved ownership and more room than the node has free.
+the hold clears. That applies only to holds that need no capacity: a service
+that waits for capacity, including capacity a quarantined VM keeps, keeps the
+revision reconciling, and its hold says whether the quarantine keeps the
+capacity or the node needs headroom.
 
 Other holds do not let the revision apply. `VMsReconciled` reports
 `resource_held` and names every held service in its message:

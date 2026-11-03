@@ -410,21 +410,18 @@ retained:
 - Recovery holds, caused by unresolved VM ownership (unknown claims, a resource
   retained by a `recovery_pending` owner directly or through a held VM, a guest
   address or MAC an undesired quarantined VM, or one whose removal recovery
-  holds, keeps, or capacity that recovery keeps in use): when every hold is one,
+  holds, keeps): when every hold is one,
   the agent applies the revision with those holds and reports
   `VMRecoveryReady=False`, so the node shows as degraded instead of
   progressing. Pending recovery keeps forcing reconciliation, so held work
   retries on an unchanged revision. The revision applies this way only if,
-  on the runtime the apply left, every desired service could take all the
-  capacity it still needs at once beside what the node uses, with undesired
-  quarantined VMs gone, desired ones at their current size, and no shrink
-  credited. A desired quarantined VM whose configuration is unknown allows no
-  other growth, and its whole desired size must fit beside what the node uses.
-  No admission order, claim among the waiting services or way of resolving
-  recovery can then turn a wait into one that outlasts recovery.
-  Otherwise the capacity holds, and recovery holds on services that need
-  capacity, report that the wait needs both resolved ownership and more room
-  than the node has free, and the revision stays incomplete.
+  on the runtime the apply left, no desired service needs capacity its VM does
+  not already use; a desired quarantined VM whose configuration is unknown may
+  need any amount, so at most one is allowed and only if its whole desired
+  size fits beside what the node uses. A capacity wait is never a recovery
+  hold: whether it outlasts recovery depends on admission order, claims and
+  how each quarantine resolves. A service recovery holds that needs capacity
+  is held for capacity too, and the revision stays incomplete.
 - Admission failures, which waiting cannot resolve: desired services whose
   combined CPU or memory exceeds node capacity, or more networked desired
   services than `vm_subnet` has guest addresses. The other services still
@@ -435,9 +432,11 @@ retained:
   reports failed.
 - Transient holds: waiting on another start or stop, on a claim that a running
   or retained VM still uses, on capacity that a removal or shrink this tick, or
-  a VM starting or stopping, will free, or on a guest address an undesired VM
-  keeps until the plan removes it. The revision stays incomplete,
-  `VMsReconciled` is unknown with `resource_held`, and the next tick retries.
+  a VM starting or stopping, will free, on capacity quarantined VMs keep when
+  everything would fit once they and the work recovery holds resolved, or on a
+  guest address an undesired VM keeps until the plan removes it. The revision
+  stays incomplete, `VMsReconciled` is unknown with `resource_held`, and the
+  next tick retries.
 - Capacity that nothing pending frees and recovery does not explain, such as
   two VMs trading sizes on a full node, or a growth waiting for a shrink that
   another hold keeps from running. The revision stays incomplete in the same

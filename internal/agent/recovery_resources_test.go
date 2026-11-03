@@ -288,20 +288,18 @@ func TestAddressExhaustionHoldsNewServiceAndKeepsExistingAssignments(t *testing.
 	}
 }
 
+// A capacity wait is never a recovery hold (C6). It names the quarantine as
+// its cause only when everything would fit once the quarantine resolved.
 func TestCapacityHoldIsAttributedToRecoveryOnlyWhenResolutionWouldFit(t *testing.T) {
 	limit := capacity.NodeCapacity{VCPUs: 4, MemoryMB: 1024}
 	for _, tc := range []struct {
-		vcpus    int
-		recovery bool
-	}{{3, true}, {6, false}} {
+		vcpus  int
+		reason string
+	}{{3, capacityOwnershipReason}, {6, capacityExceededReason}} {
 		a := retainedResourceAgent(t) // a removed 2-vCPU VM is recovery_pending
 		_, held, _ := a.admit([]config.ServiceConfig{{Name: "new", VCPUs: tc.vcpus, MemoryMB: 64}}, limit, true, nil)
-		hold, ok := held["new"]
-		if !ok || hold.Recovery != tc.recovery {
-			t.Fatalf("%d vCPUs: hold=%#v, want recovery=%v", tc.vcpus, hold, tc.recovery)
-		}
-		if !tc.recovery && hold.Reason != "desired services exceed node capacity" {
-			t.Fatalf("genuine over-capacity blamed on recovery: %q", hold.Reason)
+		if hold, ok := held["new"]; !ok || hold.Recovery || hold.Reason != tc.reason {
+			t.Fatalf("%d vCPUs: hold=%#v, want %q", tc.vcpus, hold, tc.reason)
 		}
 	}
 }

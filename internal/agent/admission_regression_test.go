@@ -74,7 +74,7 @@ func TestHeldShrinkDoesNotOvercommit(t *testing.T) {
 	}
 	// b waits on the quarantine, then on a's shrink, so resolving recovery is
 	// not all it needs: the revision stays incomplete and says why (C6).
-	if vms := conditionOf(a.agentStatusSnapshot(), "VMsReconciled"); a.lastRevision == "r2" || !strings.Contains(vms.Message, "hold b (capacity waits on unresolved VM ownership") {
+	if vms := conditionOf(a.agentStatusSnapshot(), "VMsReconciled"); a.lastRevision == "r2" || !strings.Contains(vms.Message, "hold b ("+capacityOwnershipReason) {
 		t.Fatalf("lastRevision=%q status=%s", a.lastRevision, vms.Message)
 	}
 	delete(m.instances, "x")
