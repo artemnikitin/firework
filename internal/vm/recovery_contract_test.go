@@ -13,7 +13,8 @@ import (
 // C2: startup recovery, its automatic retry on a later tick and the
 // clear-recovery command classify the same ownership evidence the same way.
 // Proven absence permits cleanup, a revalidated live owner is adopted, and
-// missing identity or a possible live claimant stays quarantined.
+// missing identity, a missing manifest or a possible live claimant stays
+// quarantined.
 func TestC2SameEvidenceSameClassificationAtEveryEntryPoint(t *testing.T) {
 	evidence := map[string]struct {
 		apply func(*testing.T, *instanceManifest, *fakeProcessInspector)
@@ -31,6 +32,18 @@ func TestC2SameEvidenceSameClassificationAtEveryEntryPoint(t *testing.T) {
 			delete(i.identities, f.PID)
 			i.find = []processIdentity{{PID: 77}}
 		}, "quarantined"},
+		"no manifest, live process": {func(t *testing.T, f *instanceManifest, i *fakeProcessInspector) {
+			if err := os.Remove(manifestPath(f.VMDir)); err != nil {
+				t.Fatal(err)
+			}
+			i.find = []processIdentity{i.identities[f.PID]}
+		}, "quarantined"},
+		"no manifest, proven absent": {func(t *testing.T, f *instanceManifest, i *fakeProcessInspector) {
+			if err := os.Remove(manifestPath(f.VMDir)); err != nil {
+				t.Fatal(err)
+			}
+			delete(i.identities, f.PID)
+		}, "absent"},
 	}
 	for name, ev := range evidence {
 		for _, entry := range []string{"startup", "retry", "command"} {
@@ -195,5 +208,52 @@ func TestAdoptionInterruptedByDeadlineSaysSoAndRetries(t *testing.T) {
 	stopAdoptedMonitors(t, m)
 	if got := m.List()[f.Service]; got == nil || got.State != StateRunning {
 		t.Fatalf("interrupted adoption did not retry: %#v", got)
+	}
+}
+
+// C1: VM state without an ownership manifest records no identity, so no
+// process presenting its paths is adopted: not one whose argv[0] names the
+// configured binary while its executable is a shell, and not the configured
+// binary itself. Neither is signalled or loses its state.
+func TestC1ManifestlessProcessIsNeverAdopted(t *testing.T) {
+	for name, executable := range map[string]string{"shell claiming to be Firecracker": "/bin/sh", "configured Firecracker binary": ""} {
+		t.Run(name, func(t *testing.T) {
+			manager, inspector, identity, vmDir, service := manifestlessFixture(t)
+			if executable != "" {
+				identity.Executable = executable
+				inspector.identities[identity.PID] = identity
+				inspector.find = []processIdentity{identity}
+			}
+			adopted, err := manager.Recover(context.Background(), config.NodeConfig{Services: []config.ServiceConfig{service}})
+			if err != nil || len(adopted) != 0 {
+				t.Fatalf("adopted=%v err=%v", adopted, err)
+			}
+			if got := manager.List()[service.Name]; got == nil || got.State != StateRecoveryPending || got.PID != 0 {
+				t.Fatalf("manifest-less process was adopted: %#v", got)
+			}
+			if _, err := os.Stat(vmDir); err != nil {
+				t.Fatalf("state of a possibly live VM was removed: %v", err)
+			}
+		})
+	}
+}
+
+// C2: the same manifest-less evidence with a live process is quarantined
+// whether startup recovery or the command meets it first.
+func TestC2ManifestlessEvidenceIsQuarantinedAtStartupAndByCommand(t *testing.T) {
+	commandFirst, _, _, _, service := manifestlessFixture(t)
+	if err := commandFirst.DiscoverRecoveryState(); err != nil {
+		t.Fatal(err)
+	}
+	result, err := commandFirst.ClearRecoveryPending(service.Name)
+	if err == nil || result.Outcome != RecoveryOutcomeAmbiguous {
+		t.Fatalf("command: %#v %v", result, err)
+	}
+	startupFirst, _, _, _, _ := manifestlessFixture(t)
+	if _, err := startupFirst.Recover(context.Background(), config.NodeConfig{Services: []config.ServiceConfig{service}}); err != nil {
+		t.Fatal(err)
+	}
+	if got := startupFirst.List()[service.Name]; got == nil || got.State != StateRecoveryPending {
+		t.Fatalf("startup classified the evidence differently from the command: %#v", got)
 	}
 }

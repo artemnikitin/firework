@@ -190,7 +190,7 @@ func TestRecoveryDeadlineAndCursorDoNotStarveReadyServices(t *testing.T) {
 	}
 }
 
-func TestLegacyRecoveryUsesOriginalLaunchPathAfterBinarySymlinkUpgrade(t *testing.T) {
+func TestManifestlessVMSurvivingBinarySymlinkUpgradeStaysQuarantined(t *testing.T) {
 	m, f, i := recoveryFixture(t)
 	m.inspector = i
 	if err := os.Remove(manifestPath(f.VMDir)); err != nil {
@@ -216,9 +216,14 @@ func TestLegacyRecoveryUsesOriginalLaunchPathAfterBinarySymlinkUpgrade(t *testin
 	if _, err := m.Recover(context.Background(), config.NodeConfig{Services: []config.ServiceConfig{f.Config}}); err != nil {
 		t.Fatal(err)
 	}
-	stopAdoptedMonitors(t, m)
-	if got := m.List()[f.Service]; got == nil || got.State != StateRunning || got.manifest.Executable != identity.Executable {
-		t.Fatalf("upgrade hid surviving legacy VM: %#v", got)
+	// Nothing records that the deleted binary was Firecracker, so the
+	// surviving process stays quarantined instead of being adopted, and its
+	// state is neither removed nor hidden by the upgrade.
+	if got := m.List()[f.Service]; got == nil || got.State != StateRecoveryPending {
+		t.Fatalf("upgrade hid or adopted surviving manifest-less VM: %#v", got)
+	}
+	if _, err := os.Stat(f.VMDir); err != nil {
+		t.Fatalf("surviving VM state was removed: %v", err)
 	}
 }
 

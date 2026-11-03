@@ -270,42 +270,30 @@ func TestRound3LegacyWithoutDesiredCanClearAfterClaimantExits(t *testing.T) {
 	}
 }
 
-func TestRound3LegacyMigrationCanClearIfProcessDiesBeforePersistenceRetry(t *testing.T) {
+func TestRound3ManifestlessStateClearsOnceItsProcessDies(t *testing.T) {
 	m, f, inspector := recoveryFixture(t)
 	m.inspector = inspector
 	if err := os.Remove(manifestPath(f.VMDir)); err != nil {
 		t.Fatal(err)
 	}
-	binary := filepath.Join(m.stateDir, "firecracker")
-	if err := os.WriteFile(binary, []byte("test binary"), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	m.firecrackerBin = binary
-	executable, err := filepath.EvalSymlinks(binary)
-	if err != nil {
-		t.Fatal(err)
-	}
 	identity := inspector.identities[f.PID]
-	identity.Executable = executable
-	identity.CommandLine = []string{binary, "--api-sock", f.SocketPath, "--config-file", f.ConfigPath}
+	identity.CommandLine = []string{m.firecrackerBin, "--api-sock", f.SocketPath, "--config-file", f.ConfigPath}
 	inspector.identities[f.PID] = identity
 	inspector.find = []processIdentity{identity}
-	m.recoveryManifestWriter = func(string, *instanceManifest) error { return errors.New("disk temporarily unavailable") }
 	if _, err := m.Recover(context.Background(), config.NodeConfig{Services: []config.ServiceConfig{f.Config}}); err != nil {
-		t.Fatal("one service persistence failure blocked recovery", err)
+		t.Fatal(err)
 	}
-	if got := m.List()[f.Service]; got == nil || got.State != StateRecoveryPending || got.recoveryCandidate == nil {
-		t.Fatalf("migration did not retain its pending candidate: %#v", got)
+	if got := m.List()[f.Service]; got == nil || got.State != StateRecoveryPending {
+		t.Fatalf("live manifest-less state was not quarantined: %#v", got)
 	}
 	delete(inspector.identities, f.PID)
 	inspector.find = nil
-	m.recoveryManifestWriter = nil
 	result, err := m.ClearRecoveryPending(f.Service)
 	if err != nil || result.Outcome != RecoveryOutcomeCleared {
-		t.Fatalf("dead legacy candidate stalled persistence retry: result=%#v err=%v", result, err)
+		t.Fatalf("dead manifest-less state was not cleared: result=%#v err=%v", result, err)
 	}
 	if _, err := os.Stat(f.VMDir); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("dead migration directory remains: %v", err)
+		t.Fatalf("dead manifest-less directory remains: %v", err)
 	}
 }
 

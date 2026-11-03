@@ -230,10 +230,13 @@ then repaired from the live process and persisted. A recorded process start time
 that disagrees is never repaired: that is the PID-reuse signal the manifest
 exists to catch.
 
-During the first upgrade from the pre-manifest runtime, the agent can migrate
-one legacy process when the configured Firecracker executable, resolved desired
-service, config path, socket path, and responsive Unix socket all match exactly.
-Any ambiguous legacy inventory is quarantined instead of guessed.
+VM state without an ownership manifest, such as a directory written before
+manifests existed, records neither a process identity nor a configuration, so
+it is never adopted, whatever process presents its paths and whether or not its
+service is desired. Startup recovery, automatic retry and the command all
+clear it after a complete absence proof and otherwise keep it quarantined;
+once its process is stopped, recovery clears the state and the service is
+recreated.
 
 Dead processes have their stale runtime directory cleaned. A host boot ID that
 disagrees with the manifest is one of them rather than an ambiguity: the boot ID
@@ -360,7 +363,7 @@ prevents deletion. The runtime assumes the agent runs in the host PID namespace.
 
 Boot ID, start time, executable inode/device and launch arguments establish
 ownership. A `/proc/PID/exe` display-path ` (deleted)` suffix does not invalidate
-an otherwise proven process, including during legacy migration.
+an otherwise proven process.
 
 Quarantined services are excluded from both rolling and all-at-once plans. They
 retain their individual `vm_recovery_pending` status while independent services

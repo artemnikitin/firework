@@ -421,7 +421,11 @@ func TestUpdatingARepairedSurvivorNoLongerStalls(t *testing.T) {
 	}
 }
 
-func TestRecoverMigratesExactlyOneLegacyFirecrackerProcess(t *testing.T) {
+// manifestlessFixture is VM state with no ownership manifest, as an agent
+// wrote it before manifests existed, and one live process that presents the
+// configured Firecracker binary with this service's socket and config paths.
+func manifestlessFixture(t *testing.T) (*Manager, *fakeProcessInspector, processIdentity, string, config.ServiceConfig) {
+	t.Helper()
 	stateDir := t.TempDir()
 	vmDir := filepath.Join(stateDir, "vms", "app")
 	if err := os.MkdirAll(vmDir, 0o755); err != nil {
@@ -435,12 +439,10 @@ func TestRecoverMigratesExactlyOneLegacyFirecrackerProcess(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	socketPath := filepath.Join(vmDir, "firecracker.sock")
-	configPath := filepath.Join(vmDir, "vm-config.json")
 	identity := processIdentity{
 		PID: 51, HostBootID: "boot", StartTicks: 200, Executable: resolvedBinary,
 		ExecutableDev: 11, ExecutableIno: 12,
-		CommandLine: []string{binary, "--api-sock", socketPath, "--config-file", configPath},
+		CommandLine: []string{binary, "--api-sock", filepath.Join(vmDir, "firecracker.sock"), "--config-file", filepath.Join(vmDir, "vm-config.json")},
 	}
 	inspector := &fakeProcessInspector{
 		identities: map[int]processIdentity{identity.PID: identity}, errors: make(map[int]error),
@@ -448,22 +450,88 @@ func TestRecoverMigratesExactlyOneLegacyFirecrackerProcess(t *testing.T) {
 	}
 	manager := NewManager(binary, stateDir, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	manager.inspector = inspector
-	service := config.ServiceConfig{Name: "app", Image: "/image", Kernel: "/kernel", VCPUs: 1, MemoryMB: 128}
+	t.Cleanup(func() {
+		manager.mu.Lock()
+		manager.instances = make(map[string]*Instance)
+		manager.mu.Unlock()
+	})
+	return manager, inspector, identity, vmDir, config.ServiceConfig{Name: "app", Image: "/image", Kernel: "/kernel", VCPUs: 1, MemoryMB: 128}
+}
 
-	adopted, err := manager.Recover(context.Background(), config.NodeConfig{Services: []config.ServiceConfig{service}})
+// State without an ownership manifest records no identity and no
+// configuration, so even the configured Firecracker binary with this
+// service's paths is not adopted for a desired service. Once the process
+// exits, recovery clears the state.
+func TestRecoverNeverAdoptsManifestlessFirecrackerProcess(t *testing.T) {
+	manager, inspector, identity, vmDir, service := manifestlessFixture(t)
+	desired := config.NodeConfig{Services: []config.ServiceConfig{service}}
+	adopted, err := manager.Recover(context.Background(), desired)
 	if err != nil {
 		t.Fatal(err)
 	}
 	instance := manager.List()[service.Name]
-	if len(adopted) != 1 || instance == nil || instance.State != StateRunning || !instance.manifest.Legacy {
-		t.Fatalf("legacy process was not migrated: adopted=%v instance=%#v", adopted, instance)
+	if len(adopted) != 0 || instance == nil || instance.State != StateRecoveryPending || !strings.Contains(instance.LastError, "never adopted") {
+		t.Fatalf("manifest-less process was adopted: adopted=%v instance=%#v", adopted, instance)
 	}
-	if _, err := os.Stat(manifestPath(vmDir)); err != nil {
-		t.Fatalf("legacy ownership manifest was not written: %v", err)
+	if _, err := os.Stat(manifestPath(vmDir)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("an ownership manifest was invented: %v", err)
 	}
-	manager.mu.Lock()
-	manager.instances = make(map[string]*Instance)
-	manager.mu.Unlock()
+	delete(inspector.identities, identity.PID)
+	inspector.find = nil
+	if _, err := manager.Recover(context.Background(), desired); err != nil {
+		t.Fatal(err)
+	}
+	if got := manager.List()[service.Name]; got != nil {
+		t.Fatalf("absent manifest-less state was not cleared: %#v", got)
+	}
+	if _, err := os.Stat(vmDir); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("manifest-less state remains: %v", err)
+	}
+}
+
+// The command treats manifest-less state like startup recovery: it refuses
+// while a process may still use it and clears it once the process is gone.
+func TestManifestlessQuarantineClearsByCommandOnceProcessExits(t *testing.T) {
+	manager, inspector, identity, vmDir, service := manifestlessFixture(t)
+	if _, err := manager.Recover(context.Background(), config.NodeConfig{Services: []config.ServiceConfig{service}}); err != nil {
+		t.Fatal(err)
+	}
+	if r, err := manager.ClearRecoveryPending(service.Name); err == nil || r.Outcome != RecoveryOutcomeAmbiguous {
+		t.Fatalf("command adopted or cleared a live manifest-less VM: %#v %v", r, err)
+	}
+	delete(inspector.identities, identity.PID)
+	inspector.find = nil
+	if r, err := manager.ClearRecoveryPending(service.Name); err != nil || r.Outcome != RecoveryOutcomeCleared {
+		t.Fatalf("command did not clear absent manifest-less state: %#v %v", r, err)
+	}
+	if _, err := os.Stat(vmDir); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("manifest-less state remains: %v", err)
+	}
+}
+
+// A service that becomes desired after startup does not change the evidence:
+// automatic retry still keeps a live manifest-less VM quarantined, and clears
+// it once the process exits.
+func TestManifestlessQuarantineIsNotAdoptedOnceDesired(t *testing.T) {
+	manager, inspector, identity, vmDir, service := manifestlessFixture(t)
+	if _, err := manager.Recover(context.Background(), config.NodeConfig{}); err != nil {
+		t.Fatal(err)
+	}
+	desired := config.NodeConfig{Services: []config.ServiceConfig{service}}
+	if adopted, err := manager.Recover(context.Background(), desired); err != nil || len(adopted) != 0 {
+		t.Fatalf("retry adopted a manifest-less VM: %v %v", adopted, err)
+	}
+	if got := manager.List()[service.Name]; got == nil || got.State != StateRecoveryPending {
+		t.Fatalf("retry released the quarantine: %#v", got)
+	}
+	delete(inspector.identities, identity.PID)
+	inspector.find = nil
+	if _, err := manager.Recover(context.Background(), desired); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(vmDir); !errors.Is(err, os.ErrNotExist) || manager.List()[service.Name] != nil {
+		t.Fatalf("retry did not clear absent manifest-less state: %v %#v", err, manager.List()[service.Name])
+	}
 }
 
 func recoveryFixture(t *testing.T) (*Manager, *instanceManifest, *fakeProcessInspector) {
@@ -545,87 +613,5 @@ func TestRecoverAdoptsSurvivorFromManifestWrittenBeforeNodeType(t *testing.T) {
 	if len(adopted) != 1 || adopted[0] != manifest.Service {
 		instance := manager.List()[manifest.Service]
 		t.Fatalf("pre-upgrade survivor was not adopted: adopted=%v instance=%#v", adopted, instance)
-	}
-}
-
-func TestLegacySocketQuarantineCanRetry(t *testing.T) {
-	stateDir := t.TempDir()
-	vmDir := filepath.Join(stateDir, "vms", "app")
-	if err := os.MkdirAll(vmDir, 0o755); err != nil {
-		t.Fatal(err)
-	}
-	binary := filepath.Join(stateDir, "firecracker")
-	if err := os.WriteFile(binary, []byte("binary"), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	resolvedBinary, err := filepath.EvalSymlinks(binary)
-	if err != nil {
-		t.Fatal(err)
-	}
-	socketPath := filepath.Join(vmDir, "firecracker.sock")
-	configPath := filepath.Join(vmDir, "vm-config.json")
-	identity := processIdentity{
-		PID: 51, HostBootID: "boot", StartTicks: 200, Executable: resolvedBinary,
-		ExecutableDev: 11, ExecutableIno: 12,
-		CommandLine: []string{binary, "--api-sock", socketPath, "--config-file", configPath},
-	}
-	inspector := &fakeProcessInspector{
-		identities: map[int]processIdentity{identity.PID: identity}, errors: make(map[int]error),
-		find: []processIdentity{identity},
-	}
-	manager := NewManager(binary, stateDir, slog.New(slog.NewTextHandler(io.Discard, nil)))
-	manager.inspector = inspector
-	service := config.ServiceConfig{Name: "app", Image: "/image", Kernel: "/kernel", VCPUs: 1, MemoryMB: 128}
-
-	inspector.socketErr = os.ErrNotExist
-	if _, err := manager.Recover(context.Background(), config.NodeConfig{Services: []config.ServiceConfig{service}}); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := os.Stat(manifestPath(vmDir)); err != nil {
-		t.Fatal("legacy identity was not persisted", err)
-	}
-	inspector.socketErr = nil
-	if r, err := manager.ClearRecoveryPending(service.Name); err != nil || r.Outcome != RecoveryOutcomeReadopted {
-		t.Fatalf("legacy retry: %#v %v", r, err)
-	}
-}
-
-func TestLegacyPersistenceFailureCanRetry(t *testing.T) {
-	stateDir := t.TempDir()
-	vmDir := filepath.Join(stateDir, "vms", "app")
-	if err := os.MkdirAll(vmDir, 0o755); err != nil {
-		t.Fatal(err)
-	}
-	binary := filepath.Join(stateDir, "firecracker")
-	if err := os.WriteFile(binary, []byte("binary"), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	resolvedBinary, err := filepath.EvalSymlinks(binary)
-	if err != nil {
-		t.Fatal(err)
-	}
-	socketPath := filepath.Join(vmDir, "firecracker.sock")
-	configPath := filepath.Join(vmDir, "vm-config.json")
-	identity := processIdentity{
-		PID: 51, HostBootID: "boot", StartTicks: 200, Executable: resolvedBinary,
-		ExecutableDev: 11, ExecutableIno: 12,
-		CommandLine: []string{binary, "--api-sock", socketPath, "--config-file", configPath},
-	}
-	inspector := &fakeProcessInspector{
-		identities: map[int]processIdentity{identity.PID: identity}, errors: make(map[int]error),
-		find: []processIdentity{identity},
-	}
-	manager := NewManager(binary, stateDir, slog.New(slog.NewTextHandler(io.Discard, nil)))
-	manager.inspector = inspector
-	service := config.ServiceConfig{Name: "app", Image: "/image", Kernel: "/kernel", VCPUs: 1, MemoryMB: 128}
-
-	manager.recoveryManifestWriter = func(string, *instanceManifest) error { return errors.New("disk write failed") }
-	if _, err := manager.Recover(context.Background(), config.NodeConfig{Services: []config.ServiceConfig{service}}); err != nil {
-		t.Fatal("one service persistence failure blocked recovery", err)
-	}
-	manager.recoveryManifestWriter = nil
-	inspector.socketErr = nil
-	if r, err := manager.ClearRecoveryPending(service.Name); err != nil || r.Outcome != RecoveryOutcomeReadopted {
-		t.Fatalf("legacy retry: %#v %v", r, err)
 	}
 }

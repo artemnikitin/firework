@@ -220,16 +220,6 @@ func (m *Manager) resolveRecoveryAttempt(ctx context.Context, service string, fo
 	if instanceID == "" || instanceID != initialManifest.InstanceID || instancePID != initialManifest.PID {
 		return recoveryAmbiguous(result, "in-memory ownership identities do not match")
 	}
-	if recoveryCandidate != nil && recoveryCandidate.Legacy {
-		if _, err := os.Lstat(manifestPath); errors.Is(err, os.ErrNotExist) {
-			if err := validateOwnedProcessContext(ctx, m.inspector, recoveryCandidate); err != nil {
-				return recoveryAmbiguous(result, err.Error())
-			}
-			if err := m.writeRecoveryManifest(manifestPath, recoveryCandidate); err != nil {
-				return recoveryAmbiguous(result, err.Error())
-			}
-		}
-	}
 	_, err := readAndVerifyRecoveryManifest(manifestPath, &initialManifest)
 	if err != nil {
 		return recoveryAmbiguous(result, err.Error())

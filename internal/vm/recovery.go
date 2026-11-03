@@ -59,10 +59,6 @@ func (m *Manager) Recover(ctx context.Context, desired config.NodeConfig) ([]str
 	cursor := m.recoveryCursor
 	m.mu.Unlock()
 	sort.Strings(names)
-	desiredByName := make(map[string]config.ServiceConfig, len(desired.Services))
-	for _, service := range desired.Services {
-		desiredByName[service.Name] = service
-	}
 	seenIDs := make(map[string]string)
 	var adopted []string
 	start := sort.SearchStrings(names, cursor)
@@ -110,27 +106,13 @@ func (m *Manager) Recover(ctx context.Context, desired config.NodeConfig) ([]str
 			vmDir := filepath.Join(root, name)
 			path := manifestPath(vmDir)
 			manifest, readErr := readManifest(path)
-			if readErr != nil {
-				if errors.Is(readErr, os.ErrNotExist) {
-					var handled bool
-					manifest, handled, err = m.recoverLegacy(ctx, name, vmDir, desiredByName)
-					if err != nil {
-						m.recordRecoveryFailure(name, err)
-					}
-					if handled {
-						return
-					}
-				} else {
-					m.addRecoveryPending(name, canonicalManifest(name, vmDir), fmt.Sprintf("cannot read ownership manifest: %v", readErr))
-					return
-				}
-			}
 			if errors.Is(readErr, os.ErrNotExist) {
-				if err := m.writeRecoveryManifest(path, manifest); err != nil {
-					m.addRecoveryPendingWithCandidate(name, manifest, manifest, "legacy migration persistence failed")
-					m.recordRecoveryFailure(name, err)
-					return
-				}
+				m.recoverLegacy(ctx, name, vmDir)
+				return
+			}
+			if readErr != nil {
+				m.addRecoveryPending(name, canonicalManifest(name, vmDir), fmt.Sprintf("cannot read ownership manifest: %v", readErr))
+				return
 			}
 			if err := verifyRecoveryManifestPaths(name, vmDir, manifest); err != nil {
 				m.addRecoveryPending(name, manifest, "ownership manifest paths do not match its state directory")
@@ -271,75 +253,21 @@ func cloneInstanceManifest(manifest *instanceManifest) *instanceManifest {
 	return &clone
 }
 
-func (m *Manager) recoverLegacy(ctx context.Context, name, vmDir string, desired map[string]config.ServiceConfig) (*instanceManifest, bool, error) {
-	service, wanted := desired[name]
+// recoverLegacy handles VM state that has no ownership manifest, such as a
+// directory written before manifests existed. Without a recorded identity or
+// configuration nothing proves which process, if any, owns it, so it is never
+// adopted, whatever process presents its paths. Proven absence clears it;
+// otherwise it stays quarantined until the process is gone. Every entry
+// point treats this evidence the same way.
+func (m *Manager) recoverLegacy(ctx context.Context, name, vmDir string) {
 	partial := canonicalManifest(name, vmDir)
-	var matches []processIdentity
-	var err error
-	if scanner, ok := m.inspector.(interface {
-		FindByArgumentsContext(context.Context, string, string) ([]processIdentity, error)
-	}); ok {
-		matches, err = scanner.FindByArgumentsContext(ctx, partial.SocketPath, partial.ConfigPath)
-	} else {
-		matches, err = m.inspector.FindByArguments(partial.SocketPath, partial.ConfigPath)
+	if err := m.removeRecoveryStateContext(ctx, partial); err != nil {
+		m.addRecoveryPending(name, partial, fmt.Sprintf("VM state without an ownership manifest is never adopted, and its absence remains unproved: %v; stop any process still using it, then recovery clears the state", err))
+		return
 	}
-	if err != nil {
-		m.addRecoveryPending(name, partial, fmt.Sprintf("cannot inspect legacy VM processes: %v", err))
-		return nil, true, nil
-	}
-	if len(matches) == 0 {
-		if err := m.removeRecoveryStateContext(ctx, partial); err != nil {
-			m.addRecoveryPending(name, partial, fmt.Sprintf("legacy runtime absence remains unproved: %v", err))
-		} else {
-			m.mu.Lock()
-			delete(m.instances, name)
-			m.mu.Unlock()
-		}
-		return nil, true, nil
-	}
-	if !wanted {
-		m.addRecoveryPending(name, partial, "live legacy VM has no desired service configuration for adoption")
-		return nil, true, nil
-	}
-	// Legacy launches have no instance ID. Their executable identity is
-	// pinned from the live process, whose argv[0] must identify the configured
-	// launch path. Resolving a symlink now would compare against the upgraded
-	// binary instead of the executable that the surviving process launched.
-	expectedExecutable, err := filepath.Abs(m.firecrackerBin)
-	if err != nil {
-		return nil, true, err
-	}
-	var owned []processIdentity
-	for _, identity := range matches {
-		if len(identity.CommandLine) > 0 && identity.CommandLine[0] == expectedExecutable {
-			owned = append(owned, identity)
-		}
-	}
-	if len(owned) == 0 {
-		m.addRecoveryPending(name, partial, "legacy process arguments match but its executable is not the configured Firecracker binary")
-		return nil, true, nil
-	}
-	if len(owned) != 1 {
-		m.addRecoveryPending(name, partial, fmt.Sprintf("found %d matching legacy Firecracker processes", len(owned)))
-		return nil, true, nil
-	}
-	identity := owned[0]
-	instanceID, err := newInstanceID()
-	if err != nil {
-		return nil, true, err
-	}
-	hash, err := serviceConfigHash(service)
-	if err != nil {
-		return nil, true, err
-	}
-	return &instanceManifest{
-		SchemaVersion: manifestSchemaVersion, Service: name, InstanceID: instanceID,
-		Lifecycle: lifecycleRunning, Config: service, ConfigHash: hash, PID: identity.PID,
-		HostBootID: identity.HostBootID, ProcessStart: identity.StartTicks,
-		Executable: identity.Executable, ExecutableDev: identity.ExecutableDev, ExecutableIno: identity.ExecutableIno,
-		SocketPath: partial.SocketPath, ConfigPath: partial.ConfigPath, VMDir: vmDir,
-		Launcher: "direct", Legacy: true, StartedAt: time.Now().UTC(),
-	}, false, nil
+	m.mu.Lock()
+	delete(m.instances, name)
+	m.mu.Unlock()
 }
 
 func instanceFromManifest(manifest *instanceManifest, state State, lastError string) *Instance {
