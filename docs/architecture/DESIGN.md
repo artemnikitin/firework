@@ -301,10 +301,16 @@ proof uses only the service's canonical paths. Recovery never releases its
 claims on its own, even once absence is proven, because what a dead owner left
 on the host is unknown. They stay fenced until an operator restores a trusted
 record or runs `--forget`, which deletes the record after the same proof; for a
-symlinked entry, only the link is removed. Untrusted metadata never drives host
-cleanup, so after `--forget`, unless the host rebooted, check for its leftover
-port forwards and any explicitly named TAP by hand. A state directory removed by
-hand is cleared after the same proof, because no metadata remains to preserve.
+symlinked entry, only the link is removed. Removing the state directory of such a
+quarantine by hand has the same effect as `--forget`: recovery clears it after
+the same proof, because no metadata remains to preserve. Untrusted or missing
+metadata never drives host cleanup, and clearing releases the fence, so the next
+tick may give the old guest address, host ports or an explicitly named TAP to
+another service. Before running `--forget` or removing such a directory, unless
+the host has rebooted since the VM ran, find the port forwards and any TAP the
+old VM used and remove them by hand. A directory that never had an ownership
+manifest is cleared the same way once its process is gone, so on a host that ran
+an agent from before ownership manifests, check for such leftovers too.
 Stopping the agent does not stop surviving VMs. Do not delete ownership records
 while a claimant may be alive.
 
