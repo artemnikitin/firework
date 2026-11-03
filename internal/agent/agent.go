@@ -77,7 +77,12 @@ type Agent struct {
 	// it. Only the tick goroutine uses them.
 	lastPeerNodes []config.NodeConfig
 	peersListed   bool
-	lifecycleMu   sync.Mutex
+	// routedGuestIPs maps each guest IP that published local routes may still
+	// point at to the service routed there. assignNetworking keeps it from
+	// other services until a publish no longer routes to it. Only the tick
+	// goroutine uses it.
+	routedGuestIPs map[string]string
+	lifecycleMu    sync.Mutex
 	// restartNeedsReconcile is set by a health restart that left its service
 	// without a running VM; the next tick then skips the unchanged-revision
 	// shortcut.
@@ -857,6 +862,21 @@ func (a *Agent) assignNetworking(services []config.ServiceConfig) map[string]rec
 			}
 		}
 	}
+	// A guest IP that a removed VM's host rules or published route may still
+	// reach is not given to another service until both are gone, or that
+	// service would receive the removed one's traffic.
+	departed := map[string]string{}
+	maps.Copy(departed, a.routedGuestIPs)
+	if a.reconciler != nil {
+		maps.Copy(departed, a.reconciler.PendingTeardownGuestIPs())
+	}
+	for ip, owner := range departed {
+		if _, tracked := reservedIP[ip]; tracked || !ipNet.Contains(net.ParseIP(ip)) {
+			delete(departed, ip)
+		} else if !desired[owner] {
+			departingReserves = true
+		}
+	}
 	exhausted := reconciler.Hold{Reason: addressExhaustedReason + a.cfg.VMSubnet, Admission: "guest_addresses_exhausted"}
 	switch {
 	case networked > guestAddressCount(ipNet):
@@ -894,6 +914,9 @@ func (a *Agent) assignNetworking(services []config.ServiceConfig) map[string]rec
 			}
 			_, ipUsed := reservedIP[candidate]
 			_, macUsed := reservedMAC[strings.ToLower(guestMACForIndex(idx))]
+			if owner, departing := departed[candidate]; departing && owner != svc.Name {
+				ipUsed = true
+			}
 			if !ipUsed && !macUsed {
 				break
 			}

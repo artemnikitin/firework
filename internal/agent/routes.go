@@ -1,6 +1,8 @@
 package agent
 
 import (
+	"maps"
+
 	"github.com/artemnikitin/firework/internal/config"
 	"github.com/artemnikitin/firework/internal/ingress"
 	"github.com/artemnikitin/firework/internal/reconciler"
@@ -19,10 +21,24 @@ func (a *Agent) syncRuntimeRoutes(services []config.ServiceConfig, remoteNodes [
 	// listing fails, but their claims are unknown until a listing succeeds.
 	peersKnown := !localOnly || a.peersListed
 	selected := a.selectLocalRoutes(a.reconciler.LocalRoutes(services), services, remoteNodes, peersKnown)
-	if localOnly {
-		return a.traefikMgr.SyncLocal(selected)
+	routed := make(map[string]string, len(selected))
+	for _, svc := range selected {
+		if svc.Network != nil && svc.Network.GuestIP != "" {
+			routed[svc.Network.GuestIP] = svc.Name
+		}
 	}
-	return a.traefikMgr.Sync(selected, remoteNodes)
+	var err error
+	if localOnly {
+		err = a.traefikMgr.SyncLocal(selected)
+	} else {
+		err = a.traefikMgr.Sync(selected, remoteNodes)
+	}
+	// A failed publish may have left any earlier route in place.
+	if err != nil {
+		maps.Copy(routed, a.routedGuestIPs)
+	}
+	a.routedGuestIPs = routed
+	return err
 }
 
 // selectLocalRoutes publishes each tracked VM from its own configuration. A

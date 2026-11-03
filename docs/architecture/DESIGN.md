@@ -514,7 +514,13 @@ unknown, and a service with no VM, publish nothing. Routes are synced after
 every reconciliation, whatever it returned, because deletes and replacements
 run even while other work is held or failing: a route never outlives its guest
 or points at an address another service now owns. The unchanged-revision path
-refreshes them on every poll as before.
+refreshes them on every poll as before. A guest address is not given to
+another service while a removed VM's host port rules for it await teardown,
+whether a failed teardown or unresolved ownership deferred them, or while a
+published route still points at it; the reconciler also holds any start on
+such an address. The service that owned the address may take it back. The
+address is reused once the rules are torn down and a route sync no longer
+routes there.
 
 Changes that apply without replacing the VM, such as `metadata.host`,
 `metadata.subdomain` or a health-check port, are committed to the running

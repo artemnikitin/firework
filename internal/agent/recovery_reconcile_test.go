@@ -198,6 +198,8 @@ type recoveryTestNetworkManager struct {
 	setupCalls      []string
 	portForwardCall []int
 	setupErr        error
+	// teardownErr fails every port-forward teardown while set.
+	teardownErr error
 }
 
 func (m *recoveryTestNetworkManager) Setup(service config.ServiceConfig) error {
@@ -216,7 +218,9 @@ func (m *recoveryTestNetworkManager) SetupPortForward(hostPort int, _ string, _ 
 	return nil
 }
 
-func (*recoveryTestNetworkManager) TeardownPortForward(int, string, int) error { return nil }
+func (m *recoveryTestNetworkManager) TeardownPortForward(int, string, int) error {
+	return m.teardownErr
+}
 
 func TestClearedRemovedServiceDropsHealthProbe(t *testing.T) {
 	a := New(testAgentConfig(t), &fakeStore{data: map[string][]byte{"web": []byte("node: web\nservices: []\n")}, revision: "empty"}, testLogger())
