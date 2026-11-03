@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/binary"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -18,6 +19,7 @@ import (
 
 	runtimeagent "github.com/artemnikitin/firework/internal/agent"
 	"github.com/artemnikitin/firework/internal/agentconfig"
+	"github.com/artemnikitin/firework/internal/vm"
 )
 
 func TestClearRecoveryCommandHelper(t *testing.T) {
@@ -306,6 +308,27 @@ func TestAgentHelpExitsSuccessfully(t *testing.T) {
 			}
 			if !strings.Contains(string(out), tc.want) {
 				t.Fatalf("missing help: %s", out)
+			}
+		})
+	}
+}
+
+// A refusal says nothing changed; a resolution that failed after settling
+// ownership says part of the state may have changed, never that nothing did.
+func TestRecoveryCommandErrorNamesWhatChanged(t *testing.T) {
+	failure := errors.New("service app remains recovery_pending: reason")
+	for name, tc := range map[string]struct {
+		outcome   vm.RecoveryOutcome
+		want, not string
+	}{
+		"refused":    {vm.RecoveryOutcomeAmbiguous, "left unchanged", "may already have changed"},
+		"incomplete": {vm.RecoveryOutcomeIncomplete, "may already have changed", "left unchanged"},
+		"transport":  {"", "service app remains recovery_pending: reason", "left unchanged"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			got := recoveryCommandError(vm.RecoveryResult{Service: "app", Outcome: tc.outcome}, failure).Error()
+			if !strings.Contains(got, tc.want) || strings.Contains(got, tc.not) || !errors.Is(recoveryCommandError(vm.RecoveryResult{Outcome: tc.outcome}, failure), failure) {
+				t.Fatalf("%q", got)
 			}
 		})
 	}

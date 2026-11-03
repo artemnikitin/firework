@@ -168,7 +168,7 @@ func (m *Manager) resolveUntrustedRecovery(ctx context.Context, result RecoveryR
 		m.mu.Lock()
 		m.instances[service] = instance
 		m.mu.Unlock()
-		return result, fmt.Errorf("remove stale VM state for %s: %w", service, removeErr)
+		return recoveryIncomplete(result, fmt.Errorf("remove stale VM state for %s: %w", service, removeErr))
 	}
 	result.Outcome = RecoveryOutcomeCleared
 	result.State = StateStopped

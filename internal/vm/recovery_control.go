@@ -18,6 +18,10 @@ const (
 	RecoveryOutcomeCleared   RecoveryOutcome = "cleared"
 	RecoveryOutcomeReadopted RecoveryOutcome = "readopted"
 	RecoveryOutcomeAmbiguous RecoveryOutcome = "still_ambiguous"
+	// RecoveryOutcomeIncomplete settled ownership but could not finish
+	// recording or removing state, so part of it may already have changed.
+	// The VM stays recovery_pending, and recovery retries the rest.
+	RecoveryOutcomeIncomplete RecoveryOutcome = "incomplete"
 )
 
 // RecoveryResult is the bounded result of resolving one service's quarantine.
@@ -206,7 +210,7 @@ func (m *Manager) resolveRecoveryAttempt(ctx context.Context, service string, fo
 			m.mu.Lock()
 			m.instances[service] = instance
 			m.mu.Unlock()
-			return result, fmt.Errorf("remove stale VM state for %s: %w", service, err)
+			return recoveryIncomplete(result, fmt.Errorf("remove stale VM state for %s: %w", service, err))
 		}
 		result.Outcome = RecoveryOutcomeCleared
 		result.State = StateStopped
@@ -299,7 +303,7 @@ func (m *Manager) resolveRecoveryAttempt(ctx context.Context, service string, fo
 		if writeErr != nil {
 			instance.recoveryCandidate = cloneInstanceManifest(&manifest)
 			m.mu.Unlock()
-			return result, fmt.Errorf("persist reconstructed identity: %w", writeErr)
+			return recoveryIncomplete(result, fmt.Errorf("persist reconstructed identity: %w", writeErr))
 		}
 		instance.recoveryCandidate = nil
 		m.mu.Unlock()
@@ -344,7 +348,7 @@ func (m *Manager) resolveRecoveryAttempt(ctx context.Context, service string, fo
 	instance.PID = snapshot.PID
 	if writeErr != nil {
 		m.mu.Unlock()
-		return result, fmt.Errorf("persist recovery adoption for %s: %w", service, writeErr)
+		return recoveryIncomplete(result, fmt.Errorf("persist recovery adoption for %s: %w", service, writeErr))
 	}
 	if err := ctx.Err(); err != nil {
 		// The revalidation could not finish, which says nothing about the
@@ -403,6 +407,13 @@ func readAndVerifyRecoveryManifest(path string, expected *instanceManifest) (*in
 		}
 	}
 	return durable, nil
+}
+
+func recoveryIncomplete(result RecoveryResult, err error) (RecoveryResult, error) {
+	result.Outcome = RecoveryOutcomeIncomplete
+	result.State = StateRecoveryPending
+	result.Message = err.Error()
+	return result, err
 }
 
 func recoveryAmbiguous(result RecoveryResult, message string) (RecoveryResult, error) {

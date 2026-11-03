@@ -72,11 +72,8 @@ func runClearRecovery(args []string, defaultConfigPath string) error {
 		resolve = agent.ForgetRecovery
 	}
 	result, err := resolve(context.Background(), cfg.StateDir, commandFlags.Arg(0))
-	if err != nil && result.Outcome == vm.RecoveryOutcomeAmbiguous {
-		return fmt.Errorf("%w\nthe VM and its state were left unchanged; resolve the reason above, for example by stopping a process that still uses the VM's paths or waiting for one to finish, then run the command again (--forget clears state only once the VM is proven absent)", err)
-	}
 	if err != nil {
-		return err
+		return recoveryCommandError(result, err)
 	}
 	switch result.Outcome {
 	case vm.RecoveryOutcomeNoop:
@@ -93,6 +90,20 @@ func runClearRecovery(args []string, defaultConfigPath string) error {
 		return fmt.Errorf("unexpected recovery outcome %q for service %s", result.Outcome, result.Service)
 	}
 	return nil
+}
+
+// recoveryCommandError adds the next step to a failed clear-recovery: a
+// refusal changed nothing, while an incomplete resolution may have changed
+// part of the VM's state before it failed.
+func recoveryCommandError(result vm.RecoveryResult, err error) error {
+	switch result.Outcome {
+	case vm.RecoveryOutcomeAmbiguous:
+		return fmt.Errorf("%w\nthe VM and its state were left unchanged; resolve the reason above, for example by stopping a process that still uses the VM's paths or waiting for one to finish, then run the command again (--forget clears state only once the VM is proven absent)", err)
+	case vm.RecoveryOutcomeIncomplete:
+		return fmt.Errorf("%w\nownership was settled, but part of the VM's state may already have changed; the service stays recovery_pending and the agent retries the rest, so check its status before running the command again", err)
+	default:
+		return err
+	}
 }
 
 func run(configPath string) error {

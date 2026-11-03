@@ -402,8 +402,10 @@ func TestClearRecoveryPendingWriteFailureKeepsQuarantineInMemory(t *testing.T) {
 		return errors.New("injected manifest write failure")
 	}
 
+	// Ownership was proved, but its record could not be written: the
+	// resolution is incomplete, not refused.
 	result, err := manager.ClearRecoveryPending(manifest.Service)
-	if err == nil || result.Outcome != RecoveryOutcomeAmbiguous {
+	if err == nil || result.Outcome != RecoveryOutcomeIncomplete || result.State != StateRecoveryPending {
 		t.Fatalf("manifest write failure was not reported: result=%#v err=%v", result, err)
 	}
 	instance := manager.List()[manifest.Service]

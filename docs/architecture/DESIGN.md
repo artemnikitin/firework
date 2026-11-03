@@ -260,7 +260,10 @@ rechecks the named service through the running manager, so memory and the
 ownership manifest change together. When ownership cannot be proved, the
 command changes nothing and exits with an error naming why the service remains
 `recovery_pending`, such as a live process still using the VM's paths, and
-saying to resolve that and run the command again.
+saying to resolve that and run the command again. If ownership is settled but
+recording or removing state then fails, the command reports an incomplete
+resolution instead: part of the state may already have changed, the service
+stays `recovery_pending`, and the agent retries the rest.
 
 The command re-adopts a VM only when the manifest, config hash, process identity,
 launch arguments, and API socket validate. Recovery retries transient failures
