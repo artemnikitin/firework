@@ -648,9 +648,9 @@ func TestC6RecoveryOnlyClaimHoldAppliesAsDegraded(t *testing.T) {
 }
 
 // C6 honest status: a capacity wait names the quarantine only when it would
-// end with it. Two VMs trading sizes beside an unrelated quarantine still ask
-// for headroom, and a growth that has room but waits only because a
-// quarantined VM's size is unknown names the quarantine, not a lack of room.
+// end with it, counting removals recovery holds as gone. Two VMs trading
+// sizes beside an unrelated quarantine still ask for headroom, and a service
+// that has room but waits on a quarantined VM's claims names those claims.
 func TestC6CapacityWaitNamesItsCause(t *testing.T) {
 	for name, tc := range map[string]struct {
 		limit     capacity.NodeCapacity
@@ -668,6 +668,24 @@ func TestC6CapacityWaitNamesItsCause(t *testing.T) {
 			desired: []c7Service{{"a", 2, 256, 0}, {"b", 1, 512, 0}, {"q", 1, 256, 0}},
 			want:    "hold a (" + capacityBlockedReason,
 		},
+		"growth behind a removal recovery holds": {
+			limit: capacity.NodeCapacity{VCPUs: 4, MemoryMB: 4096},
+			instances: map[string]*vm.Instance{
+				"b": c7Running("b", 1, 64, 0),
+				"x": c7Running("x", 2, 64, 7070),
+				"q": {Name: "q", Config: admissionService("q", 1, 64, 7070, ""), State: vm.StateRecoveryPending},
+			},
+			desired: []c7Service{{"b", 3, 64, 0}},
+			want:    "hold b (" + capacityOwnershipReason,
+		},
+		"new service held only by a quarantined VM's port": {
+			limit: capacity.NodeCapacity{VCPUs: 16, MemoryMB: 8192},
+			instances: map[string]*vm.Instance{
+				"x": {Name: "x", Config: admissionService("x", 1, 64, 7070, ""), State: vm.StateRecoveryPending},
+			},
+			desired: []c7Service{{"n", 1, 64, 7070}},
+			want:    "hold n (host port 7070",
+		},
 		"room left beside a quarantine of unknown size": {
 			limit: capacity.NodeCapacity{VCPUs: 16, MemoryMB: 8192},
 			instances: map[string]*vm.Instance{
@@ -675,7 +693,7 @@ func TestC6CapacityWaitNamesItsCause(t *testing.T) {
 				"q": {Name: "q", Config: config.ServiceConfig{Name: "q"}, State: vm.StateRecoveryPending, RecoveryConfigUnknown: true},
 			},
 			desired: []c7Service{{"b", 2, 64, 0}, {"q", 1, 64, 0}},
-			want:    "hold b (" + capacityOwnershipReason,
+			want:    "hold b (runtime resource claims are unknown for q",
 		},
 	} {
 		t.Run(name, func(t *testing.T) {
@@ -685,5 +703,18 @@ func TestC6CapacityWaitNamesItsCause(t *testing.T) {
 				t.Fatalf("lastRevision=%q status=%s", a.lastRevision, vms.Message)
 			}
 		})
+	}
+}
+
+// C6: desired state that cannot fit the node fails the revision, also when
+// every service already runs, over capacity, and one of them is quarantined.
+func TestC6ImpossibleDesiredCapacityFailsWhenNothingWaits(t *testing.T) {
+	a, _ := c7Agent(t, "", 0, capacity.NodeCapacity{VCPUs: 4, MemoryMB: 4096}, map[string]*vm.Instance{
+		"a": c7Running("a", 3, 64, 0),
+		"q": {Name: "q", Config: admissionService("q", 2, 64, 0, ""), State: vm.StateRecoveryPending},
+	}, c7Service{"a", 3, 64, 0}, c7Service{"q", 2, 64, 0})
+	a.tick(context.Background())
+	if status := a.agentStatusSnapshot(); status.Phase != "failed" || status.ReasonCode != "capacity_exceeded" || status.AppliedRevision == "r2" {
+		t.Fatalf("phase=%s reason=%s applied=%q", status.Phase, status.ReasonCode, status.AppliedRevision)
 	}
 }

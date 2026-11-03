@@ -418,7 +418,8 @@ retained:
   on the runtime the apply left, no desired service needs capacity its VM does
   not already use; a desired quarantined VM whose configuration is unknown may
   need any amount, so at most one is allowed and only if its whole desired
-  size fits beside what the node uses. A capacity wait is never a recovery
+  size fits beside what the node uses besides undesired quarantined VMs. A
+  capacity wait is never a recovery
   hold: whether it outlasts recovery depends on admission order, claims and
   how each quarantine resolves. A service recovery holds that needs capacity
   is held for capacity too, and the revision stays incomplete.

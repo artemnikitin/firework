@@ -512,6 +512,11 @@ func (a *Agent) tick(ctx context.Context) {
 		a.metrics.setCapacity(nodeCap, used)
 	}
 	admissionCode, admissionMessage := admissionFailure(addressHolds, capacityHolds)
+	if total := sumResources(merged.Services); admissionCode == "" && hasCap && (total.VCPUs > nodeCap.VCPUs || total.MemoryMB > nodeCap.MemoryMB) {
+		// Desired state that cannot fit fails even when every service already
+		// runs, over capacity, and so none waits to grow.
+		admissionCode, admissionMessage = "capacity_exceeded", capacityExceededReason
+	}
 	switch {
 	case admissionCode != "":
 		a.logger.Warn("desired services do not fit this node; holding those that do not fit", "reason", admissionCode, "detail", admissionMessage)
@@ -633,6 +638,11 @@ func (a *Agent) tick(ctx context.Context) {
 	a.setStatusCondition("Reconciled", statusmodel.ConditionTrue, "", "")
 	if traefikErr != nil {
 		a.failAgentStatus("LocalRoutesReady", "local_route_sync_failed", traefikErr.Error())
+		a.syncRegistryAfterTick(ctx, nodeCap, used)
+		return
+	}
+	if admissionCode != "" {
+		a.failAgentStatus("CapacityReady", admissionCode, admissionMessage)
 		a.syncRegistryAfterTick(ctx, nodeCap, used)
 		return
 	}
@@ -1464,7 +1474,9 @@ func admitPass(services []config.ServiceConfig, cap capacity.NodeCapacity, known
 		if byName[name] || inst.State == vm.StateRecoveryPending {
 			continue
 		}
-		settled = plus(settled, uses(inst))
+		if hold, removalHeld := deleteHeld[name]; !(removalHeld && hold.Recovery) {
+			settled = plus(settled, uses(inst))
+		}
 		if hold, removalHeld := deleteHeld[name]; reconciler.UsesCapacity(inst.State) && !(removalHeld && hold.Recovery) {
 			freeing = true // It is removed this tick, or once its lifecycle or its owner's settles.
 		}
@@ -1521,8 +1533,7 @@ func admitPass(services []config.ServiceConfig, cap capacity.NodeCapacity, known
 	for _, c := range heldElsewhere {
 		// Desired state that cannot fit fails whatever else holds a service,
 		// and a capacity wait is never left to a recovery hold to report.
-		grows := c.growth != (capacity.NodeCapacity{})
-		if grows && (exceeded && !fits(used, c.growth) || pending && c.recovery) {
+		if c.growth != (capacity.NodeCapacity{}) && !fits(used, c.growth) && (exceeded || pending && c.recovery) {
 			waiting = append(waiting, c)
 		}
 	}

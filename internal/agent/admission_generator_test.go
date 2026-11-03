@@ -66,9 +66,9 @@ func generatedRevision(r *rand.Rand) []generatedService {
 // new size, must converge within a bounded number of ticks once the
 // quarantine resolves (C5); without headroom it may wait (L2), but must not
 // report itself reconciled. While the quarantine
-// stands, a tick that changes nothing must name the quarantine for any
-// capacity wait, and apply the revision as degraded when nothing waits for
-// capacity (C6).
+// stands, a tick that changes nothing must not report a wait the quarantine
+// does not explain, and must apply the revision as degraded once every
+// service has the capacity it needs (C6).
 func TestRandomRevisionsConvergeWithinCapacity(t *testing.T) {
 	seeds := int64(600)
 	if testing.Short() {
@@ -169,14 +169,22 @@ func TestRandomRevisionsConvergeWithinCapacity(t *testing.T) {
 			vms := conditionOf(a.agentStatusSnapshot(), "VMsReconciled")
 			_, quarantined := m.instances["q"]
 			idle := actions == len(m.startCalls)+len(m.removeCalls)
+			// Every desired service already runs at least its desired size, so
+			// nothing waits for capacity.
+			sized := true
+			for _, want := range to {
+				if got := m.instances[want.name]; got == nil || !reconciler.UsesCapacity(got.State) || got.Config.VCPUs < want.vcpus || got.Config.MemoryMB < want.mem {
+					sized = false
+				}
+			}
 			if problem == "" && quarantined && tick > lifecycleTicks {
 				switch {
 				case appliedAt >= 0 && !idle:
 					problem = fmt.Sprintf("tick %d still changes VMs after tick %d applied the revision as degraded", tick, appliedAt)
-				case idle && headroom && (strings.Contains(vms.Message, "no pending change frees") || strings.Contains(vms.Message, "still used by VMs that are starting")):
-					problem = fmt.Sprintf("tick %d changes nothing but reports a capacity wait the quarantine does not explain: %s", tick, vms.Message)
-				case idle && headroom && !strings.Contains(vms.Message, capacityOwnershipReason) && a.lastRevision != "r2":
-					problem = fmt.Sprintf("tick %d holds only for recovery but did not apply the revision as degraded: %s", tick, vms.Message)
+				case idle && headroom && (strings.Contains(vms.Message, "no pending change frees") || strings.Contains(vms.Message, "still used by VMs that are starting") || strings.Contains(vms.Message, "lifecycle is in progress")):
+					problem = fmt.Sprintf("tick %d changes nothing but reports a hold the quarantine does not explain: %s", tick, vms.Message)
+				case idle && sized && a.lastRevision != "r2":
+					problem = fmt.Sprintf("tick %d needs no capacity and holds only for recovery, but did not apply the revision as degraded: %s", tick, vms.Message)
 				}
 				if appliedAt < 0 && a.lastRevision == "r2" {
 					appliedAt = tick

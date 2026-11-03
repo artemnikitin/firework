@@ -71,7 +71,7 @@ func (r *Reconciler) capacityHold(svc config.ServiceConfig, actual map[string]*v
 		}
 		if own := actual[svc.Name]; own == nil || !UsesCapacity(own.State) ||
 			svc.VCPUs > own.Config.VCPUs || svc.MemoryMB > own.Config.MemoryMB {
-			return Hold{Reason: "capacity used by " + name + " is unknown", Recovery: true, Capacity: true}
+			return Hold{Reason: "capacity used by " + name + " is unknown", Capacity: true}
 		}
 	}
 	var own, used capacity.NodeCapacity
