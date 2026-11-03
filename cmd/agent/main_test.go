@@ -199,8 +199,11 @@ enable_capacity_check: false
 }
 
 func TestClearRecoveryCommandSendsForgetOnlyWhenRequested(t *testing.T) {
-	for _, forget := range []bool{false, true} {
-		t.Run(fmt.Sprintf("forget=%t", forget), func(t *testing.T) {
+	for _, tc := range []struct {
+		forget, flagsAfterService bool
+	}{{false, false}, {true, false}, {true, true}} {
+		forget := tc.forget
+		t.Run(fmt.Sprintf("forget=%t,flags after service=%t", forget, tc.flagsAfterService), func(t *testing.T) {
 			stateDir, err := os.MkdirTemp("/tmp", "firework48-")
 			if err != nil {
 				t.Fatal(err)
@@ -227,11 +230,15 @@ func TestClearRecoveryCommandSendsForgetOnlyWhenRequested(t *testing.T) {
 			go func() {
 				checked <- checkRecoveryCommandRequest(listener, forget)
 			}()
-			args := []string{"clear-recovery", "--config", configPath}
+			flags := []string{"--config", configPath}
 			if forget {
-				args = append(args, "--forget")
+				flags = append(flags, "--forget")
 			}
-			if err := runCommand(append(args, "app"), "unused"); err != nil {
+			args := append(append([]string{"clear-recovery"}, flags...), "app")
+			if tc.flagsAfterService {
+				args = append([]string{"clear-recovery", "app"}, flags...)
+			}
+			if err := runCommand(args, "unused"); err != nil {
 				t.Fatal(err)
 			}
 			if err := <-checked; err != nil {
@@ -331,5 +338,17 @@ func TestRecoveryCommandErrorNamesWhatChanged(t *testing.T) {
 				t.Fatalf("%q", got)
 			}
 		})
+	}
+}
+
+func TestClearRecoveryCommandRequiresOneServiceWhereverFlagsGo(t *testing.T) {
+	for _, args := range [][]string{
+		{"clear-recovery"},
+		{"clear-recovery", "app", "other"},
+		{"clear-recovery", "app", "--forget", "other"},
+	} {
+		if err := runCommand(args, "unused"); err == nil || !strings.Contains(err.Error(), "requires one service name") {
+			t.Fatalf("%v: %v", args, err)
+		}
 	}
 }

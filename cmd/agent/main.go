@@ -59,10 +59,20 @@ func runClearRecovery(args []string, defaultConfigPath string) error {
 	if err := commandFlags.Parse(args); err != nil {
 		return err
 	}
-	if commandFlags.NArg() != 1 {
+	// Accept flags after the service name too, as in "clear-recovery app
+	// --forget": parsing stops at the first argument that is not a flag.
+	var services []string
+	for commandFlags.NArg() > 0 {
+		services = append(services, commandFlags.Arg(0))
+		if err := commandFlags.Parse(commandFlags.Args()[1:]); err != nil {
+			return err
+		}
+	}
+	if len(services) != 1 {
 		commandFlags.Usage()
 		return fmt.Errorf("clear-recovery requires one service name")
 	}
+	service := services[0]
 	cfg, err := agentconfig.LoadAgentConfig(*configPath)
 	if err != nil {
 		return fmt.Errorf("loading config: %w", err)
@@ -71,7 +81,7 @@ func runClearRecovery(args []string, defaultConfigPath string) error {
 	if *forget {
 		resolve = agent.ForgetRecovery
 	}
-	result, err := resolve(context.Background(), cfg.StateDir, commandFlags.Arg(0))
+	result, err := resolve(context.Background(), cfg.StateDir, service)
 	if err != nil {
 		return recoveryCommandError(result, err)
 	}
