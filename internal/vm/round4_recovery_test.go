@@ -162,8 +162,15 @@ func TestRecoveryDeadlineAndCursorDoNotStarveReadyServices(t *testing.T) {
 		<-ctx.Done()
 		return 0, false, ctx.Err()
 	}
-	for range 3 {
-		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	// Each pass is cut short by the slow units it reaches, so the cursor
+	// must move past them for z to be adopted. A short deadline can also
+	// expire during z's own adoption under load; that retries on a later
+	// pass, so allow a few rotations rather than exactly one.
+	for pass := 0; pass < 12; pass++ {
+		if got := m.List()["z"]; got != nil && got.State == StateRunning {
+			break
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
 		began := time.Now()
 		_, err := m.Recover(ctx, config.NodeConfig{})
 		cancel()

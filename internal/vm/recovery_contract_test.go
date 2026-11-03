@@ -167,3 +167,33 @@ func TestC1RefusalsKeepTheVMAndSayWhy(t *testing.T) {
 		})
 	}
 }
+
+// C3: when the recovery deadline expires while an adoption is being
+// persisted, the VM stays quarantined for a retry, and the reason says the
+// deadline expired rather than that the process changed.
+func TestAdoptionInterruptedByDeadlineSaysSoAndRetries(t *testing.T) {
+	m, f, i := recoveryFixture(t)
+	m.inspector = i
+	i.errors[f.PID] = errors.New("temporary process inspection failure")
+	if _, err := m.Recover(context.Background(), config.NodeConfig{}); err != nil {
+		t.Fatal(err)
+	}
+	delete(i.errors, f.PID)
+	ctx, cancel := context.WithCancel(context.Background())
+	m.recoveryManifestWriter = func(path string, manifest *instanceManifest) error {
+		cancel() // The deadline passes while the adoption record is written.
+		return writeManifest(path, manifest)
+	}
+	result, err := m.resolveRecovery(ctx, f.Service)
+	if err == nil || result.Outcome != RecoveryOutcomeAmbiguous || !strings.Contains(result.Message, "recovery deadline expired before the adopted process was revalidated") {
+		t.Fatalf("result=%#v err=%v", result, err)
+	}
+	m.recoveryManifestWriter = nil
+	if _, err := m.Recover(context.Background(), config.NodeConfig{}); err != nil {
+		t.Fatal(err)
+	}
+	stopAdoptedMonitors(t, m)
+	if got := m.List()[f.Service]; got == nil || got.State != StateRunning {
+		t.Fatalf("interrupted adoption did not retry: %#v", got)
+	}
+}

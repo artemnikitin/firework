@@ -356,13 +356,15 @@ func (m *Manager) resolveRecoveryAttempt(ctx context.Context, service string, fo
 		m.mu.Unlock()
 		return result, fmt.Errorf("persist recovery adoption for %s: %w", service, writeErr)
 	}
+	if err := ctx.Err(); err != nil {
+		// The revalidation could not finish, which says nothing about the
+		// process; the adoption is retried.
+		m.mu.Unlock()
+		return recoveryAmbiguous(result, fmt.Sprintf("recovery deadline expired before the adopted process was revalidated: %v", err))
+	}
 	if processErr != nil {
 		m.mu.Unlock()
 		return recoveryAmbiguous(result, fmt.Sprintf("process changed during adoption persistence: %v", processErr))
-	}
-	if err := ctx.Err(); err != nil {
-		m.mu.Unlock()
-		return recoveryAmbiguous(result, err.Error())
 	}
 	adopted := instanceFromManifest(&manifest, StateRunning, "")
 	if instance.startID != "" && manifest.Launcher == "direct" {
