@@ -254,7 +254,10 @@ Unix user. Pass `--config PATH` when the agent uses a nondefault config file.
 The command connects to `<state_dir>/control/recovery.sock`, which the agent
 creates with a private directory and owner-only socket permissions. The command
 rechecks the named service through the running manager, so memory and the
-ownership manifest change together.
+ownership manifest change together. When ownership cannot be proved, the
+command changes nothing and exits with an error naming why the service remains
+`recovery_pending`, such as a live process still using the VM's paths, and
+saying to resolve that and run the command again.
 
 The command re-adopts a VM only when the manifest, config hash, process identity,
 launch arguments, and API socket validate. Recovery retries transient failures

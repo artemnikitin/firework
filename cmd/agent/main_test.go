@@ -170,6 +170,10 @@ enable_capacity_check: false
 	if err == nil || !strings.Contains(string(output), "remains recovery_pending") {
 		t.Fatalf("command did not refuse the quarantined startup state after the initial reconciliation error: err=%v output=%s", err, output)
 	}
+	// A refusal says that nothing changed and what to do next.
+	if !strings.Contains(string(output), "the VM and its state were left unchanged") || !strings.Contains(string(output), "run the command again") {
+		t.Fatalf("refusal gives the operator no next step: %s", output)
+	}
 	command = exec.Command(os.Args[0], "-test.run=^TestClearRecoveryCommandHelper$")
 	command.Env = append(os.Environ(),
 		"FIREWORK_CLEAR_RECOVERY_HELPER=1",

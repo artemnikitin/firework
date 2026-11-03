@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"os"
+	"strings"
 	"testing"
 
 	"github.com/artemnikitin/firework/internal/config"
@@ -91,5 +92,78 @@ func TestC2SameEvidenceSameClassificationAtEveryEntryPoint(t *testing.T) {
 				}
 			})
 		}
+	}
+}
+
+// C1 and the command contract: every refusal leaves the quarantined VM and
+// its state untouched and tells the operator why, as "service S remains
+// recovery_pending: <reason>", with the reason also in the result.
+func TestC1RefusalsKeepTheVMAndSayWhy(t *testing.T) {
+	cases := map[string]struct {
+		apply  func(*testing.T, *Manager, *instanceManifest, *fakeProcessInspector)
+		forget bool
+		reason string
+	}{
+		"a live process still uses the VM paths": {apply: func(_ *testing.T, _ *Manager, f *instanceManifest, i *fakeProcessInspector) {
+			delete(i.identities, f.PID)
+			i.find = []processIdentity{{PID: 77}}
+		}, reason: "absence remains unproved: found 1 live process(es) using this service's VM socket or config paths"},
+		"the process table cannot be scanned": {apply: func(_ *testing.T, _ *Manager, f *instanceManifest, i *fakeProcessInspector) {
+			delete(i.identities, f.PID)
+			i.findErr = errors.New("host scan unavailable")
+		}, reason: "cannot scan for a live process using this VM state: host scan unavailable"},
+		"the durable identity changed": {apply: func(t *testing.T, _ *Manager, f *instanceManifest, _ *fakeProcessInspector) {
+			f.HostBootID, f.ProcessStart, f.ExecutableIno = "", 0, 0
+			if err := writeManifest(manifestPath(f.VMDir), f); err != nil {
+				t.Fatal(err)
+			}
+		}, reason: "in-memory and durable ownership identities do not match"},
+		"the live process's API socket is not ready": {apply: func(_ *testing.T, _ *Manager, _ *instanceManifest, i *fakeProcessInspector) {
+			i.socketErr = os.ErrNotExist
+		}, reason: "surviving process API socket is not ready"},
+		"forget of a VM not proven absent": {apply: func(*testing.T, *Manager, *instanceManifest, *fakeProcessInspector) {}, forget: true,
+			reason: "cannot forget a VM whose absence is unproved"},
+		"the ownership manifest is corrupt": {apply: func(t *testing.T, _ *Manager, f *instanceManifest, _ *fakeProcessInspector) {
+			if err := os.WriteFile(manifestPath(f.VMDir), []byte("{"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+		}, reason: "cannot read ownership manifest"},
+		"another verification is in progress": {apply: func(_ *testing.T, m *Manager, f *instanceManifest, _ *fakeProcessInspector) {
+			m.mu.Lock()
+			if m.recoveryReservations == nil {
+				m.recoveryReservations = map[string]bool{}
+			}
+			m.recoveryReservations[f.Service] = true
+			m.mu.Unlock()
+		}, reason: "recovery verification in progress"},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			m, f, i := recoveryFixture(t)
+			m.inspector = i
+			i.errors[f.PID] = errors.New("temporary process inspection failure")
+			if _, err := m.Recover(context.Background(), config.NodeConfig{}); err != nil {
+				t.Fatal(err)
+			}
+			delete(i.errors, f.PID)
+			tc.apply(t, m, f, i)
+			resolve := m.ClearRecoveryPending
+			if tc.forget {
+				resolve = m.ForgetRecoveryPending
+			}
+			result, err := resolve(f.Service)
+			if err == nil || result.Outcome != RecoveryOutcomeAmbiguous || result.State != StateRecoveryPending {
+				t.Fatalf("not refused: result=%#v err=%v", result, err)
+			}
+			if !strings.Contains(result.Message, tc.reason) || err.Error() != "service app remains recovery_pending: "+result.Message {
+				t.Fatalf("refusal does not say why: message=%q err=%q, want reason %q", result.Message, err, tc.reason)
+			}
+			if got := m.List()[f.Service]; got == nil || got.State != StateRecoveryPending {
+				t.Fatalf("refusal changed the quarantine: %#v", got)
+			}
+			if _, err := os.Stat(manifestPath(f.VMDir)); err != nil {
+				t.Fatalf("refusal removed VM state: %v", err)
+			}
+		})
 	}
 }

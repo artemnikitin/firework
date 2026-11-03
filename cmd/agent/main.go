@@ -72,6 +72,9 @@ func runClearRecovery(args []string, defaultConfigPath string) error {
 		resolve = agent.ForgetRecovery
 	}
 	result, err := resolve(context.Background(), cfg.StateDir, commandFlags.Arg(0))
+	if err != nil && result.Outcome == vm.RecoveryOutcomeAmbiguous {
+		return fmt.Errorf("%w\nthe VM and its state were left unchanged; resolve the reason above, for example by stopping a process that still uses the VM's paths or waiting for one to finish, then run the command again (--forget clears state only once the VM is proven absent)", err)
+	}
 	if err != nil {
 		return err
 	}
