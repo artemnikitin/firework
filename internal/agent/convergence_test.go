@@ -12,13 +12,18 @@ import (
 	"github.com/artemnikitin/firework/internal/vm"
 )
 
-// runtimeUsage sums what live VMs use between ticks.
+// runtimeUsage sums what live VMs use between ticks, including the hidden
+// size of a quarantined VM whose configuration the agent does not know.
 func runtimeUsage(m *recoveryTestVMManager) (vcpus, memoryMB int) {
-	for _, inst := range m.instances {
+	for name, inst := range m.instances {
 		switch inst.State {
 		case vm.StateRunning, vm.StateStarting, vm.StateStopping, vm.StateRecoveryPending:
 			vcpus += inst.Config.VCPUs
 			memoryMB += inst.Config.MemoryMB
+		}
+		if hidden, ok := m.hidden[name]; ok && inst.State == vm.StateRecoveryPending && inst.RecoveryConfigUnknown {
+			vcpus += hidden.VCPUs
+			memoryMB += hidden.MemoryMB
 		}
 	}
 	return vcpus, memoryMB

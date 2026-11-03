@@ -3,6 +3,7 @@ package agent
 import (
 	"context"
 	"fmt"
+	"maps"
 	"math/rand"
 	"slices"
 	"strings"
@@ -59,8 +60,9 @@ func generatedRevision(r *rand.Rand) []generatedService {
 }
 
 // Random revisions over both update strategies, with crashed and stopped VMs,
-// a VM still starting or stopping, and a quarantined survivor, each resolving
-// after a few ticks, on a tight node and on one with headroom. No start may
+// a VM still starting or stopping, and a quarantined survivor that may be
+// desired and whose configuration may be unknown, each resolving after a few
+// ticks, on a tight node and on one with headroom. No start may
 // take capacity that is not free at that moment (C7). A revision with
 // transition headroom, where every service fits at the larger of its old and
 // new size, must converge within a bounded number of ticks once the
@@ -81,6 +83,11 @@ func TestRandomRevisionsConvergeWithinCapacity(t *testing.T) {
 		roomy := seed >= seeds
 		r := rand.New(rand.NewSource(seed % seeds))
 		from, to := generatedRevision(r), generatedRevision(r)
+		// A quarantined survivor may be desired, with a configuration known or
+		// unknown to the agent, and resolves by going away or by adoption,
+		// after its configuration is restored if it was unknown.
+		qWanted, qUnknown, qAdopt := r.Intn(2) == 0, r.Intn(2) == 0, r.Intn(2) == 0
+		qDesired := generatedService{"q", 1 + r.Intn(2), []int{256, 512}[r.Intn(2)], 1111}
 		need := map[string][2]int{}
 		for _, s := range append(slices.Clone(from), to...) {
 			need[s.name] = [2]int{max(need[s.name][0], s.vcpus), max(need[s.name][1], s.mem)}
@@ -91,9 +98,8 @@ func TestRandomRevisionsConvergeWithinCapacity(t *testing.T) {
 		}
 		capVCPUs, capMemoryMB := generatedVCPUs, generatedMemoryMB
 		if roomy {
-			capVCPUs, capMemoryMB = max(capVCPUs, needVCPUs+2), max(capMemoryMB, needMemory+256)
+			capVCPUs, capMemoryMB = max(capVCPUs, needVCPUs+2), max(capMemoryMB, needMemory+512)
 		}
-		headroom := needVCPUs <= capVCPUs && needMemory <= capMemoryMB
 		strategy := ""
 		if r.Intn(2) == 0 {
 			strategy = "rolling"
@@ -135,21 +141,47 @@ func TestRandomRevisionsConvergeWithinCapacity(t *testing.T) {
 		// live VM, so an overcommit present before the revision is not its doing.
 		quarantineTicks := -1
 		usedVCPUs, usedMemory := runtimeUsage(m)
+		var qConfig config.ServiceConfig
 		if r.Intn(3) == 0 && usedVCPUs < capVCPUs && usedMemory+256 <= capMemoryMB {
 			quarantineTicks = 1 + r.Intn(3)
-			m.instances["q"] = &vm.Instance{Name: "q", State: vm.StateRecoveryPending, Config: config.ServiceConfig{
-				Name: "q", VCPUs: min(1+r.Intn(2), capVCPUs-usedVCPUs), MemoryMB: 256,
+			qConfig = config.ServiceConfig{
+				Name: "q", Image: "/q", Kernel: "/k", VCPUs: min(1+r.Intn(2), capVCPUs-usedVCPUs), MemoryMB: 256,
 				PortForwards: []config.PortForward{{HostPort: []int{5050, 6060, 7070, 8080, 9090, 1111}[r.Intn(6)], VMPort: 80}},
 				Network:      &config.NetworkConfig{GuestIP: "172.16.0.6", GuestMAC: guestMACForIndex(4)},
-			}}
+			}
+			q := &vm.Instance{Name: "q", State: vm.StateRecoveryPending, Config: qConfig}
+			if qUnknown {
+				q.Config, q.RecoveryConfigUnknown = config.ServiceConfig{Name: "q"}, true
+				m.hidden = map[string]capacity.NodeCapacity{"q": {VCPUs: qConfig.VCPUs, MemoryMB: qConfig.MemoryMB}}
+			}
+			m.instances["q"] = q
 		}
+		if quarantineTicks < 0 {
+			qWanted, qUnknown, qAdopt = false, false, false
+		}
+		if qWanted {
+			to = append(slices.Clone(to), qDesired)
+			needVCPUs += max(qConfig.VCPUs, qDesired.vcpus)
+			needMemory += max(qConfig.MemoryMB, qDesired.mem)
+		}
+		headroom := needVCPUs <= capVCPUs && needMemory <= capMemoryMB
 		store.revision = "r2"
 		store.data["web"] = generatedYAML(to)
 		var problem string
 		appliedAt := -1 // the tick that applied the revision while quarantined
-		for tick := 0; tick < len(from)+len(to)+3+lifecycleTicks && problem == ""; tick++ {
-			if tick == quarantineTicks {
-				delete(m.instances, "q")
+		for tick := 0; tick < len(from)+len(to)+5+lifecycleTicks && problem == ""; tick++ {
+			if q := m.instances["q"]; q != nil && tick == quarantineTicks {
+				// Resolve it as clear-recovery does: change the runtime, then
+				// apply the recovery wake, which forces the next tick.
+				delete(m.hidden, "q")
+				if qAdopt {
+					q.Config, q.RecoveryConfigUnknown, q.State = qConfig, false, vm.StateRunning
+					a.reconciler.MarkRecovered("q")
+				} else {
+					delete(m.instances, "q")
+					a.reconciler.ForgetRecovered("q")
+				}
+				a.forceReconcile = true
 			}
 			if inst := m.instances[lifecycle]; inst != nil && tick == lifecycleTicks {
 				if inst.State == vm.StateStarting {
@@ -167,7 +199,7 @@ func TestRandomRevisionsConvergeWithinCapacity(t *testing.T) {
 				problem = fmt.Sprintf("tick %d: %v", tick, m.overcommits)
 			}
 			vms := conditionOf(a.agentStatusSnapshot(), "VMsReconciled")
-			_, quarantined := m.instances["q"]
+			quarantined := m.instances["q"] != nil && m.instances["q"].State == vm.StateRecoveryPending
 			idle := actions == len(m.startCalls)+len(m.removeCalls)
 			// Every desired service already runs at least its desired size, so
 			// nothing waits for capacity.
@@ -215,13 +247,13 @@ func TestRandomRevisionsConvergeWithinCapacity(t *testing.T) {
 		}
 		if problem != "" {
 			failures++
-			t.Errorf("seed %d roomy=%v strategy=%q quarantine=%d lifecycle=%s/%d from=%v to=%v: %s", seed%seeds, roomy, strategy, quarantineTicks, lifecycle, lifecycleTicks, from, to, problem)
+			t.Errorf("seed %d roomy=%v strategy=%q quarantine=%d (desired=%v unknown=%v adopted=%v) lifecycle=%s/%d from=%v to=%v: %s", seed%seeds, roomy, strategy, quarantineTicks, qWanted, qUnknown, qAdopt, lifecycle, lifecycleTicks, from, to, problem)
 		}
 	}
 }
 
 // One tick from any mix of running, starting, stopping, crashed and
-// quarantined VMs, with sizes and host ports moving between services, ends
+// quarantined VMs, known or of unknown configuration, with sizes and host ports moving between services, ends
 // within capacity whenever the node started within it and the apply succeeds.
 // Holds feed back into admission through the claims of held VMs, so this
 // checks that admission settles on the holds it installs.
@@ -244,6 +276,17 @@ func TestRandomTickEndsWithinCapacity(t *testing.T) {
 			}
 		}
 		manager := &recoveryTestVMManager{instances: instances, limit: &capacity.NodeCapacity{VCPUs: capVCPUs, MemoryMB: capMemoryMB}}
+		// A quarantined VM's configuration may be unknown to the agent while
+		// its process still uses what it was given.
+		for _, name := range slices.Sorted(maps.Keys(instances)) {
+			if inst := instances[name]; inst.State == vm.StateRecoveryPending && r.Intn(2) == 0 {
+				if manager.hidden == nil {
+					manager.hidden = map[string]capacity.NodeCapacity{}
+				}
+				manager.hidden[name] = capacity.NodeCapacity{VCPUs: inst.Config.VCPUs, MemoryMB: inst.Config.MemoryMB}
+				inst.Config, inst.RecoveryConfigUnknown = config.ServiceConfig{Name: name}, true
+			}
+		}
 		if vcpus, mem := runtimeUsage(manager); vcpus > capVCPUs || mem > capMemoryMB {
 			continue
 		}
@@ -273,7 +316,11 @@ func TestRandomTickEndsWithinCapacity(t *testing.T) {
 func describeInstances(instances map[string]*vm.Instance) []string {
 	var out []string
 	for _, name := range []string{"a", "b", "c", "d", "e"} {
-		if inst := instances[name]; inst != nil {
+		switch inst := instances[name]; {
+		case inst == nil:
+		case inst.RecoveryConfigUnknown:
+			out = append(out, fmt.Sprintf("%s:%s:unknown", name, inst.State))
+		default:
 			out = append(out, fmt.Sprintf("%s:%s:%d/%d:%d", name, inst.State, inst.Config.VCPUs, inst.Config.MemoryMB, inst.Config.PortForwards[0].HostPort))
 		}
 	}

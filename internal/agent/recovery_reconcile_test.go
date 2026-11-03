@@ -106,6 +106,9 @@ type recoveryTestVMManager struct {
 	// pending is the usage before the last Remove or Stop. A replacement or
 	// restart starts the same service right after, completing that operation.
 	pending *pendingStart
+	// hidden is the size a quarantined VM of unknown configuration really
+	// uses: the agent sees no size for it, but the node's usage includes it.
+	hidden map[string]capacity.NodeCapacity
 	// startHook runs before a start takes effect, to change the runtime
 	// mid-tick as a health restart or a lifecycle transition would. An error
 	// fails the start. removeHook does the same for a removal, which keeps
