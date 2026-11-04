@@ -296,7 +296,8 @@ func (m *Manager) resolveRecoveryAttempt(ctx context.Context, service string, fo
 		m.mu.Lock()
 		if !m.isCurrentRecoveryInstanceLocked(service, instance, instanceID, &initialManifest) {
 			m.mu.Unlock()
-			return recoveryAmbiguous(result, "ownership changed during reconstruction persistence")
+			// The reconstructed identity may already be on disk.
+			return recoveryIncomplete(result, fmt.Errorf("service %s: ownership changed during reconstruction persistence", service))
 		}
 		instance.manifest = snapshot
 		instance.PID = snapshot.PID
@@ -342,7 +343,9 @@ func (m *Manager) resolveRecoveryAttempt(ctx context.Context, service string, fo
 	m.mu.Lock()
 	if !m.isCurrentRecoveryInstanceLocked(service, instance, instanceID, &initialManifest) {
 		m.mu.Unlock()
-		return recoveryAmbiguous(result, "service ownership changed during adoption persistence")
+		// From here on the adoption record may already be on disk, so a
+		// failure is incomplete rather than a refusal that changed nothing.
+		return recoveryIncomplete(result, fmt.Errorf("service %s: ownership changed during adoption persistence", service))
 	}
 	instance.manifest = snapshot
 	instance.PID = snapshot.PID
@@ -354,11 +357,11 @@ func (m *Manager) resolveRecoveryAttempt(ctx context.Context, service string, fo
 		// The revalidation could not finish, which says nothing about the
 		// process; the adoption is retried.
 		m.mu.Unlock()
-		return recoveryAmbiguous(result, fmt.Sprintf("recovery deadline expired before the adopted process was revalidated: %v", err))
+		return recoveryIncomplete(result, fmt.Errorf("service %s: recovery deadline expired before the adopted process was revalidated: %w", service, err))
 	}
 	if processErr != nil {
 		m.mu.Unlock()
-		return recoveryAmbiguous(result, fmt.Sprintf("process changed during adoption persistence: %v", processErr))
+		return recoveryIncomplete(result, fmt.Errorf("service %s: process changed during adoption persistence: %w", service, processErr))
 	}
 	adopted := instanceFromManifest(&manifest, StateRunning, "")
 	if instance.startID != "" && manifest.Launcher == "direct" {

@@ -198,7 +198,9 @@ func TestAdoptionInterruptedByDeadlineSaysSoAndRetries(t *testing.T) {
 		return writeManifest(path, manifest)
 	}
 	result, err := m.resolveRecovery(ctx, f.Service)
-	if err == nil || result.Outcome != RecoveryOutcomeAmbiguous || !strings.Contains(result.Message, "recovery deadline expired before the adopted process was revalidated") {
+	// C3: the adoption record was written, so the outcome must not claim that
+	// nothing changed.
+	if err == nil || result.Outcome != RecoveryOutcomeIncomplete || !strings.Contains(result.Message, "recovery deadline expired before the adopted process was revalidated") {
 		t.Fatalf("result=%#v err=%v", result, err)
 	}
 	m.recoveryManifestWriter = nil
@@ -208,6 +210,51 @@ func TestAdoptionInterruptedByDeadlineSaysSoAndRetries(t *testing.T) {
 	stopAdoptedMonitors(t, m)
 	if got := m.List()[f.Service]; got == nil || got.State != StateRunning {
 		t.Fatalf("interrupted adoption did not retry: %#v", got)
+	}
+}
+
+// C3: once the adoption record has been written, every failure that follows
+// reports an incomplete outcome, so the CLI never says that nothing changed
+// or suggests stopping a VM it has just validated. The VM stays quarantined
+// and a later retry adopts it.
+func TestC3FailuresAfterTheAdoptionWriteAreIncomplete(t *testing.T) {
+	for name, tc := range map[string]struct {
+		duringWrite func(*Manager, *instanceManifest, *fakeProcessInspector)
+		message     string
+	}{
+		"process changed": {
+			func(_ *Manager, f *instanceManifest, i *fakeProcessInspector) {
+				i.errors[f.PID] = errors.New("process inspection failed")
+			},
+			"process changed during adoption persistence",
+		},
+		"ownership changed": {
+			func(m *Manager, f *instanceManifest, _ *fakeProcessInspector) {
+				m.mu.Lock()
+				replaced := *m.instances[f.Service]
+				m.instances[f.Service] = &replaced
+				m.mu.Unlock()
+			},
+			"ownership changed during adoption persistence",
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			m, f, i := recoveryFixture(t)
+			m.inspector = i
+			i.errors[f.PID] = errors.New("temporary process inspection failure")
+			if _, err := m.Recover(context.Background(), config.NodeConfig{}); err != nil {
+				t.Fatal(err)
+			}
+			delete(i.errors, f.PID)
+			m.recoveryManifestWriter = func(path string, manifest *instanceManifest) error {
+				tc.duringWrite(m, f, i)
+				return writeManifest(path, manifest)
+			}
+			result, err := m.resolveRecovery(context.Background(), f.Service)
+			if err == nil || result.Outcome != RecoveryOutcomeIncomplete || !strings.Contains(result.Message, tc.message) {
+				t.Fatalf("result=%#v err=%v", result, err)
+			}
+		})
 	}
 }
 
