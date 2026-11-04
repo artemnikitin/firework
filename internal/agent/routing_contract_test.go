@@ -7,6 +7,8 @@ import (
 
 	"github.com/artemnikitin/firework/internal/capacity"
 	"github.com/artemnikitin/firework/internal/config"
+	netpkg "github.com/artemnikitin/firework/internal/network"
+	"github.com/artemnikitin/firework/internal/network/networktest"
 	"github.com/artemnikitin/firework/internal/reconciler"
 	"github.com/artemnikitin/firework/internal/traefik"
 	"github.com/artemnikitin/firework/internal/vm"
@@ -29,6 +31,7 @@ func TestC4DepartedAddressIsNotReassigned(t *testing.T) {
 			"zeta": {Name: "zeta", Config: zeta, State: vm.StateRunning},
 		}, "172.16.0.0/24")
 		network := &recoveryTestNetworkManager{teardownErr: errors.New("iptables: resource temporarily unavailable")}
+		network.kernel.Append(networktest.Rule(netpkg.PortForwardTag("zeta"), 8080, "172.16.0.2", 80)) // zeta's VM left its rule installed.
 		a.reconciler = reconciler.NewWithNetworkManager(m, testLogger(), nil, network, "", 0)
 		a.tick(context.Background()) // zeta is removed; its rule's teardown fails and stays journalled.
 		if m.instances["zeta"] != nil || a.reconciler.PendingTeardownGuestIPs()["172.16.0.2"] != "zeta" {

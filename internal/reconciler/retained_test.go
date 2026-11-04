@@ -110,6 +110,7 @@ func TestLifecycleTransitionDoesNotEnterPlanOrLoseCleanupIntent(t *testing.T) {
 			network := &fakeNetworkManager{}
 			r, manager := newNetworkTestReconciler(network)
 			service := forwardedService("app")
+			network.installRules(service)
 			manager.instances[service.Name] = &vm.Instance{Name: service.Name, Config: service, State: state}
 			if err := r.journalIntendedTeardowns(service); err != nil {
 				t.Fatal(err)
@@ -145,6 +146,8 @@ func TestUnknownRuntimeClaimsHoldMutationsAndCleanupUntilResolved(t *testing.T) 
 	old := forwardedService("old")
 	old.Network = &config.NetworkConfig{GuestIP: "172.16.0.3"}
 	manager.instances[old.Name] = &vm.Instance{Name: old.Name, Config: old, State: vm.StateRunning}
+	network.installRules(old)
+	network.installRules(forwardedService("gone"))
 	kept := forwardedService("kept")
 	kept.Network = &config.NetworkConfig{GuestIP: "172.16.0.4"}
 	kept.PortForwards = []config.PortForward{{HostPort: 9090, VMPort: 90}}

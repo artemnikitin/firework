@@ -10,6 +10,8 @@ import (
 	"github.com/artemnikitin/firework/internal/capacity"
 	"github.com/artemnikitin/firework/internal/config"
 	"github.com/artemnikitin/firework/internal/healthcheck"
+	"github.com/artemnikitin/firework/internal/network"
+	"github.com/artemnikitin/firework/internal/network/networktest"
 	"github.com/artemnikitin/firework/internal/reconciler"
 	"github.com/artemnikitin/firework/internal/vm"
 )
@@ -200,6 +202,7 @@ type recoveryTestNetworkManager struct {
 	setupErr        error
 	// teardownErr fails every port-forward teardown while set.
 	teardownErr error
+	kernel      networktest.Kernel
 }
 
 func (m *recoveryTestNetworkManager) Setup(service config.ServiceConfig) error {
@@ -213,13 +216,20 @@ func (*recoveryTestNetworkManager) DeleteTAP(string) error { return nil }
 
 func (*recoveryTestNetworkManager) DeleteBridge(string) error { return nil }
 
-func (m *recoveryTestNetworkManager) SetupPortForward(hostPort int, _ string, _ int) error {
+func (m *recoveryTestNetworkManager) SetupPortForward(service string, hostPort int, guestIP string, vmPort int) error {
 	m.portForwardCall = append(m.portForwardCall, hostPort)
-	return nil
+	return m.kernel.SetupPortForward(service, hostPort, guestIP, vmPort)
 }
 
-func (m *recoveryTestNetworkManager) TeardownPortForward(int, string, int) error {
-	return m.teardownErr
+func (m *recoveryTestNetworkManager) ListPortForwards() (network.PortForwardListing, error) {
+	return m.kernel.ListPortForwards()
+}
+
+func (m *recoveryTestNetworkManager) DeletePortForwardRule(rule network.PortForwardRule) error {
+	if m.teardownErr != nil {
+		return m.teardownErr
+	}
+	return m.kernel.DeletePortForwardRule(rule)
 }
 
 func TestClearedRemovedServiceDropsHealthProbe(t *testing.T) {

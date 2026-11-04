@@ -6,6 +6,7 @@ import (
 
 	"github.com/artemnikitin/firework/internal/config"
 	"github.com/artemnikitin/firework/internal/healthcheck"
+	"github.com/artemnikitin/firework/internal/network"
 	"github.com/artemnikitin/firework/internal/reconciler"
 	"github.com/artemnikitin/firework/internal/vm"
 )
@@ -52,9 +53,9 @@ func (r *recordingNetwork) DeleteTAP(name string) error {
 	return nil
 }
 
-func (r *recordingNetwork) TeardownPortForward(hostPort int, _ string, _ int) error {
-	r.tornDownHostPorts = append(r.tornDownHostPorts, hostPort)
-	return nil
+func (r *recordingNetwork) DeletePortForwardRule(rule network.PortForwardRule) error {
+	r.tornDownHostPorts = append(r.tornDownHostPorts, rule.HostPort)
+	return r.fakeNetwork.DeletePortForwardRule(rule)
 }
 
 const runningAPIConfig = `node: web

@@ -49,6 +49,7 @@ func TestRecoveryTeardownCleansOldConfigAndProtectsReplacementClaims(t *testing.
 	replacement.PortForwards = []config.PortForward{{HostPort: 9090, VMPort: 90}, {HostPort: 8081, VMPort: 80}}
 	manager := &teardownVMManager{fakeVMManager: newFakeVMManager()}
 	network := &fakeNetworkManager{}
+	network.installRules(old)
 	r := newRecoveryTeardownReconciler(t, manager, network, t.TempDir())
 	if err := manager.clearRecovery(old); err != nil {
 		t.Fatal(err)
@@ -75,6 +76,7 @@ func TestRecoveryTeardownJournalFailurePreservesRuntimeAndRetriesAfterRestart(t 
 	manager := &teardownVMManager{fakeVMManager: newFakeVMManager()}
 	manager.instances[old.Name] = &vm.Instance{Name: old.Name, Config: old, State: vm.StateRecoveryPending}
 	network := &fakeNetworkManager{teardownForwardErr: errors.New("iptables unavailable"), teardownErr: errors.New("device busy")}
+	network.installRules(old)
 	r := newRecoveryTeardownReconciler(t, manager, network, stateDir)
 	if err := os.Remove(stateDir); err != nil {
 		t.Fatal(err)
@@ -161,6 +163,7 @@ func TestRecoveryCleanupIntentSurvivesPartialRemovalAndRestart(t *testing.T) {
 	manager := &teardownVMManager{fakeVMManager: newFakeVMManager()}
 	stateDir := t.TempDir()
 	network := &fakeNetworkManager{}
+	network.installRules(old)
 	r := newRecoveryTeardownReconciler(t, manager, network, stateDir)
 	if err := manager.record(old); err != nil {
 		t.Fatal(err)

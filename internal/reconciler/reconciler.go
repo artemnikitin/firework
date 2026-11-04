@@ -67,8 +67,13 @@ type NetworkManager interface {
 	// guarded by the claimant checks in the retry paths.
 	DeleteTAP(name string) error
 	DeleteBridge(name string) error
-	SetupPortForward(hostPort int, guestIP string, vmPort int) error
-	TeardownPortForward(hostPort int, guestIP string, vmPort int) error
+	// SetupPortForward installs the service's tagged DNAT rules.
+	SetupPortForward(service string, hostPort int, guestIP string, vmPort int) error
+	// ListPortForwards lists the host's DNAT rules. The kernel's list, not
+	// any record, is the inventory of what can deliver traffic.
+	ListPortForwards() (network.PortForwardListing, error)
+	// DeletePortForwardRule deletes exactly one listed rule.
+	DeletePortForwardRule(network.PortForwardRule) error
 }
 
 // Reconciler compares desired state from the config store with the actual
@@ -455,7 +460,7 @@ func (r *Reconciler) persistPendingTeardownsLocked() error {
 
 // logPersistFailure reports a journal write that failed while merely clearing
 // entries whose cleanup already succeeded. That is not fatal: every host
-// operation the journal drives (DeleteTAP, DeleteBridge, TeardownPortForward)
+// operation the journal drives (DeleteTAP, DeleteBridge, port-forward teardown)
 // is idempotent, so a stale entry surviving to the next tick costs one
 // redundant delete and nothing else. errJournalCorrupt is filtered out
 // because Reconcile already surfaces that condition on every single tick.
@@ -943,7 +948,7 @@ func (r *Reconciler) syncPortForwards(desired config.NodeConfig) error {
 			continue
 		}
 		for _, pf := range svc.PortForwards {
-			if err := r.networkMgr.SetupPortForward(pf.HostPort, svc.Network.GuestIP, pf.VMPort); err != nil {
+			if err := r.networkMgr.SetupPortForward(svc.Name, pf.HostPort, svc.Network.GuestIP, pf.VMPort); err != nil {
 				errs = append(errs, stageError(FailureStageNetwork,
 					fmt.Errorf("port forward %d -> %s:%d for %s: %w",
 						pf.HostPort, svc.Network.GuestIP, pf.VMPort, svc.Name, err)))
@@ -985,7 +990,7 @@ func (r *Reconciler) restoreRecovered(ctx context.Context, desired config.NodeCo
 			if service.Network != nil {
 				failed := false
 				for _, forward := range service.PortForwards {
-					if err := r.networkMgr.SetupPortForward(forward.HostPort, service.Network.GuestIP, forward.VMPort); err != nil {
+					if err := r.networkMgr.SetupPortForward(service.Name, forward.HostPort, service.Network.GuestIP, forward.VMPort); err != nil {
 						errs = append(errs, stageError(FailureStageNetwork, fmt.Errorf("restore port forward for adopted %s: %w", name, err)))
 						failed = true
 					}
@@ -1070,7 +1075,7 @@ func (r *Reconciler) createService(ctx context.Context, svc config.ServiceConfig
 	// retried and surfaced there instead of being lost here.
 	if r.networkMgr != nil && svc.Network != nil && len(svc.PortForwards) > 0 {
 		for _, pf := range svc.PortForwards {
-			if err := r.networkMgr.SetupPortForward(pf.HostPort, svc.Network.GuestIP, pf.VMPort); err != nil {
+			if err := r.networkMgr.SetupPortForward(svc.Name, pf.HostPort, svc.Network.GuestIP, pf.VMPort); err != nil {
 				r.logger.Warn("failed to setup port forward; will be retried by port-forward sync",
 					"service", svc.Name, "host_port", pf.HostPort, "error", err)
 			}
@@ -1257,7 +1262,7 @@ func (r *Reconciler) teardownAndTrackPortForwards(svc config.ServiceConfig, pfs 
 	var errs []error
 	for _, pf := range pfs {
 		key := portForwardKey{pf.HostPort, svc.Network.GuestIP, pf.VMPort}
-		if err := r.networkMgr.TeardownPortForward(pf.HostPort, svc.Network.GuestIP, pf.VMPort); err != nil {
+		if err := r.teardownPortForward(key); err != nil {
 			r.pendingPortForwards[key] = pendingPortForward{ServiceName: svc.Name, GuestIP: svc.Network.GuestIP, PortForward: pf}
 			errs = append(errs, stageError(FailureStageNetwork,
 				fmt.Errorf("teardown port forward %d for %s: %w", pf.HostPort, svc.Name, err)))
@@ -1294,6 +1299,26 @@ func (r *Reconciler) teardownAndTrackNetwork(svc config.ServiceConfig) error {
 	return combineErrors(errs)
 }
 
+// teardownPortForward deletes every listed rule forwarding key's host port to
+// its guest, whichever host address, interface or tag it was installed with,
+// so a rule from before a host IP change or an upgrade goes too. Listing
+// first means a failure to read the chain is never mistaken for "no rule".
+func (r *Reconciler) teardownPortForward(key portForwardKey) error {
+	listing, err := r.networkMgr.ListPortForwards()
+	if err != nil {
+		return err
+	}
+	var errs []error
+	for _, rule := range listing.Rules {
+		if rule.Targets(key.hostPort, key.guestIP, key.vmPort) {
+			if err := r.networkMgr.DeletePortForwardRule(rule); err != nil {
+				errs = append(errs, err)
+			}
+		}
+	}
+	return errors.Join(errs...)
+}
+
 // deleteNetworkDevice removes one host network device by its identity.
 func (r *Reconciler) deleteNetworkDevice(dev networkDeviceKey) error {
 	if dev.kind == networkDeviceBridge {
@@ -1302,8 +1327,8 @@ func (r *Reconciler) deleteNetworkDevice(dev networkDeviceKey) error {
 	return r.networkMgr.DeleteTAP(dev.name)
 }
 
-// portForwardKey identifies a single DNAT rule the way TeardownPortForward
-// and SetupPortForward actually key it: by (hostPort, guestIP, vmPort), not
+// portForwardKey identifies a single port forward the way teardownPortForward
+// and SetupPortForward key it: by (hostPort, guestIP, vmPort), not
 // by service name. Two different service configs sharing a name across an
 // update can still have entirely distinct rules under this key.
 type portForwardKey struct {
@@ -1406,7 +1431,7 @@ func (r *Reconciler) retryPendingPortForwards() error {
 			changed = true
 			continue
 		}
-		if err := r.networkMgr.TeardownPortForward(key.hostPort, key.guestIP, key.vmPort); err != nil {
+		if err := r.teardownPortForward(key); err != nil {
 			r.logger.Warn("port forward teardown still pending, will retry next tick",
 				"service", entry.ServiceName, "host_port", key.hostPort, "error", err)
 			errs = append(errs, stageError(FailureStageNetwork,

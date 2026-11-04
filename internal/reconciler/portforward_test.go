@@ -11,6 +11,8 @@ import (
 	"testing"
 
 	"github.com/artemnikitin/firework/internal/config"
+	"github.com/artemnikitin/firework/internal/network"
+	"github.com/artemnikitin/firework/internal/network/networktest"
 	"github.com/artemnikitin/firework/internal/vm"
 )
 
@@ -32,6 +34,16 @@ type fakeNetworkManager struct {
 	// succeed normally. Keyed by device name, which is unique across taps and
 	// bridges (tap-* / br-* by construction).
 	deleteErrByDevice map[string]error
+	// kernel holds the rules the fake has installed. A restarted reconciler
+	// shares it, as a restarted agent shares the host.
+	kernel *networktest.Kernel
+}
+
+func (f *fakeNetworkManager) host() *networktest.Kernel {
+	if f.kernel == nil {
+		f.kernel = &networktest.Kernel{}
+	}
+	return f.kernel
 }
 
 func (f *fakeNetworkManager) Setup(config.ServiceConfig) error { return nil }
@@ -62,17 +74,36 @@ func (f *fakeNetworkManager) DeleteBridge(name string) error {
 	return f.teardownErr
 }
 
-func (f *fakeNetworkManager) SetupPortForward(hostPort int, _ string, _ int) error {
+func (f *fakeNetworkManager) SetupPortForward(service string, hostPort int, guestIP string, vmPort int) error {
 	f.setupForwardCalls = append(f.setupForwardCalls, hostPort)
-	return f.setupForwardErr
+	if f.setupForwardErr != nil {
+		return f.setupForwardErr
+	}
+	return f.host().SetupPortForward(service, hostPort, guestIP, vmPort)
 }
 
-func (f *fakeNetworkManager) TeardownPortForward(hostPort int, _ string, _ int) error {
-	f.teardownForwardCalls = append(f.teardownForwardCalls, hostPort)
-	if err, ok := f.teardownForwardErrByPort[hostPort]; ok {
+func (f *fakeNetworkManager) ListPortForwards() (network.PortForwardListing, error) {
+	return f.host().ListPortForwards()
+}
+
+// DeletePortForwardRule records one teardown attempt per listed rule.
+func (f *fakeNetworkManager) DeletePortForwardRule(rule network.PortForwardRule) error {
+	f.teardownForwardCalls = append(f.teardownForwardCalls, rule.HostPort)
+	if err, ok := f.teardownForwardErrByPort[rule.HostPort]; ok {
 		return err
 	}
-	return f.teardownForwardErr
+	if f.teardownForwardErr != nil {
+		return f.teardownForwardErr
+	}
+	return f.host().DeletePortForwardRule(rule)
+}
+
+// installRules puts svc's tagged rules on the fake host, as a VM that ran
+// before this reconciler started would have left them.
+func (f *fakeNetworkManager) installRules(svc config.ServiceConfig) {
+	for _, pf := range svc.PortForwards {
+		f.host().Append(networktest.Rule(network.PortForwardTag(svc.Name), pf.HostPort, svc.Network.GuestIP, pf.VMPort))
+	}
 }
 
 func forwardedService(name string) config.ServiceConfig {
@@ -596,7 +627,7 @@ func TestWithStateDir_PersistsPendingTeardownAcrossRestart(t *testing.T) {
 	// already gone before the crash — only the host cleanup was pending),
 	// pointed at the same state dir. It must load the persisted entry rather
 	// than starting with nothing to retry.
-	net2 := &fakeNetworkManager{}
+	net2 := &fakeNetworkManager{kernel: net1.host()}
 	r2 := NewWithNetworkManager(newFakeVMManager(), logger, nil, net2, "", 0).WithStateDir(dir)
 	if err := r2.Reconcile(context.Background(), config.NodeConfig{Node: "node-1"}); err != nil {
 		t.Fatalf("restarted reconciler should have converged once the persisted teardown succeeded: %v", err)

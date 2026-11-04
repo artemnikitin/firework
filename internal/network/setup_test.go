@@ -120,7 +120,6 @@ func TestPortForwardSpecsAreScopedToGuestDestination(t *testing.T) {
 	specs := map[string][]string{
 		"scoped":  scopedPortForwardSpec("enp3s0", "10.0.100.91", 9200, "172.16.0.6", 9200),
 		"hairpin": hairpinPortForwardSpec("br0", "10.0.100.91", 9200, "172.16.0.6", 9200),
-		"legacy":  legacyPortForwardSpec(9200, "172.16.0.6", 9200),
 	}
 	for name, spec := range specs {
 		got := strings.Join(spec, " ")

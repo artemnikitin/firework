@@ -9,20 +9,30 @@ import (
 	"testing"
 
 	"github.com/artemnikitin/firework/internal/config"
+	"github.com/artemnikitin/firework/internal/network"
+	"github.com/artemnikitin/firework/internal/network/networktest"
 	"github.com/artemnikitin/firework/internal/vm"
 )
 
 // forwardRecorder records the guest each host port is forwarded to.
-type forwardRecorder struct{ forwards []string }
+type forwardRecorder struct {
+	forwards []string
+	kernel   networktest.Kernel
+}
 
 func (n *forwardRecorder) Setup(config.ServiceConfig) error { return nil }
 func (n *forwardRecorder) DeleteTAP(string) error           { return nil }
 func (n *forwardRecorder) DeleteBridge(string) error        { return nil }
-func (n *forwardRecorder) SetupPortForward(hostPort int, guestIP string, vmPort int) error {
+func (n *forwardRecorder) SetupPortForward(service string, hostPort int, guestIP string, vmPort int) error {
 	n.forwards = append(n.forwards, fmt.Sprintf("%d->%s:%d", hostPort, guestIP, vmPort))
-	return nil
+	return n.kernel.SetupPortForward(service, hostPort, guestIP, vmPort)
 }
-func (n *forwardRecorder) TeardownPortForward(int, string, int) error { return nil }
+func (n *forwardRecorder) ListPortForwards() (network.PortForwardListing, error) {
+	return n.kernel.ListPortForwards()
+}
+func (n *forwardRecorder) DeletePortForwardRule(rule network.PortForwardRule) error {
+	return n.kernel.DeletePortForwardRule(rule)
+}
 
 func heldClaimsLogger() *slog.Logger { return slog.New(slog.NewTextHandler(io.Discard, nil)) }
 

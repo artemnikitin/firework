@@ -15,6 +15,8 @@ import (
 	"github.com/artemnikitin/firework/internal/agentconfig"
 	"github.com/artemnikitin/firework/internal/capacity"
 	"github.com/artemnikitin/firework/internal/config"
+	"github.com/artemnikitin/firework/internal/network"
+	"github.com/artemnikitin/firework/internal/network/networktest"
 	"github.com/artemnikitin/firework/internal/reconciler"
 	"github.com/artemnikitin/firework/internal/statusmodel"
 	"github.com/artemnikitin/firework/internal/vm"
@@ -950,19 +952,28 @@ func (r *runningVMManager) Remove(string) error                               { 
 type fakeNetwork struct {
 	setupForwardCalls []int
 	setupForwardErr   error
+	kernel            networktest.Kernel
 }
 
 func (f *fakeNetwork) Setup(config.ServiceConfig) error    { return nil }
 func (f *fakeNetwork) Teardown(config.ServiceConfig) error { return nil }
 func (f *fakeNetwork) DeleteTAP(string) error              { return nil }
 func (f *fakeNetwork) DeleteBridge(string) error           { return nil }
-func (f *fakeNetwork) TeardownPortForward(int, string, int) error {
-	return nil
+
+func (f *fakeNetwork) SetupPortForward(service string, hostPort int, guestIP string, vmPort int) error {
+	f.setupForwardCalls = append(f.setupForwardCalls, hostPort)
+	if f.setupForwardErr != nil {
+		return f.setupForwardErr
+	}
+	return f.kernel.SetupPortForward(service, hostPort, guestIP, vmPort)
 }
 
-func (f *fakeNetwork) SetupPortForward(hostPort int, _ string, _ int) error {
-	f.setupForwardCalls = append(f.setupForwardCalls, hostPort)
-	return f.setupForwardErr
+func (f *fakeNetwork) ListPortForwards() (network.PortForwardListing, error) {
+	return f.kernel.ListPortForwards()
+}
+
+func (f *fakeNetwork) DeletePortForwardRule(rule network.PortForwardRule) error {
+	return f.kernel.DeletePortForwardRule(rule)
 }
 
 // The regression: port-forward convergence lived only inside Reconcile, and the
