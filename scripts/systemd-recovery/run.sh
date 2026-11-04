@@ -16,6 +16,7 @@ docker build -t "$image_name" "$root_dir/scripts/systemd-recovery"
 architecture="$(docker image inspect "$image_name" --format '{{.Architecture}}')"
 cd "$root_dir"
 GOOS=linux GOARCH="$architecture" go test -c -tags systemd_integration -o "$test_dir/vm.test" ./internal/vm
+GOOS=linux GOARCH="$architecture" go test -c -tags systemd_integration -o "$test_dir/reconciler.test" ./internal/reconciler
 docker run -d --name "$container_name" --privileged --cgroupns=private \
   --tmpfs /run --tmpfs /run/lock "$image_name" >/dev/null
 ready=false
@@ -33,8 +34,12 @@ if [[ "$ready" != true ]]; then
 fi
 # /tmp may be replaced during systemd boot; keep the binary in /root.
 docker cp "$test_dir/vm.test" "$container_name:/root/vm.test"
+docker cp "$test_dir/reconciler.test" "$container_name:/root/reconciler.test"
 docker exec "$container_name" /usr/lib/systemd/systemd --version
 docker cp "$root_dir/scripts/systemd-recovery/tap-fd.py" "$container_name:/root/tap-fd.py"
 docker exec "$container_name" python3 /root/tap-fd.py
 docker exec -e FIREWORK_REAL_SYSTEMD=1 "$container_name" \
   /root/vm.test -test.run '^TestSystemdIntegration' -test.v -test.count=3
+# The reconciler payload needs go for its fake Firecracker; reuse the image's toolchain.
+docker exec -e FIREWORK_REAL_SYSTEMD=1 -e PATH=/usr/local/go/bin:/usr/sbin:/usr/bin:/sbin:/bin -e HOME=/root -e GOCACHE=/root/.cache/go "$container_name" \
+  /root/reconciler.test -test.run '^TestSystemdIntegration' -test.v -test.count=3
