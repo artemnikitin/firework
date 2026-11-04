@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	"github.com/artemnikitin/firework/internal/capacity"
+	"github.com/artemnikitin/firework/internal/config"
 	netpkg "github.com/artemnikitin/firework/internal/network"
 	"github.com/artemnikitin/firework/internal/network/networktest"
 	"github.com/artemnikitin/firework/internal/vm"
@@ -114,5 +115,59 @@ func TestC4ServiceRetakingItsAddressWaitsForItsOldRule(t *testing.T) {
 	}
 	if len(violations) != 0 {
 		t.Fatal(violations)
+	}
+}
+
+func addressedService(name, ip string, index int) config.ServiceConfig {
+	svc := admissionService(name, 1, 64, 0, ip)
+	svc.Network.GuestMAC = guestMACForIndex(index)
+	return svc
+}
+
+func networkedService(name string) config.ServiceConfig {
+	return config.ServiceConfig{Name: name, Network: &config.NetworkConfig{}}
+}
+
+// C6: an address held back until a removed VM's rules or route are gone is a
+// wait, not invalid address demand, even when its owner is still desired and
+// gets another address meanwhile. (Reproducer from the review of 5392d54.)
+func TestC6HeldBackAddressIsATransientWaitWhoeverOwnsIt(t *testing.T) {
+	limit := capacity.NodeCapacity{VCPUs: 8, MemoryMB: 4096}
+	// /29: guest addresses .2 to .6.
+	a, _ := admissionAgent(t, "node: web\nservices: []\n", limit, map[string]*vm.Instance{
+		"c": {Name: "c", Config: addressedService("c", "172.16.0.3", 1), State: vm.StateRunning},
+		"d": {Name: "d", Config: addressedService("d", "172.16.0.5", 3), State: vm.StateRunning},
+		"e": {Name: "e", Config: addressedService("e", "172.16.0.6", 4), State: vm.StateRunning},
+	}, "172.16.0.0/29")
+	a.routedGuestIPs = map[string]string{"172.16.0.4": "a"} // a's old VM's route is still published.
+	services := []config.ServiceConfig{networkedService("a"), networkedService("c"), networkedService("d"), networkedService("e"), networkedService("f")}
+	held := a.assignNetworking(services)
+	hold, ok := held["f"]
+	if !ok || hold.Admission != "" || hold.Recovery || hold.Reason != addressTransientReason {
+		t.Fatalf("f's hold = %+v (held=%v)", hold, ok)
+	}
+}
+
+// C6: a service keeps the address held back for it even when an earlier
+// service in the allocation order had to skip that address.
+// (Reproducer from the review of 5392d54.)
+func TestHeldBackAddressStaysAvailableToItsOwner(t *testing.T) {
+	limit := capacity.NodeCapacity{VCPUs: 8, MemoryMB: 4096}
+	a, _ := admissionAgent(t, "node: web\nservices: []\n", limit, map[string]*vm.Instance{
+		"c": {Name: "c", Config: addressedService("c", "172.16.0.2", 0), State: vm.StateRunning},
+		"d": {Name: "d", Config: addressedService("d", "172.16.0.5", 3), State: vm.StateRunning},
+		"e": {Name: "e", Config: addressedService("e", "172.16.0.6", 4), State: vm.StateRunning},
+	}, "172.16.0.0/29")
+	a.routedGuestIPs = map[string]string{"172.16.0.3": "zeta"} // zeta's old VM, route not yet withdrawn
+	services := []config.ServiceConfig{networkedService("alpha"), networkedService("c"), networkedService("d"), networkedService("e"), networkedService("zeta")}
+	held := a.assignNetworking(services)
+	if len(held) != 0 {
+		t.Fatalf("holds: %+v", held)
+	}
+	if got := services[4].Network.GuestIP; got != "172.16.0.3" {
+		t.Fatalf("zeta got %q, not its own held-back address", got)
+	}
+	if got := services[0].Network.GuestIP; got != "172.16.0.4" {
+		t.Fatalf("alpha got %q", got)
 	}
 }

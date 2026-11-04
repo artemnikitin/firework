@@ -870,10 +870,12 @@ func (a *Agent) assignNetworking(services []config.ServiceConfig) map[string]rec
 	if a.reconciler != nil {
 		maps.Copy(departed, a.reconciler.PendingTeardownGuestIPs())
 	}
-	for ip, owner := range departed {
+	for ip := range departed {
 		if _, tracked := reservedIP[ip]; tracked || !ipNet.Contains(net.ParseIP(ip)) {
 			delete(departed, ip)
-		} else if !desired[owner] {
+		} else {
+			// Released once its rules and routes are gone, whether or not its
+			// owner is still desired elsewhere: a wait, not invalid demand.
 			departingReserves = true
 		}
 	}
@@ -898,7 +900,6 @@ func (a *Agent) assignNetworking(services []config.ServiceConfig) map[string]rec
 		}
 	}
 	var held map[string]reconciler.Hold
-	idx := 0
 	for i := range services {
 		svc := &services[i]
 		if svc.Network == nil {
@@ -907,6 +908,10 @@ func (a *Agent) assignNetworking(services []config.ServiceConfig) map[string]rec
 		if old, ok := retained[svc.Name]; ok && old.Network != nil {
 			continue
 		}
+		// First fit from the start for each service: an address held back
+		// for one service is skipped by the others, and must not be skipped
+		// by its own owner because an earlier service passed it.
+		idx := 0
 		for {
 			candidate, ok := guestIPv4ForIndex(ipNet, idx)
 			if !ok {
@@ -936,6 +941,7 @@ func (a *Agent) assignNetworking(services []config.ServiceConfig) map[string]rec
 
 		svc.Network.GuestIP = guestIP
 		svc.Network.GuestMAC = mac
+		reservedIP[guestIP], reservedMAC[strings.ToLower(mac)] = svc.Name, svc.Name
 
 		// Add kernel IP autoconfig so the guest configures networking
 		// before init runs (no fc-init changes needed).
@@ -943,8 +949,6 @@ func (a *Agent) assignNetworking(services []config.ServiceConfig) map[string]rec
 		if !hasKernelArgPrefix(svc.KernelArgs, "ip=") {
 			svc.KernelArgs = insertKernelArg(svc.KernelArgs, ipArg)
 		}
-
-		idx++
 	}
 	return held
 }
