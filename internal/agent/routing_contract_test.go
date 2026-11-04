@@ -57,11 +57,12 @@ func TestC4DepartedAddressIsNotReassigned(t *testing.T) {
 		a, m := admissionAgent(t, "node: web\nservices: []\n", limit, map[string]*vm.Instance{
 			"zeta": {Name: "zeta", Config: routed, State: vm.StateRunning},
 		}, "172.16.0.0/24")
+		a.reconciler = testReconciler(t, m, &recoveryTestNetworkManager{}, "", 0) // clear-recovery needs a durable journal
 		a.traefikMgr = traefik.NewManager(t.TempDir(), "", testLogger())
 		if err := a.syncTraefikConfigs(context.Background(), []config.ServiceConfig{routed}); err != nil {
 			t.Fatal(err)
 		}
-		delete(m.instances, "zeta") // Cleared by clear-recovery between ticks.
+		m.clear(t, "zeta") // Cleared by clear-recovery between ticks.
 		next := alpha()
 		a.assignNetworking(next)
 		if next[0].Network.GuestIP == "172.16.0.2" {
@@ -70,6 +71,7 @@ func TestC4DepartedAddressIsNotReassigned(t *testing.T) {
 		if err := a.syncTraefikConfigs(context.Background(), next); err != nil {
 			t.Fatal(err)
 		}
+		a.tick(context.Background()) // Settles zeta's record, which has no rule left.
 		next = alpha()
 		a.assignNetworking(next)
 		if next[0].Network.GuestIP != "172.16.0.2" {

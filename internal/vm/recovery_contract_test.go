@@ -304,3 +304,24 @@ func TestC2ManifestlessEvidenceIsQuarantinedAtStartupAndByCommand(t *testing.T) 
 		t.Fatalf("startup classified the evidence differently from the command: %#v", got)
 	}
 }
+
+// C1: the reconciler releases an interrupted start's address only after this
+// proof. It refuses while the service has a tracked VM or VM state with a
+// manifest, and while a process presents the service's VM paths.
+func TestProveServiceAbsentRefusesAnyClaimant(t *testing.T) {
+	m, f, i := recoveryFixture(t)
+	m.inspector = i
+	if err := m.ProveServiceAbsent(context.Background(), "../escape"); err == nil {
+		t.Fatal("an unsafe service name was accepted")
+	}
+	if err := m.ProveServiceAbsent(context.Background(), f.Service); err == nil {
+		t.Fatal("VM state with a manifest was proven absent")
+	}
+	if err := m.ProveServiceAbsent(context.Background(), "fresh"); err != nil {
+		t.Fatalf("a service with no VM state and no claimant: %v", err)
+	}
+	i.find = []processIdentity{{PID: 77}}
+	if err := m.ProveServiceAbsent(context.Background(), "fresh"); err == nil {
+		t.Fatal("a process presenting the VM paths was ignored")
+	}
+}

@@ -118,14 +118,14 @@ func TestLifecycleTransitionDoesNotEnterPlanOrLoseCleanupIntent(t *testing.T) {
 			if actions := r.Plan(config.NodeConfig{}); len(actions) != 0 {
 				t.Fatalf("in-progress lifecycle entered deletion plan: %#v", actions)
 			}
-			if err := r.retryPendingTeardowns(); err != nil {
+			if err := r.retryPendingTeardowns(context.Background()); err != nil {
 				t.Fatal(err)
 			}
 			if !r.HasPendingCleanup() {
 				t.Fatal("retained cleanup intent no longer triggers another retry")
 			}
 			delete(manager.instances, service.Name)
-			if err := r.retryPendingTeardowns(); err != nil {
+			if err := r.retryPendingTeardowns(context.Background()); err != nil {
 				t.Fatal(err)
 			}
 			if r.HasPendingCleanup() || len(network.deleteTAPCalls) != 1 || len(network.teardownForwardCalls) != 1 {
@@ -179,16 +179,24 @@ func TestUnknownRuntimeClaimsHoldMutationsAndCleanupUntilResolved(t *testing.T) 
 		}
 	}
 	delete(manager.instances, unknown.Name)
+	// The first tick tears down the deferred rules. "gone" kept its address
+	// recorded until then, so "new" starts on the next one.
+	if err := r.Reconcile(context.Background(), desired); !IsIncomplete(err) {
+		t.Fatalf("new must wait for gone's address to be released: %v", err)
+	}
 	if err := r.Reconcile(context.Background(), desired); err != nil {
 		t.Fatalf("resolved ownership did not resume work: %v", err)
 	}
 	if manager.instances["new"] == nil || r.HasPendingCleanup() {
 		t.Fatal("resolved ownership failed to finish held work and cleanup")
 	}
-	// "gone" shares its DNAT tuple with the new service, so only old's rule
-	// is torn down.
-	if len(network.teardownForwardCalls) != 1 || len(network.deleteTAPCalls) == 0 {
+	// Both deferred rules go before "new" takes gone's address and installs
+	// its own rule for the same tuple.
+	if len(network.teardownForwardCalls) != 2 || len(network.deleteTAPCalls) == 0 {
 		t.Fatalf("deferred cleanup was not finished: forwards=%v taps=%v", network.teardownForwardCalls, network.deleteTAPCalls)
+	}
+	if rule, ok := network.host().Delivers(8080); !ok || !rule.TaggedFor("new") {
+		t.Fatalf("the new service does not own its port: %v", network.host().Rules())
 	}
 
 }

@@ -340,13 +340,14 @@ func TestReconcile_ConsecutiveUpdatesTrackEachGenerationsStaleRuleIndependently(
 	if err := r.Reconcile(context.Background(), toB); err == nil {
 		t.Fatal("expected A's stale 8080 rule to surface")
 	}
-	if len(r.pendingPortForwards) != 1 {
-		t.Fatalf("expected exactly one pending port forward after A->B, got %d: %#v", len(r.pendingPortForwards), r.pendingPortForwards)
+	if got := pendingHostPorts(t, r); len(got) != 1 || got[0] != 8080 {
+		t.Fatalf("expected exactly A's 8080 rule pending after A->B, got %v", got)
 	}
 
-	// B -> C: port 9191. Tearing down B's 9090 succeeds. The bug: this used
-	// to overwrite or delete the single per-name entry, losing A's still-
-	// pending 8080 rule.
+	// B -> C: port 9191. The bug: this used to overwrite or delete the
+	// single per-name entry, losing A's still-pending 8080 rule. C waits
+	// while A's rule still reaches the address: a service's own earlier
+	// rules for released ports go first.
 	c := a
 	c.PortForwards = []config.PortForward{{HostPort: 9191, VMPort: 80}}
 	toC := config.NodeConfig{Node: "node-1", Services: []config.ServiceConfig{c}}
@@ -359,13 +360,8 @@ func TestReconcile_ConsecutiveUpdatesTrackEachGenerationsStaleRuleIndependently(
 	}
 
 	// A's entry must have survived, and only A's.
-	if len(r.pendingPortForwards) != 1 {
-		t.Fatalf("expected A's entry to be the only one still pending, got %d: %#v", len(r.pendingPortForwards), r.pendingPortForwards)
-	}
-	for _, entry := range r.pendingPortForwards {
-		if entry.PortForward.HostPort != 8080 {
-			t.Fatalf("wrong entry survived: %#v", entry)
-		}
+	if got := pendingHostPorts(t, r); len(got) != 1 || got[0] != 8080 {
+		t.Fatalf("expected A's 8080 rule to be the only one still pending, got %v", got)
 	}
 
 	// One more tick with nothing changed: 8080 must still be retried, and
@@ -381,14 +377,17 @@ func TestReconcile_ConsecutiveUpdatesTrackEachGenerationsStaleRuleIndependently(
 		}
 	}
 
-	// Once A's rule is finally torn down, the tick converges and C keeps
-	// running on its own port.
+	// Once A's rule is finally torn down, C's update runs on the next tick
+	// and C runs on its own port.
 	delete(net.teardownForwardErrByPort, 8080)
+	if err := r.Reconcile(context.Background(), toC); !IsIncomplete(err) {
+		t.Fatalf("the tick that tears A's rule down should leave C's update for the next one: %v", err)
+	}
 	if err := r.Reconcile(context.Background(), toC); err != nil {
 		t.Fatalf("tick should converge once A's stale rule is torn down: %v", err)
 	}
-	if len(r.pendingPortForwards) != 0 {
-		t.Fatalf("expected no pending port forwards left, got %#v", r.pendingPortForwards)
+	if got := pendingHostPorts(t, r); len(got) != 0 || len(recordsIn(r, phaseDeparting)) != 0 {
+		t.Fatalf("expected no pending port forwards left, got %v and %#v", got, recordsIn(r, phaseDeparting))
 	}
 	inst, running := vmMgr.instances["web"]
 	if !running || len(inst.Config.PortForwards) != 1 || inst.Config.PortForwards[0].HostPort != 9191 {
@@ -594,8 +593,8 @@ func TestDeleteService_AbortsRemovalWhenCleanupCannotBeJournalled(t *testing.T) 
 	}
 	// The in-memory maps must be rolled back to match the (unchanged) journal
 	// on disk, not left holding entries for a VM that was never removed.
-	if len(r.pendingPortForwards) != 0 || len(r.pendingNetworkDevices) != 0 {
-		t.Fatalf("failed journal write left phantom pending entries: %#v / %#v", r.pendingPortForwards, r.pendingNetworkDevices)
+	if len(recordsIn(r, phaseDeparting)) != 0 || len(r.pendingNetworkDevices) != 0 {
+		t.Fatalf("failed journal write left phantom pending entries: %#v / %#v", recordsIn(r, phaseDeparting), r.pendingNetworkDevices)
 	}
 }
 
@@ -635,8 +634,8 @@ func TestWithStateDir_PersistsPendingTeardownAcrossRestart(t *testing.T) {
 	if !containsInt(net2.teardownForwardCalls, 8080) {
 		t.Fatal("restarted reconciler did not retry the persisted teardown; the entry was lost across restart")
 	}
-	if _, err := os.Stat(persisted); !os.IsNotExist(err) {
-		t.Fatalf("persisted file should have been removed once cleared, stat err = %v", err)
+	if got := recordsIn(r2, phaseDeparting); len(got) != 0 || len(net2.host().Rules()) != 0 {
+		t.Fatalf("the record should be gone once its rule is: %#v, rules %v", got, net2.host().Rules())
 	}
 }
 
@@ -708,7 +707,7 @@ func TestWithStateDir_CorruptJournalBlocksConvergencePermanently(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	r.persistPendingTeardowns()
+	_ = r.persistJournal()
 	after, err := os.ReadFile(journalPath)
 	if err != nil {
 		t.Fatal(err)
@@ -740,50 +739,40 @@ func TestNew_NilNetworkManagerStaysNil(t *testing.T) {
 	}
 }
 
-// The regression: retryPendingPortForwards guarded only against
-// entry.ServiceName being live, but a DNAT rule is identified by its tuple
-// alone. After a rename or replacement, a different service can legitimately
-// claim the exact (hostPort, guestIP, vmPort) another service left pending —
-// and the retry would then delete that live rule while reporting a successful
-// reconciliation. The guard has to consider every running service, the way
-// retryPendingNetworkDevices already did.
-func TestReconcile_PortForwardRetryDoesNotDeleteRuleClaimedByAnotherService(t *testing.T) {
-	net := &fakeNetworkManager{teardownForwardErr: errors.New("rule missing")}
+// A rule is identified by its tuple alone, so a departing record must never
+// delete a rule a running VM's configuration claims. An update that keeps its
+// address and port forwards shares the old VM's tag and tuple: when the old
+// rule's teardown fails, the retry must keep the rule for the new VM and let
+// the record go, instead of deleting the live rule.
+func TestReconcile_PortForwardRetryDoesNotDeleteRuleTheReplacementClaims(t *testing.T) {
+	net := &fakeNetworkManager{}
 	r, vmMgr := newNetworkTestReconciler(net)
-
-	// Tick 1: "web" owns 8080 -> 172.16.0.2:80.
-	if err := r.Reconcile(context.Background(), config.NodeConfig{
-		Node: "node-1", Services: []config.ServiceConfig{forwardedService("web")},
-	}); err != nil {
+	web := forwardedService("web")
+	if err := r.Reconcile(context.Background(), config.NodeConfig{Node: "node-1", Services: []config.ServiceConfig{web}}); err != nil {
 		t.Fatalf("initial create: %v", err)
 	}
 
-	// Tick 2: "web" is deleted and its teardown fails, leaving the tuple pending.
-	if err := r.Reconcile(context.Background(), config.NodeConfig{Node: "node-1"}); err == nil {
-		t.Fatal("expected the failed teardown to surface")
+	// The update replaces the VM. Tearing down the old VM's rule fails, and
+	// the new VM claims exactly that rule.
+	net.teardownForwardErr = errors.New("iptables busy")
+	updated := web
+	updated.Image = "/images/web-v2"
+	if err := r.Reconcile(context.Background(), config.NodeConfig{Node: "node-1", Services: []config.ServiceConfig{updated}}); err != nil {
+		t.Fatalf("the update should converge once its VM claims the rule: %v", err)
 	}
-	if len(r.pendingPortForwards) != 1 {
-		t.Fatalf("expected web's rule to be pending, got %#v", r.pendingPortForwards)
-	}
-
-	// Tick 3: a different service claims the identical tuple. Its rule is
-	// live, so the pending entry must be dropped without any teardown call.
-	replacement := forwardedService("web-v2")
+	net.teardownForwardErr = nil
 	callsBefore := len(net.teardownForwardCalls)
-	err := r.Reconcile(context.Background(), config.NodeConfig{
-		Node: "node-1", Services: []config.ServiceConfig{replacement},
-	})
-	if err != nil {
-		t.Fatalf("tick should converge once another service claims the tuple: %v", err)
+	if err := r.Reconcile(context.Background(), config.NodeConfig{Node: "node-1", Services: []config.ServiceConfig{updated}}); err != nil {
+		t.Fatal(err)
 	}
 	if got := net.teardownForwardCalls[callsBefore:]; len(got) != 0 {
 		t.Fatalf("retry tore down a rule claimed by the running replacement: %#v", got)
 	}
-	if len(r.pendingPortForwards) != 0 {
-		t.Fatalf("expected the claimed entry to be dropped, got %#v", r.pendingPortForwards)
+	if got := recordsIn(r, phaseDeparting); len(got) != 0 {
+		t.Fatalf("the old VM's record outlived its rule's new owner: %#v", got)
 	}
-	if _, running := vmMgr.instances["web-v2"]; !running {
-		t.Fatal("replacement service is not running")
+	if rule, ok := net.host().Delivers(8080); !ok || rule.GuestIP != "172.16.0.2" || vmMgr.instances["web"].Config.Image != "/images/web-v2" {
+		t.Fatalf("the replacement lost its rule: %v %v", rule, ok)
 	}
 }
 
@@ -895,7 +884,7 @@ func TestWithStateDir_RejectsForeignJournalShapesAsCorrupt(t *testing.T) {
 			r := NewWithNetworkManager(newFakeVMManager(), logger, nil, &fakeNetworkManager{}, "", 0).WithStateDir(dir)
 			if !r.journalCorrupt {
 				t.Fatalf("journal was accepted instead of failing closed; loaded %#v / %#v",
-					r.pendingPortForwards, r.pendingNetworkDevices)
+					r.allocations, r.pendingNetworkDevices)
 			}
 			if err := r.Reconcile(context.Background(), config.NodeConfig{Node: "node-1"}); err == nil {
 				t.Fatal("a corrupt journal must keep the node from reporting convergence")

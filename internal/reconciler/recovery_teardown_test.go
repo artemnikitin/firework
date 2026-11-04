@@ -54,12 +54,24 @@ func TestRecoveryTeardownCleansOldConfigAndProtectsReplacementClaims(t *testing.
 	if err := manager.clearRecovery(old); err != nil {
 		t.Fatal(err)
 	}
-	if err := r.Reconcile(context.Background(), config.NodeConfig{Services: []config.ServiceConfig{replacement}}); err != nil {
+	// The replacement waits one tick while the old VM's 8080 rule, a port it
+	// no longer claims, still reaches the address. Everything the old VM left
+	// goes then, and the replacement creates its own on the next tick.
+	desired := config.NodeConfig{Services: []config.ServiceConfig{replacement}}
+	if err := r.Reconcile(context.Background(), desired); !IsIncomplete(err) {
+		t.Fatalf("the replacement must wait for the old 8080 rule: %v", err)
+	}
+	if err := r.Reconcile(context.Background(), desired); err != nil {
 		t.Fatal(err)
 	}
-	if !reflect.DeepEqual(network.teardownForwardCalls, []int{8080}) || !reflect.DeepEqual(network.deleteTAPCalls, []string{"tap-old"}) || len(network.deleteBridgeCalls) != 0 {
+	if !reflect.DeepEqual(network.teardownForwardCalls, []int{8080, 9090}) || !reflect.DeepEqual(network.deleteTAPCalls, []string{"tap-old"}) || !reflect.DeepEqual(network.deleteBridgeCalls, []string{"br-app"}) {
 		t.Fatalf("cleanup removed replacement claims or missed obsolete resources: ports=%v taps=%v bridges=%v",
 			network.teardownForwardCalls, network.deleteTAPCalls, network.deleteBridgeCalls)
+	}
+	for port, want := range map[int]bool{8080: false, 9090: true, 8081: true} {
+		if _, ok := network.host().Delivers(port); ok != want {
+			t.Fatalf("host port %d forwarded=%v, want %v: %v", port, ok, want, network.host().Rules())
+		}
 	}
 	if got := manager.instances[old.Name]; got == nil || got.State != vm.StateRunning || got.Config.Network.Interface != "tap-new" {
 		t.Fatalf("replacement did not converge: %#v", got)
@@ -78,7 +90,7 @@ func TestRecoveryTeardownJournalFailurePreservesRuntimeAndRetriesAfterRestart(t 
 	network := &fakeNetworkManager{teardownForwardErr: errors.New("iptables unavailable"), teardownErr: errors.New("device busy")}
 	network.installRules(old)
 	r := newRecoveryTeardownReconciler(t, manager, network, stateDir)
-	if err := os.Remove(stateDir); err != nil {
+	if err := os.RemoveAll(stateDir); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.WriteFile(stateDir, []byte("blocks journal writes"), 0600); err != nil {
@@ -87,7 +99,7 @@ func TestRecoveryTeardownJournalFailurePreservesRuntimeAndRetriesAfterRestart(t 
 	if err := manager.clearRecovery(old); err == nil {
 		t.Fatal("runtime removed without durable cleanup journal")
 	}
-	if manager.instances[old.Name] == nil || len(r.pendingPortForwards) != 0 || len(r.pendingNetworkDevices) != 0 {
+	if manager.instances[old.Name] == nil || len(recordsIn(r, phaseDeparting)) != 0 || len(r.pendingNetworkDevices) != 0 {
 		t.Fatal("journal failure removed runtime or changed pending cleanup")
 	}
 	if err := os.Remove(stateDir); err != nil {
@@ -107,7 +119,7 @@ func TestRecoveryTeardownJournalFailurePreservesRuntimeAndRetriesAfterRestart(t 
 	if err := restarted.Reconcile(context.Background(), config.NodeConfig{}); err != nil {
 		t.Fatal(err)
 	}
-	if len(network.teardownForwardCalls) != 2 || len(network.deleteTAPCalls) != 2 || len(restarted.pendingPortForwards) != 0 || len(restarted.pendingNetworkDevices) != 0 {
+	if len(network.teardownForwardCalls) != 2 || len(network.deleteTAPCalls) != 2 || len(recordsIn(restarted, phaseDeparting)) != 0 || len(restarted.pendingNetworkDevices) != 0 {
 		t.Fatalf("restart did not retry obsolete resources: ports=%v taps=%v", network.teardownForwardCalls, network.deleteTAPCalls)
 	}
 }
@@ -174,7 +186,7 @@ func TestRecoveryCleanupIntentSurvivesPartialRemovalAndRestart(t *testing.T) {
 	if err := r.Reconcile(context.Background(), config.NodeConfig{}); err != nil {
 		t.Fatal(err)
 	}
-	if len(r.pendingPortForwards) == 0 || len(r.pendingNetworkDevices) == 0 {
+	if len(recordsIn(r, phaseDeparting)) == 0 || len(r.pendingNetworkDevices) == 0 {
 		t.Fatal("quarantine discarded cleanup journal")
 	}
 	if len(network.deleteTAPCalls) != 0 || len(network.teardownForwardCalls) != 0 {

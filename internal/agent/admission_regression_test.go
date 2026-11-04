@@ -5,6 +5,7 @@ import (
 	"os"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/artemnikitin/firework/internal/capacity"
 	"github.com/artemnikitin/firework/internal/config"
@@ -26,6 +27,15 @@ func admissionAgent(t *testing.T, yaml string, limit capacity.NodeCapacity, inst
 	m := &recoveryTestVMManager{instances: instances, limit: &limit}
 	a.reconciler = reconciler.NewWithNetworkManager(m, testLogger(), nil, &recoveryTestNetworkManager{}, "", 0)
 	return a, m
+}
+
+// testReconciler builds a reconciler with a durable journal, as the agent
+// has, written without fsync to keep long generated runs fast.
+func testReconciler(t *testing.T, manager reconciler.VMManager, network reconciler.NetworkManager, strategy string, delay time.Duration) *reconciler.Reconciler {
+	t.Helper()
+	return reconciler.NewWithNetworkManager(manager, testLogger(), nil, network, strategy, delay).
+		WithJournalWriter(func(path string, data []byte) error { return os.WriteFile(path, data, 0o644) }).
+		WithStateDir(t.TempDir())
 }
 
 func admissionService(name string, vcpus, memoryMB, port int, ip string) config.ServiceConfig {

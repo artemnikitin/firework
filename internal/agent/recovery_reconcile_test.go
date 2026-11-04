@@ -117,6 +117,24 @@ type recoveryTestVMManager struct {
 	// its VM when it fails.
 	startHook  func(name string) error
 	removeHook func(name string) error
+	// record is the reconciler's recovery cleanup recorder.
+	record func(config.ServiceConfig) error
+}
+
+func (m *recoveryTestVMManager) SetRecoveryCleanupRecorder(record func(config.ServiceConfig) error) {
+	m.record = record
+}
+
+// clear removes a quarantined VM as clear-recovery does: a trusted
+// configuration is recorded for cleanup before the VM's state goes.
+func (m *recoveryTestVMManager) clear(t *testing.T, name string) {
+	t.Helper()
+	if instance := m.instances[name]; instance != nil && !instance.RecoveryConfigUnknown && m.record != nil {
+		if err := m.record(instance.Config); err != nil {
+			t.Fatalf("recording cleanup for %s: %v", name, err)
+		}
+	}
+	delete(m.instances, name)
 }
 
 func (m *recoveryTestVMManager) usage() capacity.NodeCapacity {

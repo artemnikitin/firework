@@ -113,7 +113,7 @@ func TestRandomRevisionsConvergeWithinCapacity(t *testing.T) {
 		limit := capacity.NodeCapacity{VCPUs: capVCPUs, MemoryMB: capMemoryMB}
 		a.capacityReader = &fakeCapacityReader{cap: limit}
 		m := &recoveryTestVMManager{instances: map[string]*vm.Instance{}, limit: &limit}
-		a.reconciler = reconciler.NewWithNetworkManager(m, testLogger(), nil, &recoveryTestNetworkManager{}, strategy, time.Microsecond)
+		a.reconciler = testReconciler(t, m, &recoveryTestNetworkManager{}, strategy, time.Microsecond)
 		a.tick(context.Background())
 		if a.lastRevision != "r1" {
 			t.Fatalf("seed %d: setup did not apply: %s", seed%seeds, a.agentStatusSnapshot().Message)
@@ -178,7 +178,7 @@ func TestRandomRevisionsConvergeWithinCapacity(t *testing.T) {
 					q.Config, q.RecoveryConfigUnknown, q.State = qConfig, false, vm.StateRunning
 					a.reconciler.MarkRecovered("q")
 				} else {
-					delete(m.instances, "q")
+					m.clear(t, "q")
 					a.reconciler.ForgetRecovered("q")
 				}
 				a.forceReconcile = true

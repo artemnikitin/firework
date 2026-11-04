@@ -111,11 +111,28 @@ func (r *Reconciler) capacityHold(svc config.ServiceConfig, actual map[string]*v
 // Restart replaces a tracked VM with its current configuration, as a health
 // restart does. The caller checks CapacityHold first: a failed or stopped VM
 // takes its resources again.
+//
+// The VM's record moves to creating before the stop, so a crash before the
+// new VM is tracked recovers like an interrupted create, and a failed start
+// leaves its rules covered by a departing record.
 func (r *Reconciler) Restart(ctx context.Context, svc config.ServiceConfig) error {
+	id, err := r.journalRestart(svc)
+	if err != nil {
+		return stageError(FailureStageNetwork, fmt.Errorf("recording the restart of %s: %w", svc.Name, err))
+	}
 	if stopper, ok := r.vmManager.(vmStopper); ok {
 		if err := stopper.Stop(svc.Name); err != nil {
 			r.logger.Warn("failed to stop service during health restart", "service", svc.Name, "error", err)
 		}
 	}
-	return r.vmManager.Start(ctx, svc)
+	if err := r.vmManager.Start(ctx, svc); err != nil {
+		if _, tracked := r.vmManager.List()[svc.Name]; !tracked && id != 0 {
+			r.logPersistFailure(r.setAllocationPhase(id, phaseDeparting))
+		}
+		return err
+	}
+	if id != 0 {
+		r.logPersistFailure(r.setAllocationPhase(id, phaseRunning))
+	}
+	return nil
 }

@@ -89,8 +89,25 @@ func retainedIn(actual map[string]*vm.Instance) []*vm.Instance {
 // caller's capacity and address holds, with every hold they cause. It ignores
 // what SetHeldServices installed, so admission can weigh a hold set without
 // publishing it.
+//
+// It also includes the holds of the ownership records, so a start that waits
+// for another service's address or host port to be released is reported in
+// per-service status like any other hold.
 func (r *Reconciler) Holds(desired config.NodeConfig, external map[string]Hold) map[string]Hold {
-	return HoldsIn(r.vmManager.List(), desired, external)
+	actual := r.vmManager.List()
+	held := HoldsIn(actual, desired, external)
+	for _, service := range desired.Services {
+		if _, done := held[service.Name]; done {
+			continue
+		}
+		if instance := actual[service.Name]; instance != nil && (RetainsRuntime(instance.State) || !needsUpdate(instance, service)) {
+			continue // Nothing new is allocated.
+		}
+		if hold := r.allocationHold(service); hold.Reason != "" {
+			held[service.Name] = hold
+		}
+	}
+	return held
 }
 
 // HoldsIn is Holds over the given inventory instead of the current one, so
@@ -324,7 +341,7 @@ func (r *Reconciler) actionHold(action Action) Hold {
 	}
 	if action.Type != ActionDelete {
 		if hold.Reason == "" {
-			hold = r.departedAddressHold(action.Service)
+			hold = r.allocationHold(action.Service)
 		}
 		if hold.Reason == "" {
 			hold = r.capacityHold(action.Service, actual)
@@ -357,46 +374,4 @@ func (r *Reconciler) HasPendingRecovery() bool {
 		}
 	}
 	return false
-}
-
-// PendingTeardownGuestIPs returns, for each guest IP that pending cleanup
-// still has host rules for, the removed service those rules belong to.
-func (r *Reconciler) PendingTeardownGuestIPs() map[string]string {
-	r.cleanupMu.Lock()
-	defer r.cleanupMu.Unlock()
-	ips := make(map[string]string, len(r.pendingPortForwards))
-	for _, entry := range r.pendingPortForwards {
-		if entry.GuestIP != "" {
-			ips[entry.GuestIP] = entry.ServiceName
-		}
-	}
-	return ips
-}
-
-// departedAddressHold holds a service whose guest IP still has another
-// service's host rule waiting to be torn down: until it is gone, that
-// service's host port would forward to this guest. A rule the service itself
-// now claims is its own traffic, and the same service may take its own
-// address back, since its leftover rules reach only itself.
-func (r *Reconciler) departedAddressHold(svc config.ServiceConfig) Hold {
-	if svc.Network == nil || svc.Network.GuestIP == "" {
-		return Hold{}
-	}
-	claims := portForwardKeys(svc)
-	r.cleanupMu.Lock()
-	defer r.cleanupMu.Unlock()
-	for key, entry := range r.pendingPortForwards {
-		if _, claimed := claims[key]; key.guestIP == svc.Network.GuestIP && entry.ServiceName != svc.Name && !claimed {
-			return Hold{Reason: fmt.Sprintf("guest IP %s still has host port %d of removed service %s awaiting teardown", key.guestIP, key.hostPort, entry.ServiceName)}
-		}
-	}
-	return Hold{}
-}
-
-// HasPendingCleanup keeps retained write-ahead cleanup eligible for retry even
-// when its owner temporarily prevented teardown and the revision was applied.
-func (r *Reconciler) HasPendingCleanup() bool {
-	r.cleanupMu.Lock()
-	defer r.cleanupMu.Unlock()
-	return r.journalCorrupt || len(r.pendingNetworkDevices) != 0 || len(r.pendingPortForwards) != 0
 }
