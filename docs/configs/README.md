@@ -67,6 +67,7 @@ Examples:
 | `update_strategy` | no | `all-at-once` | `all-at-once` or `rolling` |
 | `update_delay` | no | `0s` | Delay between updates in rolling mode |
 | `traefik_config_dir` | no | empty | Enables Traefik dynamic config management for local and remote service routes |
+| `traefik_unit` | no | `traefik.service` when `traefik_config_dir` is set | systemd unit whose main process serves `traefik_config_dir`. A guest address withdrawn from one service's route is given to another service only once this process has restarted or stopped, so it must be the only process serving that directory. If the unit cannot be inspected, such addresses stay held and status names the unit |
 | `ingress_domain` | no | empty | Deployment-owned DNS suffix for `metadata.subdomain`. Final hostname is `<subdomain>.<ingress_domain>`. A bare domain only — no `*.`, scheme, port, or path. Validated/normalized at load (a trailing root dot is stripped) |
 | `registry_url` | no | empty | Enables node register/heartbeat to control-plane registry |
 | `registry_server_name` | no | empty | Optional TLS server name override for registry endpoint |

@@ -10,14 +10,14 @@ import (
 	netpkg "github.com/artemnikitin/firework/internal/network"
 	"github.com/artemnikitin/firework/internal/network/networktest"
 	"github.com/artemnikitin/firework/internal/reconciler"
-	"github.com/artemnikitin/firework/internal/traefik"
 	"github.com/artemnikitin/firework/internal/vm"
 )
 
 // C4: a guest IP is not given to another service while a removed VM's host
 // rules or published route may still reach it, so the new service cannot
-// receive the removed one's traffic. The address is free again once both
-// are gone.
+// receive the removed one's traffic. The address is free again once the rules
+// are gone and, for a route, once the Traefik that may still serve it has
+// restarted (L7).
 func TestC4DepartedAddressIsNotReassigned(t *testing.T) {
 	limit := capacity.NodeCapacity{VCPUs: 8, MemoryMB: 4096}
 	alpha := func() []config.ServiceConfig {
@@ -58,7 +58,7 @@ func TestC4DepartedAddressIsNotReassigned(t *testing.T) {
 			"zeta": {Name: "zeta", Config: routed, State: vm.StateRunning},
 		}, "172.16.0.0/24")
 		a.reconciler = testReconciler(t, m, &recoveryTestNetworkManager{}, "", 0) // clear-recovery needs a durable journal
-		a.traefikMgr = traefik.NewManager(t.TempDir(), "", testLogger())
+		traefikProcess := useRoutes(t, a)
 		if err := a.syncTraefikConfigs(context.Background(), []config.ServiceConfig{routed}); err != nil {
 			t.Fatal(err)
 		}
@@ -72,10 +72,19 @@ func TestC4DepartedAddressIsNotReassigned(t *testing.T) {
 			t.Fatal(err)
 		}
 		a.tick(context.Background()) // Settles zeta's record, which has no rule left.
+		// The route file is gone, but the running Traefik may still serve the
+		// route it read before (L7).
+		next = alpha()
+		a.assignNetworking(next)
+		if next[0].Network.GuestIP == "172.16.0.2" {
+			t.Fatal("alpha was given 172.16.0.2 while the Traefik that served zeta's route still runs")
+		}
+		traefikProcess.start = "2000" // The operator restarts Traefik.
+		a.tick(context.Background())
 		next = alpha()
 		a.assignNetworking(next)
 		if next[0].Network.GuestIP != "172.16.0.2" {
-			t.Fatalf("address not released once no route points there: %s", next[0].Network.GuestIP)
+			t.Fatalf("address not released once Traefik restarted: %s", next[0].Network.GuestIP)
 		}
 	})
 }

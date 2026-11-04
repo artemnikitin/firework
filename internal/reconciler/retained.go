@@ -36,6 +36,10 @@ const (
 	// ActionNetworkHistoryIncomplete: a host port this node has no history
 	// for, on a node whose history is incomplete (L6).
 	ActionNetworkHistoryIncomplete = "network_history_incomplete"
+	// ActionGuestAddressWithdrawalUnconfirmed: a guest address withdrawn
+	// from another service's route, which the running Traefik may still
+	// serve (L7). Restarting Traefik releases it.
+	ActionGuestAddressWithdrawalUnconfirmed = "guest_address_withdrawal_unconfirmed"
 )
 
 // ActionRequiredError is a hold that only an operator can resolve. It

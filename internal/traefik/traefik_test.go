@@ -5,6 +5,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 
@@ -530,5 +531,34 @@ func TestHasLocalRouteFiles(t *testing.T) {
 				t.Fatalf("got %v err %v, want %v", got, err, tc.want)
 			}
 		})
+	}
+}
+
+func TestReadLocalRoutesAttributesEachRouteFile(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "dynamic")
+	m := NewManager(dir, "", slog.New(slog.NewTextHandler(io.Discard, nil)))
+	web := config.ServiceConfig{Name: "web", Network: &config.NetworkConfig{GuestIP: "172.16.0.2"}, Metadata: map[string]string{"host": "web.example.com"},
+		PortForwards: []config.PortForward{{HostPort: 8080, VMPort: 80}}}
+	if err := m.SyncLocal([]config.ServiceConfig{web}); err != nil {
+		t.Fatal(err)
+	}
+	for name, body := range map[string]string{"remote-peer.yaml": "http: {}\n", "broken.yaml": "{not yaml", "extra.toml": ""} {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	routes, unreadable, err := ReadLocalRoutes(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(routes) != 1 || routes[0] != (RouteFile{Service: "web", GuestIP: "172.16.0.2"}) {
+		t.Fatalf("routes = %v", routes)
+	}
+	slices.Sort(unreadable)
+	if !slices.Equal(unreadable, []string{"broken.yaml", "extra.toml"}) {
+		t.Fatalf("unreadable = %v", unreadable)
+	}
+	if routes, unreadable, err := ReadLocalRoutes(filepath.Join(dir, "missing")); err != nil || routes != nil || unreadable != nil {
+		t.Fatalf("missing directory: %v %v %v", routes, unreadable, err)
 	}
 }

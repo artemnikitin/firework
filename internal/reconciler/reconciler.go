@@ -109,6 +109,11 @@ type Reconciler struct {
 	// hostPortHolders maps each host port this node has allocated to the
 	// service that first held it (L6).
 	hostPortHolders map[int]string
+	// routeWithdrawals hold guest addresses whose routes were withdrawn
+	// until no process that may still serve them runs (L7), and
+	// routeEvidence reads the routes and that process. See route_withdrawal.go.
+	routeWithdrawals map[routeKey]routeWithdrawal
+	routeEvidence    RouteEvidence
 	// journalReady is false until the version 2 journal is loaded or created.
 	// New networked allocations wait until then.
 	journalReady bool
@@ -313,6 +318,7 @@ func NewWithNetworkManager(vmManager VMManager, logger *slog.Logger, healthMon *
 		pendingRecovery:       make(map[string]struct{}),
 		allocations:           make(map[uint64]allocation),
 		hostPortHolders:       make(map[int]string),
+		routeWithdrawals:      make(map[routeKey]routeWithdrawal),
 		pendingNetworkDevices: make(map[networkDeviceKey]pendingNetworkDevice),
 		// Without a state directory nothing survives a restart, so this
 		// reconciler's records are the whole history.
@@ -430,6 +436,9 @@ func (r *Reconciler) loadJournalLocked(dir string) *Reconciler {
 		n, _ := strconv.Atoi(port)
 		r.hostPortHolders[n] = service
 	}
+	for _, w := range loaded.RouteWithdrawals {
+		r.routeWithdrawals[w.key()] = w
+	}
 	r.nextAllocationID, r.history, r.journalReady = loaded.NextID-1, loaded.History, true
 	return r
 }
@@ -515,6 +524,13 @@ func (r *Reconciler) persistJournalLocked() error {
 			persisted.HostPorts[strconv.Itoa(port)] = service
 		}
 	}
+	for _, w := range r.routeWithdrawals {
+		persisted.RouteWithdrawals = append(persisted.RouteWithdrawals, w)
+	}
+	sort.Slice(persisted.RouteWithdrawals, func(i, j int) bool {
+		a, b := persisted.RouteWithdrawals[i], persisted.RouteWithdrawals[j]
+		return a.Service+"/"+a.GuestIP < b.Service+"/"+b.GuestIP
+	})
 	for _, entry := range r.pendingNetworkDevices {
 		persisted.Network = append(persisted.Network, entry)
 	}

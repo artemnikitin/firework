@@ -8,6 +8,7 @@ package traefik
 import (
 	"fmt"
 	"log/slog"
+	"net/url"
 	"os"
 	"path/filepath"
 	"sort"
@@ -245,8 +246,90 @@ func (m *Manager) apply(desired map[string][]byte, preserveRemotes bool) error {
 			return fmt.Errorf("removing stale traefik config %s: %w", entry.Name(), err)
 		}
 	}
-
+	// A withdrawn route is recorded as gone only once its removal survives a
+	// crash.
+	dir, err := os.Open(m.configDir)
+	if err != nil {
+		return fmt.Errorf("syncing traefik config dir: %w", err)
+	}
+	defer dir.Close()
+	if err := dir.Sync(); err != nil {
+		return fmt.Errorf("syncing traefik config dir: %w", err)
+	}
 	return nil
+}
+
+// PlannedLocalRoutes returns the local routes a publish of services writes,
+// without writing anything. A publish that fails validation writes nothing.
+func (m *Manager) PlannedLocalRoutes(services []config.ServiceConfig) ([]RouteFile, error) {
+	desired, _, err := m.renderLocal(services)
+	if err != nil {
+		return nil, err
+	}
+	var routes []RouteFile
+	for _, svc := range services {
+		if _, ok := desired[configFileName(svc.Name)]; ok {
+			routes = append(routes, RouteFile{Service: svc.Name, GuestIP: svc.Network.GuestIP})
+		}
+	}
+	return routes, nil
+}
+
+// ReadLocalRoutes reads this manager's route directory; see ReadLocalRoutes.
+func (m *Manager) ReadLocalRoutes() ([]RouteFile, []string, error) {
+	return ReadLocalRoutes(m.configDir)
+}
+
+// RouteFile is one local route file's owner and the guest address it routes
+// to. The owner is the file's name: the agent writes <service>.yaml.
+type RouteFile struct {
+	Service string
+	GuestIP string
+}
+
+// ReadLocalRoutes reads every route file that is not one of the agent's peer
+// routes, as Traefik would load it. A file it cannot attribute to a guest
+// address, such as one that does not parse, a .yml or .toml file, or a
+// subdirectory, is returned in unreadable: it may route anywhere.
+func ReadLocalRoutes(dir string) (routes []RouteFile, unreadable []string, err error) {
+	entries, err := os.ReadDir(dir)
+	if os.IsNotExist(err) {
+		return nil, nil, nil
+	}
+	if err != nil {
+		return nil, nil, fmt.Errorf("reading traefik config dir: %w", err)
+	}
+	for _, entry := range entries {
+		name := entry.Name()
+		if entry.IsDir() {
+			if name != stageDirName {
+				unreadable = append(unreadable, name)
+			}
+			continue
+		}
+		ext := filepath.Ext(name)
+		if ext != ".yaml" && ext != ".yml" && ext != ".toml" || strings.HasPrefix(name, remoteFilePrefix) {
+			continue
+		}
+		data, err := os.ReadFile(filepath.Join(dir, name))
+		var cfg fileConfig
+		if err != nil || ext != ".yaml" || yaml.Unmarshal(data, &cfg) != nil {
+			unreadable = append(unreadable, name)
+			continue
+		}
+		service := strings.TrimSuffix(name, ext)
+		for _, svc := range cfg.HTTP.Services {
+			for _, server := range svc.LoadBalancer.Servers {
+				u, err := url.Parse(server.URL)
+				if err != nil || u.Hostname() == "" {
+					unreadable = append(unreadable, name)
+					continue
+				}
+				routes = append(routes, RouteFile{Service: service, GuestIP: u.Hostname()})
+			}
+		}
+	}
+	return routes, unreadable, nil
 }
 
 // --- Traefik dynamic config YAML structures ---

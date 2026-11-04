@@ -1,7 +1,7 @@
 package agent
 
 import (
-	"maps"
+	"fmt"
 
 	"github.com/artemnikitin/firework/internal/config"
 	"github.com/artemnikitin/firework/internal/ingress"
@@ -21,11 +21,10 @@ func (a *Agent) syncRuntimeRoutes(services []config.ServiceConfig, remoteNodes [
 	// listing fails, but their claims are unknown until a listing succeeds.
 	peersKnown := !localOnly || a.peersListed
 	selected := a.selectLocalRoutes(a.reconciler.LocalRoutes(services), services, remoteNodes, peersKnown)
-	routed := make(map[string]string, len(selected))
-	for _, svc := range selected {
-		if svc.Network != nil && svc.Network.GuestIP != "" {
-			routed[svc.Network.GuestIP] = svc.Name
-		}
+	// Record what this publish withdraws before any file changes. A failed
+	// publish keeps the withdrawals incomplete, so their addresses stay held.
+	if err := a.beginRouteWithdrawals(selected); err != nil {
+		return fmt.Errorf("recording route withdrawals before publishing: %w", err)
 	}
 	var err error
 	if localOnly {
@@ -33,11 +32,11 @@ func (a *Agent) syncRuntimeRoutes(services []config.ServiceConfig, remoteNodes [
 	} else {
 		err = a.traefikMgr.Sync(selected, remoteNodes)
 	}
-	// A failed publish may have left any earlier route in place.
-	if err != nil {
-		maps.Copy(routed, a.routedGuestIPs)
+	if err == nil {
+		if cerr := a.reconciler.CompleteRouteWithdrawals(); cerr != nil {
+			a.logger.Warn("route withdrawals cannot be completed yet", "error", cerr)
+		}
 	}
-	a.routedGuestIPs = routed
 	return err
 }
 

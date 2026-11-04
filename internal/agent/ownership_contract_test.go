@@ -3,6 +3,8 @@ package agent
 import (
 	"context"
 	"errors"
+	"os"
+	"slices"
 	"testing"
 
 	"github.com/artemnikitin/firework/internal/capacity"
@@ -10,6 +12,7 @@ import (
 	netpkg "github.com/artemnikitin/firework/internal/network"
 	"github.com/artemnikitin/firework/internal/network/networktest"
 	"github.com/artemnikitin/firework/internal/reconciler"
+	"github.com/artemnikitin/firework/internal/traefik"
 	"github.com/artemnikitin/firework/internal/vm"
 )
 
@@ -127,6 +130,42 @@ func TestC4ServiceRetakingItsAddressWaitsForItsOldRule(t *testing.T) {
 	}
 }
 
+// fakeRouteProcess is the process serving routes: a restart changes start.
+type fakeRouteProcess struct {
+	boot, start string
+	err         error
+}
+
+func (p *fakeRouteProcess) Observe() (string, string, error) { return p.boot, p.start, p.err }
+
+// useRoutes gives the agent a real route directory, served by a fake Traefik
+// process, and returns that process.
+func useRoutes(t *testing.T, a *Agent) *fakeRouteProcess {
+	t.Helper()
+	process := &fakeRouteProcess{boot: "boot-1", start: "1000"}
+	useRoutesIn(a, t.TempDir(), process)
+	return process
+}
+
+func useRoutesIn(a *Agent, dir string, process *fakeRouteProcess) {
+	a.cfg.TraefikUnit = "traefik.service"
+	a.traefikMgr = traefik.NewManager(dir, "", testLogger())
+	a.routeProcess = process
+	a.reconciler.WithRouteEvidence(&agentRouteEvidence{agent: a})
+}
+
+// publishRoute writes the route of a service at guestIP, as an earlier tick
+// would have.
+func publishRoute(t *testing.T, a *Agent, service, guestIP string) {
+	t.Helper()
+	svc := addressedService(service, guestIP, 9)
+	svc.Metadata = map[string]string{"host": service + ".example.com"}
+	svc.PortForwards = []config.PortForward{{HostPort: 1, VMPort: 80}}
+	if err := a.traefikMgr.SyncLocal([]config.ServiceConfig{svc}); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func addressedService(name, ip string, index int) config.ServiceConfig {
 	svc := admissionService(name, 1, 64, 0, ip)
 	svc.Network.GuestMAC = guestMACForIndex(index)
@@ -148,7 +187,8 @@ func TestC6HeldBackAddressIsATransientWaitWhoeverOwnsIt(t *testing.T) {
 		"d": {Name: "d", Config: addressedService("d", "172.16.0.5", 3), State: vm.StateRunning},
 		"e": {Name: "e", Config: addressedService("e", "172.16.0.6", 4), State: vm.StateRunning},
 	}, "172.16.0.0/29")
-	a.routedGuestIPs = map[string]string{"172.16.0.4": "a"} // a's old VM's route is still published.
+	useRoutes(t, a)
+	publishRoute(t, a, "a", "172.16.0.4") // a's old VM's route is still published.
 	services := []config.ServiceConfig{networkedService("a"), networkedService("c"), networkedService("d"), networkedService("e"), networkedService("f")}
 	held := a.assignNetworking(services)
 	hold, ok := held["f"]
@@ -167,7 +207,8 @@ func TestHeldBackAddressStaysAvailableToItsOwner(t *testing.T) {
 		"d": {Name: "d", Config: addressedService("d", "172.16.0.5", 3), State: vm.StateRunning},
 		"e": {Name: "e", Config: addressedService("e", "172.16.0.6", 4), State: vm.StateRunning},
 	}, "172.16.0.0/29")
-	a.routedGuestIPs = map[string]string{"172.16.0.3": "zeta"} // zeta's old VM, route not yet withdrawn
+	useRoutes(t, a)
+	publishRoute(t, a, "zeta", "172.16.0.3") // zeta's old VM, route not yet withdrawn
 	services := []config.ServiceConfig{networkedService("alpha"), networkedService("c"), networkedService("d"), networkedService("e"), networkedService("zeta")}
 	held := a.assignNetworking(services)
 	if len(held) != 0 {
@@ -178,5 +219,64 @@ func TestHeldBackAddressStaysAvailableToItsOwner(t *testing.T) {
 	}
 	if got := services[0].Network.GuestIP; got != "172.16.0.4" {
 		t.Fatalf("alpha got %q", got)
+	}
+}
+
+// C4/L7: the agent dies after removing a routed VM, before withdrawing its
+// route. After a restart, with publishing still failing, the route file on
+// disk holds its address, so a new service cannot start where Traefik still
+// routes the removed one's hostname. Once a publish removes the file, the
+// address waits for a Traefik restart. (Reproducer from the review of
+// 5392d54.)
+func TestC4RestartedAgentKeepsAPublishedRouteAddress(t *testing.T) {
+	limit := capacity.NodeCapacity{VCPUs: 8, MemoryMB: 4096}
+	stateDir, routeDir := t.TempDir(), t.TempDir()
+	process := &fakeRouteProcess{boot: "boot-1", start: "1000"}
+	zeta := addressedService("zeta", "172.16.0.2", 0)
+	zeta.Metadata = map[string]string{"host": "zeta.example.com"}
+	zeta.HealthCheck = &config.HealthCheckConfig{Type: "tcp", Port: 80}
+	first, m := admissionAgent(t, "node: web\nservices: []\n", limit, map[string]*vm.Instance{
+		"zeta": {Name: "zeta", Config: zeta, State: vm.StateRunning},
+	}, "172.16.0.0/24")
+	first.reconciler = reconciler.NewWithNetworkManager(m, testLogger(), nil, &recoveryTestNetworkManager{}, "", 0).WithStateDir(stateDir)
+	useRoutesIn(first, routeDir, process)
+	if err := first.syncTraefikConfigs(context.Background(), []config.ServiceConfig{zeta}); err != nil {
+		t.Fatal(err)
+	}
+	_ = first.reconciler.Reconcile(context.Background(), config.NodeConfig{}) // zeta goes; the agent dies before its route sync.
+	if m.instances["zeta"] != nil {
+		t.Fatal("setup: zeta was not removed")
+	}
+
+	yaml := "node: web\nservices:\n- name: alpha\n  image: /alpha\n  kernel: /k\n  vcpus: 1\n  memory_mb: 64\n  network: {}\n  metadata:\n    host: alpha.example.com\n  health_check:\n    type: tcp\n    port: 80\n"
+	second, _ := admissionAgent(t, yaml, limit, nil, "172.16.0.0/24")
+	second.reconciler = reconciler.NewWithNetworkManager(m, testLogger(), nil, &recoveryTestNetworkManager{}, "", 0)
+	useRoutesIn(second, routeDir, process)
+	second.reconciler.WithStateDir(stateDir)
+	if err := os.Chmod(routeDir, 0o555); err != nil { // publishing keeps failing
+		t.Fatal(err)
+	}
+	second.tick(context.Background())
+	if alpha := m.instances["alpha"]; alpha != nil && alpha.Config.Network.GuestIP == "172.16.0.2" {
+		t.Fatal("alpha was given zeta's address while zeta's route file still exists")
+	}
+	if err := os.Chmod(routeDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	second.tick(context.Background()) // The publish removes zeta's route.
+	if routes, _, _ := traefik.ReadLocalRoutes(routeDir); slices.ContainsFunc(routes, func(r traefik.RouteFile) bool { return r.Service == "zeta" }) {
+		t.Fatalf("zeta's route survived a successful publish: %v", routes)
+	}
+	next := []config.ServiceConfig{networkedService("beta")}
+	second.assignNetworking(next)
+	if next[0].Network.GuestIP == "172.16.0.2" {
+		t.Fatal("beta was offered 172.16.0.2 while the Traefik that served zeta's route still runs")
+	}
+	process.start = "2000"
+	second.tick(context.Background())
+	next = []config.ServiceConfig{networkedService("beta")}
+	second.assignNetworking(next)
+	if next[0].Network.GuestIP != "172.16.0.2" {
+		t.Fatalf("172.16.0.2 not released after Traefik restarted: %s", next[0].Network.GuestIP)
 	}
 }

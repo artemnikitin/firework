@@ -99,6 +99,8 @@ type persistedJournal struct {
 	// that first held it. Peers may still send that service's traffic to
 	// it, so it is never given to another service (L6).
 	HostPorts map[string]string `json:"host_ports,omitempty"`
+	// RouteWithdrawals hold addresses whose routes may still be served (L7).
+	RouteWithdrawals []routeWithdrawal `json:"route_withdrawals,omitempty"`
 }
 
 // journalHistory says how much of this host's ownership history the journal
@@ -124,6 +126,17 @@ func (p persistedJournal) validate() error {
 	for port, service := range p.HostPorts {
 		if n, err := strconv.Atoi(port); err != nil || n < 1 || n > 65535 || strconv.Itoa(n) != port || service == "" {
 			return fmt.Errorf("host port holder %q -> %q is invalid", port, service)
+		}
+	}
+	for i, w := range p.RouteWithdrawals {
+		everyAddress := w.Service == routeEveryAddress && w.GuestIP == routeEveryAddress
+		switch {
+		case w.State != routeWithdrawing && w.State != routeWithdrawn:
+			return fmt.Errorf("route withdrawal %d has unknown state %q", i, w.State)
+		case w.Service == "" || !everyAddress && net.ParseIP(w.GuestIP) == nil:
+			return fmt.Errorf("route withdrawal %d names no service or guest IP", i)
+		case w.State == routeWithdrawn && (w.BootID == "" || w.ProcessStart == ""):
+			return fmt.Errorf("route withdrawal %d is complete without the process that served it", i)
 		}
 	}
 	seen := make(map[uint64]bool, len(p.Allocations))
@@ -222,12 +235,15 @@ func (r *Reconciler) mutateJournalLocked(mutate func()) error {
 	prevNext := r.nextAllocationID
 	prevDevices := maps.Clone(r.pendingNetworkDevices)
 	prevHolders := maps.Clone(r.hostPortHolders)
+	prevRoutes := maps.Clone(r.routeWithdrawals)
 	mutate()
-	if r.nextAllocationID == prevNext && maps.EqualFunc(prevAllocations, r.allocations, allocationsEqual) && maps.Equal(prevDevices, r.pendingNetworkDevices) {
+	if r.nextAllocationID == prevNext && maps.EqualFunc(prevAllocations, r.allocations, allocationsEqual) &&
+		maps.Equal(prevDevices, r.pendingNetworkDevices) && maps.Equal(prevRoutes, r.routeWithdrawals) {
 		return nil
 	}
 	if err := r.persistJournalLocked(); err != nil {
 		r.allocations, r.nextAllocationID, r.pendingNetworkDevices, r.hostPortHolders = prevAllocations, prevNext, prevDevices, prevHolders
+		r.routeWithdrawals = prevRoutes
 		return err
 	}
 	return nil
@@ -425,6 +441,10 @@ func (r *Reconciler) teardownDeparting(service string) error {
 // journal if construction could not.
 func (r *Reconciler) settleAllocations(ctx context.Context, teardown bool) error {
 	if r.networkMgr == nil {
+		// Routes still reach guest addresses without host networking.
+		if err := r.CompleteRouteWithdrawals(); err != nil {
+			r.logger.Warn("route withdrawals cannot be settled yet", "error", err)
+		}
 		return nil
 	}
 	r.cleanupMu.Lock()
@@ -439,6 +459,7 @@ func (r *Reconciler) settleAllocations(ctx context.Context, teardown bool) error
 	before := maps.Clone(r.allocations)
 	beforeNext := r.nextAllocationID
 	beforeHolders := maps.Clone(r.hostPortHolders)
+	beforeRoutes := maps.Clone(r.routeWithdrawals)
 	for _, a := range r.sortedAllocationsLocked() {
 		inst := actual[a.Service]
 		tracked := inst != nil && sameGuestIP(guestIPOf(inst.Config), a.GuestIP)
@@ -506,11 +527,15 @@ func (r *Reconciler) settleAllocations(ctx context.Context, teardown bool) error
 			}
 		}
 	}
-	if r.nextAllocationID != beforeNext || !maps.EqualFunc(before, r.allocations, allocationsEqual) {
+	if err := r.settleRoutesLocked(); err != nil {
+		r.logger.Warn("route withdrawals cannot be settled yet", "error", err)
+	}
+	if r.nextAllocationID != beforeNext || !maps.EqualFunc(before, r.allocations, allocationsEqual) || !maps.Equal(beforeRoutes, r.routeWithdrawals) {
 		if err := r.persistJournalLocked(); err != nil {
 			// Records only ever move forward, so the next tick derives the
 			// same changes from the same evidence.
 			r.allocations, r.nextAllocationID, r.hostPortHolders = before, beforeNext, beforeHolders
+			r.routeWithdrawals = beforeRoutes
 			errs = append(errs, stageError(FailureStageNetwork, fmt.Errorf("persisting ownership records: %w", err)))
 		}
 	}
@@ -557,6 +582,7 @@ func (r *Reconciler) initializeJournalLocked(actual map[string]*vm.Instance) err
 		complete = !found
 	}
 	prevAllocations, prevNext, prevDevices, prevHolders := maps.Clone(r.allocations), r.nextAllocationID, maps.Clone(r.pendingNetworkDevices), maps.Clone(r.hostPortHolders)
+	prevRoutes := maps.Clone(r.routeWithdrawals)
 	if r.legacyJournal != nil {
 		for _, entry := range r.legacyJournal.PortForwards {
 			if a, ok := r.departingLegacyLocked(entry.ServiceName, entry.GuestIP); ok {
@@ -579,10 +605,18 @@ func (r *Reconciler) initializeJournalLocked(actual map[string]*vm.Instance) err
 			r.newAllocationLocked(name, phaseRunning, guestIPOf(inst.Config), inst.Config.PortForwards, true)
 		}
 	}
+	if !complete && r.routeEvidence != nil {
+		// Routes an earlier agent removed are not known, and a running
+		// Traefik may still serve them: every address is held for every
+		// other service until that process is gone.
+		r.routeWithdrawals[routeKey{routeEveryAddress, routeEveryAddress}] = routeWithdrawal{
+			Service: routeEveryAddress, GuestIP: routeEveryAddress, State: routeWithdrawing}
+	}
 	r.history = journalHistory{Complete: complete, InitializedAt: time.Now().UTC()}
 	r.journalReady = true
 	if err := r.persistJournalLocked(); err != nil {
 		r.allocations, r.nextAllocationID, r.pendingNetworkDevices, r.hostPortHolders = prevAllocations, prevNext, prevDevices, prevHolders
+		r.routeWithdrawals = prevRoutes
 		r.history, r.journalReady = journalHistory{}, false
 		return fmt.Errorf("initializing ownership records: %w", err)
 	}
@@ -659,7 +693,7 @@ func (r *Reconciler) allocationHold(svc config.ServiceConfig, leaving map[string
 			}
 		}
 	}
-	return Hold{}
+	return r.routeHoldLocked(svc.Name, ip)
 }
 
 // portHistoryHoldLocked applies L6: a host port this node gave to one service
@@ -712,6 +746,13 @@ func (r *Reconciler) HasPendingCleanup() bool {
 	for _, a := range r.allocations {
 		inst := actual[a.Service]
 		if a.Phase == phaseDeparting || a.Phase == phaseCreating && (inst == nil || !sameGuestIP(guestIPOf(inst.Config), a.GuestIP)) {
+			return true
+		}
+	}
+	// An incomplete route withdrawal finishes by itself; a completed one
+	// waits for a Traefik restart that only an operator starts.
+	for _, w := range r.routeWithdrawals {
+		if w.State == routeWithdrawing {
 			return true
 		}
 	}

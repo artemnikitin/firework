@@ -77,12 +77,10 @@ type Agent struct {
 	// it. Only the tick goroutine uses them.
 	lastPeerNodes []config.NodeConfig
 	peersListed   bool
-	// routedGuestIPs maps each guest IP that published local routes may still
-	// point at to the service routed there. assignNetworking keeps it from
-	// other services until a publish no longer routes to it. Only the tick
-	// goroutine uses it.
-	routedGuestIPs map[string]string
-	lifecycleMu    sync.Mutex
+	// routeProcess identifies the process serving traefikMgr's routes, which
+	// decides when a withdrawn route's address may go to another service.
+	routeProcess routeProcess
+	lifecycleMu  sync.Mutex
 	// restartNeedsReconcile is set by a health restart that left its service
 	// without a running VM; the next tick then skips the unchanged-revision
 	// shortcut.
@@ -133,12 +131,13 @@ func New(cfg agentconfig.AgentConfig, s store.Store, logger *slog.Logger) *Agent
 	}
 
 	var localRoutes func() (bool, error)
+	routeEvidence := &agentRouteEvidence{}
+	rec := reconciler.New(vmMgr, logger, healthMon, networkMgr, cfg.UpdateStrategy, cfg.UpdateDelay)
 	if cfg.TraefikConfigDir != "" {
 		localRoutes = func() (bool, error) { return traefik.HasLocalRouteFiles(cfg.TraefikConfigDir) }
+		rec.WithRouteEvidence(routeEvidence)
 	}
-	rec := reconciler.New(vmMgr, logger, healthMon, networkMgr, cfg.UpdateStrategy, cfg.UpdateDelay).
-		WithHostHistoryEvidence(cfg.VMSubnet, localRoutes).
-		WithStateDir(cfg.StateDir)
+	rec.WithHostHistoryEvidence(cfg.VMSubnet, localRoutes)
 
 	// Initialize shared bridge and masquerade if network setup is enabled.
 	if networkMgr != nil && cfg.VMBridge != "" {
@@ -201,6 +200,7 @@ func New(cfg agentconfig.AgentConfig, s store.Store, logger *slog.Logger) *Agent
 		metrics:        metrics,
 		capacityReader: capReader,
 		traefikMgr:     traefikMgr,
+		routeProcess:   systemdRouteProcess{unit: cfg.TraefikUnit},
 		restartCounts:  make(map[string]int),
 		recoveryWake:   make(chan struct{}, 1),
 		recoveryQueue:  make(map[string]bool),
@@ -212,6 +212,9 @@ func New(cfg agentconfig.AgentConfig, s store.Store, logger *slog.Logger) *Agent
 		},
 	}
 	agentRef = a
+	routeEvidence.agent = a
+	// The journal is loaded once the routes it reads are wired up.
+	rec.WithStateDir(cfg.StateDir)
 	if cfg.RegistryURL != "" {
 		a.registryClient = newRegistryClient(cfg, logger, time.Now().UTC().UnixNano())
 	}
@@ -808,6 +811,8 @@ const (
 	addressExhaustedReason = "no free guest address in vm_subnet "
 	addressRecoveryReason  = "guest address retained by unresolved VM ownership"
 	addressTransientReason = "guest addresses are still reserved by VMs being stopped or removed"
+	// addressWithdrawalReason takes the Traefik unit (L7).
+	addressWithdrawalReason = "the free guest addresses were withdrawn from other services' routes, and %s may still serve those routes; restart it to release them"
 )
 
 // assignNetworking fills in IP, MAC, and kernel IP boot args for services
@@ -882,30 +887,42 @@ func (a *Agent) assignNetworking(services []config.ServiceConfig) map[string]rec
 			}
 		}
 	}
-	// A guest IP that a removed VM's host rules or published route may still
-	// reach is not given to another service until both are gone, or that
-	// service would receive the removed one's traffic.
+	// A guest IP that a removed VM's host rules, its record, or a route may
+	// still reach is not given to another service until they are gone, or
+	// that service would receive the removed one's traffic. A withdrawn
+	// route is gone only once the process serving routes has restarted.
 	departed := map[string]string{}
-	maps.Copy(departed, a.routedGuestIPs)
+	var unconfirmed map[string]bool
+	everyAddress, unconfirmedReserves := false, false
 	if a.reconciler != nil {
+		var routeHeld map[string]string
+		routeHeld, unconfirmed, everyAddress = a.reconciler.RouteHeldGuestIPs()
+		maps.Copy(departed, routeHeld)
 		maps.Copy(departed, a.reconciler.PendingTeardownGuestIPs())
 	}
 	for ip := range departed {
-		if _, tracked := reservedIP[ip]; tracked || !ipNet.Contains(net.ParseIP(ip)) {
+		switch _, tracked := reservedIP[ip]; {
+		case tracked || !ipNet.Contains(net.ParseIP(ip)):
 			delete(departed, ip)
-		} else {
+		case unconfirmed[ip]:
+			unconfirmedReserves = true
+		default:
 			// Released once its rules and routes are gone, whether or not its
 			// owner is still desired elsewhere: a wait, not invalid demand.
 			departingReserves = true
 		}
 	}
+	unconfirmedReserves = unconfirmedReserves || everyAddress
 	exhausted := reconciler.Hold{Reason: addressExhaustedReason + a.cfg.VMSubnet, Admission: "guest_addresses_exhausted"}
 	switch {
 	case networked > guestAddressCount(ipNet):
-	case quarantinedReserves && !departingReserves:
+	case quarantinedReserves && !departingReserves && !unconfirmedReserves:
 		exhausted = reconciler.Hold{Reason: addressRecoveryReason, Recovery: true}
 	case quarantinedReserves || departingReserves:
 		exhausted = reconciler.Hold{Reason: addressTransientReason}
+	case unconfirmedReserves:
+		exhausted = reconciler.Hold{Reason: fmt.Sprintf(addressWithdrawalReason, a.cfg.TraefikUnit),
+			Admission: reconciler.ActionGuestAddressWithdrawalUnconfirmed}
 	}
 	// Restore every existing assignment before allocating any new one, so a
 	// new service that exhausts the subnet can never leave an existing VM's
@@ -939,7 +956,8 @@ func (a *Agent) assignNetworking(services []config.ServiceConfig) map[string]rec
 			}
 			_, ipUsed := reservedIP[candidate]
 			_, macUsed := reservedMAC[strings.ToLower(guestMACForIndex(idx))]
-			if owner, departing := departed[candidate]; departing && owner != svc.Name {
+			owner, departing := departed[candidate]
+			if departing && owner != svc.Name || everyAddress && !departing {
 				ipUsed = true
 			}
 			if !ipUsed && !macUsed {

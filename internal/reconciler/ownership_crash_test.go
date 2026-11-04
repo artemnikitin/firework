@@ -30,6 +30,8 @@ type crashHost struct {
 	// agent: before the write when the second result is false, after it
 	// otherwise.
 	crashOnWrite func(data string) (crash, afterWrite bool)
+	// routes, when set, is the route directory and Traefik on the host.
+	routes *fakeRoutes
 }
 
 // crashVMs is a VM manager whose VMs outlive the agent, with hooks that crash
@@ -102,6 +104,9 @@ func (h *crashHost) agent() *Reconciler {
 		}
 		return nil
 	})
+	if h.routes != nil {
+		r.WithRouteEvidence(h.routes)
+	}
 	r.WithStateDir(h.stateDir)
 	if !r.ownershipReady() {
 		h.t.Fatal("ownership records were not initialized")
