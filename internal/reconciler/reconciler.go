@@ -9,6 +9,7 @@ import (
 	"io"
 	"log/slog"
 	"maps"
+	"net"
 	"os"
 	"path/filepath"
 	"slices"
@@ -113,6 +114,10 @@ type Reconciler struct {
 	// journalWrite replaces the journal file. Tests use it to fail or crash
 	// at a chosen write.
 	journalWrite func(path string, data []byte) error
+	// guestSubnet and localRoutes are the other evidence of earlier firework
+	// state that initialization checks; see WithHostHistoryEvidence.
+	guestSubnet *net.IPNet
+	localRoutes func() (bool, error)
 	// pendingNetworkDevices holds every individual host network device whose
 	// deletion has failed, keyed by the device's own (kind, name) identity —
 	// not by service name, and not by the service's composite set of
@@ -417,6 +422,22 @@ func (r *Reconciler) loadJournalLocked(dir string) *Reconciler {
 		r.pendingNetworkDevices[entry.key()] = entry
 	}
 	r.nextAllocationID, r.history, r.journalReady = loaded.NextID-1, loaded.History, true
+	return r
+}
+
+// WithHostHistoryEvidence names the rest of the host state that may show
+// earlier firework use when the journal is created: DNAT rules toward the
+// guest subnet, tagged or not, and local route files. History is complete
+// only if there are none. Call it before WithStateDir. An empty or invalid
+// subnet counts every DNAT rule.
+func (r *Reconciler) WithHostHistoryEvidence(guestSubnet string, localRoutes func() (bool, error)) *Reconciler {
+	r.cleanupMu.Lock()
+	defer r.cleanupMu.Unlock()
+	r.guestSubnet = nil
+	if _, subnet, err := net.ParseCIDR(guestSubnet); err == nil {
+		r.guestSubnet = subnet
+	}
+	r.localRoutes = localRoutes
 	return r
 }
 

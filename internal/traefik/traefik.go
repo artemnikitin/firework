@@ -321,3 +321,34 @@ func configFileName(serviceName string) string {
 func remoteConfigFileName(serviceName string) string {
 	return remoteFilePrefix + serviceName + ".yaml"
 }
+
+// HasLocalRouteFiles reports whether the directory holds a route file that is
+// not one of the agent's peer routes. Traefik loads .yaml, .yml and .toml
+// files, including those in subdirectories, so any of them, and any
+// subdirectory but the agent's own staging directory, may route to a guest
+// address. A missing directory holds none.
+func HasLocalRouteFiles(dir string) (bool, error) {
+	entries, err := os.ReadDir(dir)
+	if os.IsNotExist(err) {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("reading traefik config dir: %w", err)
+	}
+	for _, entry := range entries {
+		name := entry.Name()
+		if entry.IsDir() {
+			if name != stageDirName {
+				return true, nil
+			}
+			continue
+		}
+		switch filepath.Ext(name) {
+		case ".yaml", ".yml", ".toml":
+			if !strings.HasPrefix(name, remoteFilePrefix) {
+				return true, nil
+			}
+		}
+	}
+	return false, nil
+}

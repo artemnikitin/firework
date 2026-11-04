@@ -874,6 +874,9 @@ func TestWithStateDir_RejectsForeignJournalShapesAsCorrupt(t *testing.T) {
 		"unknown kind":      `{"version":1,"network":[{"service_name":"web","kind":"bond","name":"bond0"}]}`,
 		"empty device":      `{"version":1,"network":[{"service_name":"web","kind":"tap","name":""}]}`,
 		"port out of range": `{"version":1,"port_forwards":[{"service_name":"web","guest_ip":"172.16.0.2","port_forward":{"host_port":0,"vm_port":80}}]}`,
+		"no next id":        `{"version":2,"history":{"complete":true,"initialized_at":"2026-11-04T00:00:00Z"}}`,
+		"id beyond next id": `{"version":2,"next_id":2,"history":{"complete":true,"initialized_at":"2026-11-04T00:00:00Z"},"allocations":[{"id":2,"service":"web","phase":"running","guest_ip":"172.16.0.2"}]}`,
+		"unknown phase":     `{"version":2,"next_id":2,"history":{"complete":true,"initialized_at":"2026-11-04T00:00:00Z"},"allocations":[{"id":1,"service":"web","phase":"paused","guest_ip":"172.16.0.2"}]}`,
 	} {
 		t.Run(name, func(t *testing.T) {
 			dir := t.TempDir()

@@ -495,3 +495,40 @@ func TestSync_WriteFailureKeepsStaleThenConverges(t *testing.T) {
 		t.Error("expected stale file deleted after successful convergence")
 	}
 }
+
+func TestHasLocalRouteFiles(t *testing.T) {
+	for name, tc := range map[string]struct {
+		files []string
+		dirs  []string
+		want  bool
+	}{
+		"missing directory":   {want: false},
+		"empty":               {dirs: []string{"."}, want: false},
+		"peer routes only":    {files: []string{"remote-a.yaml"}, want: false},
+		"staging leftovers":   {dirs: []string{stageDirName}, files: []string{stageDirName + "/a.yaml.tmp"}, want: false},
+		"a local route":       {files: []string{"a.yaml"}, want: true},
+		"a hand-written toml": {files: []string{"extra.toml"}, want: true},
+		"a subdirectory":      {dirs: []string{"nested"}, want: true},
+		"other files":         {files: []string{"README.md"}, want: false},
+	} {
+		t.Run(name, func(t *testing.T) {
+			dir := filepath.Join(t.TempDir(), "dynamic")
+			for _, d := range tc.dirs {
+				if err := os.MkdirAll(filepath.Join(dir, d), 0o755); err != nil {
+					t.Fatal(err)
+				}
+			}
+			for _, f := range tc.files {
+				if err := os.MkdirAll(filepath.Dir(filepath.Join(dir, f)), 0o755); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(filepath.Join(dir, f), nil, 0o644); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if got, err := HasLocalRouteFiles(dir); err != nil || got != tc.want {
+				t.Fatalf("got %v err %v, want %v", got, err, tc.want)
+			}
+		})
+	}
+}

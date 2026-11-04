@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/artemnikitin/firework/internal/config"
@@ -15,20 +16,78 @@ import (
 	"github.com/artemnikitin/firework/internal/vm"
 )
 
+// journalReconciler builds a reconciler as the agent does, with the guest
+// subnet 172.16.0.0/24 and route files under <dir>/routes.
 func journalReconciler(t *testing.T, vms VMManager, kernel *networktest.Kernel, dir string) *Reconciler {
 	t.Helper()
-	return NewWithNetworkManager(vms, slog.New(slog.NewTextHandler(io.Discard, nil)), nil, kernel, "", 0).WithStateDir(dir)
+	routes := func() (bool, error) {
+		entries, err := os.ReadDir(filepath.Join(dir, "routes"))
+		if os.IsNotExist(err) {
+			return false, nil
+		}
+		for _, entry := range entries {
+			if !strings.HasPrefix(entry.Name(), "remote-") {
+				return true, nil
+			}
+		}
+		return false, err
+	}
+	return NewWithNetworkManager(vms, slog.New(slog.NewTextHandler(io.Discard, nil)), nil, kernel, "", 0).
+		WithHostHistoryEvidence("172.16.0.0/24", routes).WithStateDir(dir)
+}
+
+// Initialization that cannot read its evidence waits rather than guessing:
+// new networked starts are held, and the next tick tries again.
+func TestJournalInitializationWaitsForUnreadableEvidence(t *testing.T) {
+	dir, kernel := t.TempDir(), &networktest.Kernel{}
+	failing := true
+	vms := newFakeVMManager()
+	r := NewWithNetworkManager(vms, slog.New(slog.NewTextHandler(io.Discard, nil)), nil, kernel, "", 0).
+		WithHostHistoryEvidence("172.16.0.0/24", func() (bool, error) {
+			if failing {
+				return false, errors.New("permission denied")
+			}
+			return false, nil
+		}).WithStateDir(dir)
+	desired := config.NodeConfig{Services: []config.ServiceConfig{crashService("web", "172.16.0.2", 8080)}}
+	if err := r.Reconcile(context.Background(), desired); err == nil || vms.instances["web"] != nil {
+		t.Fatalf("started without initialized records: %v", err)
+	}
+	failing = false
+	if err := r.Reconcile(context.Background(), desired); err != nil || vms.instances["web"] == nil || !r.history.Complete {
+		t.Fatalf("did not initialize once the evidence was readable: %v", err)
+	}
 }
 
 // Ownership history is complete only on a host with no earlier firework
-// state: no journal, no VM state directory and no tagged rule. Anything else
-// is migrated, and its history stays incomplete across restarts.
+// state: no journal, no VM state directory, no DNAT rule toward the guest
+// subnet, tagged or not, and no local route file. Anything else is migrated,
+// and its history stays incomplete across restarts.
 func TestJournalInitializationRecordsWhetherHistoryIsComplete(t *testing.T) {
 	for name, tc := range map[string]struct {
 		prepare  func(t *testing.T, dir string, kernel *networktest.Kernel)
 		complete bool
 	}{
 		"clean host": {func(*testing.T, string, *networktest.Kernel) {}, true},
+		"an untagged rule toward the guest subnet": {func(_ *testing.T, _ string, kernel *networktest.Kernel) {
+			kernel.Append(networktest.Rule("", 8080, "172.16.0.2", 80))
+		}, false},
+		"an unrelated rule outside the guest subnet": {func(_ *testing.T, _ string, kernel *networktest.Kernel) {
+			kernel.Append(networktest.Rule("", 8080, "10.9.0.2", 80))
+		}, true},
+		"a DNAT rule whose destination cannot be read": {func(_ *testing.T, _ string, kernel *networktest.Kernel) {
+			kernel.Unparsed = []string{"-A PREROUTING -p tcp -m tcp --dport 7000:7010 -j DNAT --to-destination 172.16.0.5"}
+		}, false},
+		"a local route file": {func(t *testing.T, dir string, _ *networktest.Kernel) {
+			if err := os.WriteFile(filepath.Join(dir, "routes", "old.yaml"), []byte("http: {}\n"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+		}, false},
+		"only peer route files": {func(t *testing.T, dir string, _ *networktest.Kernel) {
+			if err := os.WriteFile(filepath.Join(dir, "routes", "remote-peer.yaml"), []byte("http: {}\n"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+		}, true},
 		"VM state directory exists": {func(t *testing.T, dir string, _ *networktest.Kernel) {
 			if err := os.Mkdir(filepath.Join(dir, "vms"), 0o755); err != nil {
 				t.Fatal(err)
@@ -45,6 +104,9 @@ func TestJournalInitializationRecordsWhetherHistoryIsComplete(t *testing.T) {
 	} {
 		t.Run(name, func(t *testing.T) {
 			dir, kernel := t.TempDir(), &networktest.Kernel{}
+			if err := os.Mkdir(filepath.Join(dir, "routes"), 0o755); err != nil {
+				t.Fatal(err)
+			}
 			tc.prepare(t, dir, kernel)
 			r := journalReconciler(t, newFakeVMManager(), kernel, dir)
 			if !r.ownershipReady() || r.history.Complete != tc.complete {

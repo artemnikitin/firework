@@ -110,6 +110,9 @@ func (p persistedJournal) validate() error {
 	if p.Version != journalVersion {
 		return fmt.Errorf("unsupported journal version %d (expected %d)", p.Version, journalVersion)
 	}
+	if p.NextID == 0 {
+		return fmt.Errorf("journal has no next allocation id")
+	}
 	if err := validateNetworkEntries(p.Network); err != nil {
 		return err
 	}
@@ -517,7 +520,19 @@ func (r *Reconciler) initializeJournalLocked(actual map[string]*vm.Instance) err
 		if err != nil {
 			return fmt.Errorf("listing port forwards to initialize ownership records: %w", err)
 		}
-		complete = !slices.ContainsFunc(listing.Rules, network.PortForwardRule.Tagged)
+		// Any rule an earlier agent may have installed, tagged or not, or a
+		// rule whose destination cannot be read, is earlier state.
+		complete = len(listing.Unparsed) == 0 && !slices.ContainsFunc(listing.Rules, func(rule network.PortForwardRule) bool {
+			ip := net.ParseIP(rule.GuestIP)
+			return rule.Tagged() || r.guestSubnet == nil || ip == nil || r.guestSubnet.Contains(ip)
+		})
+	}
+	if complete && r.localRoutes != nil {
+		found, err := r.localRoutes()
+		if err != nil {
+			return fmt.Errorf("checking route files to initialize ownership records: %w", err)
+		}
+		complete = !found
 	}
 	prevAllocations, prevNext, prevDevices := maps.Clone(r.allocations), r.nextAllocationID, maps.Clone(r.pendingNetworkDevices)
 	if r.legacyJournal != nil {

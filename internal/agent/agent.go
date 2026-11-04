@@ -132,7 +132,13 @@ func New(cfg agentconfig.AgentConfig, s store.Store, logger *slog.Logger) *Agent
 		networkMgr = network.NewManager(logger)
 	}
 
-	rec := reconciler.New(vmMgr, logger, healthMon, networkMgr, cfg.UpdateStrategy, cfg.UpdateDelay).WithStateDir(cfg.StateDir)
+	var localRoutes func() (bool, error)
+	if cfg.TraefikConfigDir != "" {
+		localRoutes = func() (bool, error) { return traefik.HasLocalRouteFiles(cfg.TraefikConfigDir) }
+	}
+	rec := reconciler.New(vmMgr, logger, healthMon, networkMgr, cfg.UpdateStrategy, cfg.UpdateDelay).
+		WithHostHistoryEvidence(cfg.VMSubnet, localRoutes).
+		WithStateDir(cfg.StateDir)
 
 	// Initialize shared bridge and masquerade if network setup is enabled.
 	if networkMgr != nil && cfg.VMBridge != "" {

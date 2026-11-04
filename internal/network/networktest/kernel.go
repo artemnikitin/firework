@@ -33,6 +33,8 @@ type Kernel struct {
 	DeviceErr func(name string) error
 	// Deleted records every rule a delete removed, in order.
 	Deleted []network.PortForwardRule
+	// Unparsed is listed as DNAT rules whose destination cannot be read.
+	Unparsed []string
 }
 
 func (k *Kernel) Setup(svc config.ServiceConfig) error {
@@ -138,7 +140,7 @@ func (k *Kernel) ListPortForwards() (network.PortForwardListing, error) {
 		rule.Args = slices.Clone(rule.Args)
 		rules[i] = rule
 	}
-	return network.PortForwardListing{Rules: rules}, nil
+	return network.PortForwardListing{Rules: rules, Unparsed: slices.Clone(k.Unparsed)}, nil
 }
 
 func (k *Kernel) DeletePortForwardRule(rule network.PortForwardRule) error {
