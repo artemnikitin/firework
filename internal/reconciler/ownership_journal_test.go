@@ -151,10 +151,13 @@ func TestVersion1JournalMigratesIntoRecords(t *testing.T) {
 	for _, rule := range kernel.Rules() {
 		remaining = append(remaining, rule.String())
 	}
-	if len(remaining) != 4 {
-		// web's untagged rule, web's tagged re-assertion, and both rules no
-		// record covers.
+	if len(remaining) != 3 {
+		// web's tagged re-assertion, which replaced its untagged rule, and
+		// both rules no record covers.
 		t.Fatalf("rules after migration: %v", remaining)
+	}
+	if rule, ok := kernel.Delivers(8080); !ok || !rule.TaggedFor("web") {
+		t.Fatalf("web's rule was not adopted: %v", remaining)
 	}
 	for _, rule := range kernel.Rules() {
 		if rule.Targets(9090, "172.16.0.3", 80) {

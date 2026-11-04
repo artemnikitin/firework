@@ -14,6 +14,7 @@ import (
 	"path/filepath"
 	"slices"
 	"sort"
+	"strconv"
 	"sync"
 	"time"
 
@@ -105,6 +106,9 @@ type Reconciler struct {
 	allocations      map[uint64]allocation
 	nextAllocationID uint64
 	history          journalHistory
+	// hostPortHolders maps each host port this node has allocated to the
+	// service that first held it (L6).
+	hostPortHolders map[int]string
 	// journalReady is false until the version 2 journal is loaded or created.
 	// New networked allocations wait until then.
 	journalReady bool
@@ -308,6 +312,7 @@ func NewWithNetworkManager(vmManager VMManager, logger *slog.Logger, healthMon *
 		updateDelay:           updateDelay,
 		pendingRecovery:       make(map[string]struct{}),
 		allocations:           make(map[uint64]allocation),
+		hostPortHolders:       make(map[int]string),
 		pendingNetworkDevices: make(map[networkDeviceKey]pendingNetworkDevice),
 		// Without a state directory nothing survives a restart, so this
 		// reconciler's records are the whole history.
@@ -421,6 +426,10 @@ func (r *Reconciler) loadJournalLocked(dir string) *Reconciler {
 	for _, entry := range loaded.Network {
 		r.pendingNetworkDevices[entry.key()] = entry
 	}
+	for port, service := range loaded.HostPorts {
+		n, _ := strconv.Atoi(port)
+		r.hostPortHolders[n] = service
+	}
 	r.nextAllocationID, r.history, r.journalReady = loaded.NextID-1, loaded.History, true
 	return r
 }
@@ -500,6 +509,12 @@ func (r *Reconciler) persistJournalLocked() error {
 	}
 	persisted := persistedJournal{Version: journalVersion, NextID: r.nextAllocationID + 1, History: r.history,
 		Allocations: r.sortedAllocationsLocked()}
+	if len(r.hostPortHolders) > 0 {
+		persisted.HostPorts = make(map[string]string, len(r.hostPortHolders))
+		for port, service := range r.hostPortHolders {
+			persisted.HostPorts[strconv.Itoa(port)] = service
+		}
+	}
 	for _, entry := range r.pendingNetworkDevices {
 		persisted.Network = append(persisted.Network, entry)
 	}
@@ -802,8 +817,14 @@ func (r *Reconciler) applyRolling(ctx context.Context, actions []Action) error {
 			break
 		}
 		if err := r.createService(ctx, action.Service); err != nil {
-			r.logger.Error("failed to start service during update", "service", action.Service.Name, "error", err)
 			errs = append(errs, fmt.Errorf("update %s: %w", action.Service.Name, err))
+			if errors.Is(err, ErrServiceHeld) {
+				// Its start waits for its old rules; the rest of the rollout
+				// does not depend on it.
+				r.logger.Info("start held during update", "service", action.Service.Name, "error", err)
+				continue
+			}
+			r.logger.Error("failed to start service during update", "service", action.Service.Name, "error", err)
 			break
 		}
 
@@ -1107,6 +1128,12 @@ func combineErrors(errs []error) error {
 
 // createService sets up networking, starts the VM, and registers health checks.
 func (r *Reconciler) createService(ctx context.Context, svc config.ServiceConfig) error {
+	// The definitive start gate, after any old VM of the service is gone: a
+	// failed teardown of its rules, or anything another tick left, holds the
+	// start until it is resolved.
+	if hold := r.startHold(svc, false, nil); hold.Reason != "" {
+		return hold.err(svc.Name)
+	}
 	var allocationID uint64
 	if r.networkMgr != nil {
 		// Write-ahead, for the same reason deleteService journals before

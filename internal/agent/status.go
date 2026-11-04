@@ -8,6 +8,7 @@ import (
 
 	"github.com/artemnikitin/firework/internal/config"
 	"github.com/artemnikitin/firework/internal/healthcheck"
+	"github.com/artemnikitin/firework/internal/reconciler"
 	"github.com/artemnikitin/firework/internal/statusmodel"
 	"github.com/artemnikitin/firework/internal/version"
 	"github.com/artemnikitin/firework/internal/vm"
@@ -265,9 +266,9 @@ func (a *Agent) refreshAgentStatus(phase statusmodel.Phase, code, message string
 	a.statusMu.RLock()
 	desiredServices := append([]config.ServiceConfig(nil), a.statusServices...)
 	a.statusMu.RUnlock()
-	var held map[string]string
+	var held map[string]reconciler.Hold
 	if a.reconciler != nil {
-		held = a.reconciler.HeldServices(config.NodeConfig{Services: desiredServices})
+		held = a.reconciler.HeldServiceHolds(config.NodeConfig{Services: desiredServices})
 	}
 
 	a.statusMu.Lock()
@@ -345,13 +346,17 @@ func (a *Agent) refreshAgentStatus(phase statusmodel.Phase, code, message string
 				service.ReasonCode = "health_check_failed"
 			}
 		}
-		if reason := held[desired.Name]; reason != "" && service.ReasonCode == "" {
+		if hold := held[desired.Name]; hold.Reason != "" && service.ReasonCode == "" {
 			// Keep the running/health observation while explaining why a
 			// requested change is deferred. A passing health check does not
 			// erase the resource hold, but an actual failure (VM, volume or
-			// health check) or quarantine keeps its own diagnosis.
+			// health check) or quarantine keeps its own diagnosis. A hold only
+			// an operator can resolve names its own code.
 			service.ReasonCode = "resource_held"
-			service.Message = statusmodel.BoundedMessage(reason)
+			if hold.Action != "" {
+				service.ReasonCode = hold.Action
+			}
+			service.Message = statusmodel.BoundedMessage(hold.Reason)
 		}
 		if serviceReady(service) {
 			ready++

@@ -9,6 +9,7 @@ import (
 	"github.com/artemnikitin/firework/internal/config"
 	netpkg "github.com/artemnikitin/firework/internal/network"
 	"github.com/artemnikitin/firework/internal/network/networktest"
+	"github.com/artemnikitin/firework/internal/reconciler"
 	"github.com/artemnikitin/firework/internal/vm"
 )
 
@@ -63,10 +64,11 @@ func TestC4FailedHealthRestartDoesNotLeaveAnUnownedRule(t *testing.T) {
 }
 
 // C4: a removed service whose rule's teardown failed comes back on another
-// port at its old address, and another service takes its old port. Neither
-// starts while the old rule could deliver the second service's traffic to
-// the first one's guest; both start once it is gone.
-// (Reproducer from the review of 5392d54.)
+// port at its old address, and another service asks for its old port.
+// Neither starts while the old rule could deliver the second service's
+// traffic to the first one's guest. The first starts once the rule is gone;
+// the second never gets the port, which peers may still use for the first
+// (L6). (Reproducer from the review of 5392d54.)
 func TestC4ServiceRetakingItsAddressWaitsForItsOldRule(t *testing.T) {
 	limit := capacity.NodeCapacity{VCPUs: 8, MemoryMB: 4096}
 	xSvc := admissionService("x", 1, 64, 0, "172.16.0.2")
@@ -79,8 +81,8 @@ func TestC4ServiceRetakingItsAddressWaitsForItsOldRule(t *testing.T) {
 		"a": {Name: "a", Config: aSvc, State: vm.StateRunning},
 	}, "172.16.0.0/24")
 	network := &recoveryTestNetworkManager{teardownErr: errors.New("iptables: resource temporarily unavailable")}
-	network.kernel.Append(networktest.Rule(netpkg.PortForwardTag("a"), 8080, "172.16.0.3", 80))
 	a.reconciler = testReconciler(t, m, network, "", 0)
+	network.kernel.Append(networktest.Rule(netpkg.PortForwardTag("a"), 8080, "172.16.0.3", 80)) // a runs under this journal.
 	a.tick(context.Background())
 	if m.instances["a"] != nil {
 		t.Fatal("setup: a not removed")
@@ -106,12 +108,19 @@ func TestC4ServiceRetakingItsAddressWaitsForItsOldRule(t *testing.T) {
 	for tick := 0; tick < 3; tick++ {
 		a.tick(context.Background())
 	}
-	ai, bi := m.instances["a"], m.instances["b"]
-	if ai == nil || bi == nil {
-		t.Fatalf("a=%v b=%v did not start once the rule was gone", ai, bi)
+	if m.instances["a"] == nil || m.instances["b"] != nil {
+		t.Fatalf("a=%v b=%v once the rule was gone: %s", m.instances["a"], m.instances["b"], a.agentStatusSnapshot().Message)
 	}
-	if rule, ok := network.kernel.Delivers(8080); !ok || rule.GuestIP != bi.Config.Network.GuestIP || !rule.TaggedFor("b") {
-		t.Fatalf("host port 8080 does not reach b: %v", network.kernel.Rules())
+	if _, ok := network.kernel.Delivers(8080); ok {
+		t.Fatalf("host port 8080 still forwards: %v", network.kernel.Rules())
+	}
+	if reconciled := conditionOf(a.agentStatusSnapshot(), "Reconciled"); reconciled.ReasonCode != reconciler.ActionHostPortReuseBlocked {
+		t.Fatalf("status does not name the blocked port: %+v", reconciled)
+	}
+	for _, service := range a.agentStatusSnapshot().Services {
+		if service.Name == "b" && service.ReasonCode != reconciler.ActionHostPortReuseBlocked {
+			t.Fatalf("b's status = %+v", service)
+		}
 	}
 	if len(violations) != 0 {
 		t.Fatal(violations)

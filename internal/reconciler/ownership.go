@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"time"
 
 	"github.com/artemnikitin/firework/internal/config"
@@ -94,6 +95,10 @@ type persistedJournal struct {
 	History     journalHistory         `json:"history"`
 	Allocations []allocation           `json:"allocations,omitempty"`
 	Network     []pendingNetworkDevice `json:"network,omitempty"`
+	// HostPorts maps each host port this node has allocated to the service
+	// that first held it. Peers may still send that service's traffic to
+	// it, so it is never given to another service (L6).
+	HostPorts map[string]string `json:"host_ports,omitempty"`
 }
 
 // journalHistory says how much of this host's ownership history the journal
@@ -115,6 +120,11 @@ func (p persistedJournal) validate() error {
 	}
 	if err := validateNetworkEntries(p.Network); err != nil {
 		return err
+	}
+	for port, service := range p.HostPorts {
+		if n, err := strconv.Atoi(port); err != nil || n < 1 || n > 65535 || strconv.Itoa(n) != port || service == "" {
+			return fmt.Errorf("host port holder %q -> %q is invalid", port, service)
+		}
 	}
 	seen := make(map[uint64]bool, len(p.Allocations))
 	for i, a := range p.Allocations {
@@ -162,6 +172,11 @@ func (r *Reconciler) newAllocationLocked(service string, phase allocationPhase, 
 	a := allocation{ID: r.nextAllocationID, Service: service, Phase: phase, GuestIP: guestIP,
 		PortForwards: slices.Clone(pfs), Untagged: untagged}
 	r.allocations[a.ID] = a
+	for _, pf := range pfs {
+		if _, held := r.hostPortHolders[pf.HostPort]; !held {
+			r.hostPortHolders[pf.HostPort] = service
+		}
+	}
 	return a
 }
 
@@ -206,12 +221,13 @@ func (r *Reconciler) mutateJournalLocked(mutate func()) error {
 	prevAllocations := maps.Clone(r.allocations)
 	prevNext := r.nextAllocationID
 	prevDevices := maps.Clone(r.pendingNetworkDevices)
+	prevHolders := maps.Clone(r.hostPortHolders)
 	mutate()
 	if r.nextAllocationID == prevNext && maps.EqualFunc(prevAllocations, r.allocations, allocationsEqual) && maps.Equal(prevDevices, r.pendingNetworkDevices) {
 		return nil
 	}
 	if err := r.persistJournalLocked(); err != nil {
-		r.allocations, r.nextAllocationID, r.pendingNetworkDevices = prevAllocations, prevNext, prevDevices
+		r.allocations, r.nextAllocationID, r.pendingNetworkDevices, r.hostPortHolders = prevAllocations, prevNext, prevDevices, prevHolders
 		return err
 	}
 	return nil
@@ -422,6 +438,7 @@ func (r *Reconciler) settleAllocations(ctx context.Context, teardown bool) error
 	}
 	before := maps.Clone(r.allocations)
 	beforeNext := r.nextAllocationID
+	beforeHolders := maps.Clone(r.hostPortHolders)
 	for _, a := range r.sortedAllocationsLocked() {
 		inst := actual[a.Service]
 		tracked := inst != nil && sameGuestIP(guestIPOf(inst.Config), a.GuestIP)
@@ -470,17 +487,22 @@ func (r *Reconciler) settleAllocations(ctx context.Context, teardown bool) error
 			departing = append(departing, a)
 		}
 	}
-	if len(departing) > 0 && teardown {
-		if unknown := unknownRuntimeOwner(actual); unknown != "" {
-			errs = append(errs, fmt.Errorf("cleanup held by unknown runtime claims for %s: %w", unknown, ErrRecoveryHeld))
-		} else if listing, err := r.networkMgr.ListPortForwards(); err != nil {
+	if teardown {
+		listing, err := r.networkMgr.ListPortForwards()
+		switch {
+		case err != nil:
 			errs = append(errs, stageError(FailureStageNetwork, fmt.Errorf("listing port forwards for cleanup: %w", err)))
-		} else {
+		case len(departing) > 0 && unknownRuntimeOwner(actual) != "":
+			errs = append(errs, fmt.Errorf("cleanup held by unknown runtime claims for %s: %w", unknownRuntimeOwner(actual), ErrRecoveryHeld))
+		default:
 			for _, a := range departing {
 				if _, err := r.teardownDepartingLocked(a, listing, actual); err != nil {
 					r.logger.Warn("port forward teardown still pending, will retry next tick", "service", a.Service, "error", err)
 					errs = append(errs, err)
 				}
+			}
+			if err := r.adoptPortForwards(actual, listing); err != nil {
+				errs = append(errs, err)
 			}
 		}
 	}
@@ -488,7 +510,7 @@ func (r *Reconciler) settleAllocations(ctx context.Context, teardown bool) error
 		if err := r.persistJournalLocked(); err != nil {
 			// Records only ever move forward, so the next tick derives the
 			// same changes from the same evidence.
-			r.allocations, r.nextAllocationID = before, beforeNext
+			r.allocations, r.nextAllocationID, r.hostPortHolders = before, beforeNext, beforeHolders
 			errs = append(errs, stageError(FailureStageNetwork, fmt.Errorf("persisting ownership records: %w", err)))
 		}
 	}
@@ -534,7 +556,7 @@ func (r *Reconciler) initializeJournalLocked(actual map[string]*vm.Instance) err
 		}
 		complete = !found
 	}
-	prevAllocations, prevNext, prevDevices := maps.Clone(r.allocations), r.nextAllocationID, maps.Clone(r.pendingNetworkDevices)
+	prevAllocations, prevNext, prevDevices, prevHolders := maps.Clone(r.allocations), r.nextAllocationID, maps.Clone(r.pendingNetworkDevices), maps.Clone(r.hostPortHolders)
 	if r.legacyJournal != nil {
 		for _, entry := range r.legacyJournal.PortForwards {
 			if a, ok := r.departingLegacyLocked(entry.ServiceName, entry.GuestIP); ok {
@@ -560,7 +582,7 @@ func (r *Reconciler) initializeJournalLocked(actual map[string]*vm.Instance) err
 	r.history = journalHistory{Complete: complete, InitializedAt: time.Now().UTC()}
 	r.journalReady = true
 	if err := r.persistJournalLocked(); err != nil {
-		r.allocations, r.nextAllocationID, r.pendingNetworkDevices = prevAllocations, prevNext, prevDevices
+		r.allocations, r.nextAllocationID, r.pendingNetworkDevices, r.hostPortHolders = prevAllocations, prevNext, prevDevices, prevHolders
 		r.history, r.journalReady = journalHistory{}, false
 		return fmt.Errorf("initializing ownership records: %w", err)
 	}
@@ -586,7 +608,7 @@ func (r *Reconciler) departingLegacyLocked(service, guestIP string) (allocation,
 // not resolved yet. Host ports of another service's running VM are checked
 // against the VM itself, so a port can move between services within a tick
 // once the old VM's rules are gone.
-func (r *Reconciler) allocationHold(svc config.ServiceConfig) Hold {
+func (r *Reconciler) allocationHold(svc config.ServiceConfig, leaving map[string]bool) Hold {
 	ip := guestIPOf(svc)
 	if r.networkMgr == nil || ip == "" {
 		return Hold{}
@@ -599,6 +621,9 @@ func (r *Reconciler) allocationHold(svc config.ServiceConfig) Hold {
 	}
 	if !r.journalReady {
 		return Hold{Reason: "ownership records are not initialized yet"}
+	}
+	if hold := r.portHistoryHoldLocked(svc); hold.Reason != "" {
+		return hold
 	}
 	for _, a := range r.sortedAllocationsLocked() {
 		inst := actual[a.Service]
@@ -619,6 +644,9 @@ func (r *Reconciler) allocationHold(svc config.ServiceConfig) Hold {
 			}
 			continue
 		}
+		if leaving[a.Service] && a.Phase == phaseRunning && tracked {
+			continue // Its VM goes before any start this tick.
+		}
 		if sameGuestIP(a.GuestIP, ip) {
 			return Hold{Reason: fmt.Sprintf("guest IP %s is still recorded for service %s (%s)", ip, a.Service, a.Phase)}
 		}
@@ -629,6 +657,26 @@ func (r *Reconciler) allocationHold(svc config.ServiceConfig) Hold {
 			if slices.ContainsFunc(a.PortForwards, func(other config.PortForward) bool { return other.HostPort == pf.HostPort }) {
 				return Hold{Reason: fmt.Sprintf("host port %d is still recorded for service %s (%s)", pf.HostPort, a.Service, a.Phase)}
 			}
+		}
+	}
+	return Hold{}
+}
+
+// portHistoryHoldLocked applies L6: a host port this node gave to one service
+// is never given to another, because peers' routes and guests' cross-node
+// links may still send the first service's traffic to it, and this node
+// cannot observe when they stop. With incomplete history, a port without a
+// recorded holder may have such a past too. Waiting cannot resolve either.
+func (r *Reconciler) portHistoryHoldLocked(svc config.ServiceConfig) Hold {
+	for _, pf := range svc.PortForwards {
+		holder, held := r.hostPortHolders[pf.HostPort]
+		switch {
+		case held && holder != svc.Name:
+			return Hold{Reason: fmt.Sprintf("host port %d was used by service %s on this node, and peers may still send that service's traffic to it; use a fresh host port, or a node without this history", pf.HostPort, holder),
+				Action: ActionHostPortReuseBlocked}
+		case !held && !r.history.Complete:
+			return Hold{Reason: fmt.Sprintf("this node's ownership history is incomplete, so host port %d may still be referenced for another service; use a host port this node already gives %s, or a node without earlier history", pf.HostPort, svc.Name),
+				Action: ActionNetworkHistoryIncomplete}
 		}
 	}
 	return Hold{}

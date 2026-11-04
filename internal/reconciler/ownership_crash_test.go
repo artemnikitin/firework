@@ -308,7 +308,7 @@ func (h *crashHost) startsOnlyOverItsOwnRules(services ...config.ServiceConfig) 
 // another service then takes it with only its own rule toward it.
 func TestC4CrashDuringDeleteResumesAndReleasesTheAddress(t *testing.T) {
 	web := crashService("web", "172.16.0.2", 8080)
-	next := crashService("next", "172.16.0.2", 8080)
+	next := crashService("next", "172.16.0.2", 9090)
 	for name, arm := range map[string]func(*crashHost){
 		"after the departing record, before the VM stops": func(h *crashHost) { h.crashOnWrite = phaseWrite(phaseDeparting) },
 		"after the VM stops, before teardown":             func(h *crashHost) { h.vms.afterRemove = crash },

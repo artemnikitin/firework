@@ -38,10 +38,12 @@ const generatedVCPUs, generatedMemoryMB = 6, 2048
 
 // generatedRevision returns up to four services with distinct host ports that
 // fit the node together.
+// generatedRevision draws each service's host port from its own pool, so a
+// revision may move a service's port but never gives one service another's
+// old port, which L6 does not support.
 func generatedRevision(r *rand.Rand) []generatedService {
-	ports := []int{5050, 6060, 7070, 8080, 9090}
-	r.Shuffle(len(ports), func(i, j int) { ports[i], ports[j] = ports[j], ports[i] })
 	for {
+		ports := []int{5050 + r.Intn(2), 6060 + r.Intn(2), 7070 + r.Intn(2), 8080 + r.Intn(2)}
 		var out []generatedService
 		vcpus, mem := 0, 0
 		for i, name := range []string{"a", "b", "c", "d"} {
@@ -146,7 +148,7 @@ func TestRandomRevisionsConvergeWithinCapacity(t *testing.T) {
 			quarantineTicks = 1 + r.Intn(3)
 			qConfig = config.ServiceConfig{
 				Name: "q", Image: "/q", Kernel: "/k", VCPUs: min(1+r.Intn(2), capVCPUs-usedVCPUs), MemoryMB: 256,
-				PortForwards: []config.PortForward{{HostPort: []int{5050, 6060, 7070, 8080, 9090, 1111}[r.Intn(6)], VMPort: 80}},
+				PortForwards: []config.PortForward{{HostPort: []int{1111, 1112}[r.Intn(2)], VMPort: 80}},
 				Network:      &config.NetworkConfig{GuestIP: "172.16.0.6", GuestMAC: guestMACForIndex(4)},
 			}
 			q := &vm.Instance{Name: "q", State: vm.StateRecoveryPending, Config: qConfig}

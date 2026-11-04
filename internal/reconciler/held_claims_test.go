@@ -2,6 +2,7 @@ package reconciler
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -103,22 +104,25 @@ func TestHeldRunningOwnerClaimsHoldNewService(t *testing.T) {
 	if reason := r.HeldServices(desired)["t"]; !strings.Contains(reason, "host port 8080") || !strings.Contains(reason, "s") {
 		t.Fatalf("t hold reason = %q", reason)
 	}
-	// Once the owner's update is no longer held, both converge.
+	// Once the owner's update is no longer held, s moves to 9090. t still
+	// never gets 8080: s used it on this node, and peers may still send s's
+	// traffic there (L6).
 	r.SetHeldServices(nil)
-	if err := r.Reconcile(context.Background(), desired); err != nil && !IsIncomplete(err) {
-		t.Fatal(err)
+	for tick := 0; tick < 2; tick++ {
+		_ = r.Reconcile(context.Background(), desired)
 	}
-	if err := r.Reconcile(context.Background(), desired); err != nil {
-		t.Fatalf("second reconcile after the hold cleared: %v", err)
+	if m.instances["t"] != nil || m.instances["s"].Config.PortForwards[0].HostPort != 9090 {
+		t.Fatalf("t=%v s=%v", m.instances["t"], m.instances["s"].Config.PortForwards)
 	}
-	if m.instances["t"] == nil || m.instances["s"].Config.PortForwards[0].HostPort != 9090 {
-		t.Fatalf("services did not converge: t=%v s=%v", m.instances["t"], m.instances["s"].Config.PortForwards)
+	if hold := r.holds(desired)["t"]; hold.Action != ActionHostPortReuseBlocked {
+		t.Fatalf("t hold = %+v", hold)
 	}
 }
 
-// Two running services swapping host ports, with nothing held, converge
-// instead of waiting on each other forever.
-func TestUnheldPortSwapConverges(t *testing.T) {
+// L6: two running services swapping host ports is unsupported, because peers
+// may still send each service's traffic to its old port. Both keep running
+// as they are, and each hold names the operator's action.
+func TestPortSwapBetweenServicesIsBlocked(t *testing.T) {
 	m := newFakeVMManager()
 	r := NewWithNetworkManager(m, heldClaimsLogger(), nil, &forwardRecorder{}, "", 0)
 	a := config.ServiceConfig{Name: "a", VCPUs: 1, Network: &config.NetworkConfig{GuestIP: "172.16.0.2"}, PortForwards: []config.PortForward{{HostPort: 8080, VMPort: 80}}}
@@ -127,11 +131,17 @@ func TestUnheldPortSwapConverges(t *testing.T) {
 	m.instances["b"] = &vm.Instance{Name: "b", Config: b, State: vm.StateRunning}
 	a.PortForwards, b.PortForwards = b.PortForwards, a.PortForwards
 	desired := config.NodeConfig{Services: []config.ServiceConfig{a, b}}
-	if err := r.Reconcile(context.Background(), desired); err != nil {
+	err := r.Reconcile(context.Background(), desired)
+	var action *ActionRequiredError
+	if !errors.As(err, &action) || action.Code != ActionHostPortReuseBlocked {
 		t.Fatalf("swap: %v", err)
 	}
-	if m.instances["a"].Config.PortForwards[0].HostPort != 9090 || m.instances["b"].Config.PortForwards[0].HostPort != 8080 {
-		t.Fatal("swap did not converge")
+	if m.instances["a"].Config.PortForwards[0].HostPort != 8080 || m.instances["b"].Config.PortForwards[0].HostPort != 9090 {
+		t.Fatal("a swap went ahead")
+	}
+	held := r.holds(desired)
+	if held["a"].Action != ActionHostPortReuseBlocked || held["b"].Action != ActionHostPortReuseBlocked {
+		t.Fatalf("holds: %+v", held)
 	}
 }
 
@@ -219,21 +229,27 @@ func TestHeldFailedVMKeepsItsClaims(t *testing.T) {
 	}
 }
 
-// Replacing a service with one that takes its host port converges in one
-// all-at-once apply: the delete releases the port before the create.
-func TestReplacementOnSamePortConvergesInOneApply(t *testing.T) {
+// Replacing a service with one that takes its address converges in one
+// all-at-once apply: the delete releases the address before the create. Its
+// host port is never given to the replacement (L6).
+func TestReplacementOnSameAddressConvergesInOneApply(t *testing.T) {
 	m := newFakeVMManager()
 	r := NewWithNetworkManager(m, heldClaimsLogger(), nil, &forwardRecorder{}, "", 0)
-	svc := func(name, ip string) config.ServiceConfig {
-		return config.ServiceConfig{Name: name, VCPUs: 1, Network: &config.NetworkConfig{GuestIP: ip}, PortForwards: []config.PortForward{{HostPort: 8080, VMPort: 80}}}
+	svc := func(name string, port int) config.ServiceConfig {
+		return config.ServiceConfig{Name: name, VCPUs: 1, Network: &config.NetworkConfig{GuestIP: "172.16.0.2"}, PortForwards: []config.PortForward{{HostPort: port, VMPort: 80}}}
 	}
-	m.instances["d"] = &vm.Instance{Name: "d", Config: svc("d", "172.16.0.2"), State: vm.StateRunning}
-	desired := config.NodeConfig{Services: []config.ServiceConfig{svc("k", "172.16.0.3")}}
+	m.instances["d"] = &vm.Instance{Name: "d", Config: svc("d", 8080), State: vm.StateRunning}
+	desired := config.NodeConfig{Services: []config.ServiceConfig{svc("k", 9090)}}
 	if err := r.Reconcile(context.Background(), desired); err != nil {
 		t.Fatal(err)
 	}
 	if m.instances["d"] != nil || m.instances["k"] == nil {
 		t.Fatalf("d=%v k=%v", m.instances["d"], m.instances["k"])
+	}
+	onDsPort := config.NodeConfig{Services: []config.ServiceConfig{svc("k", 9090), {Name: "j", Network: &config.NetworkConfig{GuestIP: "172.16.0.3"},
+		PortForwards: []config.PortForward{{HostPort: 8080, VMPort: 80}}}}}
+	if err := r.Reconcile(context.Background(), onDsPort); m.instances["j"] != nil || err == nil {
+		t.Fatalf("j took d's old host port: %v", err)
 	}
 }
 

@@ -46,11 +46,27 @@ func convergenceYAML(services []convergenceService) []byte {
 	return []byte(b.String())
 }
 
+// portReused reports whether to gives a host port to a service other than
+// the one from had on it, which L6 does not support.
+func portReused(from, to []convergenceService) bool {
+	for _, next := range to {
+		for _, prev := range from {
+			if prev.name != next.name && prev.hostPort == next.hostPort {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 // converge applies from, then switches to to. With transition headroom it
 // reports why to has not converged within three ticks, or "" once every VM
 // runs its desired size and port and the revision is applied. Without it, a
 // transition may need to wait for headroom (L2), and converge reports only a
 // start that took capacity not free (C7) or a revision applied unconverged.
+// A transition that moves a host port between services never converges
+// (L6): converge then reports a service that got another's old port, or a
+// status that does not name the operator's action.
 func converge(t *testing.T, cap int, from, to []convergenceService, headroom bool) string {
 	t.Helper()
 	cfg := testAgentConfig(t)
@@ -76,6 +92,22 @@ func converge(t *testing.T, cap int, from, to []convergenceService, headroom boo
 		if len(manager.overcommits) != 0 {
 			return fmt.Sprintf("tick %d: %v", tick, manager.overcommits)
 		}
+	}
+	if portReused(from, to) {
+		for _, next := range to {
+			got := manager.instances[next.name]
+			for _, prev := range from {
+				if got != nil && prev.name != next.name && got.Config.PortForwards[0].HostPort == prev.hostPort {
+					return fmt.Sprintf("%s got %s's old host port %d", next.name, prev.name, prev.hostPort)
+				}
+			}
+		}
+		// With headroom nothing else waits, so status names the action.
+		// Without it, a capacity wait may be reported first (L2).
+		if reconciled := conditionOf(a.agentStatusSnapshot(), "Reconciled"); a.lastRevision == "r2" || headroom && reconciled.ReasonCode != reconciler.ActionHostPortReuseBlocked {
+			return fmt.Sprintf("a blocked port move reports %+v", reconciled)
+		}
+		return ""
 	}
 	if !headroom {
 		if a.lastRevision == "r2" {
@@ -124,7 +156,7 @@ func TestFittingRevisionsConverge(t *testing.T) {
 		for _, vcpus := range need {
 			total += vcpus
 		}
-		if total <= cap {
+		if total <= cap && !portReused(from, to) {
 			withHeadroom++
 		}
 		if reason := converge(t, cap, from, to, total <= cap); reason != "" {
@@ -170,7 +202,7 @@ func TestFittingRevisionsConverge(t *testing.T) {
 			}
 		}
 	}
-	if withHeadroom < 300 {
+	if withHeadroom < 200 {
 		t.Fatalf("only %d transitions had headroom", withHeadroom)
 	}
 }

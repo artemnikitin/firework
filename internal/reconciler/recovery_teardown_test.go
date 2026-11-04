@@ -49,8 +49,8 @@ func TestRecoveryTeardownCleansOldConfigAndProtectsReplacementClaims(t *testing.
 	replacement.PortForwards = []config.PortForward{{HostPort: 9090, VMPort: 90}, {HostPort: 8081, VMPort: 80}}
 	manager := &teardownVMManager{fakeVMManager: newFakeVMManager()}
 	network := &fakeNetworkManager{}
-	network.installRules(old)
 	r := newRecoveryTeardownReconciler(t, manager, network, t.TempDir())
+	network.installRules(old) // The quarantined VM's rules, from under this journal.
 	if err := manager.clearRecovery(old); err != nil {
 		t.Fatal(err)
 	}

@@ -286,12 +286,14 @@ func TestReconcile_UpdateWithChangedPortKeepsRetryingStaleRule(t *testing.T) {
 	if !HasFailureStage(err, FailureStageNetwork) {
 		t.Fatalf("stale-rule error lost its network failure stage: %v", err)
 	}
-	if !containsInt(net.setupForwardCalls, 9090) {
-		t.Fatal("the new port forward was not set up for the updated service")
+	// The new VM waits while the old 8080 rule still reaches its address: a
+	// service's own earlier rules for released ports go first.
+	if _, running := vmMgr.instances["web"]; running || containsInt(net.setupForwardCalls, 9090) {
+		t.Fatal("the updated VM started while its old 8080 rule still reached the address")
 	}
 
 	// The stale 8080 teardown must keep being retried every tick, without
-	// ever touching 9090's live rule.
+	// ever touching 9090's rule.
 	teardownCallsBefore := len(net.teardownForwardCalls)
 	if err := r.Reconcile(context.Background(), moved); err == nil {
 		t.Fatal("the stale rule must keep failing the tick until it is actually torn down")
@@ -304,9 +306,12 @@ func TestReconcile_UpdateWithChangedPortKeepsRetryingStaleRule(t *testing.T) {
 		t.Fatal("the stale 8080 rule was not retried")
 	}
 
-	// Once the old rule's teardown succeeds, the tick converges and the
-	// updated service keeps running on the new port.
+	// Once the old rule's teardown succeeds, the updated service starts on
+	// the new port.
 	net.teardownForwardErr = nil
+	if err := r.Reconcile(context.Background(), moved); err != nil && !IsIncomplete(err) {
+		t.Fatal(err)
+	}
 	if err := r.Reconcile(context.Background(), moved); err != nil {
 		t.Fatalf("tick should converge once the stale rule is torn down: %v", err)
 	}

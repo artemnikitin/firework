@@ -598,6 +598,20 @@ func (a *Agent) tick(ctx context.Context) {
 		a.forceReconcile = true
 		err = nil
 	}
+	var action *reconciler.ActionRequiredError
+	if err != nil && reconciler.IsIncomplete(err) && errors.As(err, &action) {
+		// Only an operator can resolve this hold, such as a host port another
+		// service used on this node (L6). Report it as a failure naming the
+		// action, not as a wait another tick may end. Independent work still
+		// converged.
+		a.logger.Warn("reconciliation needs an operator action", "reason", action.Code, "error", err)
+		a.setStatusCondition("NetworkReady", statusmodel.ConditionTrue, "", "")
+		a.setStatusCondition("VMsReconciled", statusmodel.ConditionFalse, action.Code, err.Error())
+		a.failAgentStatus("Reconciled", action.Code, action.Reason)
+		a.refreshRuntimeMetrics()
+		a.syncRegistryAfterTick(ctx, nodeCap, used)
+		return
+	}
 	if err != nil && reconciler.IsIncomplete(err) {
 		// Every collected error was a hold or a benign start race: a stop or
 		// remove arrived while a start was preparing volumes, or two starts
@@ -1636,6 +1650,12 @@ func (a *Agent) restartService(ctx context.Context, name string) error {
 	if hold := a.reconciler.CapacityHold(inst.Config); hold.Reason != "" {
 		a.restartNeedsReconcile.Store(true)
 		return fmt.Errorf("restart %s waits for capacity: %s", name, hold.Reason)
+	}
+	// A rule that could deliver another service's traffic to this address
+	// holds the restart, so a refused restart leaves the VM as it is.
+	if hold := a.reconciler.StartHold(inst.Config); hold.Reason != "" {
+		a.restartNeedsReconcile.Store(true)
+		return fmt.Errorf("restart %s waits: %s", name, hold.Reason)
 	}
 	a.metrics.recordServiceRestart(name, tenantForService(inst.Config))
 	a.recordRestart(name)

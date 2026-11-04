@@ -155,7 +155,11 @@ func TestUnknownRuntimeClaimsHoldMutationsAndCleanupUntilResolved(t *testing.T) 
 	if err := r.journalIntendedTeardowns(forwardedService("gone")); err != nil {
 		t.Fatal(err)
 	}
-	desired := config.NodeConfig{Services: []config.ServiceConfig{forwardedService("new"), kept}}
+	// "new" takes gone's address on a fresh host port: gone's port stays its
+	// own (L6).
+	newSvc := forwardedService("new")
+	newSvc.PortForwards = []config.PortForward{{HostPort: 7070, VMPort: 80}}
+	desired := config.NodeConfig{Services: []config.ServiceConfig{newSvc, kept}}
 	for tick := 0; tick < 2; tick++ {
 		if err := r.Reconcile(context.Background(), desired); !IsIncomplete(err) {
 			t.Fatalf("unknown claims must hold new allocations: %v", err)
@@ -190,13 +194,12 @@ func TestUnknownRuntimeClaimsHoldMutationsAndCleanupUntilResolved(t *testing.T) 
 	if manager.instances["new"] == nil || r.HasPendingCleanup() {
 		t.Fatal("resolved ownership failed to finish held work and cleanup")
 	}
-	// Both deferred rules go before "new" takes gone's address and installs
-	// its own rule for the same tuple.
+	// Both deferred rules go before "new" takes gone's address.
 	if len(network.teardownForwardCalls) != 2 || len(network.deleteTAPCalls) == 0 {
 		t.Fatalf("deferred cleanup was not finished: forwards=%v taps=%v", network.teardownForwardCalls, network.deleteTAPCalls)
 	}
-	if rule, ok := network.host().Delivers(8080); !ok || !rule.TaggedFor("new") {
-		t.Fatalf("the new service does not own its port: %v", network.host().Rules())
+	if rule, ok := network.host().Delivers(7070); !ok || !rule.TaggedFor("new") || len(network.host().RulesTo("172.16.0.2")) != 1 {
+		t.Fatalf("the new service does not own its address: %v", network.host().Rules())
 	}
 
 }

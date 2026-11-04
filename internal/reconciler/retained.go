@@ -22,9 +22,38 @@ type Hold struct {
 	// Capacity marks a hold made by capacity admission, which re-evaluates
 	// the service on every admission pass.
 	Capacity bool
+	// Action is the reason code of a hold that only an operator can resolve,
+	// such as ActionHostPortReuseBlocked. Status names it instead of
+	// reporting a wait another tick may end.
+	Action string
 }
 
+// Reason codes of holds that need an operator.
+const (
+	// ActionHostPortReuseBlocked: a host port this node gave to another
+	// service (L6).
+	ActionHostPortReuseBlocked = "host_port_reuse_blocked"
+	// ActionNetworkHistoryIncomplete: a host port this node has no history
+	// for, on a node whose history is incomplete (L6).
+	ActionNetworkHistoryIncomplete = "network_history_incomplete"
+)
+
+// ActionRequiredError is a hold that only an operator can resolve. It
+// unwraps to ErrServiceHeld, so the revision stays retryable.
+type ActionRequiredError struct {
+	Service, Code, Reason string
+}
+
+func (e *ActionRequiredError) Error() string {
+	return fmt.Sprintf("hold %s (%s): %v", e.Service, e.Reason, ErrServiceHeld)
+}
+
+func (e *ActionRequiredError) Unwrap() error { return ErrServiceHeld }
+
 func (h Hold) err(service string) error {
+	if h.Action != "" {
+		return &ActionRequiredError{Service: service, Code: h.Action, Reason: h.Reason}
+	}
 	sentinel := ErrServiceHeld
 	if h.Recovery {
 		sentinel = ErrRecoveryHeld
@@ -90,20 +119,31 @@ func retainedIn(actual map[string]*vm.Instance) []*vm.Instance {
 // what SetHeldServices installed, so admission can weigh a hold set without
 // publishing it.
 //
-// It also includes the holds of the ownership records, so a start that waits
-// for another service's address or host port to be released is reported in
-// per-service status like any other hold.
+// It also includes the start gate, so a start that waits for another
+// service's address or host port to be released, or for a stale rule to go,
+// is reported in per-service status like any other hold.
 func (r *Reconciler) Holds(desired config.NodeConfig, external map[string]Hold) map[string]Hold {
 	actual := r.vmManager.List()
 	held := HoldsIn(actual, desired, external)
+	// VMs the plan removes before any start, unless a retained claim holds
+	// their removal.
+	leaving := make(map[string]bool)
+	deleteHeld := DeleteHoldsIn(actual, desired)
+	for name, instance := range actual {
+		if _, wanted := held[name]; !wanted && !RetainsRuntime(instance.State) && deleteHeld[name].Reason == "" &&
+			!slices.ContainsFunc(desired.Services, func(s config.ServiceConfig) bool { return s.Name == name }) {
+			leaving[name] = true
+		}
+	}
 	for _, service := range desired.Services {
 		if _, done := held[service.Name]; done {
 			continue
 		}
-		if instance := actual[service.Name]; instance != nil && (RetainsRuntime(instance.State) || !needsUpdate(instance, service)) {
+		instance := actual[service.Name]
+		if instance != nil && (RetainsRuntime(instance.State) || !needsUpdate(instance, service)) {
 			continue // Nothing new is allocated.
 		}
-		if hold := r.allocationHold(service); hold.Reason != "" {
+		if hold := r.startHold(service, instance != nil, leaving); hold.Reason != "" {
 			held[service.Name] = hold
 		}
 	}
@@ -178,6 +218,11 @@ func deleteHold(instance *vm.Instance, retained []*vm.Instance) Hold {
 		}
 	}
 	return Hold{}
+}
+
+// HeldServiceHolds is HeldServices with each hold's full classification.
+func (r *Reconciler) HeldServiceHolds(desired config.NodeConfig) map[string]Hold {
+	return r.holds(desired)
 }
 
 // HeldServices identifies desired services whose work must wait for retained
@@ -341,7 +386,7 @@ func (r *Reconciler) actionHold(action Action) Hold {
 	}
 	if action.Type != ActionDelete {
 		if hold.Reason == "" {
-			hold = r.allocationHold(action.Service)
+			hold = r.startHold(action.Service, action.Type == ActionUpdate, nil)
 		}
 		if hold.Reason == "" {
 			hold = r.capacityHold(action.Service, actual)
