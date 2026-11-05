@@ -173,7 +173,14 @@ func (m *Manager) removeProvenRecoveryState(ctx context.Context, f *instanceMani
 		return err
 	}
 	m.markRemovedDir(f.Service)
-	return os.RemoveAll(f.VMDir)
+	if err := m.markIntent(f.Service); err != nil {
+		return err
+	}
+	if err := os.RemoveAll(f.VMDir); err != nil {
+		return err
+	}
+	m.clearIntent(f.Service)
+	return nil
 }
 
 func (m *Manager) HasPendingRecovery() bool {

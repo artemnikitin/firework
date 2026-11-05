@@ -623,6 +623,12 @@ func (m *Manager) finishStart(ctx context.Context, svc config.ServiceConfig, sta
 	svc = clampToPrepared(svc, prepared)
 
 	m.forgetRemovedDir(svc.Name)
+	// Until the ownership manifest is written, the marker is the only
+	// evidence that this directory is an interrupted create of ours.
+	if err := m.markIntent(svc.Name); err != nil {
+		delete(m.instances, svc.Name)
+		return err
+	}
 	if err := os.MkdirAll(vmDir, 0755); err != nil {
 		delete(m.instances, svc.Name)
 		return err
@@ -631,7 +637,9 @@ func (m *Manager) finishStart(ctx context.Context, svc config.ServiceConfig, sta
 	defer func() {
 		if !launchAttempted {
 			m.markRemovedDir(svc.Name)
-			_ = os.RemoveAll(vmDir)
+			if os.RemoveAll(vmDir) == nil {
+				m.clearIntent(svc.Name)
+			}
 		}
 	}()
 	configPath, err := m.writeVMConfig(vmDir, svc, prepared)
@@ -662,6 +670,7 @@ func (m *Manager) finishStart(ctx context.Context, svc config.ServiceConfig, sta
 		delete(m.instances, svc.Name)
 		return err
 	}
+	m.clearIntent(svc.Name) // The manifest now describes the directory.
 	launchManifest := cloneInstanceManifest(manifest)
 	launchAttempted = true
 	launched, err := m.launcher.Launch(ctx, launchSpec{
@@ -1113,9 +1122,13 @@ func (m *Manager) Remove(name string) error {
 		return err
 	}
 	m.markRemovedDir(name)
+	if err := m.markIntent(name); err != nil {
+		return err
+	}
 	if err := os.RemoveAll(vmDir); err != nil {
 		return fmt.Errorf("removing vm dir: %w", err)
 	}
+	m.clearIntent(name)
 	delete(m.instances, name)
 	return nil
 }

@@ -109,7 +109,12 @@ func writeManifest(path string, manifest *instanceManifest) error {
 	if err != nil {
 		return fmt.Errorf("encode manifest: %w", err)
 	}
-	data = append(data, '\n')
+	return writeManifestFile(path, append(data, '\n'))
+}
+
+// writeManifestFile atomically replaces path with data and syncs its
+// directory, so the new content survives a crash once this returns.
+func writeManifestFile(path string, data []byte) error {
 	dir := filepath.Dir(path)
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return fmt.Errorf("create manifest directory: %w", err)

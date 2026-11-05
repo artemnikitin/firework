@@ -198,6 +198,12 @@ func (m *Manager) resolveRecoveryAttempt(ctx context.Context, service string, fo
 			m.mu.Unlock()
 			return recoveryAmbiguous(result, "service ownership changed while recovery was being checked")
 		}
+		// A manifest removed by an interrupted operation of this manager is
+		// explained by its marker; one removed by hand is not.
+		if _, err := os.Lstat(manifestPath); errors.Is(err, os.ErrNotExist) && !forget && !m.hasIntent(service) {
+			m.mu.Unlock()
+			return recoveryAmbiguous(result, fmt.Sprintf("the ownership manifest is missing and no operation this agent recorded explains it: check the host networking it may have left, then run firework-agent clear-recovery --forget %s", service))
+		}
 		if err := m.verifyRecoverySnapshot(manifestPath, &initialManifest); err != nil {
 			m.mu.Unlock()
 			return recoveryAmbiguous(result, err.Error())

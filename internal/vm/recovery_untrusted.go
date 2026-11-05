@@ -134,7 +134,11 @@ func (m *Manager) resolveUntrustedRecovery(ctx context.Context, result RecoveryR
 		return recoveryAmbiguous(result, fmt.Sprintf("%s and absence remains unproved: %v", reason, absenceErr))
 	}
 	preservesMetadata := before.kind == "symlink" || (before.kind == "dir" && before.manifest != "missing")
-	if !forget && !(before.kind == "missing" && m.removedOwnDir(service)) {
+	// The manager's own interrupted operation explains a vanished directory or
+	// one without a manifest; nothing else does.
+	ownOperation := before.kind == "missing" && (m.removedOwnDir(service) || m.hasIntent(service)) ||
+		before.kind == "dir" && before.manifest == "missing" && m.hasIntent(service)
+	if !forget && !ownOperation {
 		// What a dead owner left on the host is unknown, so its claims stay
 		// fenced until an operator decides; recovery never releases them.
 		if preservesMetadata {

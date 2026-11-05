@@ -256,11 +256,17 @@ func cloneInstanceManifest(manifest *instanceManifest) *instanceManifest {
 // recoverLegacy handles VM state that has no ownership manifest, such as a
 // directory written before manifests existed. Without a recorded identity or
 // configuration nothing proves which process, if any, owns it, so it is never
-// adopted, whatever process presents its paths. Proven absence clears it;
-// otherwise it stays quarantined until the process is gone. Every entry
-// point treats this evidence the same way.
+// adopted, whatever process presents its paths. Only a directory operation
+// this manager recorded and was interrupted in (see markIntent) is cleared
+// after its absence proof; anything else stays quarantined until --forget,
+// because nothing in it identifies the host networking it may have left.
+// Every entry point treats this evidence the same way.
 func (m *Manager) recoverLegacy(ctx context.Context, name, vmDir string) {
 	partial := canonicalManifest(name, vmDir)
+	if !m.hasIntent(name) {
+		m.addRecoveryPending(name, partial, fmt.Sprintf("VM state without an ownership manifest is never adopted, and no operation this agent recorded explains it: stop any process still using it, check the host networking it may have left, then run firework-agent clear-recovery --forget %s", name))
+		return
+	}
 	if err := m.removeRecoveryStateContext(ctx, partial); err != nil {
 		m.addRecoveryPending(name, partial, fmt.Sprintf("VM state without an ownership manifest is never adopted, and its absence remains unproved: %v; stop any process still using it, then recovery clears the state", err))
 		return

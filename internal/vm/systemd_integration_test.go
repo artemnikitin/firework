@@ -330,6 +330,20 @@ func TestSystemdIntegrationAbsenceProofWithoutDBus(t *testing.T) {
 	if err := os.MkdirAll(vmDir, 0o755); err != nil {
 		t.Fatal(err)
 	}
+	// Without a marker nothing explains the state, so it stays quarantined
+	// even once absence is proven.
+	if _, err := m.Recover(context.Background(), config.NodeConfig{}); err != nil {
+		t.Fatal(err)
+	}
+	if got := m.List()["orphan"]; got == nil || got.State != StateRecoveryPending {
+		t.Fatalf("unexplained manifestless state was not quarantined: %#v", got)
+	}
+	// An interrupted create, with its marker, is cleared once the absence
+	// proof succeeds without dbus.
+	m = NewManager("/bin/sh", root, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	if err := m.markIntent("orphan"); err != nil {
+		t.Fatal(err)
+	}
 	if _, err := m.Recover(context.Background(), config.NodeConfig{}); err != nil {
 		t.Fatal(err)
 	}

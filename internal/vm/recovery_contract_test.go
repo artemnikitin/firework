@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -14,7 +15,8 @@ import (
 // clear-recovery command classify the same ownership evidence the same way.
 // Proven absence permits cleanup, a revalidated live owner is adopted, and
 // missing identity, a missing manifest or a possible live claimant stays
-// quarantined.
+// quarantined. A missing manifest is cleaned up only when an operation the
+// manager recorded explains it; otherwise only --forget clears it.
 func TestC2SameEvidenceSameClassificationAtEveryEntryPoint(t *testing.T) {
 	evidence := map[string]struct {
 		apply func(*testing.T, *instanceManifest, *fakeProcessInspector)
@@ -40,6 +42,15 @@ func TestC2SameEvidenceSameClassificationAtEveryEntryPoint(t *testing.T) {
 		}, "quarantined"},
 		"no manifest, proven absent": {func(t *testing.T, f *instanceManifest, i *fakeProcessInspector) {
 			if err := os.Remove(manifestPath(f.VMDir)); err != nil {
+				t.Fatal(err)
+			}
+			delete(i.identities, f.PID)
+		}, "quarantined"},
+		"interrupted create or removal, proven absent": {func(t *testing.T, f *instanceManifest, i *fakeProcessInspector) {
+			if err := os.Remove(manifestPath(f.VMDir)); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(filepath.Dir(f.VMDir), intentPrefix+f.Service), []byte(f.Service), 0o600); err != nil {
 				t.Fatal(err)
 			}
 			delete(i.identities, f.PID)
@@ -338,5 +349,69 @@ func TestVMServiceUnderNamesTheVMDirectory(t *testing.T) {
 		if got := vmServiceUnder(strings.Fields(args), root); got != want {
 			t.Errorf("%q: got %q, want %q", args, got, want)
 		}
+	}
+}
+
+// C2/L4: VM state without an ownership manifest whose process is already
+// gone when it is first discovered stays quarantined at startup, on retry and
+// for the plain command: nothing the agent recorded explains it. --forget
+// clears it after the absence proof. (Finding from the review of a3cbc29.)
+func TestInitiallyAbsentManifestlessStateNeedsForget(t *testing.T) {
+	for _, entry := range []string{"startup", "retry", "command"} {
+		t.Run(entry, func(t *testing.T) {
+			m, inspector, identity, vmDir, svc := manifestlessFixture(t)
+			delete(inspector.identities, identity.PID)
+			inspector.find = nil
+			if err := m.DiscoverRecoveryState(); err != nil {
+				t.Fatal(err)
+			}
+			desired := config.NodeConfig{Services: []config.ServiceConfig{svc}}
+			if _, err := m.Recover(context.Background(), desired); err != nil {
+				t.Fatal(err)
+			}
+			switch entry {
+			case "retry":
+				if _, err := m.Recover(context.Background(), desired); err != nil {
+					t.Fatal(err)
+				}
+			case "command":
+				if result, err := m.ClearRecoveryPending(svc.Name); err == nil || result.Outcome != RecoveryOutcomeAmbiguous || !strings.Contains(result.Message, "--forget") {
+					t.Fatalf("clear: %#v %v", result, err)
+				}
+			}
+			if _, err := os.Stat(vmDir); err != nil {
+				t.Fatalf("untrusted VM state was removed without --forget: %v", err)
+			}
+			if inst := m.List()[svc.Name]; inst == nil || inst.State != StateRecoveryPending || !strings.Contains(inst.LastError, "--forget") {
+				t.Fatalf("the fence was released without --forget: %#v", inst)
+			}
+			if result, err := m.ForgetRecoveryPending(svc.Name); err != nil || result.Outcome != RecoveryOutcomeCleared {
+				t.Fatalf("--forget: %#v %v", result, err)
+			}
+		})
+	}
+}
+
+// C3: a create the manager was interrupted in, before its ownership manifest
+// was written, recovers at startup without an operator: its marker is the
+// manager's own record of the operation.
+func TestInterruptedCreateWithItsMarkerRecoversAutomatically(t *testing.T) {
+	m, inspector, identity, vmDir, svc := manifestlessFixture(t)
+	delete(inspector.identities, identity.PID)
+	inspector.find = nil
+	if err := m.markIntent(svc.Name); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.DiscoverRecoveryState(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := m.Recover(context.Background(), config.NodeConfig{Services: []config.ServiceConfig{svc}}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(vmDir); !errors.Is(err, os.ErrNotExist) || m.List()[svc.Name] != nil {
+		t.Fatalf("the interrupted create was not cleared: %v %#v", err, m.List()[svc.Name])
+	}
+	if m.hasIntent(svc.Name) {
+		t.Fatal("the marker outlived the cleanup")
 	}
 }
