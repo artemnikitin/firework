@@ -3,7 +3,9 @@ package agent
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
+	"path/filepath"
 	"slices"
 	"testing"
 
@@ -402,5 +404,106 @@ func TestLocalServiceNamedLikeAPeerRouteKeepsItsAddress(t *testing.T) {
 	restarted.tick(context.Background())
 	if got := offered(restarted); got != "172.16.0.2" {
 		t.Fatalf("the address was not released after Traefik restarted: %s", got)
+	}
+}
+
+// C4/L7: an address routed under an earlier guest subnet keeps its route
+// ownership after the subnet changes: removing the route records its
+// withdrawal, and restoring the subnet does not give the address to another
+// service before Traefik restarts. (Finding from the review of a3cbc29.)
+func TestRouteOwnershipSurvivesASubnetChange(t *testing.T) {
+	limit := capacity.NodeCapacity{VCPUs: 8, MemoryMB: 4096}
+	stateDir, routeDir := t.TempDir(), t.TempDir()
+	process := &fakeRouteProcess{boot: "boot-1", start: "1000"}
+	network := &recoveryTestNetworkManager{}
+	var m *recoveryTestVMManager
+	newAgent := func(subnet, yaml string) *Agent {
+		a, fresh := admissionAgent(t, yaml, limit, map[string]*vm.Instance{}, subnet)
+		if m == nil {
+			m = fresh
+		}
+		a.reconciler = reconciler.NewWithNetworkManager(m, testLogger(), nil, network, "", 0)
+		useRoutesIn(a, routeDir, process)
+		a.reconciler.WithHostHistoryEvidence(subnet, func() (bool, error) { return traefik.HasLocalRouteFiles(routeDir) }).WithStateDir(stateDir)
+		return a
+	}
+	alpha := "node: web\nservices:\n- name: alpha\n  image: /alpha\n  kernel: /k\n  vcpus: 1\n  memory_mb: 64\n  network: {}\n  metadata:\n    host: alpha.example.com\n  health_check:\n    type: tcp\n    port: 80\n"
+	newAgent("172.16.0.0/24", alpha).tick(context.Background())
+	if routes, _, err := traefik.ReadLocalRoutes(routeDir); err != nil || len(routes) != 1 || routes[0].GuestIP != "172.16.0.2" {
+		t.Fatalf("setup: routes=%v err=%v", routes, err)
+	}
+	newAgent("10.9.0.0/24", "node: web\nservices: []\n").tick(context.Background())
+	if m.instances["alpha"] != nil {
+		t.Fatal("setup: alpha was not removed")
+	}
+	beta := "node: web\nservices:\n- name: beta\n  image: /beta\n  kernel: /k\n  vcpus: 1\n  memory_mb: 64\n  network: {}\n"
+	third := newAgent("172.16.0.0/24", beta)
+	third.tick(context.Background())
+	if inst := m.instances["beta"]; inst != nil && inst.Config.Network.GuestIP == "172.16.0.2" {
+		t.Fatal("beta took alpha's routed address without a Traefik restart")
+	}
+}
+
+// Without vm_subnet, an unchanged peer route is not taken for a withdrawn
+// local route on every publish. (Finding from the review of a3cbc29.)
+func TestPeerRoutesAreNotWithdrawnWithoutASubnet(t *testing.T) {
+	limit := capacity.NodeCapacity{VCPUs: 8, MemoryMB: 4096}
+	a, m := admissionAgent(t, "node: web\nservices: []\n", limit, map[string]*vm.Instance{}, "")
+	a.reconciler = reconciler.NewWithNetworkManager(m, testLogger(), nil, &recoveryTestNetworkManager{}, "", 0)
+	routeDir := t.TempDir()
+	useRoutesIn(a, routeDir, &fakeRouteProcess{boot: "boot-1", start: "100"})
+	a.reconciler.WithStateDir(t.TempDir())
+	peer := config.NodeConfig{Node: "other", HostIP: "10.0.0.8", Services: []config.ServiceConfig{{Name: "peer",
+		Metadata: map[string]string{"host": "peer.example.com"}, PortForwards: []config.PortForward{{HostPort: 8080, VMPort: 80}}}}}
+	for publish := 0; publish < 3; publish++ {
+		if err := a.syncRuntimeRoutes(nil, []config.NodeConfig{peer}, false); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if routes, _, err := traefik.ReadLocalRoutes(routeDir); err != nil || len(routes) != 1 || !routes[0].Peer {
+		t.Fatalf("peer route: %v %v", routes, err)
+	}
+	if held, _, _ := a.reconciler.RouteHeldGuestIPs(); a.reconciler.HasPendingCleanup() || len(held) != 0 {
+		t.Fatalf("a live peer route was recorded as withdrawn: held=%v", held)
+	}
+}
+
+// C4: a route file with a tcp or udp section may route to a guest address this
+// agent cannot read, so it holds the address like an unreadable file rather
+// than counting as a file without routes. (Finding from the review of
+// a3cbc29.)
+func TestTransportRouteFilesFenceAddresses(t *testing.T) {
+	for _, protocol := range []string{"tcp", "udp"} {
+		t.Run(protocol, func(t *testing.T) {
+			limit := capacity.NodeCapacity{VCPUs: 8, MemoryMB: 4096}
+			yaml := "node: web\nservices:\n- name: beta\n  image: /beta\n  kernel: /k\n  vcpus: 1\n  memory_mb: 64\n  network: {}\n"
+			a, m := admissionAgent(t, yaml, limit, map[string]*vm.Instance{}, "172.16.0.0/24")
+			a.reconciler = reconciler.NewWithNetworkManager(m, testLogger(), nil, &recoveryTestNetworkManager{}, "", 0)
+			routeDir := t.TempDir()
+			useRoutesIn(a, routeDir, &fakeRouteProcess{boot: "boot-1", start: "100"})
+			a.reconciler.WithStateDir(t.TempDir())
+			rule := ""
+			if protocol == "tcp" {
+				rule = "      rule: HostSNI(`*`)\n"
+			}
+			route := fmt.Sprintf("%s:\n  routers:\n    legacy:\n%s      service: legacy\n  services:\n    legacy:\n      loadBalancer:\n        servers:\n        - address: 172.16.0.2:8080\n", protocol, rule)
+			path := filepath.Join(routeDir, "legacy.yaml")
+			if err := os.WriteFile(path, []byte(route), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if _, unreadable, err := traefik.ReadLocalRoutes(routeDir); err != nil || len(unreadable) != 1 {
+				t.Fatalf("a %s route file was read as having no routes: %v %v", protocol, unreadable, err)
+			}
+			m.startHook = func(string) error {
+				if _, err := os.Stat(path); err == nil {
+					t.Errorf("beta started while the %s route file still existed", protocol)
+				}
+				return nil
+			}
+			a.tick(context.Background())
+			if inst := m.instances["beta"]; inst != nil {
+				t.Fatalf("beta started beside a %s route file: %s", protocol, inst.Config.Network.GuestIP)
+			}
+		})
 	}
 }

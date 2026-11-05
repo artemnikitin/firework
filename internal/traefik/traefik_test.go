@@ -564,3 +564,48 @@ func TestReadLocalRoutesAttributesEachRouteFile(t *testing.T) {
 		t.Fatalf("missing directory: %v %v %v", routes, unreadable, err)
 	}
 }
+
+// Route files are told apart by the header this package writes, not by their
+// names: a local service may be named remote-*, and a file without the peer
+// header may route to a local guest. A transport section this package does
+// not read makes a file unreadable rather than empty.
+func TestReadLocalRoutesClassifiesFilesByHeader(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "dynamic")
+	m := NewManager(dir, "", slog.New(slog.NewTextHandler(io.Discard, nil)))
+	local := config.ServiceConfig{Name: "remote-api", Network: &config.NetworkConfig{GuestIP: "172.16.0.3"}, Metadata: map[string]string{"host": "api.example.com"},
+		PortForwards: []config.PortForward{{HostPort: 8081, VMPort: 80}}}
+	peer := config.NodeConfig{Node: "other", HostIP: "10.0.0.8", Services: []config.ServiceConfig{{Name: "web",
+		Metadata: map[string]string{"host": "web.example.com"}, PortForwards: []config.PortForward{{HostPort: 8080, VMPort: 80}}}}}
+	if err := m.Sync([]config.ServiceConfig{local}, []config.NodeConfig{peer}); err != nil {
+		t.Fatal(err)
+	}
+	server := func(section, address string) string {
+		return section + ":\n  services:\n    s:\n      loadBalancer:\n        servers:\n        - " + address + "\n"
+	}
+	for name, body := range map[string]string{
+		"remote-legacy.yaml": server("http", "url: http://172.16.0.4:80"),
+		"opaque-tcp.yaml":    server("tcp", "address: 172.16.0.5:80"),
+		"opaque-udp.yaml":    server("udp", "address: 172.16.0.6:53"),
+	} {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	routes, unreadable, err := ReadLocalRoutes(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	slices.SortFunc(routes, func(a, b RouteFile) int { return strings.Compare(a.Service, b.Service) })
+	want := []RouteFile{
+		{Service: "remote-api", GuestIP: "172.16.0.3"},
+		{Service: "remote-legacy", GuestIP: "172.16.0.4"},
+		{Service: "remote-web", GuestIP: "10.0.0.8", Peer: true},
+	}
+	if !slices.Equal(routes, want) {
+		t.Fatalf("routes = %v, want %v", routes, want)
+	}
+	slices.Sort(unreadable)
+	if !slices.Equal(unreadable, []string{"opaque-tcp.yaml", "opaque-udp.yaml"}) {
+		t.Fatalf("unreadable = %v", unreadable)
+	}
+}

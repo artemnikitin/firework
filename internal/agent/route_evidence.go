@@ -3,7 +3,6 @@ package agent
 import (
 	"context"
 	"fmt"
-	"net"
 	"os"
 	"os/exec"
 	"slices"
@@ -82,17 +81,13 @@ func (e *agentRouteEvidence) LocalRoutes() ([]reconciler.RouteTarget, []string, 
 	return routes, unreadable, nil
 }
 
-// guestRoutes keeps the routes to guest addresses. Peer routes go to peer
-// host addresses, outside the guest subnet, whatever their file is named.
-// Without a configured subnet every route counts.
+// guestRoutes keeps the routes to local guests, whatever subnet their
+// addresses are in: an address routed under an earlier guest subnet keeps its
+// ownership. Peer routes go to peer nodes, never to a guest here.
 func (a *Agent) guestRoutes(files []traefik.RouteFile) []traefik.RouteFile {
-	_, subnet, err := net.ParseCIDR(a.cfg.VMSubnet)
-	if err != nil {
-		return files
-	}
 	var kept []traefik.RouteFile
 	for _, file := range files {
-		if ip := net.ParseIP(file.GuestIP); ip == nil || subnet.Contains(ip) {
+		if !file.Peer {
 			kept = append(kept, file)
 		}
 	}

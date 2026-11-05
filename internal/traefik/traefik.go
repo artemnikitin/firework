@@ -119,7 +119,7 @@ func (m *Manager) renderLocal(services []config.ServiceConfig) (map[string][]byt
 			return nil, nil, fmt.Errorf("duplicate Traefik hostname %q requested by %s and %s", host, prev, identity)
 		}
 		owner[host] = identity
-		data, err := marshalConfig(svc.Name, host, svc.Network.GuestIP, port)
+		data, err := marshalConfig(localRouteHeader, svc.Name, host, svc.Network.GuestIP, port)
 		if err != nil {
 			return nil, nil, fmt.Errorf("marshaling traefik config for %s: %w", svc.Name, err)
 		}
@@ -176,7 +176,7 @@ func (m *Manager) renderRemote(desired map[string][]byte, owner map[string]strin
 					"file", filename, "skipped", identity)
 				continue
 			}
-			data, err := marshalConfig(svc.Name, host, nc.HostIP, svc.PortForwards[0].HostPort)
+			data, err := marshalConfig(peerRouteHeader, svc.Name, host, nc.HostIP, svc.PortForwards[0].HostPort)
 			if err != nil {
 				m.logger.Warn("skipping remote route that failed to marshal",
 					"service", svc.Name, "node", nc.Node, "error", err)
@@ -280,19 +280,39 @@ func (m *Manager) ReadLocalRoutes() ([]RouteFile, []string, error) {
 	return ReadLocalRoutes(m.configDir)
 }
 
-// RouteFile is one local route file's owner and the guest address it routes
-// to. The owner is the file's name: the agent writes <service>.yaml.
+// onlyHTTPRoutes reports whether a route document carries traffic only
+// through the http section this package reads. A tcp or udp section, or any
+// section this package does not know, may route to a guest address it cannot
+// see, so such a file counts as unreadable rather than as one without routes.
+func onlyHTTPRoutes(data []byte) bool {
+	var sections map[string]any
+	if yaml.Unmarshal(data, &sections) != nil {
+		return false
+	}
+	for section := range sections {
+		if section != "http" && section != "tls" {
+			return false
+		}
+	}
+	return true
+}
+
+// RouteFile is one route file's owner and the address it routes to. The owner
+// is the file's name: the agent writes <service>.yaml locally and
+// remote-<service>.yaml for a peer. Peer says the file routes to a peer node,
+// from its header; a file without a header is never a peer route.
 type RouteFile struct {
 	Service string
 	GuestIP string
+	Peer    bool
 }
 
 // ReadLocalRoutes reads every route file as Traefik would load it, peer
-// routes included: a local service may be named remote-*, like a peer route
-// file, so only a route's address tells them apart. Callers keep the routes
-// whose address is a guest address. A file it cannot attribute to an address,
-// such as one that does not parse, a .yml or .toml file, or a subdirectory,
-// is returned in unreadable: it may route anywhere.
+// routes included and marked: a local service may be named remote-*, like a
+// peer route file, so the file's header tells them apart. A file it cannot
+// attribute to an address, such as one that does not parse, has a tcp or udp
+// section, is a .yml or .toml file, or is a subdirectory, is returned in
+// unreadable: it may route anywhere.
 func ReadLocalRoutes(dir string) (routes []RouteFile, unreadable []string, err error) {
 	entries, err := os.ReadDir(dir)
 	if os.IsNotExist(err) {
@@ -315,11 +335,15 @@ func ReadLocalRoutes(dir string) (routes []RouteFile, unreadable []string, err e
 		}
 		data, err := os.ReadFile(filepath.Join(dir, name))
 		var cfg fileConfig
-		if err != nil || ext != ".yaml" || yaml.Unmarshal(data, &cfg) != nil {
+		if err != nil || ext != ".yaml" || yaml.Unmarshal(data, &cfg) != nil || !onlyHTTPRoutes(data) {
 			unreadable = append(unreadable, name)
 			continue
 		}
 		service := strings.TrimSuffix(name, ext)
+		// Only this agent's peer header makes a route a peer route. A file
+		// without it, hand-written or from an older agent, may route to a
+		// local guest whatever it is named, so it is kept as a local route.
+		peer := strings.HasPrefix(string(data), peerRouteHeader)
 		for _, svc := range cfg.HTTP.Services {
 			for _, server := range svc.LoadBalancer.Servers {
 				u, err := url.Parse(server.URL)
@@ -327,7 +351,7 @@ func ReadLocalRoutes(dir string) (routes []RouteFile, unreadable []string, err e
 					unreadable = append(unreadable, name)
 					continue
 				}
-				routes = append(routes, RouteFile{Service: service, GuestIP: u.Hostname()})
+				routes = append(routes, RouteFile{Service: service, GuestIP: u.Hostname(), Peer: peer})
 			}
 		}
 	}
@@ -363,7 +387,15 @@ type serverDef struct {
 	URL string `yaml:"url"`
 }
 
-func marshalConfig(name, host, guestIP string, port int) ([]byte, error) {
+// Every route file starts with a header saying whether it routes to a local
+// guest or to a peer node, so route ownership never has to guess from a
+// file's name or from the current guest subnet. YAML ignores the comment.
+const (
+	localRouteHeader = "# firework-route: local\n"
+	peerRouteHeader  = "# firework-route: peer\n"
+)
+
+func marshalConfig(header, name, host, guestIP string, port int) ([]byte, error) {
 	cfg := fileConfig{
 		HTTP: httpSection{
 			Routers: map[string]routerDef{
@@ -384,7 +416,11 @@ func marshalConfig(name, host, guestIP string, port int) ([]byte, error) {
 			},
 		},
 	}
-	return yaml.Marshal(cfg)
+	data, err := yaml.Marshal(cfg)
+	if err != nil {
+		return nil, err
+	}
+	return append([]byte(header), data...), nil
 }
 
 // BackendPort returns the VM-side port Traefik should proxy to.

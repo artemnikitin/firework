@@ -98,7 +98,7 @@ The journal holds authority and history. The kernel and the route directory are 
 | An untagged rule covered by a migrated version-1 entry | Delete it. |
 | A tagged rule or a local route that no record covers | Fence its IP and host ports for every service, including the tagged one, and leave the rule in place. |
 | Any other untagged rule toward the subnet | **Foreign.** Never deleted. It fences its IP and port, and status names the rule and tells the operator to inspect and delete it. |
-| A route file the agent did not name, or cannot parse | Fence its server IPs. If it cannot be parsed at all, every start is held. |
+| A route file the agent did not name, or cannot parse | Fence its server IPs. If it cannot be parsed at all, or has a section other than `http` or `tls` (such as `tcp` or `udp`), every start is held. |
 | A Firecracker process whose arguments name a path under `<state_dir>/vms/`, or an active `firework-vm-*` unit, that is not tracked and not covered by an allocation | **Unaccounted VM.** Its IP is unknown, so every allocation of an address not already held by the same service's tracked VM is held. Status names the PID or unit. The hold clears when the process exits. |
 
 ## Start gate

@@ -590,9 +590,18 @@ it, is in [recovery-network-ownership.md](recovery-network-ownership.md).
   `guest_address_withdrawal_unconfirmed` naming the unit and waits for the
   operator to restart Traefik; it never restarts it. `traefik_unit` must be
   the only process serving `traefik_config_dir`. Route ownership applies
-  whether or not the agent manages host networking (`enable_network_setup`),
-  and routes are told apart by address, not file name: a local service may be
-  named like a peer route file.
+  whether or not the agent manages host networking (`enable_network_setup`).
+  Each route file starts with a `# firework-route: local` or
+  `# firework-route: peer` header, and routes are told apart by it, not by
+  file name or the current `vm_subnet`: a local service may be named like a
+  peer route file, and a route published under an earlier guest subnet stays
+  owned after the subnet changes. A file without the peer header, whether
+  hand-written or from an older agent, counts as a local route whatever it is
+  named; an older agent's peer files only add withdrawals of peer host
+  addresses on a migrated node, where every address already waits for a
+  Traefik restart. A
+  route file with any top-level section other than `http` or `tls`, such as
+  `tcp` or `udp`, is treated like an unreadable one.
 - **Initialization.** History is complete only when the journal is created on
   a host without a VM state directory, DNAT rules toward the guest subnet or
   route files, on a node endpoint with no earlier firework use. A
