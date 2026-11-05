@@ -1,7 +1,7 @@
 # Network ownership during recovery
 
 **Status:**
-- Design for C4 in PR #66 (issue #48). Decisions agreed 2026-11-04; implementation in progress.
+- Design for C4 in PR #66 (issue #48). Decisions agreed 2026-11-04. Implemented through the increments below; the final head awaits the contract review.
 - **Contract v1.1 is agreed.** It adds two limitations, both of which qualify C5:
   - **L6:** host-port history;
   - **L7:** unconfirmed route withdrawal.
@@ -42,18 +42,20 @@ Traefik's file provider gives no acknowledgment. The following was tested agains
 1. Record `{service, guest_ip, state: withdrawing}`.
 2. Rewrite or remove the route file, then fsync the file and the directory.
 3. Read the route directory again and confirm that no local route for that service points at the IP.
-4. Record `withdrawn_at` (`CLOCK_MONOTONIC`) and the boot ID, and mark the record `withdrawn`.
+4. Observe the process serving routes now (the boot ID and the unit's `ExecMainStartTimestampMonotonic`), record it, and mark the record `withdrawn`. If no process runs, release the address at once: any later process reads the directory without the route.
 
-**After a crash** between steps 1 and 4, the record stays `withdrawing` and the address stays held. After restart, the agent finishes steps 2 to 4 with the current time, so the proof needs a Traefik start after that.
+**After a crash** between steps 1 and 4, the record stays `withdrawing` and the address stays held. After restart, the agent finishes steps 2 to 4 and observes the process running then, so the proof needs a Traefik start after that.
 
-**Release requires a `withdrawn` record** and one of these, observed after `withdrawn_at`:
+**Release requires a `withdrawn` record** and one of these, observed later:
 - the configured unit (`traefik.service` by default) is inactive or failed and has no main PID;
-- its `ExecMainStartTimestampMonotonic` is later than `withdrawn_at`, in the same boot;
-- a later boot, which runs only processes that started after the durable removal.
+- its main process has another start timestamp than the one recorded: a process can only have started after the observation, which followed the durable removal;
+- another boot ID.
+
+Comparing the observed process identity, rather than times, needs no clock shared with systemd.
 
 **These never release a `withdrawing` record:** a boot change, an inactive unit or a later start. At that point the route file may still exist, and a new process would read it.
 
-**Any other answer is no proof:** an unknown unit, an error, or a start time from before `withdrawn_at`. Status names the unit and the action, and the address stays held.
+**Any other answer is no proof:** a unit that is not loaded, an error, or the recorded process. Status names the unit and the action, and the address stays held.
 
 **Assumptions** (documented with `traefik_unit`):
 - The configured unit's main process is the only process serving `traefik_config_dir`.
@@ -69,10 +71,10 @@ The journal holds authority and history. The kernel and the route directory are 
 | Record | Written | Removed |
 | --- | --- | --- |
 | **Allocation** `{service, instance_id, guest_ip, host_ports, vm_dir, socket_path, config_path, launcher_unit, phase}`, where `phase` is one of `creating`, `running` or `departing` | `creating`, before anything is created for a new VM: devices, the VM directory, rules. `running` once the VM is started, its manifest is durable and it is tracked. `departing` before the agent stops a VM for removal, replacement or a clear. | Once the VM is proven absent, the inventory shows none of its rules, its devices are gone, and its route record, if any, exists. |
-| **Route withdrawal** `{service, guest_ip, state, boot_id, withdrawn_at}`. The migration baseline is a withdrawal of every address. | `withdrawing` before the route file changes, and `withdrawn` after the change is durable and verified (sequence above). | When the Traefik proof holds. |
+| **Route withdrawal** `{service, guest_ip, state, boot_id, process_start}`. The migration baseline is a withdrawal of every address. | `withdrawing` before the route file changes, and `withdrawn` after the change is durable and verified (sequence above). | When the Traefik proof holds. |
 | **Host-port holder** `{host_port → service}` | When an allocation claims the port. | Never (L6). |
 | **History** `{complete, initialized_at}` | Once, when the journal is created (see "Initialization"). | Never. |
-| **Fence** `{service?, guest_ip?, host_ports, reason}` | When the agent finds a trace no record accounts for. | `clear-recovery --forget SERVICE`, or when the trace disappears (a foreign rule deleted by the operator). |
+| **Fences** (not persisted) | Derived from the kernel's rule list and the route directory at every check: a trace no record accounts for holds its address and ports. | `clear-recovery --forget SERVICE` turns the service's tagged traces into departing records; a foreign rule's fence ends when the operator deletes it. |
 | **Network devices** | Unchanged. | Unchanged. |
 
 **What an allocation record does:**
@@ -228,7 +230,7 @@ Every case goes through failure, recovery and eventual safe reuse. Reproducers f
 | Case | Expected sequence |
 | --- | --- |
 | Route file removed, then the agent crashes while Traefik still serves the route | After restart, another service is held at that IP and the same service may reuse it. A Traefik start time before the withdrawal is still held; after a Traefik restart (fake systemd), the address is reused. |
-| A Traefik build reads the old route and its result arrives late (SIGHUP or startup) | No marker is involved. Release requires a process start after `withdrawn_at`, and the test covers each ordering. |
+| A Traefik build reads the old route and its result arrives late (SIGHUP or startup) | No marker is involved. Release requires a process other than the one recorded at completion. |
 | Crash after the `withdrawing` record, before the file changes, then a reboot that restarts Traefik | Held: a boot change does not release a `withdrawing` record. After restart the agent removes the file and records `withdrawn`. Release needs a Traefik start after that, then the address is reused. |
 | Crash after the file change, before `withdrawn` is recorded | The same: held until the agent verifies and records `withdrawn`, then until a later Traefik start. |
 | The unit is inactive while a record is `withdrawing` | Held. After `withdrawn` is recorded, an inactive unit releases the address. |
@@ -242,7 +244,7 @@ Every case goes through failure, recovery and eventual safe reuse. Reproducers f
 | Clean initialization | History complete. Fresh ports and addresses are allocated without waiting. |
 | Migration with untagged rules and version 1 entries | Rules adopted or torn down; a crash between append and delete converges. Current services keep their ports and addresses. A new host port waits with `network_history_incomplete`. A cross-service address reuse needs a Traefik start after the migration. |
 | Corrupt journal moved aside | Migration with incomplete history, never clean initialization. |
-| Host IP changed | Rules under the old host IP are deleted by listed text and reinstalled. |
+| Host IP changed | The new rules are installed beside the old ones, which only match traffic to the old host IP. The old rules are deleted by listed text when the VM's record departs. |
 | Host port moves to a different service (including a swap) | `host_port_reuse_blocked` (G7) before the old VM is deleted, and the old VM keeps running. A fresh port converges. |
 | Subnet exhausted except for addresses withdrawn from another service | `guest_address_withdrawal_unconfirmed`, naming the unit. After a Traefik restart (fake systemd), the address is reused. |
 | The same service retakes its port or IP | Allowed once its own stale rules are gone: `TestReviewSameServiceReuseUnderSubnet`, `TestReviewSameServiceReuseRedirectsAnotherServicesPort`. |
@@ -252,6 +254,25 @@ Every case goes through failure, recovery and eventual safe reuse. Reproducers f
 | A desired owner's held address, and a hold missing from status (C6) | Transient wait, not exhausted: `TestReviewSharedIndexSkipsOwnersReservedAddress`, `TestReviewDesiredDepartedOwnerReportsExhaustion`, `TestReviewDepartedHoldMissingFromHeldServices`. |
 | Failure after the adoption write (C3) | `incomplete`. |
 | A reused tuple reconnects after teardown | No delivery to the new VM. Checked on kernel 6.12 and to be repeated on AL2023 in the real-host run. |
+
+## Implementation (PR #66)
+
+| Commit | Increment |
+| --- | --- |
+| `157c0ea` | C3: post-write recovery failures report `incomplete`. |
+| `43d9c17` | Tagged port forwards; teardown from the kernel's rule list. |
+| `4037a75`, `8bf052f` | Journal version 2 with allocation records, crash recovery, clean initialization only on a host without traces, bounded migration. |
+| `b2c4dee` | C6: held-back addresses are transient waits and stay their owner's. |
+| `b433bb4` | Restart test with a freshly built VM manager under real systemd. |
+| `4900898` | Start gate over the kernel's rules at all four call sites; L6 host-port holders. |
+| `4e27a9c` | Route withdrawal records, the Traefik process proof, `traefik_unit`, L7. |
+| `d9be837` | `--forget` for every untrusted clear; `vm_state_missing`; the unaccounted-VM scan. |
+
+Differences from the plan:
+- **Fences** are derived from live evidence at every check instead of being persisted.
+- **The L7 proof** compares process identities instead of timestamps.
+- **A missing VM directory** is cleared without `--forget` only when the VM manager removed it itself in this process (a failed start or a clear racing an inventory). Otherwise it keeps its fence.
+- **Rules under an old host IP** stay until the VM's record departs.
 
 ## Increments
 

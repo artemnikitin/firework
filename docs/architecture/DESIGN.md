@@ -296,23 +296,35 @@ unit. Stop/fence the actual owner before retrying. For corrupt metadata, preserv
 it for diagnosis and restore a trusted ownership record before retrying; the
 agent must not guess a new owner. A restored record is used on the next retry
 without restarting the agent. Untrusted metadata (an unreadable or mismatched
-manifest, or a symlinked service entry) never authorizes adoption. Its absence
-proof uses only the service's canonical paths. Recovery never releases its
-claims on its own, even once absence is proven, because what a dead owner left
-on the host is unknown. They stay fenced until an operator restores a trusted
-record or runs `--forget`, which deletes the record after the same proof; for a
-symlinked entry, only the link is removed. Removing the state directory of such a
-quarantine by hand has the same effect as `--forget`: recovery clears it after
-the same proof, because no metadata remains to preserve. Untrusted or missing
-metadata never drives host cleanup, and clearing releases the fence, so the next
-tick may give the old guest address, host ports or an explicitly named TAP to
-another service. Before running `--forget` or removing such a directory, unless
-the host has rebooted since the VM ran, find the port forwards and any TAP the
-old VM used and remove them by hand. A directory that never had an ownership
-manifest is cleared the same way once its process is gone, so on a host that ran
-an agent from before ownership manifests, check for such leftovers too.
-Stopping the agent does not stop surviving VMs. Do not delete ownership records
-while a claimant may be alive.
+manifest, VM state without a manifest, a symlinked service entry, or a
+directory that went missing) never authorizes adoption. Its absence proof uses
+only the service's canonical paths. Recovery never clears such state on its
+own, even once absence is proven, because nothing in it identifies what a dead
+owner left on the host. It stays fenced until an operator restores a trusted
+record or runs `--forget`, which deletes it after the same proof; for a
+symlinked entry, only the link is removed. The one exception is a directory the
+agent removed itself in this process, such as a failed start racing an
+inventory: that operation explains its disappearance.
+
+Removing a VM's directory by hand never releases anything either. The agent's
+ownership records outlive the directory: the service is held with
+`vm_state_missing`, and its address and host ports stay fenced. `--forget`
+then proves from the service's paths that no process or systemd launch uses
+them, and hands the service's records and the rules tagged for it that nothing
+accounts for to cleanup. A refused `--forget` changes nothing. The command
+itself releases nothing: an address is released once its rules are gone and,
+for a route, once Traefik has restarted, and host ports keep their history (see
+"Network ownership" below). A live VM process or systemd launch under the state
+directory that nothing tracks, as when a directory and the journal were both
+removed, holds every new address with `unaccounted_vm` until it stops.
+
+Rules the agent did not install are never deleted. Before running `--forget`,
+unless the host has rebooted since the VM ran, find any untagged port forward
+and any TAP the old VM used and remove them by hand: an untagged rule toward a
+guest address or a host port holds starts there, naming the rule, until it is
+gone. On a host that ran an agent from before ownership manifests or tagged
+rules, check for such leftovers too. Stopping the agent does not stop surviving
+VMs. Do not delete ownership records while a claimant may be alive.
 
 A process observed mid-exit is classified as exited, not ambiguous. Linux
 releases a process's address space, and with it its `exe` link and command line,
@@ -395,12 +407,12 @@ VM directory; prelaunch failures discard only files belonging to that attempt.
 An abort during preparation marks the attempt and leaves any old runtime state
 intact. Final removal checks the same instance that was originally selected.
 
-Before recovery deletes VM state it records old host-network resources directly
-in the existing reconciler teardown journal. There is no separate recovery
-outbox. Physical cleanup uses the usual running-config claimant guards so
-resources retained by a live or quarantined VM are preserved. When host network
-setup is disabled, recovery has no network cleanup obligation. A journal write
-failure preserves the VM directory for a later retry.
+Before recovery deletes VM state with trusted metadata, it marks the VM's
+ownership records departing in the reconciler's ownership journal. There is no
+separate recovery outbox. Physical cleanup never deletes a rule a tracked VM
+claims, so resources retained by a live or quarantined VM are preserved. When
+host network setup is disabled, recovery has no network cleanup obligation. A
+journal write failure preserves the VM directory for a later retry.
 
 Discovery publishes every persisted VM directory before spending the inspection
 budget. Valid ownership records reserve their old CPU, memory, guest IP/MAC,
@@ -524,12 +536,64 @@ every reconciliation, whatever it returned, because deletes and replacements
 run even while other work is held or failing: a route never outlives its guest
 or points at an address another service now owns. The unchanged-revision path
 refreshes them on every poll as before. A guest address is not given to
-another service while a removed VM's host port rules for it await teardown,
-whether a failed teardown or unresolved ownership deferred them, or while a
-published route still points at it; the reconciler also holds any start on
-such an address. The service that owned the address may take it back. The
-address is reused once the rules are torn down and a route sync no longer
-routes there.
+another service while a removed VM's ownership record or host port rules for
+it remain, while a route file still points at it, or while a route withdrawn
+from it may still be served; the reconciler also holds any start on such an
+address. The service that owned the address may take it back once its own
+earlier rules for ports it no longer claims are gone. See "Network ownership".
+
+## Network ownership
+
+Contract C4 and limitations L6 and L7. The design, with the experiments behind
+it, is in [recovery-network-ownership.md](recovery-network-ownership.md).
+
+- **Ownership journal.** `<state_dir>/pending_teardowns.json` (version 2)
+  records every networked VM before anything is created for it: its guest
+  address and port forwards, moving `creating`, `running`, `departing`. A
+  record is removed only once the kernel's rule list shows none of its rules.
+  A crash at any step recovers without an operator: an interrupted start whose
+  VM is not tracked keeps its address until the VM manager proves no process
+  or systemd launch uses its paths.
+- **Tagged rules, the kernel as inventory.** Port forwards carry
+  `firework:pf:<service>`. Teardown lists `nat PREROUTING` and deletes rules by
+  their listed arguments, so rules from an old host IP or an older agent go
+  too. A rule a tracked VM claims is never deleted. Untagged duplicates of a
+  running VM's rules are removed once its tagged rule is installed.
+- **Start gate.** At plan time, before an update removes the old VM, right
+  before Start, and before a health restart, a start is held while any rule
+  toward its address or for one of its host ports is not one of its own
+  claimed forwards (no exception for the service's own earlier rules), while
+  another service's record, route or unconfirmed route withdrawal holds the
+  address, or while the rules or route files cannot be read. A start held
+  after its old VM was removed does not stop a rolling update.
+- **L6: host-port history.** A host port, once given to a service on a node,
+  goes only to that service there, because peers' routes and guests'
+  `cross_node_links` may still send its traffic to it. A desired state that
+  gives it to another service, including a port swap between services, fails
+  the revision with `host_port_reuse_blocked`: change the configuration to a
+  fresh port, or use a node without this history. Waiting does not resolve
+  it.
+- **L7: route withdrawal.** A route is recorded as withdrawn before its file
+  changes, and completed once the change is durable and verified, with the
+  identity of the Traefik process running then. Its address goes to another
+  service only once that process is gone: the `traefik_unit` (default
+  `traefik.service`) is stopped, runs another main process, or the host
+  rebooted. When only such addresses are free, the agent reports
+  `guest_address_withdrawal_unconfirmed` naming the unit and waits for the
+  operator to restart Traefik; it never restarts it. `traefik_unit` must be
+  the only process serving `traefik_config_dir`.
+- **Initialization.** History is complete only when the journal is created on
+  a host without a VM state directory, DNAT rules toward the guest subnet or
+  local route files, on a node endpoint with no earlier firework use. A
+  version 1 journal, existing VM state, or a journal moved aside after
+  corruption is migrated: running VMs keep their addresses and ports, but a
+  port without a recorded holder waits with `network_history_incomplete` (L6),
+  and every address waits for a Traefik restart before going to a new service
+  (L7). Deleting the journal never makes history complete.
+- **Downgrade.** An older agent rejects a version 2 journal and cannot delete
+  tagged rules. Replace the node, or stop the agent and every VM, delete the
+  rules `iptables -t nat -S PREROUTING | grep firework:pf:` lists by their
+  listed text, delete the journal, then start the older agent.
 
 Changes that apply without replacing the VM, such as `metadata.host`,
 `metadata.subdomain` or a health-check port, are committed to the running
