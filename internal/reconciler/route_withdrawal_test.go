@@ -226,3 +226,30 @@ func TestMigrationBaselineHoldsWithoutHostNetworking(t *testing.T) {
 		t.Fatalf("next did not start after Traefik restarted: %v", r.HeldServices(desired))
 	}
 }
+
+// Without host networking, an initialization whose route evidence could not
+// be read is retried on the next tick rather than left unready.
+func TestRouteOwnershipInitializationRetriesWithoutHostNetworking(t *testing.T) {
+	failing := true
+	r := New(newFakeVMManager(), slog.New(slog.NewTextHandler(io.Discard, nil)), nil, nil, "", 0).
+		WithRouteEvidence(&fakeRoutes{boot: "boot-1", start: "100"}).
+		WithHostHistoryEvidence("172.16.0.0/24", func() (bool, error) {
+			if failing {
+				return false, errors.New("permission denied")
+			}
+			return true, nil
+		}).WithStateDir(t.TempDir())
+	if r.ownershipReady() {
+		t.Fatal("ready without reading the route directory")
+	}
+	if err := r.Reconcile(context.Background(), config.NodeConfig{}); err == nil {
+		t.Fatal("the unreadable evidence was hidden")
+	}
+	failing = false
+	if err := r.Reconcile(context.Background(), config.NodeConfig{}); err != nil || !r.ownershipReady() {
+		t.Fatalf("initialization was not retried: %v", err)
+	}
+	if err := r.BeginRouteWithdrawals([]RouteTarget{{Service: "a", GuestIP: "172.16.0.2"}}, false); err != nil {
+		t.Fatalf("withdrawals cannot be recorded after initialization: %v", err)
+	}
+}

@@ -450,7 +450,14 @@ func (r *Reconciler) teardownDeparting(service string) error {
 // journal if construction could not.
 func (r *Reconciler) settleAllocations(ctx context.Context, teardown bool) error {
 	if r.networkMgr == nil {
-		// Routes still reach guest addresses without host networking.
+		// Routes still reach guest addresses without host networking. An
+		// initialization that could not read its evidence is retried here.
+		r.cleanupMu.Lock()
+		err := r.initializeJournalLocked(nil)
+		r.cleanupMu.Unlock()
+		if err != nil {
+			return stageError(FailureStageNetwork, err)
+		}
 		if err := r.CompleteRouteWithdrawals(); err != nil {
 			r.logger.Warn("route withdrawals cannot be settled yet", "error", err)
 		}
