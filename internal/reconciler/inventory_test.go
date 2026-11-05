@@ -178,3 +178,40 @@ func TestIncompleteHistoryBlocksOnlyUnrecordedPorts(t *testing.T) {
 		t.Fatalf("fresh=%v existing=%#v", h.vms.instances["fresh"], h.vms.instances["existing"])
 	}
 }
+
+type scanningVMs struct {
+	*crashVMs
+	unaccounted []string
+	err         error
+}
+
+func (s *scanningVMs) UnaccountedVMs(context.Context) ([]string, error) { return s.unaccounted, s.err }
+
+// G5: a VM process under this node's state that nothing tracks may hold any
+// address, so no service gets a new address while it runs. A running service
+// keeps its own, and the hold names the process.
+func TestUnaccountedVMHoldsNewAddresses(t *testing.T) {
+	h := newCrashHost(t)
+	vms := &scanningVMs{crashVMs: h.vms}
+	r := NewWithNetworkManager(vms, h.agent().logger, nil, h.kernel, "", 0).WithStateDir(t.TempDir())
+	running := crashService("running", "172.16.0.2", 8080)
+	h.converge(r, config.NodeConfig{Services: []config.ServiceConfig{running}})
+	vms.unaccounted = []string{"process 4242 (VM directory of gone)"}
+	updated := running
+	updated.Image = "/images/v2"
+	desired := config.NodeConfig{Services: []config.ServiceConfig{updated, crashService("fresh", "172.16.0.3", 9090)}}
+	err := r.Reconcile(context.Background(), desired)
+	var action *ActionRequiredError
+	if !errors.As(err, &action) || action.Code != ActionUnaccountedVM || !strings.Contains(action.Reason, "4242") {
+		t.Fatalf("fresh started beside an untracked VM: %v", err)
+	}
+	if h.vms.instances["fresh"] != nil || h.vms.instances["running"].Config.Image != "/images/v2" {
+		t.Fatalf("fresh=%v running=%#v", h.vms.instances["fresh"], h.vms.instances["running"])
+	}
+	vms.unaccounted, vms.err = nil, errors.New("process table unreadable")
+	if err := r.Reconcile(context.Background(), desired); !IsIncomplete(err) || h.vms.instances["fresh"] != nil {
+		t.Fatalf("an unreadable scan did not hold new addresses: %v", err)
+	}
+	vms.err = nil
+	h.converge(r, desired)
+}

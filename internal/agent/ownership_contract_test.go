@@ -280,3 +280,81 @@ func TestC4RestartedAgentKeepsAPublishedRouteAddress(t *testing.T) {
 		t.Fatalf("172.16.0.2 not released after Traefik restarted: %s", next[0].Network.GuestIP)
 	}
 }
+
+// C1/C4/L4: a VM whose directory was removed by hand leaves its ownership
+// record and rule behind. Its service stays held and the address and port
+// stay fenced until clear-recovery --forget proves the VM absent. The
+// command only authorizes cleanup: the address is released once the rule is
+// gone, and the host port keeps its history (L6).
+func TestForgetResolvesAHandRemovedVM(t *testing.T) {
+	limit := capacity.NodeCapacity{VCPUs: 8, MemoryMB: 4096}
+	web := addressedService("web", "172.16.0.2", 0)
+	web.PortForwards = []config.PortForward{{HostPort: 8080, VMPort: 80}}
+	yaml := "node: web\nservices:\n- name: web\n  image: /web\n  kernel: /k\n  vcpus: 1\n  memory_mb: 64\n  network: {}\n  port_forwards:\n  - host_port: 8080\n    vm_port: 80\n"
+	a, m := admissionAgent(t, yaml, limit, map[string]*vm.Instance{"web": {Name: "web", Config: web, State: vm.StateRunning}}, "172.16.0.0/24")
+	network := &recoveryTestNetworkManager{}
+	writeJournal := func(path string, data []byte) error { return os.WriteFile(path, data, 0o644) }
+	a.reconciler = testReconciler(t, m, network, "", 0)
+	a.tick(context.Background())
+	if _, ok := network.kernel.Delivers(8080); !ok {
+		t.Fatal("setup: web's rule is not installed")
+	}
+
+	delete(m.instances, "web") // its directory was removed by hand; the VM may still run
+	starts := len(m.startCalls)
+	a.store.(*fakeStore).revision = "r3"
+	a.tick(context.Background())
+	if len(m.startCalls) != starts {
+		t.Fatalf("a second VM started over the vanished one: %v", m.startCalls)
+	}
+	for _, service := range a.agentStatusSnapshot().Services {
+		if service.Name == "web" && service.ReasonCode != reconciler.ActionVMStateMissing {
+			t.Fatalf("web's status = %+v", service)
+		}
+	}
+
+	live := errors.New("a live process uses the VM paths of web")
+	a.proveServiceAbsent = func(context.Context, string) error { return live }
+	if result, err := a.forgetRecoveryPending("web"); err == nil || result.Outcome != vm.RecoveryOutcomeAmbiguous {
+		t.Fatalf("--forget released a possibly live VM: %#v %v", result, err)
+	}
+	a.proveServiceAbsent = func(context.Context, string) error { return nil }
+	a.reconciler.WithJournalWriter(func(string, []byte) error { return errors.New("disk full") })
+	if result, err := a.forgetRecoveryPending("web"); err == nil || result.Outcome != vm.RecoveryOutcomeIncomplete {
+		t.Fatalf("a failed record write was hidden: %#v %v", result, err)
+	}
+	a.reconciler.WithJournalWriter(writeJournal)
+	if _, ok := network.kernel.Delivers(8080); !ok || a.reconciler.PendingTeardownGuestIPs()["172.16.0.2"] != "web" {
+		t.Fatal("a refused or failed --forget changed the fences")
+	}
+
+	result, err := a.forgetRecoveryPending("web")
+	if err != nil || result.Outcome != vm.RecoveryOutcomeCleared {
+		t.Fatalf("--forget: %#v %v", result, err)
+	}
+	// Authorized, not released: the rule and the address stay until cleanup.
+	if _, ok := network.kernel.Delivers(8080); !ok || a.reconciler.PendingTeardownGuestIPs()["172.16.0.2"] != "web" {
+		t.Fatal("--forget released the address before its rule was gone")
+	}
+	if again, err := a.forgetRecoveryPending("web"); err != nil || again.Outcome != vm.RecoveryOutcomeNoop {
+		t.Fatalf("a repeated --forget: %#v %v", again, err)
+	}
+
+	a.applyRecoveryRequests(context.Background()) // the queued tick tears the rule down and recreates web
+	a.tick(context.Background())
+	if inst := m.instances["web"]; inst == nil || inst.Config.Network.GuestIP != "172.16.0.2" {
+		t.Fatalf("web was not recreated at its address: %#v", inst)
+	}
+	if rule, ok := network.kernel.Delivers(8080); !ok || !rule.TaggedFor("web") || len(network.kernel.RulesTo("172.16.0.2")) != 1 {
+		t.Fatalf("rules after cleanup: %v", network.kernel.Rules())
+	}
+	// Another service still never gets web's port.
+	a.store.(*fakeStore).revision = "r4"
+	a.store.(*fakeStore).data["web"] = []byte("node: web\nservices:\n- name: api\n  image: /api\n  kernel: /k\n  vcpus: 1\n  memory_mb: 64\n  network: {}\n  port_forwards:\n  - host_port: 8080\n    vm_port: 80\n")
+	for tick := 0; tick < 2; tick++ {
+		a.tick(context.Background())
+	}
+	if m.instances["api"] != nil {
+		t.Fatal("api took web's host port after --forget")
+	}
+}

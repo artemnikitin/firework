@@ -316,3 +316,40 @@ func verifyProcessVisibilityFor(mounts string, uid int, groups []int) error {
 	}
 	return nil
 }
+
+// FindVMProcessesContext returns every process whose Firecracker socket or
+// config argument lies under root, with its command line.
+func (inspector osProcessInspector) FindVMProcessesContext(ctx context.Context, root string) ([]processIdentity, error) {
+	mounts, err := os.ReadFile("/proc/mounts")
+	if err != nil {
+		return nil, fmt.Errorf("cannot verify process table visibility: %w", err)
+	}
+	if err := verifyProcessTableVisibility(string(mounts)); err != nil {
+		return nil, err
+	}
+	entries, err := os.ReadDir("/proc")
+	if err != nil {
+		return nil, fmt.Errorf("read process table: %w", err)
+	}
+	var matches []processIdentity
+	for _, entry := range entries {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		pid, err := strconv.Atoi(entry.Name())
+		if err != nil {
+			continue
+		}
+		args, err := readProcessCommandLine(filepath.Join("/proc", entry.Name()))
+		if errors.Is(err, errProcessNotFound) {
+			continue
+		}
+		if err != nil {
+			return nil, fmt.Errorf("inspect process %d command line: %w", pid, err)
+		}
+		if vmServiceUnder(args, root) != "" {
+			matches = append(matches, processIdentity{PID: pid, CommandLine: args})
+		}
+	}
+	return matches, nil
+}

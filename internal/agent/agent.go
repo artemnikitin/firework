@@ -80,7 +80,9 @@ type Agent struct {
 	// routeProcess identifies the process serving traefikMgr's routes, which
 	// decides when a withdrawn route's address may go to another service.
 	routeProcess routeProcess
-	lifecycleMu  sync.Mutex
+	// proveServiceAbsent replaces vmManager.ProveServiceAbsent in tests.
+	proveServiceAbsent func(context.Context, string) error
+	lifecycleMu        sync.Mutex
 	// restartNeedsReconcile is set by a health restart that left its service
 	// without a running VM; the next tick then skips the unchanged-revision
 	// shortcut.

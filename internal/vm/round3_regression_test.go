@@ -261,9 +261,9 @@ func TestRound3LegacyWithoutDesiredCanClearAfterClaimantExits(t *testing.T) {
 		t.Fatal("legacy state with a live claimant was cleared")
 	}
 	delete(inspector.identities, f.PID)
-	result, err := m.ClearRecoveryPending(f.Service)
+	result, err := m.ForgetRecoveryPending(f.Service)
 	if err != nil || result.Outcome != RecoveryOutcomeCleared {
-		t.Fatalf("absent legacy state could not be cleared without desired config: %#v %v", result, err)
+		t.Fatalf("absent legacy state could not be forgotten without desired config: %#v %v", result, err)
 	}
 	if _, err := os.Stat(f.VMDir); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("legacy state remains after absence proof: %v", err)
@@ -288,9 +288,12 @@ func TestRound3ManifestlessStateClearsOnceItsProcessDies(t *testing.T) {
 	}
 	delete(inspector.identities, f.PID)
 	inspector.find = nil
-	result, err := m.ClearRecoveryPending(f.Service)
+	if result, err := m.ClearRecoveryPending(f.Service); err == nil || result.Outcome == RecoveryOutcomeCleared {
+		t.Fatalf("dead manifest-less state was cleared without --forget: result=%#v err=%v", result, err)
+	}
+	result, err := m.ForgetRecoveryPending(f.Service)
 	if err != nil || result.Outcome != RecoveryOutcomeCleared {
-		t.Fatalf("dead manifest-less state was not cleared: result=%#v err=%v", result, err)
+		t.Fatalf("dead manifest-less state was not forgotten: result=%#v err=%v", result, err)
 	}
 	if _, err := os.Stat(f.VMDir); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("dead manifest-less directory remains: %v", err)

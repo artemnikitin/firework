@@ -82,8 +82,11 @@ func taggedForAny(rule network.PortForwardRule, services map[string]bool) bool {
 }
 
 // startHold is the full start gate: ownership records and the kernel's rules.
-func (r *Reconciler) startHold(svc config.ServiceConfig, replacing bool, leaving map[string]bool) Hold {
-	if hold := r.allocationHold(svc, leaving); hold.Reason != "" {
+//
+// keepsAddress says the service already has this address, as an update that
+// keeps it does: an untracked VM elsewhere cannot then take it from it.
+func (r *Reconciler) startHold(svc config.ServiceConfig, replacing bool, leaving map[string]bool, keepsAddress bool) Hold {
+	if hold := r.allocationHold(svc, leaving, keepsAddress); hold.Reason != "" {
 		return hold
 	}
 	return r.inventoryHold(svc, replacing, leaving)

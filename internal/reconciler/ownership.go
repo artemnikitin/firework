@@ -177,7 +177,16 @@ type absenceProver interface {
 	ProveServiceAbsent(ctx context.Context, service string) error
 }
 
-var _ absenceProver = (*vm.Manager)(nil)
+// unaccountedVMScanner finds VM processes and launches that no tracked VM
+// accounts for. *vm.Manager implements it.
+type unaccountedVMScanner interface {
+	UnaccountedVMs(ctx context.Context) ([]string, error)
+}
+
+var (
+	_ absenceProver        = (*vm.Manager)(nil)
+	_ unaccountedVMScanner = (*vm.Manager)(nil)
+)
 
 // newAllocationLocked adds a record and returns it.
 func (r *Reconciler) newAllocationLocked(service string, phase allocationPhase, guestIP string, pfs []config.PortForward, untagged bool) allocation {
@@ -447,8 +456,16 @@ func (r *Reconciler) settleAllocations(ctx context.Context, teardown bool) error
 		}
 		return nil
 	}
+	var unaccounted []string
+	var scanErr error
+	if scanner, ok := r.vmManager.(unaccountedVMScanner); ok && !teardown {
+		unaccounted, scanErr = scanner.UnaccountedVMs(ctx)
+	}
 	r.cleanupMu.Lock()
 	defer r.cleanupMu.Unlock()
+	if !teardown {
+		r.unaccountedVMs, r.unaccountedVMsErr = unaccounted, scanErr
+	}
 	actual := r.vmManager.List()
 	if err := r.initializeJournalLocked(actual); err != nil {
 		return stageError(FailureStageNetwork, err)
@@ -642,7 +659,7 @@ func (r *Reconciler) departingLegacyLocked(service, guestIP string) (allocation,
 // not resolved yet. Host ports of another service's running VM are checked
 // against the VM itself, so a port can move between services within a tick
 // once the old VM's rules are gone.
-func (r *Reconciler) allocationHold(svc config.ServiceConfig, leaving map[string]bool) Hold {
+func (r *Reconciler) allocationHold(svc config.ServiceConfig, leaving map[string]bool, keepsAddress bool) Hold {
 	ip := guestIPOf(svc)
 	if r.networkMgr == nil || ip == "" {
 		return Hold{}
@@ -659,12 +676,32 @@ func (r *Reconciler) allocationHold(svc config.ServiceConfig, leaving map[string
 	if hold := r.portHistoryHoldLocked(svc); hold.Reason != "" {
 		return hold
 	}
+	// A VM nothing tracks may hold any address. A service keeps its own: the
+	// address its tracked VM or its records hold, as through an update.
+	ownAddress := keepsAddress || slices.ContainsFunc(r.sortedAllocationsLocked(), func(a allocation) bool {
+		return a.Service == svc.Name && sameGuestIP(a.GuestIP, ip)
+	})
+	if inst := actual[svc.Name]; !ownAddress && (inst == nil || !sameGuestIP(guestIPOf(inst.Config), ip)) {
+		switch {
+		case r.unaccountedVMsErr != nil:
+			return Hold{Reason: fmt.Sprintf("VM processes cannot be scanned, so an untracked VM may hold any address: %v", r.unaccountedVMsErr)}
+		case len(r.unaccountedVMs) > 0:
+			return Hold{Reason: fmt.Sprintf("%s uses this node's VM state but no VM tracks it, so it may hold any address; stop it, or remove its VM directory only once it has stopped", r.unaccountedVMs[0]),
+				Action: ActionUnaccountedVM}
+		}
+	}
 	for _, a := range r.sortedAllocationsLocked() {
 		inst := actual[a.Service]
 		tracked := inst != nil && sameGuestIP(guestIPOf(inst.Config), a.GuestIP)
 		if a.Service == svc.Name {
 			if a.Phase == phaseCreating && !tracked {
 				return Hold{Reason: "an interrupted start of this service is not resolved yet"}
+			}
+			if a.Phase == phaseRunning && inst == nil {
+				// Its VM left without the agent removing it, as when its
+				// directory is removed by hand. It may still run.
+				return Hold{Reason: fmt.Sprintf("the VM recorded for this service at %s has no state the agent can track; stop it if it still runs, then run firework-agent clear-recovery --forget %s", a.GuestIP, svc.Name),
+					Action: ActionVMStateMissing}
 			}
 			// No exception for the same service: an earlier VM's rule for a
 			// host port this configuration no longer claims would deliver
@@ -714,6 +751,84 @@ func (r *Reconciler) portHistoryHoldLocked(svc config.ServiceConfig) Hold {
 		}
 	}
 	return Hold{}
+}
+
+// HasUnresolvedTraces reports whether the service has records or tagged rules
+// that no tracked VM accounts for: what clear-recovery --forget hands to
+// cleanup for a service without a tracked VM, such as one whose directory
+// was removed by hand.
+func (r *Reconciler) HasUnresolvedTraces(service string) (bool, error) {
+	if r.networkMgr == nil {
+		return false, nil
+	}
+	traces, err := r.unresolvedTraces(service)
+	return len(traces) > 0, err
+}
+
+// unresolvedTraces returns the service's live records whose VM is not
+// tracked, and records covering its tagged rules that no record or tracked VM
+// accounts for.
+func (r *Reconciler) unresolvedTraces(service string) ([]allocation, error) {
+	listing, err := r.networkMgr.ListPortForwards()
+	if err != nil {
+		return nil, err
+	}
+	actual := r.vmManager.List()
+	r.cleanupMu.Lock()
+	defer r.cleanupMu.Unlock()
+	var traces []allocation
+	inst := actual[service]
+	for _, a := range r.sortedAllocationsLocked() {
+		if a.Service == service && a.live() && (inst == nil || !sameGuestIP(guestIPOf(inst.Config), a.GuestIP)) {
+			traces = append(traces, a)
+		}
+	}
+	byAddress := map[string]*allocation{}
+	for _, rule := range listing.Rules {
+		if !rule.TaggedFor(service) {
+			continue
+		}
+		if claimed, _ := ruleClaim(rule, actual); claimed || slices.ContainsFunc(r.sortedAllocationsLocked(), func(a allocation) bool { return a.covers(rule) }) {
+			continue
+		}
+		trace := byAddress[rule.GuestIP]
+		if trace == nil {
+			trace = &allocation{Service: service, Phase: phaseDeparting, GuestIP: rule.GuestIP}
+			byAddress[rule.GuestIP] = trace
+		}
+		trace.PortForwards = append(trace.PortForwards, config.PortForward{HostPort: rule.HostPort, VMPort: rule.VMPort})
+	}
+	for _, ip := range slices.Sorted(maps.Keys(byAddress)) {
+		traces = append(traces, *byAddress[ip])
+	}
+	return traces, nil
+}
+
+// ForgetService hands the unresolved traces of a service without a tracked VM
+// to cleanup: its live records and its tagged rules nothing accounts for
+// become departing records. The caller has proven the VM absent. Nothing is
+// released here: each address and port is released only once the rules are
+// gone and, for a route, once Traefik has restarted; host ports keep their
+// holder (L6).
+func (r *Reconciler) ForgetService(service string) error {
+	traces, err := r.unresolvedTraces(service)
+	if err != nil {
+		return err
+	}
+	if len(traces) == 0 {
+		return nil
+	}
+	return r.mutateJournal(func() {
+		for _, trace := range traces {
+			if trace.ID != 0 {
+				if a, ok := r.allocations[trace.ID]; ok {
+					r.departLocked(a)
+				}
+				continue
+			}
+			r.departLocked(r.newAllocationLocked(service, phaseDeparting, trace.GuestIP, trace.PortForwards, false))
+		}
+	})
 }
 
 // PendingTeardownGuestIPs returns, for each guest IP a record still holds

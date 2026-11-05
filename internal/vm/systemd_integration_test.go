@@ -340,3 +340,50 @@ func TestSystemdIntegrationAbsenceProofWithoutDBus(t *testing.T) {
 		t.Fatalf("orphan state was not removed: %v", err)
 	}
 }
+
+// A live VM under the state directory that no manager tracks, as after its
+// directory listing was lost, is reported by its process and its unit until
+// a manager adopts it.
+func TestSystemdIntegrationUnaccountedVMScan(t *testing.T) {
+	if os.Getenv("FIREWORK_REAL_SYSTEMD") != "1" {
+		t.Skip("requires isolated real systemd")
+	}
+	root := t.TempDir()
+	src := filepath.Join(root, "fake.go")
+	fake := `package main
+import("flag";"net";"os";"os/signal";"syscall")
+func main(){flag.String("id","","");p:=flag.String("api-sock","","");flag.String("config-file","","");flag.Parse(); l,e:=net.Listen("unix",*p);if e!=nil {panic(e)};defer l.Close(); go func(){for{c,e:=l.Accept();if e!=nil{return};c.Close()}}(); s:=make(chan os.Signal,1);signal.Notify(s,syscall.SIGTERM,syscall.SIGINT);<-s}
+`
+	if err := os.WriteFile(src, []byte(fake), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	binary := filepath.Join(root, "fake-firecracker")
+	if out, err := exec.Command("go", "build", "-o", binary, src).CombinedOutput(); err != nil {
+		t.Fatalf("build: %v %s", err, out)
+	}
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	m := NewManager(binary, root, logger)
+	svc := config.ServiceConfig{Name: "scanned", Image: "/image", Kernel: "/kernel", VCPUs: 1, MemoryMB: 128}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	if err := m.Start(ctx, svc); err != nil {
+		t.Fatal(err)
+	}
+	unit := m.List()[svc.Name].manifest.LauncherUnit
+	defer exec.Command("systemctl", "stop", unit).Run()
+	if found, err := m.UnaccountedVMs(ctx); err != nil || len(found) != 0 {
+		t.Fatalf("the tracked VM was reported: %v %v", found, err)
+	}
+	stranger := NewManager(binary, root, logger) // tracks nothing
+	found, err := stranger.UnaccountedVMs(ctx)
+	if err != nil || len(found) != 2 || !strings.Contains(strings.Join(found, " "), "scanned") || !strings.Contains(strings.Join(found, " "), unit) {
+		t.Fatalf("an untracked live VM was not reported by process and unit: %v %v", found, err)
+	}
+	if adopted, err := stranger.Recover(ctx, config.NodeConfig{Services: []config.ServiceConfig{svc}}); err != nil || len(adopted) != 1 {
+		t.Fatalf("adoption: %v %v", adopted, err)
+	}
+	if found, err := stranger.UnaccountedVMs(ctx); err != nil || len(found) != 0 {
+		t.Fatalf("an adopted VM is still reported: %v %v", found, err)
+	}
+	t.Logf("untracked VM reported as %v until adopted", found)
+}

@@ -61,10 +61,63 @@ func (a *Agent) resolveRecoveryPending(service string, forget bool) (vm.Recovery
 	if err != nil {
 		return result, err
 	}
+	if forget && result.Outcome == vm.RecoveryOutcomeNoop && result.State == "" {
+		result, err = a.forgetUntrackedService(service, result)
+		if err != nil {
+			return result, err
+		}
+	} else if forget && result.Outcome == vm.RecoveryOutcomeCleared {
+		// The cleared state was untrusted or absent, so whatever its VM was
+		// given is known only from ownership records and tagged rules.
+		if err := a.reconciler.ForgetService(service); err != nil {
+			return incompleteForget(result, err)
+		}
+	}
 	if result.Outcome == vm.RecoveryOutcomeCleared || result.Outcome == vm.RecoveryOutcomeReadopted {
 		a.queueRecoveryReconcile(service, result.Outcome == vm.RecoveryOutcomeReadopted)
 	}
 	return result, nil
+}
+
+// forgetUntrackedService resolves a service with no tracked VM that still has
+// ownership records or tagged rules, as when its VM directory was removed by
+// hand. It proves from the service's paths that no process or launch still
+// uses them, then hands the records and rules to cleanup. Nothing is released
+// by the command itself: each address and port is released only once its
+// rules are gone and, for a route, once Traefik has restarted; host ports
+// keep their history (L6).
+func (a *Agent) forgetUntrackedService(service string, result vm.RecoveryResult) (vm.RecoveryResult, error) {
+	traces, err := a.reconciler.HasUnresolvedTraces(service)
+	if err != nil {
+		result.Outcome, result.Message = vm.RecoveryOutcomeAmbiguous, "the host's port-forward rules cannot be read: "+err.Error()
+		return result, fmt.Errorf("service %s: %s", service, result.Message)
+	}
+	if !traces {
+		return result, nil
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), recoveryControlDeadline)
+	defer cancel()
+	prove := a.proveServiceAbsent
+	if prove == nil {
+		prove = a.vmManager.ProveServiceAbsent
+	}
+	if err := prove(ctx, service); err != nil {
+		result.Outcome = vm.RecoveryOutcomeAmbiguous
+		result.Message = "the VM recorded for this service may still run: " + err.Error()
+		return result, fmt.Errorf("service %s: %s", service, result.Message)
+	}
+	if err := a.reconciler.ForgetService(service); err != nil {
+		return incompleteForget(result, err)
+	}
+	result.Outcome = vm.RecoveryOutcomeCleared
+	result.Message = "no process uses the VM paths; its host networking is torn down, and its address released once nothing reaches it"
+	return result, nil
+}
+
+func incompleteForget(result vm.RecoveryResult, err error) (vm.RecoveryResult, error) {
+	result.Outcome, result.State = vm.RecoveryOutcomeIncomplete, vm.StateRecoveryPending
+	result.Message = "recording the service's host networking for cleanup: " + err.Error()
+	return result, fmt.Errorf("service %s: %s", result.Service, result.Message)
 }
 
 func (a *Agent) queueRecoveryReconcile(service string, adopted bool) {

@@ -325,3 +325,18 @@ func TestProveServiceAbsentRefusesAnyClaimant(t *testing.T) {
 		t.Fatal("a process presenting the VM paths was ignored")
 	}
 }
+
+func TestVMServiceUnderNamesTheVMDirectory(t *testing.T) {
+	root := "/var/lib/firework/vms"
+	for args, want := range map[string]string{
+		"/usr/bin/firecracker --api-sock /var/lib/firework/vms/web/firecracker.sock":  "web",
+		"/usr/bin/firecracker --config-file=/var/lib/firework/vms/api/vm-config.json": "api",
+		"/usr/bin/firecracker --api-sock /var/lib/firework/vmsx/web/firecracker.sock": "",
+		"/usr/bin/firecracker --api-sock /var/lib/firework/vms/../etc/sock":           "",
+		"/usr/bin/sleep 300": "",
+	} {
+		if got := vmServiceUnder(strings.Fields(args), root); got != want {
+			t.Errorf("%q: got %q, want %q", args, got, want)
+		}
+	}
+}

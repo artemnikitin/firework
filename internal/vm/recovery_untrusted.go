@@ -90,11 +90,14 @@ func recoveryAbsenceProbe(service, vmDir string, recorded *instanceManifest, unt
 }
 
 // resolveUntrustedRecovery handles state that can never authorize adoption:
-// an unreadable or mismatched manifest, or a service path that is not a real
-// directory. Its claims stay fenced until --forget deletes it after an absence
-// proof, or a restored trusted record replaces it, so corrupt records stay
-// available for diagnosis; a missing directory or manifest has nothing to
-// preserve and is cleared automatically.
+// an unreadable or mismatched manifest, a missing manifest or directory, or a
+// service path that is not a real directory. State on disk stays fenced until
+// --forget deletes it after an absence proof, or a restored trusted record
+// replaces it: nothing in it identifies the host networking a dead owner
+// left, so the operator checks that networking first (L4). A directory that
+// is gone is no exception, unless this manager removed it itself, as a failed
+// start, a removal or a clear racing an inventory does: only then does an
+// operation the agent recorded explain its disappearance.
 func (m *Manager) resolveUntrustedRecovery(ctx context.Context, result RecoveryResult, instance *Instance, recorded *instanceManifest, untrusted, forget bool) (RecoveryResult, error) {
 	service := result.Service
 	vmDir, path := m.recoveryManifestPath(service)
@@ -131,10 +134,13 @@ func (m *Manager) resolveUntrustedRecovery(ctx context.Context, result RecoveryR
 		return recoveryAmbiguous(result, fmt.Sprintf("%s and absence remains unproved: %v", reason, absenceErr))
 	}
 	preservesMetadata := before.kind == "symlink" || (before.kind == "dir" && before.manifest != "missing")
-	if preservesMetadata && !forget {
+	if !forget && !(before.kind == "missing" && m.removedOwnDir(service)) {
 		// What a dead owner left on the host is unknown, so its claims stay
 		// fenced until an operator decides; recovery never releases them.
-		return recoveryAmbiguous(result, fmt.Sprintf("%s; no process owns it, so it is preserved for diagnosis and its claims stay fenced: restore a trusted ownership record or run firework-agent clear-recovery --forget %s", reason, service))
+		if preservesMetadata {
+			return recoveryAmbiguous(result, fmt.Sprintf("%s; no process owns it, so it is preserved for diagnosis and its claims stay fenced: restore a trusted ownership record or run firework-agent clear-recovery --forget %s", reason, service))
+		}
+		return recoveryAmbiguous(result, fmt.Sprintf("%s; no process owns it, but nothing identifies the host networking it may have left, so its claims stay fenced: check that networking, then run firework-agent clear-recovery --forget %s", reason, service))
 	}
 
 	if err := m.lockRecovery(ctx); err != nil {

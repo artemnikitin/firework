@@ -172,6 +172,7 @@ func (m *Manager) removeProvenRecoveryState(ctx context.Context, f *instanceMani
 	if err := ctx.Err(); err != nil {
 		return err
 	}
+	m.markRemovedDir(f.Service)
 	return os.RemoveAll(f.VMDir)
 }
 

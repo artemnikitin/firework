@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
+	"time"
 
 	"github.com/artemnikitin/firework/internal/config"
 )
@@ -58,4 +60,86 @@ func (m *Manager) ProveServiceAbsent(ctx context.Context, service string) error 
 		return err
 	}
 	return m.noClaimingUnitContext(ctx, paths)
+}
+
+// vmServiceUnder returns the service whose VM directory under root a
+// Firecracker socket or config argument names, or "".
+func vmServiceUnder(args []string, root string) string {
+	prefix := filepath.Clean(root) + string(filepath.Separator)
+	for i, arg := range args {
+		value := ""
+		switch {
+		case (arg == "--api-sock" || arg == "--config-file") && i+1 < len(args):
+			value = args[i+1]
+		case strings.HasPrefix(arg, "--api-sock="), strings.HasPrefix(arg, "--config-file="):
+			_, value, _ = strings.Cut(arg, "=")
+		}
+		if rest, ok := strings.CutPrefix(filepath.Clean(value), prefix); ok && value != "" {
+			if service, _, found := strings.Cut(rest, string(filepath.Separator)); found && service != "" {
+				return service
+			}
+		}
+	}
+	return ""
+}
+
+// UnaccountedVMs lists VM processes and systemd launches under this state
+// directory that no tracked VM accounts for, such as a VM whose directory was
+// removed by hand while it ran. Their guest addresses are unknown, so the
+// reconciler gives no new address to anyone while any exists.
+func (m *Manager) UnaccountedVMs(ctx context.Context) ([]string, error) {
+	scanner, ok := m.inspector.(interface {
+		FindVMProcessesContext(context.Context, string) ([]processIdentity, error)
+	})
+	if !ok {
+		return nil, fmt.Errorf("this host cannot scan for VM processes")
+	}
+	root := filepath.Join(m.stateDir, "vms")
+	processes, err := scanner.FindVMProcessesContext(ctx, root)
+	if err != nil {
+		return nil, err
+	}
+	m.mu.Lock()
+	tracked := make(map[string]bool, len(m.instances))
+	units := make(map[string]bool, len(m.instances))
+	for name, instance := range m.instances {
+		tracked[name] = true
+		if instance.instanceID != "" {
+			units["firework-vm-"+instance.instanceID+".service"] = true
+		}
+		if instance.manifest != nil && instance.manifest.LauncherUnit != "" {
+			units[instance.manifest.LauncherUnit] = true
+		}
+	}
+	_, systemd := m.launcher.(*systemdLauncher)
+	m.mu.Unlock()
+	var found []string
+	for _, process := range processes {
+		if service := vmServiceUnder(process.CommandLine, root); !tracked[service] {
+			found = append(found, fmt.Sprintf("process %d (VM directory of %s)", process.PID, service))
+		}
+	}
+	if !systemd {
+		return found, nil
+	}
+	ctx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
+	run := m.recoveryCommandOutput
+	if run == nil {
+		run = commandOutput
+	}
+	out, err := run(ctx, m.recoverySystemctl(), "show", "firework-vm-*.service", "--property=Id,ActiveState,MainPID,Job")
+	if err != nil {
+		return nil, fmt.Errorf("inspect systemd launches: %w", err)
+	}
+	for _, block := range strings.Split(string(out), "\n\n") {
+		fields := parseUnitProperties(block)
+		id := fields["Id"]
+		inactive := fields["ActiveState"] == "inactive" || fields["ActiveState"] == "failed"
+		if id == "" || units[id] || inactive && (fields["MainPID"] == "" || fields["MainPID"] == "0") && fields["Job"] == "" {
+			continue
+		}
+		found = append(found, "systemd unit "+id)
+	}
+	return found, nil
 }

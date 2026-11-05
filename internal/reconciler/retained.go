@@ -40,6 +40,12 @@ const (
 	// from another service's route, which the running Traefik may still
 	// serve (L7). Restarting Traefik releases it.
 	ActionGuestAddressWithdrawalUnconfirmed = "guest_address_withdrawal_unconfirmed"
+	// ActionUnaccountedVM: a VM process or launch under this node's state
+	// that no tracked VM accounts for, whose address is unknown.
+	ActionUnaccountedVM = "unaccounted_vm"
+	// ActionVMStateMissing: a VM the agent recorded as running has no state
+	// it can track, as when its directory was removed by hand.
+	ActionVMStateMissing = "vm_state_missing"
 )
 
 // ActionRequiredError is a hold that only an operator can resolve. It
@@ -147,7 +153,8 @@ func (r *Reconciler) Holds(desired config.NodeConfig, external map[string]Hold) 
 		if instance != nil && (RetainsRuntime(instance.State) || !needsUpdate(instance, service)) {
 			continue // Nothing new is allocated.
 		}
-		if hold := r.startHold(service, instance != nil, leaving); hold.Reason != "" {
+		keeps := instance != nil && sameGuestIP(guestIPOf(instance.Config), guestIPOf(service))
+		if hold := r.startHold(service, instance != nil, leaving, keeps); hold.Reason != "" {
 			held[service.Name] = hold
 		}
 	}
@@ -390,7 +397,8 @@ func (r *Reconciler) actionHold(action Action) Hold {
 	}
 	if action.Type != ActionDelete {
 		if hold.Reason == "" {
-			hold = r.startHold(action.Service, action.Type == ActionUpdate, nil)
+			keeps := action.PreviousService != nil && sameGuestIP(guestIPOf(*action.PreviousService), guestIPOf(action.Service))
+			hold = r.startHold(action.Service, action.Type == ActionUpdate, nil, keeps)
 		}
 		if hold.Reason == "" {
 			hold = r.capacityHold(action.Service, actual)

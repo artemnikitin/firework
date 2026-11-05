@@ -149,9 +149,16 @@ type Manager struct {
 	mu                   sync.Mutex
 	instances            map[string]*Instance
 	recoveryReservations map[string]bool
-	recoveryCondition    *sync.Cond
-	recoveryCursor       string
-	volumeErrors         map[string]string
+	// removedDirs names services whose VM directory this manager removed
+	// itself, as a failed start, a removal or a clear does. A recovery entry
+	// whose directory vanished is cleared without --forget only for these:
+	// the agent's own operation explains the disappearance. removedMu guards
+	// it on its own, so removal paths need no particular lock state.
+	removedMu         sync.Mutex
+	removedDirs       map[string]bool
+	recoveryCondition *sync.Cond
+	recoveryCursor    string
+	volumeErrors      map[string]string
 }
 
 // NewManager creates a new VM manager.
@@ -615,6 +622,7 @@ func (m *Manager) finishStart(ctx context.Context, svc config.ServiceConfig, sta
 	// later.
 	svc = clampToPrepared(svc, prepared)
 
+	m.forgetRemovedDir(svc.Name)
 	if err := os.MkdirAll(vmDir, 0755); err != nil {
 		delete(m.instances, svc.Name)
 		return err
@@ -622,6 +630,7 @@ func (m *Manager) finishStart(ctx context.Context, svc config.ServiceConfig, sta
 	launchAttempted := false
 	defer func() {
 		if !launchAttempted {
+			m.markRemovedDir(svc.Name)
 			_ = os.RemoveAll(vmDir)
 		}
 	}()
@@ -1103,11 +1112,34 @@ func (m *Manager) Remove(name string) error {
 	if err := verifyRecoveryDirectories(vmDir); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return err
 	}
+	m.markRemovedDir(name)
 	if err := os.RemoveAll(vmDir); err != nil {
 		return fmt.Errorf("removing vm dir: %w", err)
 	}
 	delete(m.instances, name)
 	return nil
+}
+
+// markRemovedDir records that this manager removes the service's directory.
+func (m *Manager) markRemovedDir(service string) {
+	m.removedMu.Lock()
+	defer m.removedMu.Unlock()
+	if m.removedDirs == nil {
+		m.removedDirs = make(map[string]bool)
+	}
+	m.removedDirs[service] = true
+}
+
+func (m *Manager) forgetRemovedDir(service string) {
+	m.removedMu.Lock()
+	defer m.removedMu.Unlock()
+	delete(m.removedDirs, service)
+}
+
+func (m *Manager) removedOwnDir(service string) bool {
+	m.removedMu.Lock()
+	defer m.removedMu.Unlock()
+	return m.removedDirs[service]
 }
 
 func (m *Manager) IsRunning(name string) bool {

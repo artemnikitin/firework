@@ -114,6 +114,11 @@ type Reconciler struct {
 	// routeEvidence reads the routes and that process. See route_withdrawal.go.
 	routeWithdrawals map[routeKey]routeWithdrawal
 	routeEvidence    RouteEvidence
+	// unaccountedVMs is the last scan for VM processes and launches no
+	// tracked VM accounts for, or the error that prevented it. Their
+	// addresses are unknown, so no new address is given out while any runs.
+	unaccountedVMs    []string
+	unaccountedVMsErr error
 	// journalReady is false until the version 2 journal is loaded or created.
 	// New networked allocations wait until then.
 	journalReady bool
@@ -708,7 +713,7 @@ func (r *Reconciler) applyAllAtOnce(ctx context.Context, actions []Action) error
 		switch action.Type {
 		case ActionCreate:
 			r.logger.Info("creating service", "service", action.Service.Name)
-			if err := r.createService(ctx, action.Service); err != nil {
+			if err := r.createService(ctx, action.Service, nil); err != nil {
 				r.logger.Error("failed to create service", "service", action.Service.Name, "error", err)
 				errs = append(errs, fmt.Errorf("create %s: %w", action.Service.Name, err))
 			}
@@ -733,7 +738,7 @@ func (r *Reconciler) applyAllAtOnce(ctx context.Context, actions []Action) error
 				errs = append(errs, fmt.Errorf("remove previous %s: %w", action.Service.Name, err))
 				continue
 			}
-			if err := r.createService(ctx, action.Service); err != nil {
+			if err := r.createService(ctx, action.Service, &prev); err != nil {
 				r.logger.Error("failed to start service during update", "service", action.Service.Name, "error", err)
 				errs = append(errs, fmt.Errorf("update %s: %w", action.Service.Name, err))
 			}
@@ -782,7 +787,7 @@ func (r *Reconciler) applyRolling(ctx context.Context, actions []Action) error {
 			continue
 		}
 		r.logger.Info("creating service", "service", action.Service.Name)
-		if err := r.createService(ctx, action.Service); err != nil {
+		if err := r.createService(ctx, action.Service, nil); err != nil {
 			r.logger.Error("failed to create service", "service", action.Service.Name, "error", err)
 			errs = append(errs, fmt.Errorf("create %s: %w", action.Service.Name, err))
 		}
@@ -832,7 +837,7 @@ func (r *Reconciler) applyRolling(ctx context.Context, actions []Action) error {
 			errs = append(errs, fmt.Errorf("remove previous %s: %w", action.Service.Name, err))
 			break
 		}
-		if err := r.createService(ctx, action.Service); err != nil {
+		if err := r.createService(ctx, action.Service, &prev); err != nil {
 			errs = append(errs, fmt.Errorf("update %s: %w", action.Service.Name, err))
 			if errors.Is(err, ErrServiceHeld) {
 				// Its start waits for its old rules; the rest of the rollout
@@ -1143,11 +1148,14 @@ func combineErrors(errs []error) error {
 }
 
 // createService sets up networking, starts the VM, and registers health checks.
-func (r *Reconciler) createService(ctx context.Context, svc config.ServiceConfig) error {
+//
+// previous is the configuration an update replaces, or nil for a create.
+func (r *Reconciler) createService(ctx context.Context, svc config.ServiceConfig, previous *config.ServiceConfig) error {
 	// The definitive start gate, after any old VM of the service is gone: a
 	// failed teardown of its rules, or anything another tick left, holds the
 	// start until it is resolved.
-	if hold := r.startHold(svc, false, nil); hold.Reason != "" {
+	keepsAddress := previous != nil && sameGuestIP(guestIPOf(*previous), guestIPOf(svc))
+	if hold := r.startHold(svc, false, nil, keepsAddress); hold.Reason != "" {
 		return hold.err(svc.Name)
 	}
 	var allocationID uint64

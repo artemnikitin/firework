@@ -461,7 +461,8 @@ func manifestlessFixture(t *testing.T) (*Manager, *fakeProcessInspector, process
 // State without an ownership manifest records no identity and no
 // configuration, so even the configured Firecracker binary with this
 // service's paths is not adopted for a desired service. Once the process
-// exits, recovery clears the state.
+// exits, recovery still keeps it quarantined: nothing in it identifies the
+// host networking it may have left, so only --forget clears it.
 func TestRecoverNeverAdoptsManifestlessFirecrackerProcess(t *testing.T) {
 	manager, inspector, identity, vmDir, service := manifestlessFixture(t)
 	desired := config.NodeConfig{Services: []config.ServiceConfig{service}}
@@ -481,8 +482,11 @@ func TestRecoverNeverAdoptsManifestlessFirecrackerProcess(t *testing.T) {
 	if _, err := manager.Recover(context.Background(), desired); err != nil {
 		t.Fatal(err)
 	}
-	if got := manager.List()[service.Name]; got != nil {
-		t.Fatalf("absent manifest-less state was not cleared: %#v", got)
+	if got := manager.List()[service.Name]; got == nil || got.State != StateRecoveryPending || !strings.Contains(got.LastError, "--forget") {
+		t.Fatalf("absent manifest-less state was cleared without --forget: %#v", got)
+	}
+	if r, err := manager.ForgetRecoveryPending(service.Name); err != nil || r.Outcome != RecoveryOutcomeCleared {
+		t.Fatalf("--forget did not clear absent manifest-less state: %#v %v", r, err)
 	}
 	if _, err := os.Stat(vmDir); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("manifest-less state remains: %v", err)
@@ -490,7 +494,8 @@ func TestRecoverNeverAdoptsManifestlessFirecrackerProcess(t *testing.T) {
 }
 
 // The command treats manifest-less state like startup recovery: it refuses
-// while a process may still use it and clears it once the process is gone.
+// while a process may still use it, and once the process is gone only
+// --forget clears it.
 func TestManifestlessQuarantineClearsByCommandOnceProcessExits(t *testing.T) {
 	manager, inspector, identity, vmDir, service := manifestlessFixture(t)
 	if _, err := manager.Recover(context.Background(), config.NodeConfig{Services: []config.ServiceConfig{service}}); err != nil {
@@ -501,8 +506,11 @@ func TestManifestlessQuarantineClearsByCommandOnceProcessExits(t *testing.T) {
 	}
 	delete(inspector.identities, identity.PID)
 	inspector.find = nil
-	if r, err := manager.ClearRecoveryPending(service.Name); err != nil || r.Outcome != RecoveryOutcomeCleared {
-		t.Fatalf("command did not clear absent manifest-less state: %#v %v", r, err)
+	if r, err := manager.ClearRecoveryPending(service.Name); err == nil || r.Outcome != RecoveryOutcomeAmbiguous || !strings.Contains(r.Message, "--forget") {
+		t.Fatalf("a plain clear released manifest-less state: %#v %v", r, err)
+	}
+	if r, err := manager.ForgetRecoveryPending(service.Name); err != nil || r.Outcome != RecoveryOutcomeCleared {
+		t.Fatalf("--forget did not clear absent manifest-less state: %#v %v", r, err)
 	}
 	if _, err := os.Stat(vmDir); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("manifest-less state remains: %v", err)
@@ -510,8 +518,7 @@ func TestManifestlessQuarantineClearsByCommandOnceProcessExits(t *testing.T) {
 }
 
 // A service that becomes desired after startup does not change the evidence:
-// automatic retry still keeps a live manifest-less VM quarantined, and clears
-// it once the process exits.
+// automatic retry keeps a manifest-less VM quarantined, live or not.
 func TestManifestlessQuarantineIsNotAdoptedOnceDesired(t *testing.T) {
 	manager, inspector, identity, vmDir, service := manifestlessFixture(t)
 	if _, err := manager.Recover(context.Background(), config.NodeConfig{}); err != nil {
@@ -529,8 +536,8 @@ func TestManifestlessQuarantineIsNotAdoptedOnceDesired(t *testing.T) {
 	if _, err := manager.Recover(context.Background(), desired); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := os.Stat(vmDir); !errors.Is(err, os.ErrNotExist) || manager.List()[service.Name] != nil {
-		t.Fatalf("retry did not clear absent manifest-less state: %v %#v", err, manager.List()[service.Name])
+	if _, err := os.Stat(vmDir); err != nil || manager.List()[service.Name] == nil {
+		t.Fatalf("retry cleared manifest-less state without --forget: %v %#v", err, manager.List()[service.Name])
 	}
 }
 

@@ -3,6 +3,7 @@ package vm
 import (
 	"context"
 	"os"
+	"strings"
 	"testing"
 
 	"github.com/artemnikitin/firework/internal/config"
@@ -128,9 +129,14 @@ func TestRecoveryClearsRemovedStateDirectoryAfterAbsenceProof(t *testing.T) {
 		t.Fatalf("missing state of a live owner was cleared: result=%#v err=%v", result, err)
 	}
 	delete(inspector.identities, f.PID)
-	result, err := m.ClearRecoveryPending(f.Service)
+	// Removed by hand, not by an operation the agent recorded: only --forget
+	// clears it.
+	if result, err := m.ClearRecoveryPending(f.Service); err == nil || !strings.Contains(result.Message, "--forget") {
+		t.Fatalf("hand-removed state was cleared without --forget: result=%#v err=%v", result, err)
+	}
+	result, err := m.ForgetRecoveryPending(f.Service)
 	if err != nil || result.Outcome != RecoveryOutcomeCleared {
-		t.Fatalf("removed state of an absent owner was not cleared: result=%#v err=%v", result, err)
+		t.Fatalf("removed state of an absent owner was not forgotten: result=%#v err=%v", result, err)
 	}
 	if got := m.List()[f.Service]; got != nil {
 		t.Fatalf("cleared state is still tracked: %#v", got)
