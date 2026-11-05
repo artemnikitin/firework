@@ -621,7 +621,9 @@ it, is in [recovery-network-ownership.md](recovery-network-ownership.md).
   journal's cleanup records for a later agent that manages networking. It
   cannot list the kernel's rules then and records no host-port holders, so
   once networking is enabled, a host port without a recorded holder waits
-  with `network_history_incomplete`.
+  with `network_history_incomplete`. An agent without host networking that
+  loads an existing journal records this in it before anything starts; until
+  that write succeeds, networked starts wait.
 - **Downgrade.** An older agent rejects a version 2 journal and cannot delete
   tagged rules. Replace the node, or stop the agent and every VM, delete the
   rules `iptables -t nat -S PREROUTING | grep firework:pf:` lists by their

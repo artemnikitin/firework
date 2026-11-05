@@ -349,3 +349,67 @@ func TestServiceFromDisabledNetworkingKeepsItsPortOnceEnabled(t *testing.T) {
 		t.Fatalf("an unrecorded port was given out after ports went untracked: %+v", hold)
 	}
 }
+
+// B2 transition: an existing journal records an interval without host
+// networking before anything starts, so a host port used meanwhile is not
+// given to another service once networking is enabled again (L6). While that
+// record cannot be written, starts wait. (Finding from the review of
+// 7a89e07.)
+func TestDisabledNetworkingIntervalIsRecordedInAnExistingJournal(t *testing.T) {
+	dir := t.TempDir()
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	vms := newFakeVMManager()
+	kernel := &networktest.Kernel{}
+	routes := &fakeRoutes{boot: "boot-1", start: "100"}
+	build := func(enabled bool) *Reconciler {
+		var network NetworkManager
+		if enabled {
+			network = kernel
+		}
+		return NewWithNetworkManager(vms, logger, nil, network, "", 0).WithRouteEvidence(routes).WithStateDir(dir)
+	}
+	a := crashService("a", "172.16.0.2", 8080)
+	first := build(true)
+	if err := first.Reconcile(context.Background(), config.NodeConfig{Services: []config.ServiceConfig{a}}); err != nil {
+		t.Fatal(err)
+	}
+	if !first.history.Complete || first.history.PortsUntracked {
+		t.Fatalf("setup: history=%+v", first.history)
+	}
+
+	b := crashService("b", "172.16.0.3", 9090)
+	withB := config.NodeConfig{Services: []config.ServiceConfig{a, b}}
+	failing := New(vms, logger, nil, nil, "", 0).WithRouteEvidence(routes).
+		WithJournalWriter(func(string, []byte) error { return errors.New("disk full") }).WithStateDir(dir)
+	_ = failing.Reconcile(context.Background(), withB)
+	if vms.instances["b"] != nil {
+		t.Fatal("b started before the interval without host networking was recorded")
+	}
+
+	disabled := build(false)
+	if err := disabled.Reconcile(context.Background(), withB); err != nil {
+		t.Fatal(err)
+	}
+	if vms.instances["b"] == nil {
+		t.Fatalf("setup: b did not start without host networking: %v", disabled.HeldServiceHolds(withB))
+	}
+	if err := disabled.Reconcile(context.Background(), config.NodeConfig{Services: []config.ServiceConfig{a}}); err != nil {
+		t.Fatal(err)
+	}
+	if vms.instances["b"] != nil {
+		t.Fatal("setup: b was not removed")
+	}
+
+	final := build(true)
+	c := crashService("c", "172.16.0.4", 9090)
+	desired := config.NodeConfig{Services: []config.ServiceConfig{a, c}}
+	for tick := 0; tick < 3; tick++ {
+		_ = final.Reconcile(context.Background(), desired)
+	}
+	if hold := final.HeldServiceHolds(desired)["c"]; vms.instances["c"] != nil || hold.Action != ActionNetworkHistoryIncomplete {
+		t.Fatalf("c took b's untracked port: history=%+v hold=%+v rules=%v", final.history, hold, kernel.Rules())
+	}
+	if holds := final.HeldServiceHolds(desired); holds["a"].Reason != "" {
+		t.Fatalf("a lost its recorded port: %+v", holds["a"])
+	}
+}

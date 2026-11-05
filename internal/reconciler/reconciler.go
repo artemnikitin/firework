@@ -122,6 +122,10 @@ type Reconciler struct {
 	// journalReady is false until the version 2 journal is loaded or created.
 	// New networked allocations wait until then.
 	journalReady bool
+	// portsUntrackedPending means a loaded journal must still record that
+	// host ports go untracked while this agent runs without host networking.
+	// Until that write succeeds the journal is not ready, so nothing starts.
+	portsUntrackedPending bool
 	// legacyJournal holds a version 1 journal until the first tick migrates
 	// it, once the VM inventory is known.
 	legacyJournal *persistedPendingTeardowns
@@ -372,7 +376,7 @@ func (r *Reconciler) loadJournalLocked(dir string) *Reconciler {
 	if dir == "" {
 		return r
 	}
-	r.journalReady, r.history = false, journalHistory{}
+	r.journalReady, r.history, r.portsUntrackedPending = false, journalHistory{}, false
 	path := filepath.Join(dir, pendingTeardownsFile)
 	fail := func(msg string, err error) *Reconciler {
 		r.logger.Error(msg+"; this node will not report converged until it is resolved manually", "path", path, "error", err)
@@ -445,6 +449,14 @@ func (r *Reconciler) loadJournalLocked(dir string) *Reconciler {
 		r.routeWithdrawals[w.key()] = w
 	}
 	r.nextAllocationID, r.history, r.journalReady = loaded.NextID-1, loaded.History, true
+	if r.networkMgr == nil && !r.history.PortsUntracked {
+		// Without host networking, VMs use host ports this journal does not
+		// record holders for, and peers may keep sending a port's traffic
+		// to its service after it is gone. The interval is recorded before
+		// anything starts, so a later agent that manages host networking
+		// treats a port without a recorded holder as having unknown history.
+		r.history.PortsUntracked, r.portsUntrackedPending, r.journalReady = true, true, false
+	}
 	return r
 }
 

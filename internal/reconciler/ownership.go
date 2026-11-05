@@ -575,7 +575,19 @@ func (r *Reconciler) settleAllocations(ctx context.Context, teardown bool) error
 // history. Anything else is migrated from what is known now, and its history
 // stays incomplete.
 func (r *Reconciler) initializeJournalLocked(actual map[string]*vm.Instance) error {
-	if r.journalReady || r.journalCorrupt {
+	if r.journalCorrupt {
+		return nil
+	}
+	if r.portsUntrackedPending {
+		r.journalReady = true
+		if err := r.persistJournalLocked(); err != nil {
+			r.journalReady = false
+			return fmt.Errorf("recording that host ports go untracked without host networking: %w", err)
+		}
+		r.portsUntrackedPending = false
+		return nil
+	}
+	if r.journalReady {
 		return nil
 	}
 	if r.networkMgr == nil && (r.routeEvidence == nil || r.stateDir == "") {
@@ -687,6 +699,9 @@ func (r *Reconciler) allocationHold(svc config.ServiceConfig, leaving map[string
 		// and so does evidence of it that cannot be read.
 		r.cleanupMu.Lock()
 		defer r.cleanupMu.Unlock()
+		if r.portsUntrackedPending {
+			return Hold{Reason: "the ownership journal cannot record yet that host ports go untracked without host networking"}
+		}
 		if r.routeEvidence == nil {
 			return Hold{}
 		}
