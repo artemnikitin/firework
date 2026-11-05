@@ -3,6 +3,7 @@ package reconciler
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"os"
@@ -11,6 +12,7 @@ import (
 	"testing"
 
 	"github.com/artemnikitin/firework/internal/config"
+	"github.com/artemnikitin/firework/internal/vm"
 )
 
 // fakeRoutes is a route directory and the Traefik process serving it.
@@ -251,5 +253,88 @@ func TestRouteOwnershipInitializationRetriesWithoutHostNetworking(t *testing.T) 
 	}
 	if err := r.BeginRouteWithdrawals([]RouteTarget{{Service: "a", GuestIP: "172.16.0.2"}}, false); err != nil {
 		t.Fatalf("withdrawals cannot be recorded after initialization: %v", err)
+	}
+}
+
+// C4 without host networking: a corrupt journal may have held a withdrawal
+// that cannot be read, so no start takes an address another service may
+// still be routed to. After the operator moves the journal aside, the node is
+// migrated and the address waits for a Traefik restart.
+// (Finding from the review of b651c15.)
+func TestCorruptJournalHoldsAddressesWithoutHostNetworking(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.Mkdir(filepath.Join(dir, "vms"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	journal := filepath.Join(dir, pendingTeardownsFile)
+	if err := os.WriteFile(journal, []byte("{not json"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	routes := &fakeRoutes{boot: "boot-1", start: "100"} // A's route file is already gone.
+	vms := newFakeVMManager()
+	build := func() *Reconciler {
+		return New(vms, slog.New(slog.NewTextHandler(io.Discard, nil)), nil, nil, "", 0).WithRouteEvidence(routes).WithStateDir(dir)
+	}
+	r := build()
+	desired := config.NodeConfig{Services: []config.ServiceConfig{next}}
+	for tick := 0; tick < 2; tick++ {
+		_ = r.Reconcile(context.Background(), desired)
+	}
+	if vms.instances["next"] != nil {
+		t.Fatal("next started while the ownership journal was corrupt")
+	}
+	if err := os.Rename(journal, journal+".corrupt"); err != nil { // the documented repair
+		t.Fatal(err)
+	}
+	r = build()
+	for tick := 0; tick < 2; tick++ {
+		_ = r.Reconcile(context.Background(), desired)
+	}
+	if hold := r.HeldServiceHolds(desired)["next"]; vms.instances["next"] != nil || hold.Action != ActionGuestAddressWithdrawalUnconfirmed {
+		t.Fatalf("next started after the repair without a Traefik restart: %+v", hold)
+	}
+	routes.start = "200"
+	for tick := 0; tick < 2; tick++ {
+		_ = r.Reconcile(context.Background(), desired)
+	}
+	if vms.instances["next"] == nil {
+		t.Fatalf("next did not start after Traefik restarted: %v", r.HeldServices(desired))
+	}
+}
+
+// L7: the migration baseline holds addresses for new owners only. A tracked
+// service updating at its own address proceeds without a Traefik restart,
+// with or without host networking, while a new address still waits.
+// (Finding from the review of b651c15.)
+func TestMigrationBaselineLetsAServiceKeepItsAddress(t *testing.T) {
+	for _, hostNetworking := range []bool{false, true} {
+		t.Run(fmt.Sprintf("host networking=%v", hostNetworking), func(t *testing.T) {
+			h := newCrashHost(t)
+			h.routes = &fakeRoutes{boot: "boot-1", start: "100"}
+			if err := os.Mkdir(filepath.Join(h.stateDir, "vms"), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			web := crashService("web", "172.16.0.2", 8080)
+			h.vms.instances[web.Name] = &vm.Instance{Name: web.Name, Config: web, State: vm.StateRunning}
+			var r *Reconciler
+			if hostNetworking {
+				r = h.agent()
+			} else {
+				r = New(h.vms, slog.New(slog.NewTextHandler(io.Discard, nil)), nil, nil, "", 0).WithRouteEvidence(h.routes).WithStateDir(h.stateDir)
+			}
+			updated := web
+			updated.Image = "/images/web-v2"
+			fresh := crashService("fresh", "172.16.0.9", 9090)
+			desired := config.NodeConfig{Services: []config.ServiceConfig{updated, fresh}}
+			for tick := 0; tick < 3; tick++ {
+				_ = r.Reconcile(context.Background(), desired)
+			}
+			if inst := h.vms.instances["web"]; inst == nil || inst.Config.Image != "/images/web-v2" || inst.Config.Network.GuestIP != "172.16.0.2" {
+				t.Fatalf("web's update at its own address waited for Traefik: %#v %v", inst, r.HeldServices(desired))
+			}
+			if h.vms.instances["fresh"] != nil {
+				t.Fatal("fresh took a new address before Traefik restarted")
+			}
+		})
 	}
 }

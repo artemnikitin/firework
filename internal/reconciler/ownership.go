@@ -697,14 +697,26 @@ func (r *Reconciler) allocationHold(svc config.ServiceConfig, leaving map[string
 	if ip == "" {
 		return Hold{}
 	}
+	actual := r.vmManager.List()
+	inst := actual[svc.Name]
+	trackedHere := inst != nil && sameGuestIP(guestIPOf(inst.Config), ip)
 	if r.networkMgr == nil {
 		// The agent installs no rules and keeps no allocation records, but
-		// Traefik still routes to guest addresses: route ownership holds.
+		// Traefik still routes to guest addresses: route ownership holds,
+		// and so does evidence of it that cannot be read.
 		r.cleanupMu.Lock()
 		defer r.cleanupMu.Unlock()
-		return r.routeHoldLocked(svc.Name, ip)
+		if r.routeEvidence == nil {
+			return Hold{}
+		}
+		if r.journalCorrupt {
+			return Hold{Reason: "the ownership journal is corrupt, so route withdrawals it held cannot be read and no new address is given out"}
+		}
+		if !r.journalReady {
+			return Hold{Reason: "ownership records are not initialized yet"}
+		}
+		return r.routeHoldLocked(svc.Name, ip, keepsAddress || trackedHere)
 	}
-	actual := r.vmManager.List()
 	r.cleanupMu.Lock()
 	defer r.cleanupMu.Unlock()
 	if r.journalCorrupt {
@@ -718,10 +730,10 @@ func (r *Reconciler) allocationHold(svc config.ServiceConfig, leaving map[string
 	}
 	// A VM nothing tracks may hold any address. A service keeps its own: the
 	// address its tracked VM or its records hold, as through an update.
-	ownAddress := keepsAddress || slices.ContainsFunc(r.sortedAllocationsLocked(), func(a allocation) bool {
+	ownAddress := keepsAddress || trackedHere || slices.ContainsFunc(r.sortedAllocationsLocked(), func(a allocation) bool {
 		return a.Service == svc.Name && sameGuestIP(a.GuestIP, ip)
 	})
-	if inst := actual[svc.Name]; !ownAddress && (inst == nil || !sameGuestIP(guestIPOf(inst.Config), ip)) {
+	if !ownAddress {
 		switch {
 		case r.unaccountedVMsErr != nil:
 			return Hold{Reason: fmt.Sprintf("VM processes cannot be scanned, so an untracked VM may hold any address: %v", r.unaccountedVMsErr)}
@@ -770,7 +782,7 @@ func (r *Reconciler) allocationHold(svc config.ServiceConfig, leaving map[string
 			}
 		}
 	}
-	return r.routeHoldLocked(svc.Name, ip)
+	return r.routeHoldLocked(svc.Name, ip, ownAddress)
 }
 
 // portHistoryHoldLocked applies L6: a host port this node gave to one service

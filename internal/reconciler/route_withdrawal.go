@@ -149,9 +149,11 @@ func (r *Reconciler) settleRoutesLocked() error {
 
 // routeHoldLocked holds a start at ip while a route still points there for
 // another service, while a route file cannot be attributed, or while a
-// withdrawn route of another service may still be served (L7). A service
-// keeps its own recorded address through a baseline withdrawal.
-func (r *Reconciler) routeHoldLocked(svc string, ip string) Hold {
+// withdrawn route of another service may still be served (L7). ownsAddress
+// says the address is already the service's: its tracked VM, its records or
+// the update replacing it hold it. Such a service keeps it through a
+// baseline withdrawal, which holds addresses only for new owners.
+func (r *Reconciler) routeHoldLocked(svc string, ip string, ownsAddress bool) Hold {
 	if r.routeEvidence == nil {
 		return Hold{}
 	}
@@ -167,7 +169,6 @@ func (r *Reconciler) routeHoldLocked(svc string, ip string) Hold {
 			return Hold{Reason: fmt.Sprintf("the route of service %s still points at guest IP %s", route.Service, ip)}
 		}
 	}
-	_, ownsAddress := r.liveAllocationLocked(svc, ip)
 	for _, key := range slices.SortedFunc(maps.Keys(r.routeWithdrawals), func(a, b routeKey) int {
 		return strings.Compare(a.service+"/"+a.guestIP, b.service+"/"+b.guestIP)
 	}) {
