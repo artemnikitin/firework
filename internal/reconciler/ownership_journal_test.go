@@ -307,3 +307,45 @@ func TestUnreadableRouteFileConservativelyHoldsAnOwnAddressUpdate(t *testing.T) 
 		t.Fatal("the update did not resume once the file was gone")
 	}
 }
+
+// B2 transition: a service that ran while host networking was disabled keeps
+// its address and host port once networking is enabled. The journal was
+// initialized without recording it, so it is recorded on the first networked
+// load. A service new to an unrecorded port still waits (L6).
+func TestServiceFromDisabledNetworkingKeepsItsPortOnceEnabled(t *testing.T) {
+	dir := t.TempDir()
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	routes := &fakeRoutes{boot: "boot-1", start: "100"}
+	web := crashService("web", "172.16.0.2", 8080)
+	vms := newFakeVMManager()
+	disabled := New(vms, logger, nil, nil, "", 0).WithRouteEvidence(routes).WithStateDir(dir)
+	desired := config.NodeConfig{Services: []config.ServiceConfig{web}}
+	for tick := 0; tick < 2; tick++ {
+		_ = disabled.Reconcile(context.Background(), desired)
+	}
+	if vms.instances["web"] == nil {
+		t.Fatalf("setup: web did not start without host networking: %v", disabled.HeldServiceHolds(desired))
+	}
+	kernel := &networktest.Kernel{}
+	enabled := NewWithNetworkManager(vms, logger, nil, kernel, "", 0).WithRouteEvidence(routes).WithStateDir(dir)
+	for tick := 0; tick < 3; tick++ {
+		_ = enabled.Reconcile(context.Background(), desired)
+	}
+	if holds := enabled.HeldServiceHolds(desired); len(holds) != 0 {
+		t.Fatalf("the service that ran without host networking is held: %v", holds)
+	}
+	if hold := enabled.StartHold(web); hold.Reason != "" {
+		t.Fatalf("its health restart is held: %+v", hold)
+	}
+	if rules := kernel.Rules(); len(rules) != 1 || !rules[0].TaggedFor("web") {
+		t.Fatalf("its port forward was not installed: %v", rules)
+	}
+	fresh := crashService("fresh", "172.16.0.5", 9090)
+	desired.Services = append(desired.Services, fresh)
+	for tick := 0; tick < 2; tick++ {
+		_ = enabled.Reconcile(context.Background(), desired)
+	}
+	if hold := enabled.HeldServiceHolds(desired)["fresh"]; vms.instances["fresh"] != nil || hold.Action != ActionNetworkHistoryIncomplete {
+		t.Fatalf("an unrecorded port was given out after ports went untracked: %+v", hold)
+	}
+}
