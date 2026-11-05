@@ -16,14 +16,20 @@ func TestQuarantinedChildExitRetainsRecoveryEligibility(t *testing.T) {
 		name                     string
 		clean, command, stopping bool
 		writeFailure             string
+		unreadable               bool
 	}{
 		{name: "abnormal automatic"}, {name: "clean automatic", clean: true},
 		{name: "abnormal command", command: true}, {name: "clean command", clean: true, command: true},
 		{name: "stopping automatic", stopping: true}, {name: "stopping command", stopping: true, command: true},
 		{name: "exit persistence failure", writeFailure: "before rename"},
 		{name: "exit directory sync failure", writeFailure: "after rename"},
+		{name: "exit write with unreadable snapshot", writeFailure: "after rename", unreadable: true},
+		{name: "exit command with unreadable snapshot", writeFailure: "after rename", unreadable: true, command: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
+			if tc.unreadable && os.Geteuid() == 0 {
+				t.Skip("run as non-root so the ownership manifest can be made unreadable")
+			}
 			m, f, i := recoveryFixture(t)
 			m.inspector = i
 			i.identities = map[int]processIdentity{}
@@ -49,6 +55,11 @@ func TestQuarantinedChildExitRetainsRecoveryEligibility(t *testing.T) {
 					if tc.writeFailure == "after rename" {
 						if err := writeManifest(path, terminal); err != nil {
 							return err
+						}
+						if tc.unreadable {
+							if err := os.Chmod(path, 0); err != nil {
+								return err
+							}
 						}
 					}
 					return errors.New("injected exit persistence failure")
@@ -77,11 +88,16 @@ func TestQuarantinedChildExitRetainsRecoveryEligibility(t *testing.T) {
 			if got.State != StateRecoveryPending || !m.HasPendingRecovery() {
 				t.Fatalf("lost recovery eligibility: %#v", got)
 			}
+			if tc.unreadable {
+				if err := os.Chmod(manifestPath(f.VMDir), 0o600); err != nil {
+					t.Fatal(err)
+				}
+			}
 			durable, err := readManifest(manifestPath(f.VMDir))
 			if err != nil {
 				t.Fatal(err)
 			}
-			if !sameRecoveryIdentity(got.manifest, durable) || got.PID != durable.PID {
+			if !tc.unreadable && (!sameRecoveryIdentity(got.manifest, durable) || got.PID != durable.PID) {
 				t.Fatal("exit persistence split memory from disk")
 			}
 			if tc.stopping && durable.Lifecycle != lifecycleStopping {

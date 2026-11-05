@@ -109,6 +109,10 @@ type Instance struct {
 	// failed. The durable and published manifests remain unchanged until a
 	// later ClearRecoveryPending retries the write successfully.
 	recoveryCandidate *instanceManifest
+	// recoveryWriteCandidate is the exact manifest an uncertain write may
+	// have installed while its readback was unavailable. Recovery accepts
+	// only it or the published snapshot before retrying ownership checks.
+	recoveryWriteCandidate *instanceManifest
 	// recoveryDiscoveryPending fences directories not yet inspected this process.
 	recoveryDiscoveryPending bool
 	// RecoveryConfigUnknown means resource allocation must conservatively fence
@@ -687,8 +691,10 @@ func (m *Manager) finishStart(ctx context.Context, svc config.ServiceConfig, sta
 			// recovery can establish whether a VM was actually launched.
 			// Recovery compares memory with disk, so publish whichever record
 			// is durable if the failed-lifecycle write did not land.
-			snapshot := recoverySnapshotAfterWrite(manifestPath(vmDir), launchManifest, manifest, writeErr)
-			m.instances[svc.Name] = instanceFromManifest(snapshot, StateRecoveryPending, manifest.LastError)
+			snapshot, pendingWrite := recoverySnapshotAfterWrite(manifestPath(vmDir), launchManifest, manifest, writeErr)
+			pending := instanceFromManifest(snapshot, StateRecoveryPending, manifest.LastError)
+			pending.recoveryWriteCandidate = pendingWrite
+			m.instances[svc.Name] = pending
 		} else {
 			delete(m.instances, svc.Name)
 		}
@@ -699,8 +705,10 @@ func (m *Manager) finishStart(ctx context.Context, svc config.ServiceConfig, sta
 	manifest.LauncherUnit = launched.Unit
 	if identityErr := m.recordLaunchedIdentity(manifest, launched); identityErr != nil {
 		if retained, writeErr := m.abandonLaunch(svc.Name, manifest, launched, identityErr); retained {
-			snapshot := recoverySnapshotAfterWrite(manifestPath(vmDir), launchManifest, manifest, writeErr)
-			m.instances[svc.Name] = instanceFromManifest(snapshot, StateRecoveryPending, manifest.LastError)
+			snapshot, pendingWrite := recoverySnapshotAfterWrite(manifestPath(vmDir), launchManifest, manifest, writeErr)
+			pending := instanceFromManifest(snapshot, StateRecoveryPending, manifest.LastError)
+			pending.recoveryWriteCandidate = pendingWrite
+			m.instances[svc.Name] = pending
 		} else {
 			delete(m.instances, svc.Name)
 		}
@@ -710,12 +718,10 @@ func (m *Manager) finishStart(ctx context.Context, svc config.ServiceConfig, sta
 	if err := m.writeRecoveryManifest(manifestPath(vmDir), manifest); err != nil {
 		// The VM is live even when recording its identity fails. Publish the
 		// durable snapshot and retain the verified identity for a later retry.
-		durable, readErr := readManifest(manifestPath(vmDir))
-		if readErr != nil || durable.InstanceID != manifest.InstanceID {
-			durable = launchManifest
-		}
+		durable, pendingWrite := recoverySnapshotAfterWrite(manifestPath(vmDir), launchManifest, manifest, err)
 		pending := instanceFromManifest(durable, StateRecoveryPending, err.Error())
 		pending.startID = startID
+		pending.recoveryWriteCandidate = pendingWrite
 		pending.recoveryCandidate = cloneInstanceManifest(manifest)
 		pending.recoveryCandidate.Lifecycle = durable.Lifecycle
 		m.instances[svc.Name] = pending
@@ -1222,13 +1228,8 @@ func (m *Manager) monitor(name, instanceID string, launched *launchedProcess) {
 		if writeErr := m.writeRecoveryManifest(manifestPath(inst.manifest.VMDir), inst.manifest); writeErr != nil && wasRecoveryPending {
 			// Rename may have succeeded before directory sync failed. Align
 			// memory with whichever trusted snapshot is actually durable.
-			terminalManifest := inst.manifest
-			durable, readErr := readManifest(manifestPath(previousManifest.VMDir))
-			if readErr == nil && (sameRecoveryIdentity(durable, previousManifest) || sameRecoveryIdentity(durable, terminalManifest)) {
-				inst.manifest = durable
-			} else {
-				inst.manifest = previousManifest
-			}
+			inst.manifest, inst.recoveryWriteCandidate = recoverySnapshotAfterWrite(
+				manifestPath(previousManifest.VMDir), previousManifest, inst.manifest, writeErr)
 			inst.PID = inst.manifest.PID
 			inst.LastError = fmt.Sprintf("persist quarantined process exit: %v", writeErr)
 		}

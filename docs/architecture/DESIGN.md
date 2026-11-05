@@ -316,6 +316,13 @@ Without such evidence, state without a manifest stays quarantined at startup,
 on retry and for a plain `clear-recovery`, even when no process uses its
 paths; only `--forget` clears it.
 
+An agent's own manifest write can finish its rename before reporting an error.
+If its immediate readback also fails, the VM stays quarantined and recovery
+retains the exact before and attempted records in memory. Once reads recover,
+only a record matching one of those identities lets recovery resume its normal
+ownership and absence checks; an unrelated record stays fenced. After an agent
+restart, startup recovery validates the durable record as usual.
+
 Removing a VM's directory by hand never releases anything either. The agent's
 ownership records outlive the directory: the service is held with
 `vm_state_missing`, and its address and host ports stay fenced. `--forget`

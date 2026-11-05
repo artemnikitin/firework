@@ -155,6 +155,7 @@ func (m *Manager) resolveRecoveryAttempt(ctx context.Context, service string, fo
 	initialManifest := *instance.manifest
 	manifest := initialManifest
 	recoveryCandidate := cloneInstanceManifest(instance.recoveryCandidate)
+	recoveryWriteCandidate := cloneInstanceManifest(instance.recoveryWriteCandidate)
 	instanceID := instance.instanceID
 	instancePID := instance.PID
 	untrusted := instance.RecoveryConfigUnknown
@@ -168,6 +169,37 @@ func (m *Manager) resolveRecoveryAttempt(ctx context.Context, service string, fo
 	}
 	if err := verifyRecoveryDirectories(vmDir); err != nil {
 		return recoveryAmbiguous(result, err.Error())
+	}
+	if recoveryWriteCandidate != nil {
+		if err := verifyRecoveryManifestPaths(service, vmDir, recoveryWriteCandidate); err != nil {
+			return recoveryAmbiguous(result, err.Error())
+		}
+		// A failed rename/fsync and failed readback leave two possible
+		// durable snapshots. Accept only one of this operation's own exact
+		// identities, then run the normal ownership policy again. Neither
+		// unavailable evidence nor an unrelated manifest authorizes progress.
+		snapshot, err := readAndVerifyRecoveryManifest(manifestPath, &initialManifest)
+		if err != nil {
+			snapshot, err = readAndVerifyRecoveryManifest(manifestPath, recoveryWriteCandidate)
+		}
+		if err != nil {
+			return recoveryAmbiguous(result, err.Error())
+		}
+		if err := m.lockRecovery(ctx); err != nil {
+			return recoveryAmbiguous(result, err.Error())
+		}
+		if !m.isCurrentRecoveryInstanceLocked(service, instance, instanceID, &initialManifest) {
+			m.mu.Unlock()
+			return recoveryAmbiguous(result, "ownership changed while settling an incomplete manifest write")
+		}
+		instance.recoveryWriteCandidate = nil
+		if !sameRecoveryIdentity(&initialManifest, snapshot) {
+			instance.manifest, instance.PID = snapshot, snapshot.PID
+			instance.recoveryCandidate = nil
+			m.mu.Unlock()
+			return result, errRecoveryRetry
+		}
+		m.mu.Unlock()
 	}
 	if initialManifest.InstanceID == "" {
 		if durable, err := readManifest(manifestPath); err == nil {
@@ -298,7 +330,7 @@ func (m *Manager) resolveRecoveryAttempt(ctx context.Context, service string, fo
 		}
 		m.mu.Unlock()
 		writeErr := m.persistReconstructedIdentity(service, vmDir, manifestPath, &initialManifest, &manifest)
-		snapshot := recoverySnapshotAfterWrite(manifestPath, &initialManifest, &manifest, writeErr)
+		snapshot, pendingWrite := recoverySnapshotAfterWrite(manifestPath, &initialManifest, &manifest, writeErr)
 		m.mu.Lock()
 		if !m.isCurrentRecoveryInstanceLocked(service, instance, instanceID, &initialManifest) {
 			m.mu.Unlock()
@@ -307,6 +339,7 @@ func (m *Manager) resolveRecoveryAttempt(ctx context.Context, service string, fo
 		}
 		instance.manifest = snapshot
 		instance.PID = snapshot.PID
+		instance.recoveryWriteCandidate = pendingWrite
 		if writeErr != nil {
 			instance.recoveryCandidate = cloneInstanceManifest(&manifest)
 			m.mu.Unlock()
@@ -342,7 +375,7 @@ func (m *Manager) resolveRecoveryAttempt(ctx context.Context, service string, fo
 	manifest.LastError = ""
 	m.mu.Unlock()
 	writeErr := m.writeRecoveryManifest(manifestPath, &manifest)
-	snapshot := recoverySnapshotAfterWrite(manifestPath, &initialManifest, &manifest, writeErr)
+	snapshot, pendingWrite := recoverySnapshotAfterWrite(manifestPath, &initialManifest, &manifest, writeErr)
 	// A child can exit while fsync is blocked. Its Wait monitor is waiting on
 	// the reservation, so revalidate before publishing a running instance.
 	processErr = validateOwnedProcessContext(ctx, m.inspector, &manifest)
@@ -355,6 +388,7 @@ func (m *Manager) resolveRecoveryAttempt(ctx context.Context, service string, fo
 	}
 	instance.manifest = snapshot
 	instance.PID = snapshot.PID
+	instance.recoveryWriteCandidate = pendingWrite
 	if writeErr != nil {
 		m.mu.Unlock()
 		return recoveryIncomplete(result, fmt.Errorf("persist recovery adoption for %s: %w", service, writeErr))
@@ -388,15 +422,17 @@ func (m *Manager) resolveRecoveryAttempt(ctx context.Context, service string, fo
 // Rename may have succeeded before directory fsync reported an error. Keep
 // memory aligned with either trusted disk snapshot so the next retry can
 // validate ownership instead of becoming stuck on a stale lifecycle or PID.
-func recoverySnapshotAfterWrite(path string, before, after *instanceManifest, writeErr error) *instanceManifest {
+// If readback is unavailable, retain the attempted snapshot too: a later
+// retry can establish which one landed without trusting any other identity.
+func recoverySnapshotAfterWrite(path string, before, after *instanceManifest, writeErr error) (snapshot, pendingWrite *instanceManifest) {
 	if writeErr == nil {
-		return cloneInstanceManifest(after)
+		return cloneInstanceManifest(after), nil
 	}
 	if durable, err := readManifest(path); err == nil &&
 		(sameRecoveryIdentity(durable, before) || sameRecoveryIdentity(durable, after)) {
-		return durable
+		return durable, nil
 	}
-	return cloneInstanceManifest(before)
+	return cloneInstanceManifest(before), cloneInstanceManifest(after)
 }
 
 func readAndVerifyRecoveryManifest(path string, expected *instanceManifest) (*instanceManifest, error) {
