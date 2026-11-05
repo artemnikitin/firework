@@ -321,12 +321,15 @@ ownership records outlive the directory: the service is held with
 `vm_state_missing`, and its address and host ports stay fenced. `--forget`
 then proves from the service's paths that no process or systemd launch uses
 them, and hands the service's records and the rules tagged for it that nothing
-accounts for to cleanup. A refused `--forget` changes nothing. If the hand-off
-cannot be written to the ownership journal, nothing is released and the
-command reports an incomplete resolution: the running agent retries the
-absence proof and hand-off every tick until the journal can be written. That
-retry is not persisted, so if the agent restarts first the service stays held
-and `--forget` must be run again once storage is healthy. The command
+accounts for to cleanup. A refused `--forget` changes nothing. If clearing
+the quarantined state or the hand-off cannot be written to the ownership
+journal, nothing is released and the command reports an incomplete
+resolution: the running agent reruns the same `--forget` every tick, proving
+the VM absent again each time, until it succeeds. A retry that is refused,
+as when a process uses the VM's paths again, ends like a refused command and
+leaves the state quarantined. The retry is not persisted, so if the agent
+restarts first the service stays held and `--forget` must be run again once
+storage is healthy. The command
 itself releases nothing: an address is released once its rules are gone and,
 for a route, once Traefik has restarted, and host ports keep their history (see
 "Network ownership" below). A live VM process or systemd launch under the state

@@ -12,6 +12,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"slices"
 	"sync"
 	"syscall"
 	"time"
@@ -59,6 +60,14 @@ func (a *Agent) resolveRecoveryPending(service string, forget bool) (vm.Recovery
 	}
 	result, err := resolve(service)
 	if err != nil {
+		if forget && result.Outcome == vm.RecoveryOutcomeIncomplete {
+			// Clearing the VM state itself failed after the absence proof,
+			// as when its cleanup could not be recorded. The plain recovery
+			// policy never clears untrusted state, so the forget is retried.
+			a.queueForgetRetry(service)
+			result.Message += forgetRetryNote
+			return result, fmt.Errorf("%w%s", err, forgetRetryNote)
+		}
 		return result, err
 	}
 	if forget && result.Outcome == vm.RecoveryOutcomeNoop && result.State == "" {
@@ -114,23 +123,35 @@ func (a *Agent) forgetUntrackedService(service string, result vm.RecoveryResult)
 	return result, nil
 }
 
+// forgetRetryNote ends the message of an incomplete --forget.
+const forgetRetryNote = "; the running agent retries it, and after an agent restart the command must be run again"
+
 func (a *Agent) incompleteForget(result vm.RecoveryResult, err error) (vm.RecoveryResult, error) {
-	// The command's absence proof and hand-off are retried every tick until
-	// they succeed, as the incomplete outcome tells the operator.
-	a.recoveryMu.Lock()
-	if a.forgetRetries == nil {
-		a.forgetRetries = make(map[string]bool)
-	}
-	a.forgetRetries[result.Service] = true
-	a.recoveryMu.Unlock()
+	a.queueForgetRetry(result.Service)
 	result.Outcome, result.State = vm.RecoveryOutcomeIncomplete, vm.StateRecoveryPending
-	result.Message = "recording the service's host networking for cleanup: " + err.Error() + "; the running agent retries it, and after an agent restart the command must be run again"
+	result.Message = "recording the service's host networking for cleanup: " + err.Error() + forgetRetryNote
 	return result, fmt.Errorf("service %s: %s", result.Service, result.Message)
 }
 
-// retryForgets retries the hand-off of each service whose --forget could not
-// record its host networking for cleanup, proving its paths unused again
-// first. A service that has a tracked VM again no longer needs it.
+// queueForgetRetry records that a --forget of the service was incomplete, so
+// every tick retries it until it succeeds, as the incomplete outcome tells
+// the operator.
+func (a *Agent) queueForgetRetry(service string) {
+	a.recoveryMu.Lock()
+	defer a.recoveryMu.Unlock()
+	if a.forgetRetries == nil {
+		a.forgetRetries = make(map[string]bool)
+	}
+	a.forgetRetries[service] = true
+}
+
+// retryForgets reruns each incomplete --forget through the same guarded path
+// as the command, so every attempt proves the VM absent again: it clears the
+// quarantined VM state, then hands the service's host networking to cleanup.
+// A retry ends once it succeeds, once a VM that is not quarantined is tracked
+// for the service again, or when the attempt is refused, as when a process
+// uses the VM's paths again: like the command's refusal, that leaves the
+// state quarantined until an operator resolves it and runs the command again.
 func (a *Agent) retryForgets() {
 	a.recoveryMu.Lock()
 	services := make([]string, 0, len(a.forgetRetries))
@@ -138,24 +159,23 @@ func (a *Agent) retryForgets() {
 		services = append(services, service)
 	}
 	a.recoveryMu.Unlock()
+	slices.Sort(services)
 	for _, service := range services {
-		done := a.vmManager.List()[service] != nil
-		if !done {
-			result, err := a.forgetUntrackedService(service, vm.RecoveryResult{Service: service, Outcome: vm.RecoveryOutcomeNoop})
-			if err != nil {
+		if inst := a.vmManager.List()[service]; inst == nil || inst.State == vm.StateRecoveryPending {
+			result, err := a.resolveRecoveryPending(service, true)
+			switch {
+			case err != nil && result.Outcome == vm.RecoveryOutcomeIncomplete:
 				a.logger.Warn("clear-recovery --forget is still incomplete; retrying on the next tick", "service", service, "error", err)
 				continue
-			}
-			done = true
-			if result.Outcome == vm.RecoveryOutcomeCleared {
-				a.queueRecoveryReconcile(service, false)
+			case err != nil:
+				a.logger.Warn("clear-recovery --forget was refused on retry; the service stays held until the command is run again", "service", service, "outcome", result.Outcome, "error", err)
+			default:
+				a.logger.Info("incomplete clear-recovery --forget finished", "service", service, "outcome", result.Outcome)
 			}
 		}
-		if done {
-			a.recoveryMu.Lock()
-			delete(a.forgetRetries, service)
-			a.recoveryMu.Unlock()
-		}
+		a.recoveryMu.Lock()
+		delete(a.forgetRetries, service)
+		a.recoveryMu.Unlock()
 	}
 }
 
