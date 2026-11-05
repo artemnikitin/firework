@@ -225,7 +225,7 @@ func (m *Manager) resolveRecoveryAttempt(ctx context.Context, service string, fo
 		return result, nil
 	}
 	if forget {
-		return recoveryAmbiguous(result, "cannot forget a VM whose absence is unproved")
+		return recoveryAmbiguousCause(result, fmt.Errorf("cannot forget a VM whose absence is unproved: %w", absenceErr))
 	}
 	if instanceID == "" || instanceID != initialManifest.InstanceID || instancePID != initialManifest.PID {
 		return recoveryAmbiguous(result, "in-memory ownership identities do not match")
@@ -426,10 +426,14 @@ func recoveryIncomplete(result RecoveryResult, err error) (RecoveryResult, error
 }
 
 func recoveryAmbiguous(result RecoveryResult, message string) (RecoveryResult, error) {
+	return recoveryAmbiguousCause(result, errors.New(message))
+}
+
+func recoveryAmbiguousCause(result RecoveryResult, cause error) (RecoveryResult, error) {
 	result.Outcome = RecoveryOutcomeAmbiguous
 	result.State = StateRecoveryPending
-	result.Message = message
-	return result, &recoveryPendingError{fmt.Errorf("service %s remains recovery_pending: %s", result.Service, message)}
+	result.Message = cause.Error()
+	return result, &recoveryPendingError{fmt.Errorf("service %s remains recovery_pending: %w", result.Service, cause)}
 }
 
 // ValidateRecoveryServiceName rejects service identifiers that are not one
@@ -520,7 +524,7 @@ func (m *Manager) noLiveClaimantContext(ctx context.Context, manifest *instanceM
 			return err
 		}
 		if len(matches) != 0 {
-			return fmt.Errorf("found %d live process(es) using this service's VM socket or config paths", len(matches))
+			return recoveryClaimant("found %d live process(es) using this service's VM socket or config paths", len(matches))
 		}
 		return nil
 	}
@@ -535,7 +539,7 @@ func (m *Manager) noLiveClaimantContext(ctx context.Context, manifest *instanceM
 		return fmt.Errorf("cannot scan for a live process using this VM state: %w", err)
 	}
 	if len(matches) != 0 {
-		return fmt.Errorf("found %d live process(es) using this service's VM socket or config paths", len(matches))
+		return recoveryClaimant("found %d live process(es) using this service's VM socket or config paths", len(matches))
 	}
 	return nil
 }
@@ -572,6 +576,8 @@ func (m *Manager) lockRecovery(ctx context.Context) error {
 }
 
 type recoveryPendingError struct{ error }
+
+func (e *recoveryPendingError) Unwrap() error { return e.error }
 
 func (m *Manager) verifyRecoverySnapshot(path string, initial *instanceManifest) error {
 	if err := verifyRecoveryDirectories(initial.VMDir); err != nil {

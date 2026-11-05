@@ -107,7 +107,7 @@ func (m *Manager) noClaimingUnitContext(ctx context.Context, f *instanceManifest
 			return fmt.Errorf("systemd unit %s reported no ExecStart", fields["Id"])
 		}
 		if (f.SocketPath != "" && strings.Contains(block, f.SocketPath)) || (f.ConfigPath != "" && strings.Contains(block, f.ConfigPath)) {
-			return fmt.Errorf("systemd unit %s may still run this service's VM", fields["Id"])
+			return recoveryClaimant("systemd unit %s may still run this service's VM", fields["Id"])
 		}
 	}
 	return nil
@@ -124,7 +124,7 @@ func (m *Manager) proveRecoveryAbsentContext(ctx context.Context, f *instanceMan
 	if f.PID > 0 {
 		identity, err := inspectProcessContext(ctx, m.inspector, f.PID)
 		if err == nil && (f.ProcessStart == 0 || (identity.StartTicks == f.ProcessStart && identity.HostBootID == f.HostBootID)) {
-			return fmt.Errorf("recorded process is still live")
+			return recoveryClaimant("recorded process is still live")
 		}
 		if err != nil && !errors.Is(err, errProcessNotFound) {
 			return err
@@ -136,7 +136,7 @@ func (m *Manager) proveRecoveryAbsentContext(ctx context.Context, f *instanceMan
 			return err
 		}
 		if !inactive {
-			return fmt.Errorf("systemd unit may still own the VM")
+			return recoveryClaimant("systemd unit may still own the VM")
 		}
 	}
 	if err := m.noClaimingUnitContext(ctx, f); err != nil {

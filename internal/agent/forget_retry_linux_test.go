@@ -98,34 +98,93 @@ func TestIncompleteForgetIsRetriedWithTheRealVMManager(t *testing.T) {
 	}
 }
 
+// Unavailable evidence keeps the original --forget pending through both
+// phases: a quarantined manifest that cannot be read, or an absence scan
+// that times out after the VM state has been cleared.
+func TestRetriedForgetRecoversWhenInspectionBecomesAvailable(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("run as a non-root user so the real VM manager uses its direct launcher")
+	}
+	for name, recorded := range map[string]bool{
+		"quarantined manifest unreadable":  true,
+		"untracked absence scan timed out": false,
+	} {
+		t.Run(name, func(t *testing.T) {
+			a, kernel, storage, dir := forgetRetryAgent(t, recorded)
+			storage(false)
+			if result, err := a.forgetRecoveryPending("web"); err == nil || result.Outcome != vm.RecoveryOutcomeIncomplete {
+				t.Fatalf("forget: %+v %v", result, err)
+			}
+			storage(true)
+			path := filepath.Join(dir, "instance.json")
+			if recorded {
+				if err := os.Chmod(path, 0); err != nil {
+					t.Fatal(err)
+				}
+				t.Cleanup(func() { _ = os.Chmod(path, 0o600) })
+			} else {
+				a.proveServiceAbsent = func(context.Context, string) error { return context.DeadlineExceeded }
+			}
+			a.tick(context.Background())
+			if !a.forgetRetries["web"] || len(kernel.kernel.Rules()) != 1 {
+				t.Fatalf("unavailable evidence cancelled the retry or released its rule: queued=%v rules=%v", a.forgetRetries, kernel.kernel.Rules())
+			}
+			if recorded {
+				if inst := a.vmManager.List()["web"]; inst == nil || inst.State != vm.StateRecoveryPending {
+					t.Fatalf("unavailable evidence released quarantine: %+v", inst)
+				}
+				if err := os.Chmod(path, 0o600); err != nil {
+					t.Fatal(err)
+				}
+			} else {
+				a.proveServiceAbsent = nil // Use the real process-absence proof again.
+			}
+			for tick := 0; tick < 4; tick++ {
+				a.tick(context.Background())
+				a.applyRecoveryRequests(context.Background())
+			}
+			if inst := a.vmManager.List()["web"]; inst != nil || len(kernel.kernel.Rules()) != 0 || len(a.forgetRetries) != 0 {
+				t.Fatalf("restored inspection did not finish the original --forget: VM=%+v rules=%v queued=%v", inst, kernel.kernel.Rules(), a.forgetRetries)
+			}
+		})
+	}
+}
+
 // A retried --forget is refused like the command when a process uses the
-// VM's paths again: the state stays quarantined, the retry ends, and it is
-// not cleared on its own once the process exits.
+// VM's paths again: the state stays held, the retry ends, and it is not
+// cleared on its own once the process exits, in either phase.
 func TestRetriedForgetIsRefusedByALiveClaimant(t *testing.T) {
 	if os.Geteuid() == 0 {
 		t.Skip("run as a non-root user so the real VM manager uses its direct launcher")
 	}
-	a, kernel, storage, dir := forgetRetryAgent(t, true)
-	storage(false)
-	if result, err := a.forgetRecoveryPending("web"); err == nil || result.Outcome != vm.RecoveryOutcomeIncomplete {
-		t.Fatalf("forget: %+v %v", result, err)
-	}
-	claimant := exec.Command("/bin/sh", "-c", "sleep 300", "fc", "--api-sock", filepath.Join(dir, "firecracker.sock"))
-	if err := claimant.Start(); err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = claimant.Process.Kill(); _ = claimant.Wait() })
-	storage(true)
-	a.tick(context.Background())
-	if inst := a.vmManager.List()["web"]; inst == nil || inst.State != vm.StateRecoveryPending || len(a.forgetRetries) != 0 {
-		t.Fatalf("a retried --forget was not refused by a live claimant: VM=%+v queued=%v", inst, a.forgetRetries)
-	}
-	_ = claimant.Process.Kill()
-	_ = claimant.Wait()
-	for tick := 0; tick < 3; tick++ {
-		a.tick(context.Background())
-	}
-	if inst := a.vmManager.List()["web"]; inst == nil || inst.State != vm.StateRecoveryPending || len(kernel.kernel.Rules()) != 1 {
-		t.Fatalf("refused state was cleared without the command: VM=%+v rules=%v", inst, kernel.kernel.Rules())
+	for name, recorded := range map[string]bool{"quarantined VM": true, "untracked VM": false} {
+		t.Run(name, func(t *testing.T) {
+			a, kernel, storage, dir := forgetRetryAgent(t, recorded)
+			storage(false)
+			if result, err := a.forgetRecoveryPending("web"); err == nil || result.Outcome != vm.RecoveryOutcomeIncomplete {
+				t.Fatalf("forget: %+v %v", result, err)
+			}
+			claimant := exec.Command("/bin/sh", "-c", "sleep 300", "fc", "--api-sock", filepath.Join(dir, "firecracker.sock"))
+			if err := claimant.Start(); err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = claimant.Process.Kill(); _ = claimant.Wait() })
+			assertHeld := func() {
+				t.Helper()
+				inst := a.vmManager.List()["web"]
+				if recorded && (inst == nil || inst.State != vm.StateRecoveryPending) || !recorded && inst != nil || len(a.forgetRetries) != 0 || len(kernel.kernel.Rules()) != 1 {
+					t.Fatalf("live claimant's fence was released: VM=%+v queued=%v rules=%v", inst, a.forgetRetries, kernel.kernel.Rules())
+				}
+			}
+			storage(true)
+			a.tick(context.Background())
+			assertHeld()
+			_ = claimant.Process.Kill()
+			_ = claimant.Wait()
+			for tick := 0; tick < 3; tick++ {
+				a.tick(context.Background())
+			}
+			assertHeld()
+		})
 	}
 }

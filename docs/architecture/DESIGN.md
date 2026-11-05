@@ -325,9 +325,11 @@ accounts for to cleanup. A refused `--forget` changes nothing. If clearing
 the quarantined state or the hand-off cannot be written to the ownership
 journal, nothing is released and the command reports an incomplete
 resolution: the running agent reruns the same `--forget` every tick, proving
-the VM absent again each time, until it succeeds. A retry that is refused,
-as when a process uses the VM's paths again, ends like a refused command and
-leaves the state quarantined. The retry is not persisted, so if the agent
+the VM absent again each time, until it succeeds. If inspection times out or
+cannot read the ownership evidence, the state stays held and the retry stays
+pending until inspection works again. Finding a process or systemd launch
+claiming the VM ends the retry and leaves the state quarantined until the
+operator acts again. The retry is not persisted, so if the agent
 restarts first the service stays held and `--forget` must be run again once
 storage is healthy. The command
 itself releases nothing: an address is released once its rules are gone and,

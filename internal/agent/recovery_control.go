@@ -113,7 +113,7 @@ func (a *Agent) forgetUntrackedService(service string, result vm.RecoveryResult)
 	if err := prove(ctx, service); err != nil {
 		result.Outcome = vm.RecoveryOutcomeAmbiguous
 		result.Message = "the VM recorded for this service may still run: " + err.Error()
-		return result, fmt.Errorf("service %s: %s", service, result.Message)
+		return result, fmt.Errorf("service %s: the VM recorded for this service may still run: %w", service, err)
 	}
 	if err := a.reconciler.ForgetService(service); err != nil {
 		return a.incompleteForget(result, err)
@@ -149,9 +149,9 @@ func (a *Agent) queueForgetRetry(service string) {
 // as the command, so every attempt proves the VM absent again: it clears the
 // quarantined VM state, then hands the service's host networking to cleanup.
 // A retry ends once it succeeds, once a VM that is not quarantined is tracked
-// for the service again, or when the attempt is refused, as when a process
-// uses the VM's paths again: like the command's refusal, that leaves the
-// state quarantined until an operator resolves it and runs the command again.
+// for the service again, or when a process or launch claims the VM again.
+// Unavailable evidence keeps the state held and the retry pending until
+// inspection works; a claimant ends it until the operator acts again.
 func (a *Agent) retryForgets() {
 	a.recoveryMu.Lock()
 	services := make([]string, 0, len(a.forgetRetries))
@@ -164,7 +164,7 @@ func (a *Agent) retryForgets() {
 		if inst := a.vmManager.List()[service]; inst == nil || inst.State == vm.StateRecoveryPending {
 			result, err := a.resolveRecoveryPending(service, true)
 			switch {
-			case err != nil && result.Outcome == vm.RecoveryOutcomeIncomplete:
+			case err != nil && !vm.IsRecoveryClaimant(err):
 				a.logger.Warn("clear-recovery --forget is still incomplete; retrying on the next tick", "service", service, "error", err)
 				continue
 			case err != nil:

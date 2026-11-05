@@ -238,6 +238,9 @@ func TestSystemdLaunchScanFindsQueuedAndLiveClaimants(t *testing.T) {
 					if (err != nil) != tc.claims {
 						t.Fatalf("claim=%v, want %v", err, tc.claims)
 					}
+					if IsRecoveryClaimant(err) != tc.claims {
+						t.Fatalf("claimant evidence=%v, want %v: %v", IsRecoveryClaimant(err), tc.claims, err)
+					}
 				})
 			}
 		})
@@ -265,8 +268,8 @@ func TestSystemdLaunchScanFailsClosed(t *testing.T) {
 			if probe == nil {
 				probe = &instanceManifest{SocketPath: "/b/firecracker.sock", ConfigPath: "/b/vm-config.json"}
 			}
-			if err := m.noClaimingUnitContext(context.Background(), probe); err == nil {
-				t.Fatal("unreadable launch state authorized absence")
+			if err := m.noClaimingUnitContext(context.Background(), probe); err == nil || IsRecoveryClaimant(err) {
+				t.Fatalf("unreadable launch state must prevent cleanup without claiming an observed owner: %v", err)
 			}
 		})
 	}

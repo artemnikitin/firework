@@ -442,6 +442,57 @@ func TestIncompleteForgetIsRetriedByTheAgent(t *testing.T) {
 	}
 }
 
+// C3/C5: unavailable absence evidence keeps an accepted --forget pending.
+// Nothing is released until inspection works again, and no new command or
+// revision is needed once the transient failure is gone.
+func TestIncompleteForgetRetriesUnavailableAbsenceEvidence(t *testing.T) {
+	for name, inspectionErr := range map[string]error{
+		"inspection deadline":   context.DeadlineExceeded,
+		"inspection unreadable": os.ErrPermission,
+	} {
+		t.Run(name, func(t *testing.T) {
+			web := addressedService("web", "172.16.0.2", 0)
+			web.PortForwards = []config.PortForward{{HostPort: 8080, VMPort: 80}}
+			yaml := "node: web\nservices:\n- name: web\n  image: /web\n  kernel: /k\n  vcpus: 1\n  memory_mb: 64\n  network: {}\n  port_forwards:\n  - host_port: 8080\n    vm_port: 80\n"
+			a, m := admissionAgent(t, yaml, capacity.NodeCapacity{VCPUs: 8, MemoryMB: 4096},
+				map[string]*vm.Instance{"web": {Name: "web", Config: web, State: vm.StateRunning}}, "172.16.0.0/24")
+			network := &recoveryTestNetworkManager{}
+			a.reconciler = testReconciler(t, m, network, "", 0)
+			a.tick(context.Background())
+			delete(m.instances, "web")
+			a.store.(*fakeStore).revision = "r3"
+			a.tick(context.Background())
+			a.proveServiceAbsent = func(context.Context, string) error { return nil }
+			a.reconciler.WithJournalWriter(func(string, []byte) error { return errors.New("disk full") })
+			if result, err := a.forgetRecoveryPending("web"); err == nil || result.Outcome != vm.RecoveryOutcomeIncomplete {
+				t.Fatalf("setup: forget=%+v err=%v", result, err)
+			}
+			a.reconciler.WithJournalWriter(func(path string, data []byte) error { return os.WriteFile(path, data, 0o600) })
+			starts := len(m.startCalls)
+			a.proveServiceAbsent = func(context.Context, string) error { return inspectionErr }
+			a.tick(context.Background())
+			if !a.forgetRetries["web"] {
+				t.Fatal("unavailable absence evidence discarded the pending --forget")
+			}
+			if len(m.startCalls) != starts || a.reconciler.PendingTeardownGuestIPs()["172.16.0.2"] != "web" {
+				t.Fatal("unavailable absence evidence released the VM's fence")
+			}
+			if _, ok := network.kernel.Delivers(8080); !ok {
+				t.Fatal("unavailable absence evidence authorized rule deletion")
+			}
+			a.proveServiceAbsent = func(context.Context, string) error { return nil }
+			for tick := 0; tick < 4; tick++ {
+				a.tick(context.Background())
+				a.applyRecoveryRequests(context.Background())
+			}
+			if m.instances["web"] == nil || len(a.forgetRetries) != 0 || a.lastRevision != "r3" || len(m.startCalls) != starts+1 {
+				t.Fatalf("inspection recovery did not finish the original --forget: VM=%+v retry=%v revision=%q starts=%v",
+					m.instances["web"], a.forgetRetries, a.lastRevision, m.startCalls)
+			}
+		})
+	}
+}
+
 // C4/L7: an address routed under an earlier guest subnet keeps its route
 // ownership after the subnet changes: removing the route records its
 // withdrawal, and restoring the subnet does not give the address to another

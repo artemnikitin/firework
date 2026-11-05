@@ -131,7 +131,7 @@ func (m *Manager) resolveUntrustedRecovery(ctx context.Context, result RecoveryR
 	probe := recoveryAbsenceProbe(service, vmDir, recorded, untrusted)
 	absenceErr := m.proveRecoveryAbsentContext(ctx, probe)
 	if absenceErr != nil {
-		return recoveryAmbiguous(result, fmt.Sprintf("%s and absence remains unproved: %v", reason, absenceErr))
+		return recoveryAmbiguousCause(result, fmt.Errorf("%s and absence remains unproved: %w", reason, absenceErr))
 	}
 	preservesMetadata := before.kind == "symlink" || (before.kind == "dir" && before.manifest != "missing")
 	// The manager's own interrupted operation explains a vanished directory or
