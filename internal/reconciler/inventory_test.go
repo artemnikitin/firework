@@ -215,3 +215,14 @@ func TestUnaccountedVMHoldsNewAddresses(t *testing.T) {
 	vms.err = nil
 	h.converge(r, desired)
 }
+
+// Without host networking there is nothing to forget, and asking is safe.
+func TestForgetServiceWithoutHostNetworking(t *testing.T) {
+	r := New(newFakeVMManager(), heldClaimsLogger(), nil, nil, "", 0)
+	if err := r.ForgetService("web"); err != nil {
+		t.Fatal(err)
+	}
+	if traces, err := r.HasUnresolvedTraces("web"); err != nil || traces {
+		t.Fatalf("traces=%v err=%v", traces, err)
+	}
+}

@@ -811,6 +811,9 @@ func (r *Reconciler) unresolvedTraces(service string) ([]allocation, error) {
 // gone and, for a route, once Traefik has restarted; host ports keep their
 // holder (L6).
 func (r *Reconciler) ForgetService(service string) error {
+	if r.networkMgr == nil {
+		return nil // Without host networking nothing was installed or recorded.
+	}
 	traces, err := r.unresolvedTraces(service)
 	if err != nil {
 		return err
