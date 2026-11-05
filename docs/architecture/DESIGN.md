@@ -306,7 +306,7 @@ owner left on the host. It stays fenced until an operator restores a trusted
 record or runs `--forget`, which deletes it after the same proof; for a
 symlinked entry, only the link is removed. The exception is state that an
 operation of the agent's own explains. Before the manager creates or removes a
-VM directory it durably writes an intent marker, `vms/.firework-intent-<service>`,
+VM directory it durably writes an intent marker, `<state_dir>/.firework-intent-<service>`,
 and removes it once the directory has its ownership manifest or is gone.
 A restart records that intent before reclaiming the old manifest, so a crash
 during volume preparation or a preparation failure also recovers without
@@ -317,6 +317,14 @@ process, such as a failed start racing an inventory, is cleared the same way.
 Without such evidence, state without a manifest stays quarantined at startup,
 on retry and for a plain `clear-recovery`, even when no process uses its
 paths; only `--forget` clears it.
+
+Markers live outside `vms`, so every valid service name keeps its own runtime
+directory. Markers from older agents under `vms/.firework-intent-<service>`
+remain readable when they are regular files naming that service; directories
+and symlinks never count as markers. Recovery also inventories intents whose
+VM directory was never created or is already gone, proves absence and retires
+them. A service whose name occupies an old marker path waits for that operation
+to finish, then retries without a new revision or `--forget`.
 
 An agent's own manifest write can finish its rename before reporting an error.
 If its immediate readback also fails, the VM stays quarantined and recovery

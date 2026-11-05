@@ -461,6 +461,9 @@ func (m *Manager) beginStartContext(ctx context.Context, svc config.ServiceConfi
 	if m.recoveryReservations[svc.Name] {
 		return "", "", "", fmt.Errorf("service %s recovery discovery in progress: %w", svc.Name, ErrStartInProgress)
 	}
+	if owner := m.legacyIntentOwner(svc.Name); owner != "" {
+		return "", "", "", fmt.Errorf("service %s waits for the legacy directory operation of %s to finish recovery: %w", svc.Name, owner, ErrStartInProgress)
+	}
 	previous := m.instances[svc.Name]
 	if inst := previous; inst != nil {
 		switch inst.State {

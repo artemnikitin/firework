@@ -36,6 +36,9 @@ func (m *Manager) Recover(ctx context.Context, desired config.NodeConfig) ([]str
 	// A missing root lists nothing, but quarantines held in memory still need
 	// their absence proved, so fall through with no entries.
 	m.inventoryRecoveryEntries(root, entries)
+	if err := m.inventoryIntents(entries); err != nil {
+		return nil, err
+	}
 	// Visit every listed entry and every quarantined name. A quarantine whose
 	// directory disappeared (removed by an operator, or listed by an inventory
 	// that raced its removal) has no entry left, but it still fences the node
@@ -152,19 +155,16 @@ func (m *Manager) Recover(ctx context.Context, desired config.NodeConfig) ([]str
 }
 
 // DiscoverRecoveryState inventories runtime ownership before the agent allocates
-// addresses or capacity. It performs no unit/process probes or cleanup. Unknown
+// addresses or capacity. It performs no unit/process probes or runtime cleanup. Unknown
 // metadata remains visible and fenced until recovery can verify it.
 func (m *Manager) DiscoverRecoveryState() error {
 	root := filepath.Join(m.stateDir, "vms")
 	entries, err := os.ReadDir(root)
-	if errors.Is(err, os.ErrNotExist) {
-		return nil
-	}
-	if err != nil {
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
 		return fmt.Errorf("read VM state directory: %w", err)
 	}
 	m.inventoryRecoveryEntries(root, entries)
-	return nil
+	return m.inventoryIntents(entries)
 }
 
 func (m *Manager) inventoryRecoveryEntries(root string, entries []os.DirEntry) {

@@ -96,6 +96,12 @@ func (m *Manager) resolveRecoveryAttempt(ctx context.Context, service string, fo
 	}
 	instance := m.instances[service]
 	if instance == nil {
+		vmDir, _ := m.recoveryManifestPath(service)
+		if _, err := os.Lstat(vmDir); errors.Is(err, os.ErrNotExist) && m.hasIntentEntry(service) {
+			m.instances[service] = m.recoveryInstanceForService(service, canonicalManifest(service, vmDir), "retrying interrupted VM directory operation")
+			m.mu.Unlock()
+			return result, errRecoveryRetry
+		}
 		m.mu.Unlock()
 		vmDir, path := m.recoveryManifestPath(service)
 		manifest, err := readManifest(path)
@@ -403,6 +409,7 @@ func (m *Manager) resolveRecoveryAttempt(ctx context.Context, service string, fo
 		m.mu.Unlock()
 		return recoveryIncomplete(result, fmt.Errorf("service %s: process changed during adoption persistence: %w", service, processErr))
 	}
+	m.clearIntent(service) // The durable ownership record now describes the VM.
 	adopted := instanceFromManifest(&manifest, StateRunning, "")
 	if instance.startID != "" && manifest.Launcher == "direct" {
 		// A direct child launched by this manager still has its Wait monitor.
