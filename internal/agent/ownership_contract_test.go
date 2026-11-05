@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strings"
 	"testing"
 
 	"github.com/artemnikitin/firework/internal/capacity"
@@ -404,6 +405,40 @@ func TestLocalServiceNamedLikeAPeerRouteKeepsItsAddress(t *testing.T) {
 	restarted.tick(context.Background())
 	if got := offered(restarted); got != "172.16.0.2" {
 		t.Fatalf("the address was not released after Traefik restarted: %s", got)
+	}
+}
+
+// C3: when --forget cannot record the service's host networking for cleanup,
+// the agent retries the absence proof and hand-off itself, as the incomplete
+// outcome says, and the service recovers once the journal can be written.
+// (Finding from the review of a3cbc29.)
+func TestIncompleteForgetIsRetriedByTheAgent(t *testing.T) {
+	limit := capacity.NodeCapacity{VCPUs: 8, MemoryMB: 4096}
+	web := addressedService("web", "172.16.0.2", 0)
+	web.PortForwards = []config.PortForward{{HostPort: 8080, VMPort: 80}}
+	yaml := "node: web\nservices:\n- name: web\n  image: /web\n  kernel: /k\n  vcpus: 1\n  memory_mb: 64\n  network: {}\n  port_forwards:\n  - host_port: 8080\n    vm_port: 80\n"
+	a, m := admissionAgent(t, yaml, limit, map[string]*vm.Instance{"web": {Name: "web", Config: web, State: vm.StateRunning}}, "172.16.0.0/24")
+	a.reconciler = testReconciler(t, m, &recoveryTestNetworkManager{}, "", 0)
+	a.tick(context.Background())
+	delete(m.instances, "web") // its directory was removed by hand
+	a.store.(*fakeStore).revision = "r3"
+	a.tick(context.Background())
+	a.proveServiceAbsent = func(context.Context, string) error { return nil }
+	a.reconciler.WithJournalWriter(func(string, []byte) error { return errors.New("disk full") })
+	result, err := a.forgetRecoveryPending("web")
+	if err == nil || result.Outcome != vm.RecoveryOutcomeIncomplete || !strings.Contains(result.Message, "retries") {
+		t.Fatalf("forget: %#v %v", result, err)
+	}
+	a.reconciler.WithJournalWriter(func(path string, data []byte) error { return os.WriteFile(path, data, 0o600) })
+	for tick := 0; tick < 3; tick++ {
+		a.tick(context.Background())
+		a.applyRecoveryRequests(context.Background())
+	}
+	if inst := m.instances["web"]; inst == nil || inst.Config.Network.GuestIP != "172.16.0.2" {
+		t.Fatalf("the incomplete --forget was not retried: %#v holds=%v", inst, a.reconciler.HeldServices(config.NodeConfig{Services: []config.ServiceConfig{web}}))
+	}
+	if again, err := a.forgetRecoveryPending("web"); err != nil || again.Outcome != vm.RecoveryOutcomeNoop {
+		t.Fatalf("a repeated --forget after the retry: %#v %v", again, err)
 	}
 }
 

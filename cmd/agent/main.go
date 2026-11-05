@@ -110,7 +110,7 @@ func recoveryCommandError(result vm.RecoveryResult, err error) error {
 	case vm.RecoveryOutcomeAmbiguous:
 		return fmt.Errorf("%w\nthe VM and its state were left unchanged; resolve the reason above, for example by stopping a process that still uses the VM's paths or waiting for one to finish, then run the command again (--forget clears state only once the VM is proven absent)", err)
 	case vm.RecoveryOutcomeIncomplete:
-		return fmt.Errorf("%w\nownership was settled, but part of the VM's state may already have changed; the service stays recovery_pending and the agent retries the rest, so check its status before running the command again", err)
+		return fmt.Errorf("%w\nownership was settled, but part of the VM's state may already have changed; the service stays held and the running agent retries the rest, so check its status before running the command again; run it again if the service is still held after an agent restart", err)
 	default:
 		return err
 	}

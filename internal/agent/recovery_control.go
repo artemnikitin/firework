@@ -70,7 +70,7 @@ func (a *Agent) resolveRecoveryPending(service string, forget bool) (vm.Recovery
 		// The cleared state was untrusted or absent, so whatever its VM was
 		// given is known only from ownership records and tagged rules.
 		if err := a.reconciler.ForgetService(service); err != nil {
-			return incompleteForget(result, err)
+			return a.incompleteForget(result, err)
 		}
 	}
 	if result.Outcome == vm.RecoveryOutcomeCleared || result.Outcome == vm.RecoveryOutcomeReadopted {
@@ -107,17 +107,56 @@ func (a *Agent) forgetUntrackedService(service string, result vm.RecoveryResult)
 		return result, fmt.Errorf("service %s: %s", service, result.Message)
 	}
 	if err := a.reconciler.ForgetService(service); err != nil {
-		return incompleteForget(result, err)
+		return a.incompleteForget(result, err)
 	}
 	result.Outcome = vm.RecoveryOutcomeCleared
 	result.Message = "no process uses the VM paths; its host networking is torn down, and its address released once nothing reaches it"
 	return result, nil
 }
 
-func incompleteForget(result vm.RecoveryResult, err error) (vm.RecoveryResult, error) {
+func (a *Agent) incompleteForget(result vm.RecoveryResult, err error) (vm.RecoveryResult, error) {
+	// The command's absence proof and hand-off are retried every tick until
+	// they succeed, as the incomplete outcome tells the operator.
+	a.recoveryMu.Lock()
+	if a.forgetRetries == nil {
+		a.forgetRetries = make(map[string]bool)
+	}
+	a.forgetRetries[result.Service] = true
+	a.recoveryMu.Unlock()
 	result.Outcome, result.State = vm.RecoveryOutcomeIncomplete, vm.StateRecoveryPending
-	result.Message = "recording the service's host networking for cleanup: " + err.Error()
+	result.Message = "recording the service's host networking for cleanup: " + err.Error() + "; the running agent retries it, and after an agent restart the command must be run again"
 	return result, fmt.Errorf("service %s: %s", result.Service, result.Message)
+}
+
+// retryForgets retries the hand-off of each service whose --forget could not
+// record its host networking for cleanup, proving its paths unused again
+// first. A service that has a tracked VM again no longer needs it.
+func (a *Agent) retryForgets() {
+	a.recoveryMu.Lock()
+	services := make([]string, 0, len(a.forgetRetries))
+	for service := range a.forgetRetries {
+		services = append(services, service)
+	}
+	a.recoveryMu.Unlock()
+	for _, service := range services {
+		done := a.vmManager.List()[service] != nil
+		if !done {
+			result, err := a.forgetUntrackedService(service, vm.RecoveryResult{Service: service, Outcome: vm.RecoveryOutcomeNoop})
+			if err != nil {
+				a.logger.Warn("clear-recovery --forget is still incomplete; retrying on the next tick", "service", service, "error", err)
+				continue
+			}
+			done = true
+			if result.Outcome == vm.RecoveryOutcomeCleared {
+				a.queueRecoveryReconcile(service, false)
+			}
+		}
+		if done {
+			a.recoveryMu.Lock()
+			delete(a.forgetRetries, service)
+			a.recoveryMu.Unlock()
+		}
+	}
 }
 
 func (a *Agent) queueRecoveryReconcile(service string, adopted bool) {

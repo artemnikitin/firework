@@ -70,7 +70,11 @@ type Agent struct {
 	recoveryWake    chan struct{}
 	recoveryMu      sync.Mutex
 	recoveryQueue   map[string]bool
-	forceReconcile  bool
+	// forgetRetries names services whose clear-recovery --forget could not
+	// hand their records to cleanup; every tick retries them. recoveryMu
+	// guards it.
+	forgetRetries  map[string]bool
+	forceReconcile bool
 	// lastPeerNodes is the last complete peer listing, and peersListed says
 	// whether this process has one. While listing fails, its remote route
 	// files are preserved, and local routes resolve hostname claims against
@@ -407,6 +411,7 @@ func (a *Agent) tick(ctx context.Context) {
 		a.syncRegistryAfterTick(ctx, nodeCap, capacity.NodeCapacity{})
 		return
 	}
+	a.retryForgets()
 
 	// Clamp any volume size this node has already refused, before anything
 	// else in the tick reads the merged configuration. Normalizing later — say,

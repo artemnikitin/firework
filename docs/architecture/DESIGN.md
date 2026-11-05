@@ -263,7 +263,9 @@ command changes nothing and exits with an error naming why the service remains
 saying to resolve that and run the command again. If ownership is settled but
 recording or removing state then fails, the command reports an incomplete
 resolution instead: part of the state may already have changed, the service
-stays `recovery_pending`, and the agent retries the rest.
+stays held, and the running agent retries the rest. Check the service's status
+before running the command again; run it again if the service is still held
+after an agent restart.
 
 The command re-adopts a VM only when the manifest, config hash, process identity,
 launch arguments, and API socket validate. Recovery retries transient failures
@@ -319,7 +321,12 @@ ownership records outlive the directory: the service is held with
 `vm_state_missing`, and its address and host ports stay fenced. `--forget`
 then proves from the service's paths that no process or systemd launch uses
 them, and hands the service's records and the rules tagged for it that nothing
-accounts for to cleanup. A refused `--forget` changes nothing. The command
+accounts for to cleanup. A refused `--forget` changes nothing. If the hand-off
+cannot be written to the ownership journal, nothing is released and the
+command reports an incomplete resolution: the running agent retries the
+absence proof and hand-off every tick until the journal can be written. That
+retry is not persisted, so if the agent restarts first the service stays held
+and `--forget` must be run again once storage is healthy. The command
 itself releases nothing: an address is released once its rules are gone and,
 for a route, once Traefik has restarted, and host ports keep their history (see
 "Network ownership" below). A live VM process or systemd launch under the state
