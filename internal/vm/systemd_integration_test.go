@@ -342,8 +342,8 @@ func TestSystemdIntegrationAbsenceProofWithoutDBus(t *testing.T) {
 }
 
 // A live VM under the state directory that no manager tracks, as after its
-// directory listing was lost, is reported by its process and its unit until
-// a manager adopts it.
+// directory listing was lost, is reported by its process and its unit. Once
+// its owner removes it, nothing is reported.
 func TestSystemdIntegrationUnaccountedVMScan(t *testing.T) {
 	if os.Getenv("FIREWORK_REAL_SYSTEMD") != "1" {
 		t.Skip("requires isolated real systemd")
@@ -379,11 +379,11 @@ func main(){flag.String("id","","");p:=flag.String("api-sock","","");flag.String
 	if err != nil || len(found) != 2 || !strings.Contains(strings.Join(found, " "), "scanned") || !strings.Contains(strings.Join(found, " "), unit) {
 		t.Fatalf("an untracked live VM was not reported by process and unit: %v %v", found, err)
 	}
-	if adopted, err := stranger.Recover(ctx, config.NodeConfig{Services: []config.ServiceConfig{svc}}); err != nil || len(adopted) != 1 {
-		t.Fatalf("adoption: %v %v", adopted, err)
+	if err := m.Remove(svc.Name); err != nil {
+		t.Fatalf("removing the VM: %v", err)
 	}
-	if found, err := stranger.UnaccountedVMs(ctx); err != nil || len(found) != 0 {
-		t.Fatalf("an adopted VM is still reported: %v %v", found, err)
+	if after, err := stranger.UnaccountedVMs(ctx); err != nil || len(after) != 0 {
+		t.Fatalf("a removed VM is still reported: %v %v", after, err)
 	}
-	t.Logf("untracked VM reported as %v until adopted", found)
+	t.Logf("untracked VM reported as %v until removed", found)
 }
