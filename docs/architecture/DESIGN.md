@@ -307,9 +307,11 @@ record or runs `--forget`, which deletes it after the same proof; for a
 symlinked entry, only the link is removed. The exception is state that an
 operation of the agent's own explains. Before the manager creates or removes a
 VM directory it durably writes an intent marker, `vms/.firework-intent-<service>`,
-and removes it once the directory has its ownership manifest or is gone. A
-directory without a manifest, or a missing directory, that has a marker is an
-interrupted create or removal: recovery clears it after the absence proof,
+and removes it once the directory has its ownership manifest or is gone.
+A restart records that intent before reclaiming the old manifest, so a crash
+during volume preparation or a preparation failure also recovers without
+`--forget`. A directory without a manifest, or a missing directory, that has a
+marker is an interrupted create or removal: recovery clears it after the absence proof,
 across agent restarts. A missing directory the agent removed itself in this
 process, such as a failed start racing an inventory, is cleared the same way.
 Without such evidence, state without a manifest stays quarantined at startup,

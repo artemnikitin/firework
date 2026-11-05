@@ -533,14 +533,20 @@ func (m *Manager) reclaimStartState(ctx context.Context, service, vmDir string, 
 	if err := ctx.Err(); err != nil {
 		return err
 	}
+	// Reclaim removes the ownership manifest before volume preparation, which
+	// may fail or outlive this agent. Record the operation first so recovery
+	// can distinguish it from state whose manifest was removed by hand.
+	if err := m.markIntent(service); err != nil {
+		return err
+	}
 	return removeVMStateKeepingLog(vmDir)
 }
 
 // removeVMStateKeepingLog clears a confirmed-exited owner's state before its
 // replacement starts. The launcher appends to firecracker.log, so a crashed
 // run's output survives a health restart, as it did before manifests existed.
-// The next manifest write follows immediately; a directory left with only the
-// log is absence-proven and removed like any other manifest-less directory.
+// The caller records intent first: while volume preparation runs, the directory
+// has only its log, so an interrupted restart needs that evidence to recover.
 func removeVMStateKeepingLog(vmDir string) error {
 	entries, err := os.ReadDir(vmDir)
 	if err != nil {
