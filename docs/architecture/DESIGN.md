@@ -600,7 +600,12 @@ it, is in [recovery-network-ownership.md](recovery-network-ownership.md).
   corruption is migrated: running VMs keep their addresses and ports, but a
   port without a recorded holder waits with `network_history_incomplete` (L6),
   and every address waits for a Traefik restart before going to a new service
-  (L7). Deleting the journal never makes history complete.
+  (L7). Deleting the journal never makes history complete. Without host
+  networking the journal still records route ownership and keeps a version 1
+  journal's cleanup records for a later agent that manages networking. It
+  cannot list the kernel's rules then and records no host-port holders, so
+  once networking is enabled, a host port without a recorded holder waits
+  with `network_history_incomplete`.
 - **Downgrade.** An older agent rejects a version 2 journal and cannot delete
   tagged rules. Replace the node, or stop the agent and every VM, delete the
   rules `iptables -t nat -S PREROUTING | grep firework:pf:` lists by their

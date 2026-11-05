@@ -111,6 +111,10 @@ type journalHistory struct {
 	// repaired journal is never complete.
 	Complete      bool      `json:"complete"`
 	InitializedAt time.Time `json:"initialized_at"`
+	// PortsUntracked means host ports were used without this journal
+	// recording their holders, as while host networking was disabled. A
+	// port without a recorded holder then has unknown history (L6).
+	PortsUntracked bool `json:"ports_untracked,omitempty"`
 }
 
 func (p persistedJournal) validate() error {
@@ -574,36 +578,11 @@ func (r *Reconciler) initializeJournalLocked(actual map[string]*vm.Instance) err
 	if r.journalReady || r.journalCorrupt {
 		return nil
 	}
-	if r.networkMgr == nil {
-		// Without host networking nothing is installed or owned, so there is
-		// nothing to record, and a version 1 journal stays on disk untouched.
-		// Routes still reach guest addresses: earlier state holds every
-		// address until Traefik restarts, as on a migrated node.
+	if r.networkMgr == nil && (r.routeEvidence == nil || r.stateDir == "") {
+		// Without host networking or routes nothing is installed or owned,
+		// so nothing is recorded, and a version 1 journal stays on disk
+		// untouched for a later agent that manages host networking.
 		r.journalReady = true
-		if r.routeEvidence == nil || r.stateDir == "" {
-			return nil
-		}
-		earlier := r.legacyJournal != nil
-		if _, err := os.Lstat(filepath.Join(r.stateDir, "vms")); err == nil || !os.IsNotExist(err) {
-			earlier = true
-		}
-		if !earlier && r.localRoutes != nil {
-			found, err := r.localRoutes()
-			if err != nil {
-				r.journalReady = false
-				return fmt.Errorf("checking route files to initialize ownership records: %w", err)
-			}
-			earlier = found
-		}
-		if earlier {
-			r.routeWithdrawals[routeKey{routeEveryAddress, routeEveryAddress}] = routeWithdrawal{
-				Service: routeEveryAddress, GuestIP: routeEveryAddress, State: routeWithdrawing}
-			if err := r.persistJournalLocked(); err != nil {
-				delete(r.routeWithdrawals, routeKey{routeEveryAddress, routeEveryAddress})
-				r.journalReady = false
-				return fmt.Errorf("initializing ownership records: %w", err)
-			}
-		}
 		return nil
 	}
 	complete := r.legacyJournal == nil
@@ -612,7 +591,7 @@ func (r *Reconciler) initializeJournalLocked(actual map[string]*vm.Instance) err
 			complete = false
 		}
 	}
-	if complete {
+	if complete && r.networkMgr != nil {
 		listing, err := r.networkMgr.ListPortForwards()
 		if err != nil {
 			return fmt.Errorf("listing port forwards to initialize ownership records: %w", err)
@@ -646,9 +625,11 @@ func (r *Reconciler) initializeJournalLocked(actual map[string]*vm.Instance) err
 			r.pendingNetworkDevices[entry.key()] = entry
 		}
 	}
+	// Without host networking only route ownership is recorded; the
+	// migrated cleanup above waits for an agent that manages networking.
 	for _, name := range slices.Sorted(maps.Keys(actual)) {
 		inst := actual[name]
-		if inst.RecoveryConfigUnknown || guestIPOf(inst.Config) == "" {
+		if r.networkMgr == nil || inst.RecoveryConfigUnknown || guestIPOf(inst.Config) == "" {
 			continue
 		}
 		if _, ok := r.liveAllocationLocked(name, guestIPOf(inst.Config)); !ok {
@@ -662,7 +643,7 @@ func (r *Reconciler) initializeJournalLocked(actual map[string]*vm.Instance) err
 		r.routeWithdrawals[routeKey{routeEveryAddress, routeEveryAddress}] = routeWithdrawal{
 			Service: routeEveryAddress, GuestIP: routeEveryAddress, State: routeWithdrawing}
 	}
-	r.history = journalHistory{Complete: complete, InitializedAt: time.Now().UTC()}
+	r.history = journalHistory{Complete: complete, InitializedAt: time.Now().UTC(), PortsUntracked: r.networkMgr == nil}
 	r.journalReady = true
 	if err := r.persistJournalLocked(); err != nil {
 		r.allocations, r.nextAllocationID, r.pendingNetworkDevices, r.hostPortHolders = prevAllocations, prevNext, prevDevices, prevHolders
@@ -797,7 +778,7 @@ func (r *Reconciler) portHistoryHoldLocked(svc config.ServiceConfig) Hold {
 		case held && holder != svc.Name:
 			return Hold{Reason: fmt.Sprintf("host port %d was used by service %s on this node, and peers may still send that service's traffic to it; use a fresh host port, or a node without this history", pf.HostPort, holder),
 				Action: ActionHostPortReuseBlocked}
-		case !held && !r.history.Complete:
+		case !held && (!r.history.Complete || r.history.PortsUntracked):
 			return Hold{Reason: fmt.Sprintf("this node's ownership history is incomplete, so host port %d may still be referenced for another service; use a host port this node already gives %s, or a node without earlier history", pf.HostPort, svc.Name),
 				Action: ActionNetworkHistoryIncomplete}
 		}

@@ -2,6 +2,7 @@ package reconciler
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"io"
 	"log/slog"
@@ -206,5 +207,103 @@ func TestCreateWithoutADurableRecordStartsNothing(t *testing.T) {
 	}
 	if len(h.vms.startCalls) != 0 || len(h.kernel.Rules()) != 0 || h.kernel.HasDevice("tap-web") {
 		t.Fatalf("something was created without a record: starts=%v rules=%v", h.vms.startCalls, h.kernel.Rules())
+	}
+}
+
+// Without host networking, a version 1 journal's pending cleanup is migrated,
+// not dropped: an agent that later manages host networking still deletes the
+// old rule and TAP. Ports went unrecorded meanwhile, so an unrecorded port
+// waits (L6). (Finding from the review of a3cbc29.)
+func TestLegacyCleanupSurvivesDisabledHostNetworking(t *testing.T) {
+	dir := t.TempDir()
+	legacy := `{"version":1,"port_forwards":[{"service_name":"gone","guest_ip":"172.16.0.2","port_forward":{"host_port":8080,"vm_port":80}}],"network":[{"service_name":"gone","kind":"tap","name":"tap-gone"}]}`
+	if err := os.WriteFile(filepath.Join(dir, pendingTeardownsFile), []byte(legacy), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	routes := &fakeRoutes{boot: "boot-1", start: "100"}
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	disabled := New(newFakeVMManager(), logger, nil, nil, "", 0).WithRouteEvidence(routes).WithStateDir(dir)
+	if !disabled.ownershipReady() {
+		t.Fatal("the agent without host networking did not initialize")
+	}
+	kernel := &networktest.Kernel{}
+	if err := kernel.Setup(config.ServiceConfig{Name: "gone", Network: &config.NetworkConfig{GuestIP: "172.16.0.2"}}); err != nil {
+		t.Fatal(err)
+	}
+	kernel.Append(networktest.Rule("", 8080, "172.16.0.2", 80))
+	vms := newFakeVMManager()
+	enabled := NewWithNetworkManager(vms, logger, nil, kernel, "", 0).WithRouteEvidence(routes).WithStateDir(dir)
+	routes.start = "200" // Traefik restarted, so only L6 can hold a start.
+	fresh := crashService("fresh", "172.16.0.5", 9090)
+	desired := config.NodeConfig{Services: []config.ServiceConfig{fresh}}
+	for tick := 0; tick < 3; tick++ {
+		_ = enabled.Reconcile(context.Background(), desired)
+	}
+	if kernel.HasDevice("tap-gone") || len(kernel.Rules()) != 0 {
+		t.Fatalf("the migrated cleanup was lost: tap=%v rules=%v", kernel.HasDevice("tap-gone"), kernel.Rules())
+	}
+	if hold := enabled.HeldServiceHolds(desired)["fresh"]; vms.instances["fresh"] != nil || hold.Action != ActionNetworkHistoryIncomplete {
+		t.Fatalf("an unrecorded port was given out after ports went untracked: %+v", hold)
+	}
+}
+
+// Without host networking, a clean node records its initialization, so its
+// own VM state on a later restart is not taken for earlier history.
+// (Finding from the review of a3cbc29.)
+func TestCleanInitializationIsDurableWithoutHostNetworking(t *testing.T) {
+	dir := t.TempDir()
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	routes := &fakeRoutes{boot: "boot-1", start: "100"}
+	build := func(vms VMManager) *Reconciler {
+		return New(vms, logger, nil, nil, "", 0).WithRouteEvidence(routes).WithStateDir(dir)
+	}
+	_ = build(newFakeVMManager())
+	data, err := os.ReadFile(filepath.Join(dir, pendingTeardownsFile))
+	if err != nil {
+		t.Fatalf("clean initialization was not recorded: %v", err)
+	}
+	var journal persistedJournal
+	if err := json.Unmarshal(data, &journal); err != nil || !journal.History.Complete {
+		t.Fatalf("clean initialization is not complete: %s (%v)", data, err)
+	}
+	if err := os.Mkdir(filepath.Join(dir, "vms"), 0o755); err != nil { // this agent's own VMs
+		t.Fatal(err)
+	}
+	vms := newFakeVMManager()
+	restarted := build(vms)
+	svc := config.ServiceConfig{Name: "fresh", Image: "/image", Kernel: "/kernel", Network: &config.NetworkConfig{GuestIP: "172.16.0.3"}}
+	desired := config.NodeConfig{Services: []config.ServiceConfig{svc}}
+	for tick := 0; tick < 2; tick++ {
+		_ = restarted.Reconcile(context.Background(), desired)
+	}
+	if vms.instances[svc.Name] == nil {
+		t.Fatalf("the restart took the node's own state for earlier history: %v", restarted.HeldServiceHolds(desired))
+	}
+}
+
+// L1: a route file that cannot be read may route to any address, so even an
+// update at the service's own address waits, keeping the old VM, and resumes
+// once the file is gone.
+func TestUnreadableRouteFileConservativelyHoldsAnOwnAddressUpdate(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	vms := newFakeVMManager()
+	svc := config.ServiceConfig{Name: "web", Image: "/v1", Network: &config.NetworkConfig{GuestIP: "172.16.0.2"}}
+	vms.instances[svc.Name] = &vm.Instance{Name: svc.Name, Config: svc, State: vm.StateRunning}
+	routes := &fakeRoutes{boot: "boot-1", start: "100"}
+	r := New(vms, logger, nil, nil, "", 0).WithRouteEvidence(routes).WithStateDir(t.TempDir())
+	routes.unreadable = []string{"middlewares.yml"}
+	updated := svc
+	updated.Image = "/v2"
+	desired := config.NodeConfig{Services: []config.ServiceConfig{updated}}
+	_ = r.Reconcile(context.Background(), desired)
+	if inst := vms.instances[svc.Name]; inst == nil || inst.Config.Image != "/v1" || r.HeldServiceHolds(desired)[svc.Name].Reason == "" {
+		t.Fatalf("unreadable route evidence did not keep the VM and report the hold: %#v", inst)
+	}
+	routes.unreadable = nil
+	for tick := 0; tick < 2; tick++ {
+		_ = r.Reconcile(context.Background(), desired)
+	}
+	if inst := vms.instances[svc.Name]; inst == nil || inst.Config.Image != "/v2" {
+		t.Fatal("the update did not resume once the file was gone")
 	}
 }
