@@ -569,8 +569,34 @@ func (r *Reconciler) initializeJournalLocked(actual map[string]*vm.Instance) err
 	}
 	if r.networkMgr == nil {
 		// Without host networking nothing is installed or owned, so there is
-		// nothing to record. A version 1 journal stays on disk untouched.
+		// nothing to record, and a version 1 journal stays on disk untouched.
+		// Routes still reach guest addresses: earlier state holds every
+		// address until Traefik restarts, as on a migrated node.
 		r.journalReady = true
+		if r.routeEvidence == nil || r.stateDir == "" {
+			return nil
+		}
+		earlier := r.legacyJournal != nil
+		if _, err := os.Lstat(filepath.Join(r.stateDir, "vms")); err == nil || !os.IsNotExist(err) {
+			earlier = true
+		}
+		if !earlier && r.localRoutes != nil {
+			found, err := r.localRoutes()
+			if err != nil {
+				r.journalReady = false
+				return fmt.Errorf("checking route files to initialize ownership records: %w", err)
+			}
+			earlier = found
+		}
+		if earlier {
+			r.routeWithdrawals[routeKey{routeEveryAddress, routeEveryAddress}] = routeWithdrawal{
+				Service: routeEveryAddress, GuestIP: routeEveryAddress, State: routeWithdrawing}
+			if err := r.persistJournalLocked(); err != nil {
+				delete(r.routeWithdrawals, routeKey{routeEveryAddress, routeEveryAddress})
+				r.journalReady = false
+				return fmt.Errorf("initializing ownership records: %w", err)
+			}
+		}
 		return nil
 	}
 	complete := r.legacyJournal == nil
@@ -661,8 +687,15 @@ func (r *Reconciler) departingLegacyLocked(service, guestIP string) (allocation,
 // once the old VM's rules are gone.
 func (r *Reconciler) allocationHold(svc config.ServiceConfig, leaving map[string]bool, keepsAddress bool) Hold {
 	ip := guestIPOf(svc)
-	if r.networkMgr == nil || ip == "" {
+	if ip == "" {
 		return Hold{}
+	}
+	if r.networkMgr == nil {
+		// The agent installs no rules and keeps no allocation records, but
+		// Traefik still routes to guest addresses: route ownership holds.
+		r.cleanupMu.Lock()
+		defer r.cleanupMu.Unlock()
+		return r.routeHoldLocked(svc.Name, ip)
 	}
 	actual := r.vmManager.List()
 	r.cleanupMu.Lock()

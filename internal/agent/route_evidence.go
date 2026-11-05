@@ -3,6 +3,7 @@ package agent
 import (
 	"context"
 	"fmt"
+	"net"
 	"os"
 	"os/exec"
 	"slices"
@@ -31,10 +32,11 @@ func (a *Agent) beginRouteWithdrawals(selected []config.ServiceConfig) error {
 	if !ok || a.reconciler == nil {
 		return nil
 	}
-	current, unreadable, err := reader.ReadLocalRoutes()
+	files, unreadable, err := reader.ReadLocalRoutes()
 	if err != nil {
 		return err
 	}
+	current := a.guestRoutes(files)
 	planned, err := reader.PlannedLocalRoutes(selected)
 	if err != nil {
 		return nil // The publish fails the same validation and changes nothing.
@@ -73,11 +75,28 @@ func (e *agentRouteEvidence) LocalRoutes() ([]reconciler.RouteTarget, []string, 
 	if err != nil {
 		return nil, nil, err
 	}
-	routes := make([]reconciler.RouteTarget, len(files))
-	for i, file := range files {
-		routes[i] = reconciler.RouteTarget{Service: file.Service, GuestIP: file.GuestIP}
+	var routes []reconciler.RouteTarget
+	for _, file := range e.agent.guestRoutes(files) {
+		routes = append(routes, reconciler.RouteTarget{Service: file.Service, GuestIP: file.GuestIP})
 	}
 	return routes, unreadable, nil
+}
+
+// guestRoutes keeps the routes to guest addresses. Peer routes go to peer
+// host addresses, outside the guest subnet, whatever their file is named.
+// Without a configured subnet every route counts.
+func (a *Agent) guestRoutes(files []traefik.RouteFile) []traefik.RouteFile {
+	_, subnet, err := net.ParseCIDR(a.cfg.VMSubnet)
+	if err != nil {
+		return files
+	}
+	var kept []traefik.RouteFile
+	for _, file := range files {
+		if ip := net.ParseIP(file.GuestIP); ip == nil || subnet.Contains(ip) {
+			kept = append(kept, file)
+		}
+	}
+	return kept
 }
 
 func (e *agentRouteEvidence) ServingProcess() (string, string, error) {

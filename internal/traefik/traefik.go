@@ -287,10 +287,12 @@ type RouteFile struct {
 	GuestIP string
 }
 
-// ReadLocalRoutes reads every route file that is not one of the agent's peer
-// routes, as Traefik would load it. A file it cannot attribute to a guest
-// address, such as one that does not parse, a .yml or .toml file, or a
-// subdirectory, is returned in unreadable: it may route anywhere.
+// ReadLocalRoutes reads every route file as Traefik would load it, peer
+// routes included: a local service may be named remote-*, like a peer route
+// file, so only a route's address tells them apart. Callers keep the routes
+// whose address is a guest address. A file it cannot attribute to an address,
+// such as one that does not parse, a .yml or .toml file, or a subdirectory,
+// is returned in unreadable: it may route anywhere.
 func ReadLocalRoutes(dir string) (routes []RouteFile, unreadable []string, err error) {
 	entries, err := os.ReadDir(dir)
 	if os.IsNotExist(err) {
@@ -308,7 +310,7 @@ func ReadLocalRoutes(dir string) (routes []RouteFile, unreadable []string, err e
 			continue
 		}
 		ext := filepath.Ext(name)
-		if ext != ".yaml" && ext != ".yml" && ext != ".toml" || strings.HasPrefix(name, remoteFilePrefix) {
+		if ext != ".yaml" && ext != ".yml" && ext != ".toml" {
 			continue
 		}
 		data, err := os.ReadFile(filepath.Join(dir, name))
@@ -405,11 +407,11 @@ func remoteConfigFileName(serviceName string) string {
 	return remoteFilePrefix + serviceName + ".yaml"
 }
 
-// HasLocalRouteFiles reports whether the directory holds a route file that is
-// not one of the agent's peer routes. Traefik loads .yaml, .yml and .toml
-// files, including those in subdirectories, so any of them, and any
-// subdirectory but the agent's own staging directory, may route to a guest
-// address. A missing directory holds none.
+// HasLocalRouteFiles reports whether the directory holds any route file.
+// Traefik loads .yaml, .yml and .toml files, including those in
+// subdirectories, so any of them, and any subdirectory but the agent's own
+// staging directory, may route to a guest address. A peer route file counts
+// too: a local service may be named like one. A missing directory holds none.
 func HasLocalRouteFiles(dir string) (bool, error) {
 	entries, err := os.ReadDir(dir)
 	if os.IsNotExist(err) {
@@ -428,9 +430,7 @@ func HasLocalRouteFiles(dir string) (bool, error) {
 		}
 		switch filepath.Ext(name) {
 		case ".yaml", ".yml", ".toml":
-			if !strings.HasPrefix(name, remoteFilePrefix) {
-				return true, nil
-			}
+			return true, nil
 		}
 	}
 	return false, nil

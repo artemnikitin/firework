@@ -7,7 +7,6 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
-	"strings"
 	"testing"
 
 	"github.com/artemnikitin/firework/internal/config"
@@ -25,12 +24,7 @@ func journalReconciler(t *testing.T, vms VMManager, kernel *networktest.Kernel, 
 		if os.IsNotExist(err) {
 			return false, nil
 		}
-		for _, entry := range entries {
-			if !strings.HasPrefix(entry.Name(), "remote-") {
-				return true, nil
-			}
-		}
-		return false, err
+		return len(entries) > 0, err
 	}
 	return NewWithNetworkManager(vms, slog.New(slog.NewTextHandler(io.Discard, nil)), nil, kernel, "", 0).
 		WithHostHistoryEvidence("172.16.0.0/24", routes).WithStateDir(dir)
@@ -84,10 +78,11 @@ func TestJournalInitializationRecordsWhetherHistoryIsComplete(t *testing.T) {
 			}
 		}, false},
 		"only peer route files": {func(t *testing.T, dir string, _ *networktest.Kernel) {
+			// A local service may be named like a peer route file.
 			if err := os.WriteFile(filepath.Join(dir, "routes", "remote-peer.yaml"), []byte("http: {}\n"), 0o644); err != nil {
 				t.Fatal(err)
 			}
-		}, true},
+		}, false},
 		"VM state directory exists": {func(t *testing.T, dir string, _ *networktest.Kernel) {
 			if err := os.Mkdir(filepath.Join(dir, "vms"), 0o755); err != nil {
 				t.Fatal(err)

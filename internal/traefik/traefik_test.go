@@ -505,7 +505,7 @@ func TestHasLocalRouteFiles(t *testing.T) {
 	}{
 		"missing directory":   {want: false},
 		"empty":               {dirs: []string{"."}, want: false},
-		"peer routes only":    {files: []string{"remote-a.yaml"}, want: false},
+		"peer routes only":    {files: []string{"remote-a.yaml"}, want: true},
 		"staging leftovers":   {dirs: []string{stageDirName}, files: []string{stageDirName + "/a.yaml.tmp"}, want: false},
 		"a local route":       {files: []string{"a.yaml"}, want: true},
 		"a hand-written toml": {files: []string{"extra.toml"}, want: true},
@@ -551,6 +551,8 @@ func TestReadLocalRoutesAttributesEachRouteFile(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// remote-peer.yaml defines no server, so it adds no route; a peer route
+	// with servers would be read too, for callers to tell by its address.
 	if len(routes) != 1 || routes[0] != (RouteFile{Service: "web", GuestIP: "172.16.0.2"}) {
 		t.Fatalf("routes = %v", routes)
 	}

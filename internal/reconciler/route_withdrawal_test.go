@@ -3,6 +3,8 @@ package reconciler
 import (
 	"context"
 	"errors"
+	"io"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
@@ -166,4 +168,61 @@ func TestUnreadableRouteFileHoldsStarts(t *testing.T) {
 	}
 	h.routes.unreadable = nil
 	h.converge(r, config.NodeConfig{Services: []config.ServiceConfig{next}})
+}
+
+// C4/L7 without host network setup: the agent manages no TAPs or rules, but
+// Traefik still routes to guest addresses. A static address another service's
+// route still points at, or was withdrawn from without proof, waits.
+// (Finding from the review of 2f5aa27.)
+func TestRouteOwnershipHoldsWithoutHostNetworking(t *testing.T) {
+	routes := &fakeRoutes{routes: []RouteTarget{{Service: "zeta", GuestIP: "172.16.0.2"}}, boot: "boot-1", start: "100"}
+	vms := newFakeVMManager()
+	r := New(vms, slog.New(slog.NewTextHandler(io.Discard, nil)), nil, nil, "", 0).WithRouteEvidence(routes).WithStateDir(t.TempDir())
+	desired := config.NodeConfig{Services: []config.ServiceConfig{next}}
+	_ = r.Reconcile(context.Background(), desired)
+	if vms.instances["next"] != nil {
+		t.Fatal("next started where zeta's route still points")
+	}
+	if err := r.BeginRouteWithdrawals([]RouteTarget{{Service: "zeta", GuestIP: "172.16.0.2"}}, false); err != nil {
+		t.Fatal(err)
+	}
+	routes.routes = nil
+	_ = r.Reconcile(context.Background(), desired)
+	if hold := r.HeldServiceHolds(desired)["next"]; vms.instances["next"] != nil || hold.Action != ActionGuestAddressWithdrawalUnconfirmed {
+		t.Fatalf("next started before Traefik restarted: %+v", hold)
+	}
+	routes.start = "200"
+	for tick := 0; tick < 2; tick++ {
+		_ = r.Reconcile(context.Background(), desired)
+	}
+	if vms.instances["next"] == nil {
+		t.Fatalf("next did not start after Traefik restarted: %v", r.HeldServices(desired))
+	}
+}
+
+// L7 without host network setup: on a host with earlier VM state, routes an
+// earlier agent removed are unknown, so a new address waits for a Traefik
+// restart here too.
+func TestMigrationBaselineHoldsWithoutHostNetworking(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.Mkdir(filepath.Join(dir, "vms"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	routes := &fakeRoutes{boot: "boot-1", start: "100"}
+	vms := newFakeVMManager()
+	r := New(vms, slog.New(slog.NewTextHandler(io.Discard, nil)), nil, nil, "", 0).WithRouteEvidence(routes).WithStateDir(dir)
+	desired := config.NodeConfig{Services: []config.ServiceConfig{next}}
+	for tick := 0; tick < 2; tick++ {
+		_ = r.Reconcile(context.Background(), desired)
+	}
+	if hold := r.HeldServiceHolds(desired)["next"]; vms.instances["next"] != nil || hold.Action != ActionGuestAddressWithdrawalUnconfirmed {
+		t.Fatalf("a migrated node gave out an address before Traefik restarted: %+v", hold)
+	}
+	routes.start = "200"
+	for tick := 0; tick < 2; tick++ {
+		_ = r.Reconcile(context.Background(), desired)
+	}
+	if vms.instances["next"] == nil {
+		t.Fatalf("next did not start after Traefik restarted: %v", r.HeldServices(desired))
+	}
 }

@@ -581,10 +581,13 @@ it, is in [recovery-network-ownership.md](recovery-network-ownership.md).
   rebooted. When only such addresses are free, the agent reports
   `guest_address_withdrawal_unconfirmed` naming the unit and waits for the
   operator to restart Traefik; it never restarts it. `traefik_unit` must be
-  the only process serving `traefik_config_dir`.
+  the only process serving `traefik_config_dir`. Route ownership applies
+  whether or not the agent manages host networking (`enable_network_setup`),
+  and routes are told apart by address, not file name: a local service may be
+  named like a peer route file.
 - **Initialization.** History is complete only when the journal is created on
   a host without a VM state directory, DNAT rules toward the guest subnet or
-  local route files, on a node endpoint with no earlier firework use. A
+  route files, on a node endpoint with no earlier firework use. A
   version 1 journal, existing VM state, or a journal moved aside after
   corruption is migrated: running VMs keep their addresses and ports, but a
   port without a recorded holder waits with `network_history_incomplete` (L6),

@@ -358,3 +358,49 @@ func TestForgetResolvesAHandRemovedVM(t *testing.T) {
 		t.Fatal("api took web's host port after --forget")
 	}
 }
+
+// C4/L7: a local service may be named remote-*, like the agent's peer route
+// files. Its route still holds its address, and its withdrawal is recorded,
+// through removal and an agent restart, until Traefik has restarted.
+// (Finding from the review of 2f5aa27.)
+func TestLocalServiceNamedLikeAPeerRouteKeepsItsAddress(t *testing.T) {
+	limit := capacity.NodeCapacity{VCPUs: 8, MemoryMB: 4096}
+	stateDir, routeDir := t.TempDir(), t.TempDir()
+	process := &fakeRouteProcess{boot: "boot-1", start: "1000"}
+	svc := addressedService("remote-app", "172.16.0.2", 0)
+	svc.Metadata = map[string]string{"host": "app.example.com"}
+	svc.PortForwards = []config.PortForward{{HostPort: 8080, VMPort: 80}}
+	a, m := admissionAgent(t, "node: web\nservices: []\n", limit, map[string]*vm.Instance{
+		"remote-app": {Name: "remote-app", Config: svc, State: vm.StateRunning},
+	}, "172.16.0.0/24")
+	a.reconciler = reconciler.NewWithNetworkManager(m, testLogger(), nil, &recoveryTestNetworkManager{}, "", 0).WithStateDir(stateDir)
+	useRoutesIn(a, routeDir, process)
+	if err := a.syncTraefikConfigs(context.Background(), []config.ServiceConfig{svc}); err != nil {
+		t.Fatal(err)
+	}
+	offered := func(a *Agent) string {
+		next := []config.ServiceConfig{networkedService("beta")}
+		a.assignNetworking(next)
+		return next[0].Network.GuestIP
+	}
+	m.clear(t, "remote-app")
+	if got := offered(a); got == "172.16.0.2" {
+		t.Fatal("remote-app's address was offered while its route points there")
+	}
+	a.tick(context.Background()) // publishes without remote-app and tears down its rule
+	if got := offered(a); got == "172.16.0.2" {
+		t.Fatal("remote-app's address was offered while the Traefik that served its route still runs")
+	}
+	restarted, _ := admissionAgent(t, "node: web\nservices: []\n", limit, nil, "172.16.0.0/24")
+	restarted.reconciler = reconciler.NewWithNetworkManager(m, testLogger(), nil, &recoveryTestNetworkManager{}, "", 0)
+	useRoutesIn(restarted, routeDir, process)
+	restarted.reconciler.WithStateDir(stateDir)
+	if got := offered(restarted); got == "172.16.0.2" {
+		t.Fatal("a restarted agent offered remote-app's address before Traefik restarted")
+	}
+	process.start = "2000"
+	restarted.tick(context.Background())
+	if got := offered(restarted); got != "172.16.0.2" {
+		t.Fatalf("the address was not released after Traefik restarted: %s", got)
+	}
+}

@@ -189,7 +189,7 @@ If this node gives host port P to another service, stale peer references deliver
 
 ## Initialization, migration and downgrade
 
-- **Clean initialization (complete history).** It applies when the state directory has no `vms` directory and no journal, the host has no DNAT rule toward the guest subnet, and the route directory has no local route file.
+- **Clean initialization (complete history).** It applies when the state directory has no `vms` directory and no journal, the host has no DNAT rule toward the guest subnet, and the route directory has no route file (a local service may be named like a peer route file).
   - **Prerequisite** (documented; the agent cannot verify it): the node's host IP has no previous firework history. That means a new address, or a deployment in which every node and guest that could reference it is also new.
 - **Bounded migration (incomplete history).** It applies to anything else without a version 2 journal: a version 1 journal, or VM state without a journal.
   - **What it records:**
