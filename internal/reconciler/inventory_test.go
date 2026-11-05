@@ -3,6 +3,7 @@ package reconciler
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -191,9 +192,21 @@ func (s *scanningVMs) UnaccountedVMs(context.Context) ([]string, error) { return
 // address, so no service gets a new address while it runs. A running service
 // keeps its own, and the hold names the process.
 func TestUnaccountedVMHoldsNewAddresses(t *testing.T) {
+	for _, enabled := range []bool{false, true} {
+		t.Run(fmt.Sprintf("host networking=%v", enabled), func(t *testing.T) {
+			testUnaccountedVMHoldsNewAddresses(t, enabled)
+		})
+	}
+}
+
+func testUnaccountedVMHoldsNewAddresses(t *testing.T, enabled bool) {
 	h := newCrashHost(t)
 	vms := &scanningVMs{crashVMs: h.vms}
-	r := NewWithNetworkManager(vms, h.agent().logger, nil, h.kernel, "", 0).WithStateDir(t.TempDir())
+	var networkMgr NetworkManager
+	if enabled {
+		networkMgr = h.kernel
+	}
+	r := NewWithNetworkManager(vms, h.agent().logger, nil, networkMgr, "", 0).WithStateDir(t.TempDir())
 	running := crashService("running", "172.16.0.2", 8080)
 	h.converge(r, config.NodeConfig{Services: []config.ServiceConfig{running}})
 	vms.unaccounted = []string{"process 4242 (VM directory of gone)"}

@@ -624,7 +624,10 @@ it, is in [recovery-network-ownership.md](recovery-network-ownership.md).
   (L7). Deleting the journal never makes history complete. Without host
   networking the journal still records route ownership and keeps a version 1
   journal's cleanup records for a later agent that manages networking. It
-  cannot list the kernel's rules then and records no host-port holders, so
+  also keeps existing address fences and known host-port holders, and the
+  unaccounted-VM scan still holds new addresses. Enable host networking again
+  to finish pending rule cleanup before reusing a recorded address. It
+  cannot list the kernel's rules then and records no new host-port holders, so
   once networking is enabled, a host port without a recorded holder waits
   with `network_history_incomplete`. An agent without host networking that
   loads an existing journal records this in it before anything starts; until

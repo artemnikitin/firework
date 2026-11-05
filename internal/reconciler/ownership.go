@@ -453,9 +453,21 @@ func (r *Reconciler) teardownDeparting(service string) error {
 // teardown is set, departing records are torn down. It initializes the
 // journal if construction could not.
 func (r *Reconciler) settleAllocations(ctx context.Context, teardown bool) error {
+	if !teardown {
+		var unaccounted []string
+		var scanErr error
+		if scanner, ok := r.vmManager.(unaccountedVMScanner); ok {
+			unaccounted, scanErr = scanner.UnaccountedVMs(ctx)
+		}
+		r.cleanupMu.Lock()
+		r.unaccountedVMs, r.unaccountedVMsErr = unaccounted, scanErr
+		r.cleanupMu.Unlock()
+	}
 	if r.networkMgr == nil {
-		// Routes still reach guest addresses without host networking. An
-		// initialization that could not read its evidence is retried here.
+		// Disabling setup does not release the addresses of unaccounted VMs
+		// or existing records. Keep the records intact until an agent that
+		// manages networking can verify their cleanup, and retry route
+		// initialization if its evidence was unavailable.
 		r.cleanupMu.Lock()
 		err := r.initializeJournalLocked(nil)
 		r.cleanupMu.Unlock()
@@ -467,16 +479,8 @@ func (r *Reconciler) settleAllocations(ctx context.Context, teardown bool) error
 		}
 		return nil
 	}
-	var unaccounted []string
-	var scanErr error
-	if scanner, ok := r.vmManager.(unaccountedVMScanner); ok && !teardown {
-		unaccounted, scanErr = scanner.UnaccountedVMs(ctx)
-	}
 	r.cleanupMu.Lock()
 	defer r.cleanupMu.Unlock()
-	if !teardown {
-		r.unaccountedVMs, r.unaccountedVMsErr = unaccounted, scanErr
-	}
 	actual := r.vmManager.List()
 	if err := r.initializeJournalLocked(actual); err != nil {
 		return stageError(FailureStageNetwork, err)
@@ -693,28 +697,11 @@ func (r *Reconciler) allocationHold(svc config.ServiceConfig, leaving map[string
 	actual := r.vmManager.List()
 	inst := actual[svc.Name]
 	trackedHere := inst != nil && sameGuestIP(guestIPOf(inst.Config), ip)
-	if r.networkMgr == nil {
-		// The agent installs no rules and keeps no allocation records, but
-		// Traefik still routes to guest addresses: route ownership holds,
-		// and so does evidence of it that cannot be read.
-		r.cleanupMu.Lock()
-		defer r.cleanupMu.Unlock()
-		if r.portsUntrackedPending {
-			return Hold{Reason: "the ownership journal cannot record yet that host ports go untracked without host networking"}
-		}
-		if r.routeEvidence == nil {
-			return Hold{}
-		}
-		if r.journalCorrupt {
-			return Hold{Reason: "the ownership journal is corrupt, so route withdrawals it held cannot be read and no new address is given out"}
-		}
-		if !r.journalReady {
-			return Hold{Reason: "ownership records are not initialized yet"}
-		}
-		return r.routeHoldLocked(svc.Name, ip, keepsAddress || trackedHere)
-	}
 	r.cleanupMu.Lock()
 	defer r.cleanupMu.Unlock()
+	if r.portsUntrackedPending {
+		return Hold{Reason: "the ownership journal cannot record yet that host ports go untracked without host networking"}
+	}
 	if r.journalCorrupt {
 		return Hold{Reason: "the ownership journal is corrupt, so no new network allocation can be recorded"}
 	}
@@ -763,7 +750,7 @@ func (r *Reconciler) allocationHold(svc config.ServiceConfig, leaving map[string
 			}
 			continue
 		}
-		if leaving[a.Service] && a.Phase == phaseRunning && tracked {
+		if r.networkMgr != nil && leaving[a.Service] && a.Phase == phaseRunning && tracked {
 			continue // Its VM goes before any start this tick.
 		}
 		if sameGuestIP(a.GuestIP, ip) {
@@ -785,7 +772,9 @@ func (r *Reconciler) allocationHold(svc config.ServiceConfig, leaving map[string
 // is never given to another, because peers' routes and guests' cross-node
 // links may still send the first service's traffic to it, and this node
 // cannot observe when they stop. With incomplete history, a port without a
-// recorded holder may have such a past too. Waiting cannot resolve either.
+// recorded holder may have such a past too and cannot be installed by an
+// agent that manages networking. Without setup no rule is installed, but
+// known holders still fence their ports. Waiting cannot resolve either.
 func (r *Reconciler) portHistoryHoldLocked(svc config.ServiceConfig) Hold {
 	for _, pf := range svc.PortForwards {
 		holder, held := r.hostPortHolders[pf.HostPort]
@@ -793,7 +782,7 @@ func (r *Reconciler) portHistoryHoldLocked(svc config.ServiceConfig) Hold {
 		case held && holder != svc.Name:
 			return Hold{Reason: fmt.Sprintf("host port %d was used by service %s on this node, and peers may still send that service's traffic to it; use a fresh host port, or a node without this history", pf.HostPort, holder),
 				Action: ActionHostPortReuseBlocked}
-		case !held && (!r.history.Complete || r.history.PortsUntracked):
+		case !held && r.networkMgr != nil && (!r.history.Complete || r.history.PortsUntracked):
 			return Hold{Reason: fmt.Sprintf("this node's ownership history is incomplete, so host port %d may still be referenced for another service; use a host port this node already gives %s, or a node without earlier history", pf.HostPort, svc.Name),
 				Action: ActionNetworkHistoryIncomplete}
 		}
