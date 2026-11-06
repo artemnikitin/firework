@@ -15,10 +15,7 @@ type recoveryCleanupRecorder interface {
 func (r *Reconciler) installRecoveryCleanupRecorder() {
 	if manager, ok := r.vmManager.(recoveryCleanupRecorder); ok {
 		manager.SetRecoveryCleanupRecorder(func(service config.ServiceConfig) error {
-			if r.networkMgr == nil {
-				return nil // Host networking is explicitly disabled for this agent.
-			}
-			if r.stateDir == "" {
+			if r.networkMgr != nil && r.stateDir == "" {
 				return fmt.Errorf("recovery cleanup requires a durable cleanup journal")
 			}
 			return r.journalIntendedTeardowns(service)

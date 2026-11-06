@@ -2,6 +2,7 @@ package reconciler
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"testing"
@@ -65,6 +66,93 @@ func TestDisabledNetworkingKeepsRecordedAddressFences(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestDisabledNetworkingRecordsRemovalBeforeReadding(t *testing.T) {
+	h := newCrashHost(t)
+	a := crashService("a", "172.16.0.2", 8080)
+	enabled := h.agent()
+	h.converge(enabled, config.NodeConfig{Services: []config.ServiceConfig{a}})
+	disabled := NewWithNetworkManager(h.vms, enabled.logger, nil, nil, "", 0).WithStateDir(h.stateDir)
+	h.converge(disabled, config.NodeConfig{})
+	if len(recordsIn(disabled, phaseDeparting)) == 0 {
+		t.Fatal("the removed VM still has a running allocation")
+	}
+	if _, ok := h.kernel.Delivers(8080); !ok {
+		t.Fatal("disabled networking released the old rules")
+	}
+	// The phase change must survive an agent restart, and the same service
+	// may reclaim precisely its own address and ports while cleanup waits.
+	disabled = NewWithNetworkManager(h.vms, enabled.logger, nil, nil, "", 0).WithStateDir(h.stateDir)
+	h.converge(disabled, config.NodeConfig{Services: []config.ServiceConfig{a}})
+	if h.vms.instances[a.Name] == nil {
+		t.Fatal("re-adding the service remained blocked")
+	}
+}
+
+func TestDisabledNetworkingForgetRecordsExistingTraces(t *testing.T) {
+	h := newCrashHost(t)
+	a := crashService("a", "172.16.0.2", 8080)
+	enabled := h.agent()
+	h.converge(enabled, config.NodeConfig{Services: []config.ServiceConfig{a}})
+	delete(h.vms.instances, a.Name) // Model the disappearance requiring --forget.
+	disabled := NewWithNetworkManager(h.vms, enabled.logger, nil, nil, "", 0).WithStateDir(h.stateDir)
+	if found, err := disabled.HasUnresolvedTraces(a.Name); err != nil || !found {
+		t.Fatalf("the operator command cannot discover the recorded VM: %v %v", found, err)
+	}
+	writer := disabled.journalWrite
+	disabled.WithJournalWriter(func(string, []byte) error { return errors.New("disk unavailable") })
+	if err := disabled.ForgetService(a.Name); err == nil || len(recordsIn(disabled, phaseRunning)) == 0 {
+		t.Fatalf("a failed handoff lost the running record: %v", err)
+	}
+	disabled.WithJournalWriter(writer)
+	if err := disabled.ForgetService(a.Name); err != nil {
+		t.Fatal(err)
+	}
+	if len(recordsIn(disabled, phaseDeparting)) == 0 {
+		t.Fatal("forget did not hand existing records to cleanup")
+	}
+	if _, ok := h.kernel.Delivers(8080); !ok || disabled.hostPortHolders[8080] != a.Name {
+		t.Fatal("forget released rules or host-port history")
+	}
+	h.converge(disabled, config.NodeConfig{Services: []config.ServiceConfig{a}})
+}
+
+func TestDisabledNetworkingRecoveryRecordsExistingRemoval(t *testing.T) {
+	h := newCrashHost(t)
+	a := crashService("a", "172.16.0.2", 8080)
+	enabled := h.agent()
+	h.converge(enabled, config.NodeConfig{Services: []config.ServiceConfig{a}})
+	manager := &teardownVMManager{fakeVMManager: h.vms.fakeVMManager}
+	disabled := NewWithNetworkManager(manager, enabled.logger, nil, nil, "", 0).WithStateDir(h.stateDir)
+	writer := disabled.journalWrite
+	disabled.WithJournalWriter(func(string, []byte) error { return errors.New("disk unavailable") })
+	if err := manager.clearRecovery(a); err == nil || h.vms.instances[a.Name] == nil {
+		t.Fatalf("recovery removed the VM before recording its departure: %v", err)
+	}
+	disabled.WithJournalWriter(writer)
+	if err := manager.clearRecovery(a); err != nil {
+		t.Fatal(err)
+	}
+	if len(recordsIn(disabled, phaseDeparting)) == 0 {
+		t.Fatal("recovery removal left a running allocation")
+	}
+	h.converge(disabled, config.NodeConfig{Services: []config.ServiceConfig{a}})
+}
+
+func TestDisabledNetworkingFailedRestartKeepsRemovalRetryable(t *testing.T) {
+	h := newCrashHost(t)
+	a := crashService("a", "172.16.0.2", 8080)
+	enabled := h.agent()
+	h.converge(enabled, config.NodeConfig{Services: []config.ServiceConfig{a}})
+	disabled := NewWithNetworkManager(h.vms, enabled.logger, nil, nil, "", 0).WithStateDir(h.stateDir)
+	h.vms.startErr = errors.New("volume preparation failed")
+	h.vms.beforeStart = func(name string) { delete(h.vms.instances, name) }
+	if err := disabled.Restart(context.Background(), a); err == nil {
+		t.Fatal("setup: the restart unexpectedly succeeded")
+	}
+	h.vms.startErr, h.vms.beforeStart = nil, nil
+	h.converge(disabled, config.NodeConfig{Services: []config.ServiceConfig{a}})
 }
 
 // C4/L6: turning off setup also keeps the known holder of a host port,

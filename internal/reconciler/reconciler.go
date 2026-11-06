@@ -1339,10 +1339,18 @@ func (r *Reconciler) deleteService(svc config.ServiceConfig) error {
 // atomicWriteFile leaves the previous file untouched when it fails, so
 // rolling back in memory restores agreement between the two.
 func (r *Reconciler) journalIntendedTeardowns(svc config.ServiceConfig) error {
-	if r.networkMgr == nil {
-		return nil
-	}
 	return r.mutateJournal(func() {
+		if r.networkMgr == nil {
+			// Earlier networking-enabled agents may still own these rules.
+			// Record the VM's departure without inventing new cleanup claims
+			// or releasing anything we cannot inspect in this mode.
+			for _, a := range r.sortedAllocationsLocked() {
+				if a.Service == svc.Name && a.live() {
+					r.departLocked(a)
+				}
+			}
+			return
+		}
 		r.markDepartingLocked(svc)
 		r.addPendingNetworkDevices(svc)
 	})

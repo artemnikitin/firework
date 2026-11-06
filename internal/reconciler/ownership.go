@@ -309,7 +309,10 @@ func (r *Reconciler) setAllocationPhase(id uint64, phase allocationPhase) error 
 // journalRestart moves the record of the VM a health restart replaces to
 // creating, adding one if the VM has none.
 func (r *Reconciler) journalRestart(svc config.ServiceConfig) (uint64, error) {
-	if r.networkMgr == nil || guestIPOf(svc) == "" {
+	if r.networkMgr == nil {
+		return 0, r.journalIntendedTeardowns(svc)
+	}
+	if guestIPOf(svc) == "" {
 		return 0, nil
 	}
 	var id uint64
@@ -416,6 +419,9 @@ func (r *Reconciler) teardownDepartingLocked(a allocation, listing network.PortF
 // teardownDeparting tears down the service's departing records now, after its
 // VM was removed.
 func (r *Reconciler) teardownDeparting(service string) error {
+	if r.networkMgr == nil {
+		return nil // Existing records remain fenced until kernel cleanup is possible.
+	}
 	r.cleanupMu.Lock()
 	defer r.cleanupMu.Unlock()
 	var departing []allocation
@@ -795,9 +801,6 @@ func (r *Reconciler) portHistoryHoldLocked(svc config.ServiceConfig) Hold {
 // cleanup for a service without a tracked VM, such as one whose directory
 // was removed by hand.
 func (r *Reconciler) HasUnresolvedTraces(service string) (bool, error) {
-	if r.networkMgr == nil {
-		return false, nil
-	}
 	traces, err := r.unresolvedTraces(service)
 	return len(traces) > 0, err
 }
@@ -806,9 +809,13 @@ func (r *Reconciler) HasUnresolvedTraces(service string) (bool, error) {
 // tracked, and records covering its tagged rules that no record or tracked VM
 // accounts for.
 func (r *Reconciler) unresolvedTraces(service string) ([]allocation, error) {
-	listing, err := r.networkMgr.ListPortForwards()
-	if err != nil {
-		return nil, err
+	var listing network.PortForwardListing
+	if r.networkMgr != nil {
+		var err error
+		listing, err = r.networkMgr.ListPortForwards()
+		if err != nil {
+			return nil, err
+		}
 	}
 	actual := r.vmManager.List()
 	r.cleanupMu.Lock()
@@ -848,9 +855,6 @@ func (r *Reconciler) unresolvedTraces(service string) ([]allocation, error) {
 // gone and, for a route, once Traefik has restarted; host ports keep their
 // holder (L6).
 func (r *Reconciler) ForgetService(service string) error {
-	if r.networkMgr == nil {
-		return nil // Without host networking nothing was installed or recorded.
-	}
 	traces, err := r.unresolvedTraces(service)
 	if err != nil {
 		return err

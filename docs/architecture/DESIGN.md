@@ -448,8 +448,12 @@ Before recovery deletes VM state with trusted metadata, it marks the VM's
 ownership records departing in the reconciler's ownership journal. There is no
 separate recovery outbox. Physical cleanup never deletes a rule a tracked VM
 claims, so resources retained by a live or quarantined VM are preserved. When
-host network setup is disabled, recovery has no network cleanup obligation. A
-journal write failure preserves the VM directory for a later retry.
+host network setup is disabled, normal removal, recovery and `--forget` still
+mark existing records departing before releasing the VM state. They install no
+new cleanup claims and leave rules and devices fenced until networking is
+enabled again. A service may reclaim its own recorded address and unchanged
+ports meanwhile. A journal write failure preserves the VM directory for a
+later retry.
 
 Discovery publishes every persisted VM directory before spending the inspection
 budget. Valid ownership records reserve their old CPU, memory, guest IP/MAC,
