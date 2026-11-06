@@ -53,9 +53,13 @@ func (m *Manager) clearIntent(service string) error {
 	var errs []error
 	for _, path := range []string{m.intentPath(service), m.legacyIntentPath(service)} {
 		// The current path is private bookkeeping for this service. Its
-		// contents never authorize adoption, but a completed operation can
-		// retire it even if damaged. A legacy path shares the VM namespace,
-		// so only a matching regular marker may be unlinked there.
+		// contents never authorize adoption or deletion, but once something
+		// else explains the VM state (a validated trusted manifest or an
+		// operation this manager finished) it is redundant and retired even
+		// if damaged. Deleting VM state while a directory sits at this path
+		// needs --forget (removeProvenRecoveryState). A legacy path shares
+		// the VM namespace, so only a matching regular marker may be unlinked
+		// there.
 		if path == m.legacyIntentPath(service) && !intentFileMatches(path, service) {
 			continue
 		}

@@ -331,7 +331,10 @@ a VM quarantine for the other name. Inventory rechecks listed markers under the
 manager lock, so a completed clear cannot be undone by a stale listing. An
 absence-verified `--forget` also retires malformed private markers, including a
 directory at the marker path, without following its symlinks or deleting a VM
-directory in the legacy namespace.
+directory in the legacy namespace. A malformed marker never authorizes deleting
+VM state. Once a validated trusted ownership manifest or an operation the
+manager itself finished explains the state, the marker is redundant, and
+recovery retires it automatically even if damaged.
 For a real VM directory, `--forget` repairs a malformed private marker after
 the absence proof and cleanup journal write. Automatic recovery and a plain
 `clear-recovery` refuse a directory at the marker path before recording any

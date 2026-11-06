@@ -58,7 +58,7 @@ func TestForgetRepairsDirectoryIntentWithRemainingState(t *testing.T) {
 				t.Fatal(err)
 			}
 			if info, err := os.Lstat(m.intentPath(f.Service)); err != nil || !info.IsDir() {
-				t.Fatalf("automatic recovery repaired metadata without --forget: %v", err)
+				t.Fatalf("automatic recovery retired the marker while deleting VM state without --forget: %v", err)
 			}
 			if result, err := m.ForgetRecoveryPending(f.Service); err != nil || result.Outcome != RecoveryOutcomeCleared {
 				t.Fatalf("forget could not repair its private marker: %+v %v", result, err)
