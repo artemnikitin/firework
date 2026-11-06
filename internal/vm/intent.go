@@ -53,15 +53,29 @@ func (m *Manager) clearIntent(service string) error {
 	var errs []error
 	for _, path := range []string{m.intentPath(service), m.legacyIntentPath(service)} {
 		// The current path is private bookkeeping for this service. Its
-		// contents never authorize recovery, but a completed operation can
+		// contents never authorize adoption, but a completed operation can
 		// retire it even if damaged. A legacy path shares the VM namespace,
 		// so only a matching regular marker may be unlinked there.
 		if path == m.legacyIntentPath(service) && !intentFileMatches(path, service) {
 			continue
 		}
-		// Unlike os.Remove, Unlink never falls back to removing a directory:
-		// a legacy path may now be another service's VM directory.
-		if err := syscall.Unlink(path); err != nil && !os.IsNotExist(err) {
+		if _, err := os.Lstat(path); os.IsNotExist(err) {
+			continue
+		} else if err != nil {
+			errs = append(errs, fmt.Errorf("inspect VM directory intent %s: %w", path, err))
+			continue
+		}
+		var removeErr error
+		if path == m.legacyIntentPath(service) {
+			// Unlink cannot remove another service's runtime directory if a
+			// legacy marker is replaced after it was inspected.
+			removeErr = syscall.Unlink(path)
+		} else {
+			// This is private bookkeeping outside the VM namespace. A
+			// damaged directory there is retired too, without following links.
+			removeErr = os.RemoveAll(path)
+		}
+		if err := removeErr; err != nil && !os.IsNotExist(err) {
 			m.logger.Warn("failed to remove a VM directory operation marker", "service", service, "path", path, "error", err)
 			errs = append(errs, fmt.Errorf("remove VM directory intent %s: %w", path, err))
 			continue
@@ -91,12 +105,20 @@ func (m *Manager) hasIntentEntry(service string) bool {
 }
 
 func intentFileMatches(path, service string) bool {
+	matched, _ := readIntent(path, service)
+	return matched
+}
+
+func readIntent(path, service string) (bool, error) {
 	info, err := os.Lstat(path)
-	if err != nil || !info.Mode().IsRegular() || (info.Size() != int64(len(service)) && info.Size() != int64(len(service)+1)) {
-		return false
+	if err != nil {
+		return false, err
+	}
+	if !info.Mode().IsRegular() || (info.Size() != int64(len(service)) && info.Size() != int64(len(service)+1)) {
+		return false, nil
 	}
 	data, err := os.ReadFile(path)
-	return err == nil && (string(data) == service || string(data) == service+"\n")
+	return err == nil && (string(data) == service || string(data) == service+"\n"), err
 }
 
 // legacyIntentOwner identifies a marker occupying a possible service name in
@@ -104,10 +126,14 @@ func intentFileMatches(path, service string) bool {
 // the marker into an unrelated, permanently quarantined VM entry.
 func (m *Manager) legacyIntentOwner(name string) string {
 	service, ok := strings.CutPrefix(name, intentPrefix)
-	if !ok || ValidateRecoveryServiceName(service) != nil || !intentFileMatches(m.legacyIntentPath(service), service) {
+	if !ok || ValidateRecoveryServiceName(service) != nil {
 		return ""
 	}
-	return service
+	matched, err := readIntent(m.legacyIntentPath(service), service)
+	if matched || err != nil && !os.IsNotExist(err) {
+		return service // Unavailable evidence is a wait, never another VM's state.
+	}
+	return ""
 }
 
 // inventoryIntents fences interrupted operations even if their VM directory
@@ -118,6 +144,13 @@ func (m *Manager) inventoryIntents(legacy []os.DirEntry) error {
 	if err != nil && !os.IsNotExist(err) {
 		return fmt.Errorf("read VM directory intents: %w", err)
 	}
+	m.inventoryIntentEntries(current, legacy)
+	return nil
+}
+
+// A listing is only a candidate snapshot: another resolver may clear an
+// entry before inventory acquires the manager lock.
+func (m *Manager) inventoryIntentEntries(current, legacy []os.DirEntry) {
 	owners := make(map[string]bool)
 	for _, source := range []struct {
 		root    string
@@ -136,6 +169,9 @@ func (m *Manager) inventoryIntents(legacy []os.DirEntry) error {
 		if m.recoveryReservations[service] {
 			continue
 		}
+		if !m.hasIntentEntry(service) {
+			continue // The operation completed since its directory was listed.
+		}
 		if instance := m.instances[service]; instance != nil {
 			if instance.manifest != nil && (instance.State == StateRunning || instance.State == StateStopped || instance.State == StateFailed) {
 				if _, err := readAndVerifyRecoveryManifest(manifestPath(instance.manifest.VMDir), instance.manifest); err == nil {
@@ -147,5 +183,4 @@ func (m *Manager) inventoryIntents(legacy []os.DirEntry) error {
 		vmDir := filepath.Join(m.stateDir, "vms", service)
 		m.instances[service] = m.recoveryInstanceForService(service, canonicalManifest(service, vmDir), "interrupted VM directory operation")
 	}
-	return nil
 }

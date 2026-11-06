@@ -326,6 +326,12 @@ and symlinks never count as markers. Recovery also inventories intents whose
 VM directory was never created or is already gone, proves absence and retires
 them. A service whose name occupies an old marker path waits for that operation
 to finish, then retries without a new revision or `--forget`.
+An unreadable legacy marker keeps that wait eligible for retry; it never creates
+a VM quarantine for the other name. Inventory rechecks listed markers under the
+manager lock, so a completed clear cannot be undone by a stale listing. An
+absence-verified `--forget` also retires malformed private markers, including a
+directory at the marker path, without following its symlinks or deleting a VM
+directory in the legacy namespace.
 
 An agent's own manifest write can finish its rename before reporting an error.
 If its immediate readback also fails, the VM stays quarantined and recovery

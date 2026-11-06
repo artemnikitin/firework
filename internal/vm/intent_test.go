@@ -171,11 +171,25 @@ func TestMalformedLegacyIntentDoesNotAuthorizeCleanup(t *testing.T) {
 }
 
 func TestUntrustedOrphanedIntentNeedsForget(t *testing.T) {
-	for _, kind := range []string{"damaged file", "symlink"} {
+	for _, kind := range []string{"damaged file", "symlink", "directory"} {
 		t.Run(kind, func(t *testing.T) {
 			m, f, _, path := orphanedIntentFixture(t, false)
 			var target string
-			if kind == "symlink" {
+			if kind == "directory" {
+				if err := os.Remove(path); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.Mkdir(path, 0o700); err != nil {
+					t.Fatal(err)
+				}
+				target = filepath.Join(t.TempDir(), "preserved")
+				if err := os.WriteFile(target, []byte("not VM metadata"), 0o600); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.Symlink(target, filepath.Join(path, "preserved-link")); err != nil {
+					t.Fatal(err)
+				}
+			} else if kind == "symlink" {
 				target = filepath.Join(t.TempDir(), "preserved")
 				if err := os.WriteFile(target, []byte(f.Service+"\n"), 0o600); err != nil {
 					t.Fatal(err)
@@ -211,4 +225,56 @@ func TestUntrustedOrphanedIntentNeedsForget(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestClearedIntentIsNotRepublishedFromAStaleListing(t *testing.T) {
+	m, f, _, _ := orphanedIntentFixture(t, false)
+	listed, err := os.ReadDir(m.stateDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Another resolver completes after the inventory's ReadDir, before it
+	// acquires the manager lock. The listing must not recreate its quarantine.
+	if result, err := m.ClearRecoveryPending(f.Service); err != nil || result.Outcome != RecoveryOutcomeCleared {
+		t.Fatalf("setup: %+v %v", result, err)
+	}
+	m.inventoryIntentEntries(listed, nil)
+	if inst := m.List()[f.Service]; inst != nil {
+		t.Fatalf("a stale listing recreated completed ownership: %+v", inst)
+	}
+}
+
+func TestUnreadableLegacyIntentDoesNotInventAnotherVM(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("needs non-root file permissions")
+	}
+	m, f, _, legacy := orphanedIntentFixture(t, true)
+	if err := os.Chmod(legacy, 0); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(legacy, 0o600) })
+	if _, err := m.Recover(context.Background(), config.NodeConfig{}); err != nil {
+		t.Fatal(err)
+	}
+	prefixed := f.Config
+	prefixed.Name = intentPrefix + f.Service
+	if _, _, _, err := m.beginStartContext(context.Background(), prefixed); !errors.Is(err, ErrStartInProgress) || m.List()[prefixed.Name] != nil {
+		t.Fatalf("the unreadable marker became another VM's state: %v %+v", err, m.List()[prefixed.Name])
+	}
+	if err := os.Chmod(legacy, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	for pass := 0; pass < 4; pass++ {
+		if _, err := m.Recover(context.Background(), config.NodeConfig{}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := os.Lstat(legacy); !errors.Is(err, os.ErrNotExist) || m.List()[f.Service] != nil {
+		t.Fatalf("the restored legacy intent did not recover: marker=%v owner=%+v", err, m.List()[f.Service])
+	}
+	id, _, _, err := m.beginStartContext(context.Background(), prefixed)
+	if err != nil {
+		t.Fatalf("the transient read error still blocks a VM that never existed: %v", err)
+	}
+	m.discardStart(prefixed.Name, id)
 }
