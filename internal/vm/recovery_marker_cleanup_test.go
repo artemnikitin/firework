@@ -193,6 +193,51 @@ func TestForgetMarkerCleanupPreservesVMOnPersistenceFailure(t *testing.T) {
 	}
 }
 
+// C1/C3: a crash after --forget retired a directory marker but before its new
+// deletion intent was durable leaves a trusted manifest and no marker. A
+// fresh agent keeps the VM state while a claimant uses its paths, and once
+// none does, recovers it on its own through the cleanup journal, leaving no
+// marker behind. (Coverage gap from the review of a2df89d.)
+func TestCrashBetweenMarkerRepairAndIntentWriteRecovers(t *testing.T) {
+	m, f, _, _ := directoryIntentCleanupFixture(t, "trusted")
+	f.PID, f.Lifecycle = 0, lifecycleFailed
+	if err := writeManifest(manifestPath(f.VMDir), f); err != nil {
+		t.Fatal(err)
+	}
+	// The crash boundary: the malformed marker is gone, no intent written.
+	if err := os.RemoveAll(m.intentPath(f.Service)); err != nil {
+		t.Fatal(err)
+	}
+	inspector := &fakeProcessInspector{identities: map[int]processIdentity{
+		99: {PID: 99, CommandLine: []string{"other", "--config-file", f.ConfigPath}},
+	}}
+	restarted := NewManager(m.firecrackerBin, m.stateDir, m.logger)
+	restarted.inspector = inspector
+	var recorded []config.ServiceConfig
+	restarted.SetRecoveryCleanupRecorder(func(s config.ServiceConfig) error { recorded = append(recorded, s); return nil })
+	if _, err := restarted.Recover(context.Background(), config.NodeConfig{}); err != nil {
+		t.Fatal(err)
+	}
+	if inst := restarted.List()[f.Service]; inst == nil || inst.State != StateRecoveryPending || len(recorded) != 0 {
+		t.Fatalf("a live claimant did not keep the VM held: %+v recorded=%d", inst, len(recorded))
+	}
+	if _, err := os.Stat(manifestPath(f.VMDir)); err != nil {
+		t.Fatalf("the VM state was removed while claimed: %v", err)
+	}
+	delete(inspector.identities, 99)
+	if _, err := restarted.Recover(context.Background(), config.NodeConfig{}); err != nil {
+		t.Fatal(err)
+	}
+	if inst := restarted.List()[f.Service]; inst != nil || len(recorded) != 1 {
+		t.Fatalf("the trusted state did not recover on its own: %+v recorded=%d", inst, len(recorded))
+	}
+	for _, path := range []string{f.VMDir, m.intentPath(f.Service)} {
+		if _, err := os.Lstat(path); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("recovered state remains at %s: %v", path, err)
+		}
+	}
+}
+
 // The symlink may already be unlinked when private marker cleanup fails. That
 // is incomplete, and a retry must finish the remaining work after a new proof.
 func TestForgetSymlinkRetriesPrivateMarkerCleanup(t *testing.T) {
