@@ -326,6 +326,11 @@ func TestStartReclaimsInterruptedPreparationWithoutRecoveryTick(t *testing.T) {
 	if err := os.Remove(manifestPath(f.VMDir)); err != nil {
 		t.Fatal(err)
 	}
+	// Interrupted preparation is explained by the manager's write-ahead
+	// marker; removing a manifest alone is untrusted state under B1.
+	if err := m.markIntent(f.Service); err != nil {
+		t.Fatal(err)
+	}
 	id, _, _, err := m.beginStartContext(context.Background(), f.Config)
 	if err != nil {
 		t.Fatalf("empty preparation required another tick: %v", err)

@@ -778,8 +778,11 @@ func (m *Manager) reclaimUnownedStateContext(ctx context.Context, service, vmDir
 		if _, statErr := os.Lstat(vmDir); errors.Is(statErr, os.ErrNotExist) {
 			return nil
 		}
-		// Interrupted preparation may leave a directory before its first
-		// manifest. Use the same absence proof now instead of wasting a tick.
+		// A directory discovered after recovery's inventory is subject to
+		// the same policy: absence alone cannot explain its missing metadata.
+		if !m.hasIntent(service) {
+			return fmt.Errorf("service %s has VM state without a manifest or recorded operation; check leftover host networking, then run firework-agent clear-recovery --forget %s", service, service)
+		}
 		partial := canonicalManifest(service, vmDir)
 		return m.removeRecoveryStateContext(ctx, partial)
 	}

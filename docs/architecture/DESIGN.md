@@ -316,7 +316,8 @@ across agent restarts. A missing directory the agent removed itself in this
 process, such as a failed start racing an inventory, is cleared the same way.
 Without such evidence, state without a manifest stays quarantined at startup,
 on retry and for a plain `clear-recovery`, even when no process uses its
-paths; only `--forget` clears it.
+paths; only `--forget` clears it. Start applies the same requirement when it
+discovers a directory after the tick's recovery inventory.
 
 Markers live outside `vms`, so every valid service name keeps its own runtime
 directory. Markers from older agents under `vms/.firework-intent-<service>`
