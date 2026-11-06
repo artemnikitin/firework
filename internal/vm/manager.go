@@ -1139,10 +1139,13 @@ func (m *Manager) Remove(name string) error {
 	if err := verifyRecoveryDirectories(vmDir); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return err
 	}
-	m.markRemovedDir(name)
+	// Record the removal durably before claiming it in memory: a failed
+	// intent write must not leave evidence that this manager removed a
+	// directory that something else deletes later.
 	if err := m.markIntent(name); err != nil {
 		return err
 	}
+	m.markRemovedDir(name)
 	if err := os.RemoveAll(vmDir); err != nil {
 		return fmt.Errorf("removing vm dir: %w", err)
 	}

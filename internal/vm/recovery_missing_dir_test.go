@@ -48,6 +48,58 @@ func TestInventoryOfRemovedDirectoryLeavesNoPlaceholder(t *testing.T) {
 
 // A directory removed by hand under a listed entry is not explained by any
 // operation the agent recorded, so its fence stays until --forget.
+// C2/L4: a Remove whose intent write fails has removed nothing, so it leaves
+// no evidence of its own removal. Here the marker path is a directory: the
+// VM directory is then removed by hand, a start fails in volume preparation
+// and drops the tracked VM, and inventory quarantines the service from its
+// marker entry. The missing state stays fenced until --forget.
+// (Candidate #4 from the review of a2df89d.)
+func TestFailedRemoveIntentLeavesNoOwnRemovalEvidence(t *testing.T) {
+	m, f, inspector := recoveryFixture(t)
+	m.inspector = inspector
+	delete(inspector.identities, f.PID)
+	f.PID, f.Lifecycle = 0, lifecycleStopped
+	if err := writeManifest(manifestPath(f.VMDir), f); err != nil {
+		t.Fatal(err)
+	}
+	m.mu.Lock()
+	m.instances[f.Service] = instanceFromManifest(f, StateStopped, "")
+	m.mu.Unlock()
+	if err := os.Mkdir(m.intentPath(f.Service), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.Remove(f.Service); err == nil {
+		t.Fatal("setup: Remove wrote its intent over a directory")
+	}
+	if err := os.RemoveAll(f.VMDir); err != nil {
+		t.Fatal(err)
+	}
+	svc := f.Config
+	svc.Volumes = []config.VolumeConfig{{Name: "data", SizeBytes: 1024}}
+	if err := m.Start(context.Background(), svc); err == nil || m.List()[f.Service] != nil {
+		t.Fatalf("setup: the start did not fail in volume preparation: %v", err)
+	}
+	if err := m.DiscoverRecoveryState(); err != nil {
+		t.Fatal(err)
+	}
+	recorded := 0
+	m.SetRecoveryCleanupRecorder(func(config.ServiceConfig) error { recorded++; return nil })
+	for pass := 0; pass < 2; pass++ {
+		if _, err := m.Recover(context.Background(), config.NodeConfig{}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if inst := m.List()[f.Service]; inst == nil || inst.State != StateRecoveryPending || recorded != 0 {
+		t.Fatalf("unexplained missing state was cleared without --forget: %+v recorded=%d", inst, recorded)
+	}
+	if info, err := os.Lstat(m.intentPath(f.Service)); err != nil || !info.IsDir() {
+		t.Fatalf("automatic recovery retired the marker without --forget: %v", err)
+	}
+	if result, err := m.ForgetRecoveryPending(f.Service); err != nil || result.Outcome != RecoveryOutcomeCleared || recorded != 1 {
+		t.Fatalf("forget: %+v %v recorded=%d", result, err, recorded)
+	}
+}
+
 func TestInventoryOfHandRemovedDirectoryKeepsItsFence(t *testing.T) {
 	m, f, inspector := recoveryFixture(t)
 	m.inspector = inspector
