@@ -167,6 +167,20 @@ func (m *Manager) resolveRecoveryAttempt(ctx context.Context, service string, fo
 	untrusted := instance.RecoveryConfigUnknown
 	m.mu.Unlock()
 	vmDir, manifestPath := m.recoveryManifestPath(service)
+	if forget && recoveryWriteCandidate != nil {
+		// The exact before/after snapshots constrain adoption. Explicit
+		// absence-verified cleanup does not need to choose between them, but
+		// neither possible process owner may be discarded with the record.
+		for _, possible := range []*instanceManifest{&initialManifest, recoveryWriteCandidate} {
+			if err := verifyRecoveryManifestPaths(service, vmDir, possible); err != nil {
+				return recoveryAmbiguous(result, err.Error())
+			}
+			if err := m.proveRecoveryAbsentContext(ctx, recoveryAbsenceProbe(service, vmDir, possible, true)); err != nil {
+				return recoveryAmbiguousCause(result, fmt.Errorf("cannot forget an unresolved manifest write whose possible owner remains unproved: %w", err))
+			}
+		}
+		return m.resolveUntrustedRecovery(ctx, result, instance, &initialManifest, true, true)
+	}
 	if untrusted || verifyRecoveryDirectories(vmDir) != nil {
 		return m.resolveUntrustedRecovery(ctx, result, instance, &initialManifest, untrusted, forget)
 	}

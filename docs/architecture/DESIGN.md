@@ -334,6 +334,11 @@ only a record matching one of those identities lets recovery resume its normal
 ownership and absence checks; an unrelated record stays fenced. After an agent
 restart, startup recovery validates the durable record as usual.
 
+If the record is later missing or corrupt, `--forget` remains available in the
+same agent process. It proves both possible owners absent and uses the normal
+untrusted-state cleanup policy; it never adopts either candidate. Unreadable
+files remain held until they can be inspected safely.
+
 Removing a VM's directory by hand never releases anything either. The agent's
 ownership records outlive the directory: the service is held with
 `vm_state_missing`, and its address and host ports stay fenced. `--forget`

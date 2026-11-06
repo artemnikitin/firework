@@ -161,3 +161,75 @@ func TestRecoveryRestartsAfterUnreadableWriteSnapshot(t *testing.T) {
 		t.Fatalf("the restart did not recover its durable owner: %+v", inst)
 	}
 }
+
+// An unresolved write constrains adoption, not the supported --forget path.
+// If its manifest later disappears or is corrupt, absence-proven forget must
+// work in the same agent process. A live before/after owner still refuses it.
+func TestForgetAfterUncertainWriteAndLostMetadata(t *testing.T) {
+	for _, missing := range []bool{false, true} {
+		for _, live := range []bool{false, true} {
+			t.Run(fmt.Sprintf("missing=%v/live=%v", missing, live), func(t *testing.T) {
+				m, f, inspector := recoveryFixture(t)
+				m.inspector = inspector
+				f.Lifecycle = lifecycleStopping
+				if err := writeManifest(manifestPath(f.VMDir), f); err != nil {
+					t.Fatal(err)
+				}
+				m.addRecoveryPending(f.Service, f, "interrupted stop")
+				restore := unreadableRecoveryWrite(t, m, f, true)
+				if result, err := m.ClearRecoveryPending(f.Service); err == nil || result.Outcome != RecoveryOutcomeIncomplete {
+					t.Fatalf("setup: %+v %v", result, err)
+				}
+				restore()
+				if missing {
+					if err := os.Remove(manifestPath(f.VMDir)); err != nil {
+						t.Fatal(err)
+					}
+				} else if err := os.WriteFile(manifestPath(f.VMDir), []byte("corrupt"), 0o600); err != nil {
+					t.Fatal(err)
+				}
+				if !live {
+					delete(inspector.identities, f.PID)
+				}
+				if result, err := m.ClearRecoveryPending(f.Service); err == nil || result.Outcome != RecoveryOutcomeAmbiguous {
+					t.Fatalf("plain clear trusted lost metadata: %+v %v", result, err)
+				}
+				result, err := m.ForgetRecoveryPending(f.Service)
+				if live {
+					if err == nil || result.Outcome != RecoveryOutcomeAmbiguous {
+						t.Fatalf("forget released a live owner: %+v %v", result, err)
+					}
+					return
+				}
+				if err != nil || result.Outcome != RecoveryOutcomeCleared || m.List()[f.Service] != nil {
+					t.Fatalf("forget requires an agent restart: %+v %v", result, err)
+				}
+				if _, err := os.Stat(f.VMDir); !errors.Is(err, os.ErrNotExist) {
+					t.Fatalf("forgotten state remains: %v", err)
+				}
+			})
+		}
+	}
+}
+
+func TestForgetProvesBothUncertainWriteOwnersAbsent(t *testing.T) {
+	m, f, inspector := recoveryFixture(t)
+	m.inspector = inspector
+	m.addRecoveryPending(f.Service, f, "uncertain identity reconstruction")
+	candidate := cloneInstanceManifest(f)
+	candidate.PID, candidate.ProcessStart = 77, 200
+	m.instances[f.Service].recoveryWriteCandidate = candidate
+	delete(inspector.identities, f.PID)
+	// This known candidate remains a claimant even if a process scan no
+	// longer sees the canonical arguments.
+	inspector.identities[77] = processIdentity{PID: 77, HostBootID: candidate.HostBootID, StartTicks: 200}
+	if err := os.Remove(manifestPath(f.VMDir)); err != nil {
+		t.Fatal(err)
+	}
+	if result, err := m.ForgetRecoveryPending(f.Service); err == nil || result.Outcome != RecoveryOutcomeAmbiguous {
+		t.Fatalf("forget ignored its possible post-write owner: %+v %v", result, err)
+	}
+	if _, err := os.Stat(f.VMDir); err != nil {
+		t.Fatalf("live candidate's state was removed: %v", err)
+	}
+}
