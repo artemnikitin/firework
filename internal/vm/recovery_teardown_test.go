@@ -63,6 +63,50 @@ func TestRecoveryCleanupJournalFailurePreventsRuntimeDeletion(t *testing.T) {
 	}
 }
 
+// C3/C5: --forget of a quarantined VM whose directory was replaced by a
+// symlink hands the trusted configuration it still has in memory to the
+// cleanup journal before the link goes, so its devices are torn down. A
+// journal failure keeps the link and the quarantine until a retry succeeds.
+// (Finding from the review of a2df89d.)
+func TestForgetSymlinkedStateRecordsTrustedTeardown(t *testing.T) {
+	m, manifest := teardownFixture(t)
+	m.inspector = &fakeProcessInspector{}
+	m.addRecoveryPending(manifest.Service, manifest, "dead process")
+	if err := os.RemoveAll(manifest.VMDir); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(t.TempDir(), manifest.VMDir); err != nil {
+		t.Fatal(err)
+	}
+	m.SetRecoveryCleanupRecorder(func(config.ServiceConfig) error { return errors.New("journal unavailable") })
+	if result, err := m.ForgetRecoveryPending(manifest.Service); err == nil || result.Outcome != RecoveryOutcomeIncomplete {
+		t.Fatalf("forget succeeded without a durable cleanup intent: %+v %v", result, err)
+	}
+	if _, err := os.Lstat(manifest.VMDir); err != nil {
+		t.Fatalf("the link was removed before its cleanup was recorded: %v", err)
+	}
+	if got := m.List()[manifest.Service]; got == nil || got.State != StateRecoveryPending {
+		t.Fatalf("a failed journal write lost quarantine: %+v", got)
+	}
+	var recorded []config.ServiceConfig
+	m.SetRecoveryCleanupRecorder(func(service config.ServiceConfig) error {
+		if _, err := os.Lstat(manifest.VMDir); err != nil {
+			return err
+		}
+		recorded = append(recorded, service)
+		return nil
+	})
+	if result, err := m.ForgetRecoveryPending(manifest.Service); err != nil || result.Outcome != RecoveryOutcomeCleared {
+		t.Fatalf("forget did not retry: %+v %v", result, err)
+	}
+	if len(recorded) != 1 || !reflect.DeepEqual(recorded[0], manifest.Config) {
+		t.Fatalf("the journal did not receive the trusted configuration with its devices: %+v", recorded)
+	}
+	if _, err := os.Lstat(manifest.VMDir); !os.IsNotExist(err) {
+		t.Fatalf("the link remains: %v", err)
+	}
+}
+
 func TestRecoveryCleanupSupportsConfiguredStateRootSymlink(t *testing.T) {
 	m, manifest := teardownFixture(t)
 	physicalRoot := m.stateDir

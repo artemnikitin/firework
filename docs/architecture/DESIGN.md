@@ -334,8 +334,10 @@ directory at the marker path, without following its symlinks or deleting a VM
 directory in the legacy namespace.
 For a real VM directory, `--forget` repairs a malformed private marker after
 the absence proof and cleanup journal write. It then durably records a fresh
-deletion intent before removing VM files. A symlinked VM path is unlinked and
-its marker retired before the command reports completion. Cleanup failures
+deletion intent before removing VM files. A symlinked VM path is unlinked only
+after the cleanup journal records the configuration the agent still trusts in
+memory, so the devices it names are torn down, and its marker is retired
+before the command reports completion. Cleanup failures
 remain incomplete and retryable; live or unproved owners keep both entries.
 
 An agent's own manifest write can finish its rename before reporting an error.

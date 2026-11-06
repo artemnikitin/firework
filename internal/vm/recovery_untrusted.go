@@ -170,8 +170,14 @@ func (m *Manager) resolveUntrustedRecovery(ctx context.Context, result RecoveryR
 			removeErr = m.clearIntent(service)
 		}
 	case "symlink":
-		// Remove the link itself; never follow it into another directory.
-		if removeErr = ctx.Err(); removeErr == nil {
+		// Record what the VM was given before its state goes: a trusted
+		// in-memory record still names its devices. Then remove the link
+		// itself; never follow it into another directory.
+		removeErr = m.persistRecoveryTeardown(probe)
+		if removeErr == nil {
+			removeErr = ctx.Err()
+		}
+		if removeErr == nil {
 			removeErr = os.Remove(vmDir)
 		}
 		if removeErr == nil {
