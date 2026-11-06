@@ -98,7 +98,10 @@ func recoveryAbsenceProbe(service, vmDir string, recorded *instanceManifest, unt
 // is gone is no exception, unless this manager removed it itself, as a failed
 // start, a removal or a clear racing an inventory does: only then does an
 // operation the agent recorded explain its disappearance.
-func (m *Manager) resolveUntrustedRecovery(ctx context.Context, result RecoveryResult, instance *Instance, recorded *instanceManifest, untrusted, forget bool) (RecoveryResult, error) {
+//
+// trusted lists in-memory snapshots the cleanup journal records when the
+// probe is canonical; see persistRecoveryTeardowns.
+func (m *Manager) resolveUntrustedRecovery(ctx context.Context, result RecoveryResult, instance *Instance, recorded *instanceManifest, untrusted, forget bool, trusted []*instanceManifest) (RecoveryResult, error) {
 	service := result.Service
 	vmDir, path := m.recoveryManifestPath(service)
 	before, err := snapshotRecoveryEntry(vmDir)
@@ -165,7 +168,7 @@ func (m *Manager) resolveUntrustedRecovery(ctx context.Context, result RecoveryR
 	var removeErr error
 	switch before.kind {
 	case "missing":
-		removeErr = m.persistRecoveryTeardown(probe)
+		removeErr = m.persistRecoveryTeardowns(probe, trusted)
 		if removeErr == nil {
 			removeErr = m.clearIntent(service)
 		}
@@ -173,7 +176,7 @@ func (m *Manager) resolveUntrustedRecovery(ctx context.Context, result RecoveryR
 		// Record what the VM was given before its state goes: a trusted
 		// in-memory record still names its devices. Then remove the link
 		// itself; never follow it into another directory.
-		removeErr = m.persistRecoveryTeardown(probe)
+		removeErr = m.persistRecoveryTeardowns(probe, trusted)
 		if removeErr == nil {
 			removeErr = ctx.Err()
 		}
@@ -184,7 +187,7 @@ func (m *Manager) resolveUntrustedRecovery(ctx context.Context, result RecoveryR
 			removeErr = m.clearIntent(service)
 		}
 	default:
-		removeErr = m.removeProvenRecoveryState(ctx, probe, forget)
+		removeErr = m.removeProvenRecoveryState(ctx, probe, forget, trusted)
 	}
 	if removeErr != nil {
 		m.mu.Lock()

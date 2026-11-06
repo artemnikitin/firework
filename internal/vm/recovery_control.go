@@ -179,10 +179,18 @@ func (m *Manager) resolveRecoveryAttempt(ctx context.Context, service string, fo
 				return recoveryAmbiguousCause(result, fmt.Errorf("cannot forget an unresolved manifest write whose possible owner remains unproved: %w", err))
 			}
 		}
-		return m.resolveUntrustedRecovery(ctx, result, instance, &initialManifest, true, true)
+		// Neither snapshot authorizes adoption, so the canonical probe proves
+		// absence. Both were built by this manager in memory, so unless its
+		// configuration was already unknown they still say what the VM was
+		// given, whatever the disk now holds.
+		var trusted []*instanceManifest
+		if !untrusted {
+			trusted = []*instanceManifest{&initialManifest, recoveryWriteCandidate}
+		}
+		return m.resolveUntrustedRecovery(ctx, result, instance, &initialManifest, true, true, trusted)
 	}
 	if untrusted || verifyRecoveryDirectories(vmDir) != nil {
-		return m.resolveUntrustedRecovery(ctx, result, instance, &initialManifest, untrusted, forget)
+		return m.resolveUntrustedRecovery(ctx, result, instance, &initialManifest, untrusted, forget, nil)
 	}
 	if err := verifyRecoveryManifestPaths(service, vmDir, &manifest); err != nil {
 		return recoveryAmbiguous(result, err.Error())
@@ -264,7 +272,7 @@ func (m *Manager) resolveRecoveryAttempt(ctx context.Context, service string, fo
 		// also prevents its Wait monitor from recreating files during deletion.
 		delete(m.instances, service)
 		m.mu.Unlock()
-		if err := m.removeProvenRecoveryState(ctx, &manifest, forget); err != nil {
+		if err := m.removeProvenRecoveryState(ctx, &manifest, forget, nil); err != nil {
 			m.mu.Lock()
 			m.instances[service] = instance
 			m.mu.Unlock()

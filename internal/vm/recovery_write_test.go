@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"slices"
 	"testing"
 
 	"github.com/artemnikitin/firework/internal/config"
@@ -212,6 +213,74 @@ func TestForgetAfterUncertainWriteAndLostMetadata(t *testing.T) {
 	}
 }
 
+// C3 (L4 boundary): --forget after an uncertain write keeps the canonical
+// absence proof, but the cleanup journal still receives the configuration the
+// agent trusts in memory, before and as attempted by the write, so the VM's
+// devices are torn down. Disk contents never contribute. A journal failure
+// keeps the VM state and the quarantine until a retry records it.
+// (Finding #1 from the review of 9167319.)
+func TestForgetAfterUncertainWriteRecordsTrustedTeardown(t *testing.T) {
+	for _, missing := range []bool{false, true} {
+		t.Run(fmt.Sprintf("missing=%v", missing), func(t *testing.T) {
+			m, f, inspector := recoveryFixture(t)
+			m.inspector = inspector
+			f.Lifecycle = lifecycleStopping
+			f.Config.Network = &config.NetworkConfig{Interface: "tap-old", HostDevName: "eth0", GuestIP: "172.16.0.2"}
+			hash, err := serviceConfigHash(f.Config)
+			if err != nil {
+				t.Fatal(err)
+			}
+			f.ConfigHash = hash
+			if err := writeManifest(manifestPath(f.VMDir), f); err != nil {
+				t.Fatal(err)
+			}
+			m.addRecoveryPending(f.Service, f, "interrupted stop")
+			restore := unreadableRecoveryWrite(t, m, f, true)
+			if result, err := m.ClearRecoveryPending(f.Service); err == nil || result.Outcome != RecoveryOutcomeIncomplete {
+				t.Fatalf("setup: %+v %v", result, err)
+			}
+			restore()
+			if missing {
+				if err := os.Remove(manifestPath(f.VMDir)); err != nil {
+					t.Fatal(err)
+				}
+			} else if err := os.WriteFile(manifestPath(f.VMDir), []byte(`{"service":"app","config":{"name":"app","network":{"interface":"tap-forged"}}}`), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			delete(inspector.identities, f.PID)
+			m.SetRecoveryCleanupRecorder(func(config.ServiceConfig) error { return errors.New("journal unavailable") })
+			if result, err := m.ForgetRecoveryPending(f.Service); err == nil || result.Outcome != RecoveryOutcomeIncomplete {
+				t.Fatalf("forget succeeded without a durable cleanup intent: %+v %v", result, err)
+			}
+			if _, err := os.Stat(f.VMDir); err != nil {
+				t.Fatalf("the VM state was removed before its cleanup was recorded: %v", err)
+			}
+			if inst := m.List()[f.Service]; inst == nil || inst.State != StateRecoveryPending {
+				t.Fatalf("a failed journal write lost quarantine: %+v", inst)
+			}
+			var devices []string
+			m.SetRecoveryCleanupRecorder(func(service config.ServiceConfig) error {
+				if _, err := os.Stat(f.VMDir); err != nil {
+					return err
+				}
+				if service.Network != nil {
+					devices = append(devices, service.Network.Interface)
+				}
+				return nil
+			})
+			if result, err := m.ForgetRecoveryPending(f.Service); err != nil || result.Outcome != RecoveryOutcomeCleared {
+				t.Fatalf("forget did not retry: %+v %v", result, err)
+			}
+			if len(devices) == 0 || slices.Contains(devices, "tap-forged") || slices.ContainsFunc(devices, func(d string) bool { return d != "tap-old" }) {
+				t.Fatalf("the journal did not receive only the trusted devices: %v", devices)
+			}
+			if _, err := os.Stat(f.VMDir); !errors.Is(err, os.ErrNotExist) {
+				t.Fatalf("forgotten state remains: %v", err)
+			}
+		})
+	}
+}
+
 func TestForgetProvesBothUncertainWriteOwnersAbsent(t *testing.T) {
 	m, f, inspector := recoveryFixture(t)
 	m.inspector = inspector
@@ -226,8 +295,10 @@ func TestForgetProvesBothUncertainWriteOwnersAbsent(t *testing.T) {
 	if err := os.Remove(manifestPath(f.VMDir)); err != nil {
 		t.Fatal(err)
 	}
-	if result, err := m.ForgetRecoveryPending(f.Service); err == nil || result.Outcome != RecoveryOutcomeAmbiguous {
-		t.Fatalf("forget ignored its possible post-write owner: %+v %v", result, err)
+	recorded := 0
+	m.SetRecoveryCleanupRecorder(func(config.ServiceConfig) error { recorded++; return nil })
+	if result, err := m.ForgetRecoveryPending(f.Service); err == nil || result.Outcome != RecoveryOutcomeAmbiguous || recorded != 0 {
+		t.Fatalf("forget ignored its possible post-write owner: %+v %v, cleanup recorded %d times", result, err, recorded)
 	}
 	if _, err := os.Stat(f.VMDir); err != nil {
 		t.Fatalf("live candidate's state was removed: %v", err)

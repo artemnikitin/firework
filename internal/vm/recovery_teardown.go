@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"reflect"
+	"slices"
 	"strings"
 	"time"
 
@@ -32,6 +34,28 @@ func (m *Manager) persistRecoveryTeardown(manifest *instanceManifest) error {
 		return nil // Standalone VM managers delegate host networking to callers.
 	}
 	return record(manifest.Config)
+}
+
+// persistRecoveryTeardowns records cleanup for state cleared through an
+// absence probe. An untrusted probe carries only the canonical paths and the
+// service name, so the in-memory snapshots the manager still trusts, never
+// disk contents, contribute what the VM was given. Without any, the probe
+// itself is recorded, which departs the service's recorded allocations.
+func (m *Manager) persistRecoveryTeardowns(probe *instanceManifest, trusted []*instanceManifest) error {
+	if len(trusted) == 0 {
+		return m.persistRecoveryTeardown(probe)
+	}
+	for i, snapshot := range trusted {
+		if slices.ContainsFunc(trusted[:i], func(earlier *instanceManifest) bool {
+			return reflect.DeepEqual(earlier.Config, snapshot.Config)
+		}) {
+			continue
+		}
+		if err := m.persistRecoveryTeardown(snapshot); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // ProveServiceAbsent proves that no live process and no active or queued

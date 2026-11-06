@@ -354,7 +354,10 @@ restart, startup recovery validates the durable record as usual.
 
 If the record is later missing or corrupt, `--forget` remains available in the
 same agent process. It proves both possible owners absent and uses the normal
-untrusted-state cleanup policy; it never adopts either candidate. Unreadable
+untrusted-state cleanup policy; it never adopts either candidate. The cleanup
+journal still records the before and attempted records the agent holds in
+memory, so the devices they name are torn down; the disk contents never
+contribute. Unreadable
 files remain held until they can be inspected safely.
 
 Removing a VM's directory by hand never releases anything either. The agent's

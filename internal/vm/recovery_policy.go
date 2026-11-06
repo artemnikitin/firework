@@ -153,7 +153,7 @@ func (m *Manager) removeRecoveryStateContext(ctx context.Context, f *instanceMan
 	if err := m.proveRecoveryAbsentContext(ctx, f); err != nil {
 		return err
 	}
-	return m.removeProvenRecoveryState(ctx, f, false)
+	return m.removeProvenRecoveryState(ctx, f, false, nil)
 }
 
 // errDirectoryIntent refuses a removal that only --forget may perform. It is
@@ -161,7 +161,9 @@ func (m *Manager) removeRecoveryStateContext(ctx context.Context, f *instanceMan
 // needing an operator rather than as an incomplete cleanup.
 var errDirectoryIntent = errors.New("private VM directory intent is a directory")
 
-func (m *Manager) removeProvenRecoveryState(ctx context.Context, f *instanceManifest, forget bool) error {
+// trusted lists in-memory snapshots whose configurations the cleanup journal
+// records instead of f's, as persistRecoveryTeardowns describes.
+func (m *Manager) removeProvenRecoveryState(ctx context.Context, f *instanceManifest, forget bool, trusted []*instanceManifest) error {
 	if err := verifyRecoveryManifestPaths(f.Service, filepath.Join(m.stateDir, "vms", f.Service), f); err != nil {
 		return err
 	}
@@ -183,7 +185,7 @@ func (m *Manager) removeProvenRecoveryState(ctx context.Context, f *instanceMani
 	if directoryIntent && !forget {
 		return fmt.Errorf("%w; run firework-agent clear-recovery --forget %s", errDirectoryIntent, f.Service)
 	}
-	if err := m.persistRecoveryTeardown(f); err != nil {
+	if err := m.persistRecoveryTeardowns(f, trusted); err != nil {
 		return fmt.Errorf("persist recovery cleanup intent: %w", err)
 	}
 	if err := ctx.Err(); err != nil {
