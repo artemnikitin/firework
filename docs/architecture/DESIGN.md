@@ -333,7 +333,9 @@ absence-verified `--forget` also retires malformed private markers, including a
 directory at the marker path, without following its symlinks or deleting a VM
 directory in the legacy namespace.
 For a real VM directory, `--forget` repairs a malformed private marker after
-the absence proof and cleanup journal write. It then durably records a fresh
+the absence proof and cleanup journal write. Automatic recovery and a plain
+`clear-recovery` refuse a directory at the marker path before recording any
+cleanup, and report that `--forget` is needed. `--forget` then durably records a fresh
 deletion intent before removing VM files. A symlinked VM path is unlinked only
 after the cleanup journal records the configuration the agent still trusts in
 memory, so the devices it names are torn down, and its marker is retired

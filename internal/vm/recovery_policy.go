@@ -156,6 +156,11 @@ func (m *Manager) removeRecoveryStateContext(ctx context.Context, f *instanceMan
 	return m.removeProvenRecoveryState(ctx, f, false)
 }
 
+// errDirectoryIntent refuses a removal that only --forget may perform. It is
+// returned before anything is recorded or removed, so callers report it as
+// needing an operator rather than as an incomplete cleanup.
+var errDirectoryIntent = errors.New("private VM directory intent is a directory")
+
 func (m *Manager) removeProvenRecoveryState(ctx context.Context, f *instanceManifest, forget bool) error {
 	if err := verifyRecoveryManifestPaths(f.Service, filepath.Join(m.stateDir, "vms", f.Service), f); err != nil {
 		return err
@@ -166,25 +171,30 @@ func (m *Manager) removeProvenRecoveryState(ctx context.Context, f *instanceMani
 	if err := ctx.Err(); err != nil {
 		return err
 	}
+	// Only explicit, absence-proven forget may repair malformed private
+	// bookkeeping before deleting VM state. Any other path refuses before
+	// it records a teardown, so a refusal changes nothing.
+	path := m.intentPath(f.Service)
+	info, err := os.Lstat(path)
+	directoryIntent := err == nil && info.IsDir()
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("inspect private VM directory intent: %w", err)
+	}
+	if directoryIntent && !forget {
+		return fmt.Errorf("%w; run firework-agent clear-recovery --forget %s", errDirectoryIntent, f.Service)
+	}
 	if err := m.persistRecoveryTeardown(f); err != nil {
 		return fmt.Errorf("persist recovery cleanup intent: %w", err)
 	}
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	// Only explicit, absence-proven forget may repair malformed private
-	// bookkeeping. Retire it before writing our new deletion intent, while
-	// leaving every VM file intact until that intent is durable.
-	path := m.intentPath(f.Service)
-	if info, err := os.Lstat(path); err == nil && info.IsDir() {
-		if !forget {
-			return fmt.Errorf("private VM directory intent is a directory; run firework-agent clear-recovery --forget %s", f.Service)
-		}
+	// Retire the malformed marker before writing our new deletion intent,
+	// while leaving every VM file intact until that intent is durable.
+	if directoryIntent {
 		if err := os.RemoveAll(path); err != nil {
 			return fmt.Errorf("repair private VM directory intent: %w", err)
 		}
-	} else if err != nil && !errors.Is(err, os.ErrNotExist) {
-		return fmt.Errorf("inspect private VM directory intent: %w", err)
 	}
 	if err := m.markIntent(f.Service); err != nil {
 		return err

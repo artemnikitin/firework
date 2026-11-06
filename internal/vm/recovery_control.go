@@ -268,6 +268,9 @@ func (m *Manager) resolveRecoveryAttempt(ctx context.Context, service string, fo
 			m.mu.Lock()
 			m.instances[service] = instance
 			m.mu.Unlock()
+			if errors.Is(err, errDirectoryIntent) {
+				return recoveryAmbiguousCause(result, err)
+			}
 			return recoveryIncomplete(result, fmt.Errorf("remove stale VM state for %s: %w", service, err))
 		}
 		result.Outcome = RecoveryOutcomeCleared

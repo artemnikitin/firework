@@ -6,6 +6,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/artemnikitin/firework/internal/config"
@@ -87,6 +88,33 @@ func TestForgetRepairsDirectoryIntentWithRemainingState(t *testing.T) {
 				t.Fatalf("an agent restart recreated the quarantine: %+v %v", restarted.List()[f.Service], err)
 			}
 		})
+	}
+}
+
+// C3: automatic recovery and a plain clear refuse a directory at the private
+// marker path before recording any cleanup, and report that only --forget
+// resolves it. --forget then records the teardown once and clears the VM.
+// (Finding from the review of a2df89d.)
+func TestPlainRecoveryRefusesDirectoryIntentBeforeJournaling(t *testing.T) {
+	m, f, inspector, _ := directoryIntentCleanupFixture(t, "trusted")
+	delete(inspector.identities, f.PID)
+	calls := 0
+	m.SetRecoveryCleanupRecorder(func(config.ServiceConfig) error { calls++; return nil })
+	if _, err := m.Recover(context.Background(), config.NodeConfig{}); err != nil {
+		t.Fatal(err)
+	}
+	result, err := m.ClearRecoveryPending(f.Service)
+	if err == nil || result.Outcome != RecoveryOutcomeAmbiguous || !strings.Contains(result.Message, "--forget "+f.Service) {
+		t.Fatalf("a plain clear did not refuse as needing --forget: %+v %v", result, err)
+	}
+	if calls != 0 {
+		t.Fatalf("a refused recovery recorded its cleanup %d times", calls)
+	}
+	if inst := m.List()[f.Service]; inst == nil || inst.State != StateRecoveryPending {
+		t.Fatalf("the refusal lost quarantine: %+v", inst)
+	}
+	if result, err := m.ForgetRecoveryPending(f.Service); err != nil || result.Outcome != RecoveryOutcomeCleared || calls != 1 {
+		t.Fatalf("forget: %+v %v, cleanup recorded %d times", result, err, calls)
 	}
 }
 
