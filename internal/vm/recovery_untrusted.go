@@ -174,8 +174,11 @@ func (m *Manager) resolveUntrustedRecovery(ctx context.Context, result RecoveryR
 		if removeErr = ctx.Err(); removeErr == nil {
 			removeErr = os.Remove(vmDir)
 		}
+		if removeErr == nil {
+			removeErr = m.clearIntent(service)
+		}
 	default:
-		removeErr = m.removeProvenRecoveryState(ctx, probe)
+		removeErr = m.removeProvenRecoveryState(ctx, probe, forget)
 	}
 	if removeErr != nil {
 		m.mu.Lock()

@@ -264,7 +264,7 @@ func (m *Manager) resolveRecoveryAttempt(ctx context.Context, service string, fo
 		// also prevents its Wait monitor from recreating files during deletion.
 		delete(m.instances, service)
 		m.mu.Unlock()
-		if err := m.removeProvenRecoveryState(ctx, &manifest); err != nil {
+		if err := m.removeProvenRecoveryState(ctx, &manifest, forget); err != nil {
 			m.mu.Lock()
 			m.instances[service] = instance
 			m.mu.Unlock()

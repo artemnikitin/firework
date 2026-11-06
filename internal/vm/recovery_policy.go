@@ -153,10 +153,10 @@ func (m *Manager) removeRecoveryStateContext(ctx context.Context, f *instanceMan
 	if err := m.proveRecoveryAbsentContext(ctx, f); err != nil {
 		return err
 	}
-	return m.removeProvenRecoveryState(ctx, f)
+	return m.removeProvenRecoveryState(ctx, f, false)
 }
 
-func (m *Manager) removeProvenRecoveryState(ctx context.Context, f *instanceManifest) error {
+func (m *Manager) removeProvenRecoveryState(ctx context.Context, f *instanceManifest, forget bool) error {
 	if err := verifyRecoveryManifestPaths(f.Service, filepath.Join(m.stateDir, "vms", f.Service), f); err != nil {
 		return err
 	}
@@ -172,10 +172,24 @@ func (m *Manager) removeProvenRecoveryState(ctx context.Context, f *instanceMani
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	m.markRemovedDir(f.Service)
+	// Only explicit, absence-proven forget may repair malformed private
+	// bookkeeping. Retire it before writing our new deletion intent, while
+	// leaving every VM file intact until that intent is durable.
+	path := m.intentPath(f.Service)
+	if info, err := os.Lstat(path); err == nil && info.IsDir() {
+		if !forget {
+			return fmt.Errorf("private VM directory intent is a directory; run firework-agent clear-recovery --forget %s", f.Service)
+		}
+		if err := os.RemoveAll(path); err != nil {
+			return fmt.Errorf("repair private VM directory intent: %w", err)
+		}
+	} else if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("inspect private VM directory intent: %w", err)
+	}
 	if err := m.markIntent(f.Service); err != nil {
 		return err
 	}
+	m.markRemovedDir(f.Service)
 	if err := os.RemoveAll(f.VMDir); err != nil {
 		return err
 	}
