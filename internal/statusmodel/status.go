@@ -71,7 +71,10 @@ var (
 	// at the requested quota — but it must not read as ordinary convergence,
 	// or the operator sees a service quietly running at the wrong size with no
 	// explanation.
-	nonBlockingConditionTypes = []string{"PeerRoutesReady", "VolumeSizesApplied"}
+	// VMRecoveryReady describes the full runtime inventory, including removed
+	// services and survivors omitted from the bounded services list. Recovery
+	// uncertainty must stay visible without blocking independent workloads.
+	nonBlockingConditionTypes = []string{"PeerRoutesReady", "VolumeSizesApplied", "VMRecoveryReady"}
 )
 
 // Closed vocabularies for enum-shaped status fields. The registry rejects a

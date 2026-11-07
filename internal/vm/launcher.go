@@ -167,15 +167,3 @@ func startingLauncherMetadata(launcher processLauncher, instanceID string) (stri
 	}
 	return "direct", ""
 }
-
-func systemdMainPID(systemctl, unit string) (int, error) {
-	output, err := exec.Command(systemctl, "show", "--property=MainPID", "--value", unit).Output()
-	if err != nil {
-		return 0, err
-	}
-	pid, err := strconv.Atoi(strings.TrimSpace(string(output)))
-	if err != nil || pid <= 0 {
-		return 0, fmt.Errorf("unit %s has no main PID", unit)
-	}
-	return pid, nil
-}

@@ -267,8 +267,8 @@ func TestStartAbandonsALaunchWhoseIdentityIsNeverProvable(t *testing.T) {
 
 			manifest, manifestErr := readManifest(manifestPath(filepath.Join(dir, "vms", "app")))
 			if !testCase.wantRetained {
-				if !errors.Is(manifestErr, os.ErrNotExist) {
-					t.Fatalf("state of a killed launch was not removed: %v", manifestErr)
+				if manifestErr != nil || manifest.Lifecycle != lifecycleFailed || manifest.PID != 0 {
+					t.Fatalf("killed launch must remain reclaimable for unlocked proof: %#v %v", manifest, manifestErr)
 				}
 				return
 			}
@@ -417,4 +417,8 @@ func TestPreflightRetainsVisibleVolumeError(t *testing.T) {
 	if got := manager.VolumeError("app"); !strings.Contains(got, "storage is not configured") {
 		t.Fatalf("unexpected retained volume error %q", got)
 	}
+}
+
+func (i *execRacingInspector) FindByAnyArgument(a, b string) ([]processIdentity, error) {
+	return i.FindByArguments(a, b)
 }

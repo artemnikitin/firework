@@ -880,7 +880,7 @@ func (s visibilitySnapshot) nodeRevisionStatus() operatorapi.RevisionStatus {
 			continue
 		}
 		agentStatus, fresh := s.freshStatus(record)
-		if !fresh || agentStatus.ServicesTruncated {
+		if !fresh || (agentStatus.ServicesTruncated && !truncatedRecoverySurvivors(agentStatus, expectedServices[nodeID])) {
 			status.UnknownNodes = append(status.UnknownNodes, nodeID)
 			continue
 		}
@@ -992,13 +992,30 @@ func reportsAllServices(status statusmodel.AgentStatus, expected []string) bool 
 	return true
 }
 
+// truncatedRecoverySurvivors permits a degraded result when all desired
+// services are present and the agent explicitly reports recovery uncertainty
+// across its full runtime inventory. Omitted survivor details cannot hide that
+// degradation. Any missing desired service or unexplained truncation still
+// leaves the node unknown.
+func truncatedRecoverySurvivors(status statusmodel.AgentStatus, expected []string) bool {
+	if status.DesiredServices != len(expected) || !reportsAllServices(status, expected) {
+		return false
+	}
+	for _, condition := range status.Conditions {
+		if condition.Type == "VMRecoveryReady" && condition.Status == statusmodel.ConditionFalse {
+			return true
+		}
+	}
+	return false
+}
+
 // degradedFleetReason names the fleet-level cause of a degraded phase. The
 // precedence is fixed rather than derived from map order so the reported reason
-// is stable, and a volume running at the wrong size outranks peer-route
-// telemetry because it describes the workload rather than the observability of
-// it.
+// is stable. Unresolved VMs and refused volume sizes outrank peer-route
+// telemetry because they describe workloads rather than their observability.
 func degradedFleetReason(types map[string]struct{}) string {
 	for _, candidate := range []struct{ conditionType, reason string }{
+		{"VMRecoveryReady", "vm_recovery_pending"},
 		{"VolumeSizesApplied", "volume_size_rejected"},
 		{"PeerRoutesReady", "peer_routes_degraded"},
 	} {

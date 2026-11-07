@@ -15,6 +15,8 @@ import (
 	"github.com/artemnikitin/firework/internal/agentconfig"
 	"github.com/artemnikitin/firework/internal/capacity"
 	"github.com/artemnikitin/firework/internal/config"
+	"github.com/artemnikitin/firework/internal/network"
+	"github.com/artemnikitin/firework/internal/network/networktest"
 	"github.com/artemnikitin/firework/internal/reconciler"
 	"github.com/artemnikitin/firework/internal/statusmodel"
 	"github.com/artemnikitin/firework/internal/vm"
@@ -237,6 +239,12 @@ services:
 	a := New(cfg, s, testLogger())
 	rs := &fakeRouteSyncer{}
 	a.traefikMgr = rs
+	local, err := config.ParseNodeConfig(s.data["web"])
+	if err != nil {
+		t.Fatal(err)
+	}
+	a.assignNetworking(local.Services)
+	a.reconciler = reconciler.New(&runningVMManager{names: []string{"local"}, configs: map[string]config.ServiceConfig{"local": local.Services[0]}}, testLogger(), nil, nil, "", 0)
 	a.lastRevision = "rev-1"
 
 	a.tick(context.Background())
@@ -470,7 +478,10 @@ func TestAssignNetworking_StopsWhenSubnetExhausted(t *testing.T) {
 		{Name: "second", Network: &config.NetworkConfig{Interface: "tap-second"}},
 	}
 
-	a.assignNetworking(services)
+	held := a.assignNetworking(services)
+	if len(held) != 1 || !strings.HasPrefix(held["second"].Reason, addressExhaustedReason) {
+		t.Fatalf("expected only the second service to be held, got %v", held)
+	}
 
 	if got := services[0].Network.GuestIP; got != "172.16.0.2" {
 		t.Fatalf("expected first guest IP 172.16.0.2, got %s", got)
@@ -921,12 +932,15 @@ func TestTick_DistinctHostPortsReconcileNormally(t *testing.T) {
 // runningVMManager reports a service as already running, which is what steady
 // state looks like: port forwards are only asserted for services that have a
 // guest to forward to.
-type runningVMManager struct{ names []string }
+type runningVMManager struct {
+	names   []string
+	configs map[string]config.ServiceConfig
+}
 
 func (r *runningVMManager) List() map[string]*vm.Instance {
 	out := make(map[string]*vm.Instance, len(r.names))
 	for _, name := range r.names {
-		out[name] = &vm.Instance{Name: name, State: vm.StateRunning}
+		out[name] = &vm.Instance{Name: name, State: vm.StateRunning, Config: r.configs[name]}
 	}
 	return out
 }
@@ -938,19 +952,28 @@ func (r *runningVMManager) Remove(string) error                               { 
 type fakeNetwork struct {
 	setupForwardCalls []int
 	setupForwardErr   error
+	kernel            networktest.Kernel
 }
 
 func (f *fakeNetwork) Setup(config.ServiceConfig) error    { return nil }
 func (f *fakeNetwork) Teardown(config.ServiceConfig) error { return nil }
 func (f *fakeNetwork) DeleteTAP(string) error              { return nil }
 func (f *fakeNetwork) DeleteBridge(string) error           { return nil }
-func (f *fakeNetwork) TeardownPortForward(int, string, int) error {
-	return nil
+
+func (f *fakeNetwork) SetupPortForward(service string, hostPort int, guestIP string, vmPort int) error {
+	f.setupForwardCalls = append(f.setupForwardCalls, hostPort)
+	if f.setupForwardErr != nil {
+		return f.setupForwardErr
+	}
+	return f.kernel.SetupPortForward(service, hostPort, guestIP, vmPort)
 }
 
-func (f *fakeNetwork) SetupPortForward(hostPort int, _ string, _ int) error {
-	f.setupForwardCalls = append(f.setupForwardCalls, hostPort)
-	return f.setupForwardErr
+func (f *fakeNetwork) ListPortForwards() (network.PortForwardListing, error) {
+	return f.kernel.ListPortForwards()
+}
+
+func (f *fakeNetwork) DeletePortForwardRule(rule network.PortForwardRule) error {
+	return f.kernel.DeletePortForwardRule(rule)
 }
 
 // The regression: port-forward convergence lived only inside Reconcile, and the
@@ -975,7 +998,7 @@ services:
 	cfg.VMGateway = "172.16.0.1"
 	a := New(cfg, s, testLogger())
 	net := &fakeNetwork{}
-	a.reconciler = reconciler.NewWithNetworkManager(&runningVMManager{names: []string{"local"}}, testLogger(), nil, net, "", 0)
+	a.reconciler = reconciler.NewWithNetworkManager(&runningVMManager{names: []string{"local"}, configs: map[string]config.ServiceConfig{"local": {Name: "local", Network: &config.NetworkConfig{GuestIP: "172.16.0.2"}, PortForwards: []config.PortForward{{HostPort: 8080, VMPort: 8080}}}}}, testLogger(), nil, net, "", 0)
 	a.traefikMgr = &fakeRouteSyncer{}
 	a.lastRevision = "rev-1"
 
@@ -1008,7 +1031,7 @@ services:
 	cfg.VMSubnet = "172.16.0.0/24"
 	cfg.VMGateway = "172.16.0.1"
 	a := New(cfg, s, testLogger())
-	a.reconciler = reconciler.NewWithNetworkManager(&runningVMManager{names: []string{"local"}}, testLogger(),
+	a.reconciler = reconciler.NewWithNetworkManager(&runningVMManager{names: []string{"local"}, configs: map[string]config.ServiceConfig{"local": {Name: "local", Network: &config.NetworkConfig{GuestIP: "172.16.0.2"}, PortForwards: []config.PortForward{{HostPort: 8080, VMPort: 8080}}}}}, testLogger(),
 		nil, &fakeNetwork{setupForwardErr: errors.New("nat table flushed")}, "", 0)
 	a.traefikMgr = &fakeRouteSyncer{}
 	a.lastRevision = "rev-1"

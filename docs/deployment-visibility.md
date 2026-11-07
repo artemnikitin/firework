@@ -316,3 +316,64 @@ discarded, so a slow load can never overwrite the view you navigated to.
 Rotate access by replacing the operator token secret and restarting the API
 role. Existing browser sessions become invalid because their derived session
 value no longer matches.
+
+An applied node revision acknowledges processing the desired configuration; it
+does not assert that every VM is healthy. A `recovery_pending` service keeps its
+individual status and makes fleet status degraded with `vm_recovery_pending`.
+Quarantined survivors removed from desired configuration remain reported until
+their runtime ownership is resolved. Independent services continue reconciling.
+A desired service waiting on resources retained by an unresolved VM reports
+`resource_held` on the applied revision, and fleet status stays degraded until
+the hold clears. That applies only to holds that need no capacity: a service
+that waits for capacity, including capacity a quarantined VM keeps, keeps the
+revision reconciling, and its hold says whether the quarantine keeps the
+capacity or the node needs headroom.
+
+Other holds do not let the revision apply. `VMsReconciled` reports
+`resource_held` and names every held service in its message:
+
+- Desired services whose combined CPU or memory exceeds node capacity, or more
+  networked desired services than `vm_subnet` has guest addresses, fail the node with
+  `capacity_exceeded` or `guest_addresses_exhausted` on `CapacityReady`. The
+  other services still converge as far as admission in service-name order and
+  the claims of held VMs allow.
+- A service waiting on another VM's start or stop, on a host port, address or
+  device another VM still uses, or on capacity or a guest address still held by
+  VMs that are starting, stopping, being removed or kept by other holds keeps
+  the node reconciling,
+  and the next poll retries it. A guest address kept by a quarantined VM is a
+  recovery hold.
+- A create or growth takes only capacity that is free when it runs: a VM
+  being removed or shrunk keeps its capacity until that succeeds, so the
+  growth waits for a later poll. When nothing pending frees the capacity, as
+  when two VMs trade sizes on a full node, the hold's reason asks for headroom
+  or a desired configuration staged so that one service shrinks first.
+- A guest address or host port still held by a removed VM's ownership record,
+  host rules or route keeps the node reconciling until they are gone; each
+  hold names what it waits for. A rule firework did not install holds starts
+  at its address or port, naming the rule, until an operator removes it.
+
+Some holds only an operator can end. They fail the revision with their own
+reason code on `Reconciled`, and the held service reports the same code:
+
+| Reason code | Cause | Action |
+| --- | --- | --- |
+| `host_port_reuse_blocked` | Desired state gives a host port to another service than the one that used it on this node (L6), as in a port swap between services. Peers may still send the first service's traffic to it. | Change the configuration to a fresh host port, or place the service on a node without this history. Waiting never resolves it. |
+| `network_history_incomplete` | On a migrated or repaired node, a host port this node has no record of (L6). | Use a port this node already gives the service, or a node without earlier history. |
+| `guest_address_withdrawal_unconfirmed` | The only free guest addresses were withdrawn from other services' routes, and the running Traefik may still serve them (L7). Reported on `CapacityReady`, or on `Reconciled` for a static address. | Restart Traefik (`traefik_unit`). The agent releases the addresses on its next poll and never restarts Traefik itself. |
+| `vm_state_missing` | A VM the agent recorded as running has no state it can track, as when its directory was removed by hand. | Stop the VM if it still runs, check its leftover host networking, then run `firework-agent clear-recovery --forget SERVICE`. |
+| `unaccounted_vm` | A Firecracker process or `firework-vm-*` unit under the state directory that no tracked VM accounts for. Its address is unknown, so no service gets a new one. | Stop it. Its traces are then cleaned up or, for a service, resolved with `--forget`. |
+
+The agent reports the nonblocking `VMRecoveryReady` condition from its complete
+runtime inventory. A false value carries `vm_recovery_pending`, including when
+survivor summaries exceed the status limit. Desired services take priority in
+that list. Truncated survivor summaries permit degraded classification only
+when all desired summaries remain present and the recovery condition explains
+the truncation; missing desired telemetry remains unknown.
+
+Upgrade the control plane before agents. Agents always report
+`VMRecoveryReady`, even when it is true, and an older control plane treats any
+condition type it does not know as unknown. Until the control plane is
+upgraded, every node running the new agent, including healthy ones, shows as
+`unknown`, and fleet status cannot converge. An older agent works with the new
+control plane unchanged.

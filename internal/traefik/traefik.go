@@ -8,6 +8,7 @@ package traefik
 import (
 	"fmt"
 	"log/slog"
+	"net/url"
 	"os"
 	"path/filepath"
 	"sort"
@@ -109,7 +110,7 @@ func (m *Manager) renderLocal(services []config.ServiceConfig) (map[string][]byt
 		if svc.Network == nil || svc.Network.GuestIP == "" {
 			return nil, nil, fmt.Errorf("service %s requests routing (host %q) but has no resolved guest network", svc.Name, host)
 		}
-		port := backendPort(svc)
+		port := BackendPort(svc)
 		if port == 0 {
 			return nil, nil, fmt.Errorf("service %s requests routing (host %q) but has no usable backend port", svc.Name, host)
 		}
@@ -118,7 +119,7 @@ func (m *Manager) renderLocal(services []config.ServiceConfig) (map[string][]byt
 			return nil, nil, fmt.Errorf("duplicate Traefik hostname %q requested by %s and %s", host, prev, identity)
 		}
 		owner[host] = identity
-		data, err := marshalConfig(svc.Name, host, svc.Network.GuestIP, port)
+		data, err := marshalConfig(localRouteHeader, svc.Name, host, svc.Network.GuestIP, port)
 		if err != nil {
 			return nil, nil, fmt.Errorf("marshaling traefik config for %s: %w", svc.Name, err)
 		}
@@ -175,7 +176,7 @@ func (m *Manager) renderRemote(desired map[string][]byte, owner map[string]strin
 					"file", filename, "skipped", identity)
 				continue
 			}
-			data, err := marshalConfig(svc.Name, host, nc.HostIP, svc.PortForwards[0].HostPort)
+			data, err := marshalConfig(peerRouteHeader, svc.Name, host, nc.HostIP, svc.PortForwards[0].HostPort)
 			if err != nil {
 				m.logger.Warn("skipping remote route that failed to marshal",
 					"service", svc.Name, "node", nc.Node, "error", err)
@@ -245,8 +246,116 @@ func (m *Manager) apply(desired map[string][]byte, preserveRemotes bool) error {
 			return fmt.Errorf("removing stale traefik config %s: %w", entry.Name(), err)
 		}
 	}
-
+	// A withdrawn route is recorded as gone only once its removal survives a
+	// crash.
+	dir, err := os.Open(m.configDir)
+	if err != nil {
+		return fmt.Errorf("syncing traefik config dir: %w", err)
+	}
+	defer dir.Close()
+	if err := dir.Sync(); err != nil {
+		return fmt.Errorf("syncing traefik config dir: %w", err)
+	}
 	return nil
+}
+
+// PlannedLocalRoutes returns the local routes a publish of services writes,
+// without writing anything. A publish that fails validation writes nothing.
+func (m *Manager) PlannedLocalRoutes(services []config.ServiceConfig) ([]RouteFile, error) {
+	desired, _, err := m.renderLocal(services)
+	if err != nil {
+		return nil, err
+	}
+	var routes []RouteFile
+	for _, svc := range services {
+		if _, ok := desired[configFileName(svc.Name)]; ok {
+			routes = append(routes, RouteFile{Service: svc.Name, GuestIP: svc.Network.GuestIP})
+		}
+	}
+	return routes, nil
+}
+
+// ReadLocalRoutes reads this manager's route directory; see ReadLocalRoutes.
+func (m *Manager) ReadLocalRoutes() ([]RouteFile, []string, error) {
+	return ReadLocalRoutes(m.configDir)
+}
+
+// onlyHTTPRoutes reports whether a route document carries traffic only
+// through the http section this package reads. A tcp or udp section, or any
+// section this package does not know, may route to a guest address it cannot
+// see, so such a file counts as unreadable rather than as one without routes.
+func onlyHTTPRoutes(data []byte) bool {
+	var sections map[string]any
+	if yaml.Unmarshal(data, &sections) != nil {
+		return false
+	}
+	for section := range sections {
+		if section != "http" && section != "tls" {
+			return false
+		}
+	}
+	return true
+}
+
+// RouteFile is one route file's owner and the address it routes to. The owner
+// is the file's name: the agent writes <service>.yaml locally and
+// remote-<service>.yaml for a peer. Peer says the file routes to a peer node,
+// from its header; a file without a header is never a peer route.
+type RouteFile struct {
+	Service string
+	GuestIP string
+	Peer    bool
+}
+
+// ReadLocalRoutes reads every route file as Traefik would load it, peer
+// routes included and marked: a local service may be named remote-*, like a
+// peer route file, so the file's header tells them apart. A file it cannot
+// attribute to an address, such as one that does not parse, has a tcp or udp
+// section, is a .yml or .toml file, or is a subdirectory, is returned in
+// unreadable: it may route anywhere.
+func ReadLocalRoutes(dir string) (routes []RouteFile, unreadable []string, err error) {
+	entries, err := os.ReadDir(dir)
+	if os.IsNotExist(err) {
+		return nil, nil, nil
+	}
+	if err != nil {
+		return nil, nil, fmt.Errorf("reading traefik config dir: %w", err)
+	}
+	for _, entry := range entries {
+		name := entry.Name()
+		if entry.IsDir() {
+			if name != stageDirName {
+				unreadable = append(unreadable, name)
+			}
+			continue
+		}
+		ext := filepath.Ext(name)
+		if ext != ".yaml" && ext != ".yml" && ext != ".toml" {
+			continue
+		}
+		data, err := os.ReadFile(filepath.Join(dir, name))
+		var cfg fileConfig
+		if err != nil || ext != ".yaml" || yaml.Unmarshal(data, &cfg) != nil || !onlyHTTPRoutes(data) {
+			unreadable = append(unreadable, name)
+			continue
+		}
+		service := strings.TrimSuffix(name, ext)
+		// Only this agent's peer header makes a route a peer route. A file
+		// without it, hand-written or from an older agent, may route to a
+		// local guest whatever it is named, so it is kept as a local route.
+		peer := strings.HasPrefix(string(data), peerRouteHeader)
+		for _, svc := range cfg.HTTP.Services {
+			for _, server := range svc.LoadBalancer.Servers {
+				u, err := url.Parse(server.URL)
+				if err != nil || u.Hostname() == "" {
+					unreadable = append(unreadable, name)
+					continue
+				}
+				routes = append(routes, RouteFile{Service: service, GuestIP: u.Hostname(), Peer: peer})
+			}
+		}
+	}
+	return routes, unreadable, nil
 }
 
 // --- Traefik dynamic config YAML structures ---
@@ -278,7 +387,15 @@ type serverDef struct {
 	URL string `yaml:"url"`
 }
 
-func marshalConfig(name, host, guestIP string, port int) ([]byte, error) {
+// Every route file starts with a header saying whether it routes to a local
+// guest or to a peer node, so route ownership never has to guess from a
+// file's name or from the current guest subnet. YAML ignores the comment.
+const (
+	localRouteHeader = "# firework-route: local\n"
+	peerRouteHeader  = "# firework-route: peer\n"
+)
+
+func marshalConfig(header, name, host, guestIP string, port int) ([]byte, error) {
 	cfg := fileConfig{
 		HTTP: httpSection{
 			Routers: map[string]routerDef{
@@ -299,12 +416,16 @@ func marshalConfig(name, host, guestIP string, port int) ([]byte, error) {
 			},
 		},
 	}
-	return yaml.Marshal(cfg)
+	data, err := yaml.Marshal(cfg)
+	if err != nil {
+		return nil, err
+	}
+	return append([]byte(header), data...), nil
 }
 
-// backendPort returns the VM-side port Traefik should proxy to.
+// BackendPort returns the VM-side port Traefik should proxy to.
 // Prefers the first port forward's VM port; falls back to the health check port.
-func backendPort(svc config.ServiceConfig) int {
+func BackendPort(svc config.ServiceConfig) int {
 	if len(svc.PortForwards) > 0 {
 		return svc.PortForwards[0].VMPort
 	}
@@ -320,4 +441,33 @@ func configFileName(serviceName string) string {
 
 func remoteConfigFileName(serviceName string) string {
 	return remoteFilePrefix + serviceName + ".yaml"
+}
+
+// HasLocalRouteFiles reports whether the directory holds any route file.
+// Traefik loads .yaml, .yml and .toml files, including those in
+// subdirectories, so any of them, and any subdirectory but the agent's own
+// staging directory, may route to a guest address. A peer route file counts
+// too: a local service may be named like one. A missing directory holds none.
+func HasLocalRouteFiles(dir string) (bool, error) {
+	entries, err := os.ReadDir(dir)
+	if os.IsNotExist(err) {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("reading traefik config dir: %w", err)
+	}
+	for _, entry := range entries {
+		name := entry.Name()
+		if entry.IsDir() {
+			if name != stageDirName {
+				return true, nil
+			}
+			continue
+		}
+		switch filepath.Ext(name) {
+		case ".yaml", ".yml", ".toml":
+			return true, nil
+		}
+	}
+	return false, nil
 }

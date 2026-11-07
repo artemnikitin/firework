@@ -90,6 +90,13 @@ func LoadAgentConfig(path string) (AgentConfig, error) {
 		return cfg, fmt.Errorf("s3_images_bucket and gcs_images_bucket are mutually exclusive")
 	}
 
+	if cfg.TraefikConfigDir != "" && cfg.TraefikUnit == "" {
+		cfg.TraefikUnit = "traefik.service"
+	}
+	if cfg.TraefikUnit != "" && (strings.ContainsAny(cfg.TraefikUnit, " \t\n/") || !strings.Contains(cfg.TraefikUnit, ".")) {
+		return cfg, fmt.Errorf("traefik_unit %q is not a systemd unit name such as traefik.service", cfg.TraefikUnit)
+	}
+
 	if cfg.IngressDomain != "" {
 		normalized, err := ingress.NormalizeDomain(cfg.IngressDomain)
 		if err != nil {

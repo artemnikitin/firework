@@ -98,10 +98,11 @@ func (m *Manager) pinSubnetRoute(bridgeName, gatewayIP, subnet string) error {
 	return nil
 }
 
-// SetupPortForward creates an iptables DNAT rule forwarding traffic from
-// a host port to a VM port on the given guest IP.
-func (m *Manager) SetupPortForward(hostPort int, guestIP string, vmPort int) error {
-	m.logger.Info("setting up port forward", "host_port", hostPort, "guest_ip", guestIP, "vm_port", vmPort)
+// SetupPortForward creates the DNAT rules forwarding traffic from a host port
+// to a VM port on the given guest IP. Both rules carry the service's tag, so
+// the kernel's own rule list says whose they are.
+func (m *Manager) SetupPortForward(service string, hostPort int, guestIP string, vmPort int) error {
+	m.logger.Info("setting up port forward", "service", service, "host_port", hostPort, "guest_ip", guestIP, "vm_port", vmPort)
 
 	// Scope DNAT to traffic arriving on the external interface and addressed
 	// to the host IP. This avoids hijacking guest-to-peer traffic that also
@@ -111,7 +112,7 @@ func (m *Manager) SetupPortForward(hostPort int, guestIP string, vmPort int) err
 		return fmt.Errorf("resolving host ingress context: %w", err)
 	}
 
-	spec := scopedPortForwardSpec(outInterface, hostIP, hostPort, guestIP, vmPort)
+	spec := tagged(scopedPortForwardSpec(outInterface, hostIP, hostPort, guestIP, vmPort), PortForwardTag(service))
 	if err := ensureIPTablesRule("nat", "PREROUTING", spec...); err != nil {
 		return fmt.Errorf("adding scoped port-forward rule: %w", err)
 	}
@@ -122,7 +123,7 @@ func (m *Manager) SetupPortForward(hostPort int, guestIP string, vmPort int) err
 	// interface. Still scoped to the host IP, so guest-to-peer-host traffic
 	// on the same port is untouched.
 	if m.bridgeName != "" {
-		hairpin := hairpinPortForwardSpec(m.bridgeName, hostIP, hostPort, guestIP, vmPort)
+		hairpin := tagged(hairpinPortForwardSpec(m.bridgeName, hostIP, hostPort, guestIP, vmPort), PortForwardTag(service))
 		if err := ensureIPTablesRule("nat", "PREROUTING", hairpin...); err != nil {
 			return fmt.Errorf("adding hairpin port-forward rule: %w", err)
 		}
@@ -130,47 +131,16 @@ func (m *Manager) SetupPortForward(hostPort int, guestIP string, vmPort int) err
 	return nil
 }
 
-// TeardownPortForward removes the iptables DNAT rule for a port forward.
-func (m *Manager) TeardownPortForward(hostPort int, guestIP string, vmPort int) error {
-	m.logger.Info("tearing down port forward", "host_port", hostPort, "guest_ip", guestIP, "vm_port", vmPort)
-
-	var errs []error
-
-	// Remove scoped rule first (new behavior).
-	if outInterface, hostIP, err := m.resolveHostIngressContext(); err == nil {
-		spec := scopedPortForwardSpec(outInterface, hostIP, hostPort, guestIP, vmPort)
-		if err := removeIPTablesRule("nat", "PREROUTING", spec...); err != nil {
-			errs = append(errs, fmt.Errorf("removing scoped port-forward rule: %w", err))
+// tagged inserts the comment match before the rule's target.
+func tagged(spec []string, tag string) []string {
+	for i, arg := range spec {
+		if arg == "-j" {
+			out := append([]string(nil), spec[:i]...)
+			out = append(out, "-m", "comment", "--comment", tag)
+			return append(out, spec[i:]...)
 		}
-		if m.bridgeName != "" {
-			hairpin := hairpinPortForwardSpec(m.bridgeName, hostIP, hostPort, guestIP, vmPort)
-			if err := removeIPTablesRule("nat", "PREROUTING", hairpin...); err != nil {
-				errs = append(errs, fmt.Errorf("removing hairpin port-forward rule: %w", err))
-			}
-		}
-	} else {
-		// A resolution failure must not be reported as a successful
-		// teardown. The legacy cleanup below cannot stand in for the scoped
-		// rule, and removeIPTablesRule treats "no such rule" as success — so
-		// swallowing this returned nil while the scoped DNAT rule was still
-		// installed, which is precisely the "converged while leaking" shape
-		// the caller's pending-teardown retry exists to prevent. Surfacing it
-		// keeps the rule on the retry list until resolution works again.
-		m.logger.Warn("failed to resolve host ingress context for scoped cleanup, trying legacy rule only",
-			"host_port", hostPort, "error", err)
-		errs = append(errs, fmt.Errorf("resolving host ingress context for scoped cleanup: %w", err))
 	}
-
-	// Backward-compatible cleanup for older unscoped rules.
-	legacySpec := legacyPortForwardSpec(hostPort, guestIP, vmPort)
-	if err := removeIPTablesRule("nat", "PREROUTING", legacySpec...); err != nil {
-		errs = append(errs, fmt.Errorf("removing legacy port-forward rule: %w", err))
-	}
-
-	if len(errs) > 0 {
-		return fmt.Errorf("tearing down port-forward rules: %v", errs)
-	}
-	return nil
+	return append(spec, "-m", "comment", "--comment", tag)
 }
 
 func scopedPortForwardSpec(outInterface, hostIP string, hostPort int, guestIP string, vmPort int) []string {
@@ -193,16 +163,6 @@ func hairpinPortForwardSpec(bridgeName, hostIP string, hostPort int, guestIP str
 	return []string{
 		"-i", bridgeName,
 		"-d", hostIP + "/32",
-		"-p", "tcp",
-		"-m", "tcp",
-		"--dport", fmt.Sprintf("%d", hostPort),
-		"-j", "DNAT",
-		"--to-destination", fmt.Sprintf("%s:%d", guestIP, vmPort),
-	}
-}
-
-func legacyPortForwardSpec(hostPort int, guestIP string, vmPort int) []string {
-	return []string{
 		"-p", "tcp",
 		"-m", "tcp",
 		"--dport", fmt.Sprintf("%d", hostPort),

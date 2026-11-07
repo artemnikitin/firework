@@ -49,3 +49,9 @@ func TestConditionAccessorsReturnCopies(t *testing.T) {
 		t.Fatal("BlockingConditionTypes exposed its backing array")
 	}
 }
+
+func TestVMRecoveryConditionIsNonBlocking(t *testing.T) {
+	if !IsNonBlockingCondition("VMRecoveryReady") || IsBlockingCondition("VMRecoveryReady") {
+		t.Fatal("recovery uncertainty must degrade the node without blocking unrelated work")
+	}
+}
