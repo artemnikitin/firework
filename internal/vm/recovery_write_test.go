@@ -281,6 +281,94 @@ func TestForgetAfterUncertainWriteRecordsTrustedTeardown(t *testing.T) {
 	}
 }
 
+// C1/C3: the trusted teardown after an uncertain write holds for every kind of
+// remaining state. Both in-memory snapshots are recorded when their devices
+// differ; a configuration already unknown contributes none; a live original
+// owner refuses before anything is recorded.
+func TestForgetAfterUncertainWriteCoversEveryStateKind(t *testing.T) {
+	for _, tc := range []struct {
+		name         string
+		state        string // "missing", "symlink" or "corrupt"
+		candidateTap string
+		unknown      bool
+		live         bool
+		want         []string
+	}{
+		{name: "missing directory", state: "missing", want: []string{"tap-old"}},
+		{name: "symlink", state: "symlink", want: []string{"tap-old"}},
+		{name: "differing snapshots", state: "corrupt", candidateTap: "tap-new", want: []string{"tap-old", "tap-new"}},
+		{name: "configuration already unknown", state: "corrupt", unknown: true, want: []string{""}},
+		{name: "live original owner", state: "corrupt", live: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			m, f, inspector := recoveryFixture(t)
+			m.inspector = inspector
+			f.Config.Network = &config.NetworkConfig{Interface: "tap-old", HostDevName: "eth0", GuestIP: "172.16.0.2"}
+			hash, err := serviceConfigHash(f.Config)
+			if err != nil {
+				t.Fatal(err)
+			}
+			f.ConfigHash = hash
+			m.addRecoveryPending(f.Service, f, "uncertain write")
+			candidate := cloneInstanceManifest(f)
+			candidate.Lifecycle = lifecycleStopped
+			if tc.candidateTap != "" {
+				network := *candidate.Config.Network
+				network.Interface = tc.candidateTap
+				candidate.Config.Network = &network
+				if candidate.ConfigHash, err = serviceConfigHash(candidate.Config); err != nil {
+					t.Fatal(err)
+				}
+			}
+			m.mu.Lock()
+			m.instances[f.Service].recoveryWriteCandidate = candidate
+			m.instances[f.Service].RecoveryConfigUnknown = tc.unknown
+			m.mu.Unlock()
+			if !tc.live {
+				delete(inspector.identities, f.PID)
+			}
+			switch tc.state {
+			case "missing":
+				err = os.RemoveAll(f.VMDir)
+			case "symlink":
+				if err = os.RemoveAll(f.VMDir); err == nil {
+					err = os.Symlink(t.TempDir(), f.VMDir)
+				}
+			case "corrupt":
+				err = os.WriteFile(manifestPath(f.VMDir), []byte("corrupt"), 0o600)
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			var devices []string
+			m.SetRecoveryCleanupRecorder(func(service config.ServiceConfig) error {
+				if _, err := os.Lstat(f.VMDir); tc.state != "missing" && err != nil {
+					return err // Recorded only while the runtime state remains.
+				}
+				device := ""
+				if service.Network != nil {
+					device = service.Network.Interface
+				}
+				devices = append(devices, device)
+				return nil
+			})
+			result, err := m.ForgetRecoveryPending(f.Service)
+			if tc.live {
+				if err == nil || result.Outcome != RecoveryOutcomeAmbiguous || len(devices) != 0 {
+					t.Fatalf("forget released a live owner: %+v %v devices=%v", result, err, devices)
+				}
+				return
+			}
+			if err != nil || result.Outcome != RecoveryOutcomeCleared || !slices.Equal(devices, tc.want) {
+				t.Fatalf("forget: %+v %v devices=%v, want %v", result, err, devices, tc.want)
+			}
+			if _, err := os.Lstat(f.VMDir); !errors.Is(err, os.ErrNotExist) {
+				t.Fatalf("forgotten state remains: %v", err)
+			}
+		})
+	}
+}
+
 func TestForgetProvesBothUncertainWriteOwnersAbsent(t *testing.T) {
 	m, f, inspector := recoveryFixture(t)
 	m.inspector = inspector
