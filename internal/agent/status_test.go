@@ -1,6 +1,10 @@
 package agent
 
 import (
+	"context"
+	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -9,6 +13,72 @@ import (
 	"github.com/artemnikitin/firework/internal/vm"
 	"github.com/artemnikitin/firework/internal/volume"
 )
+
+func TestRecoveryConditionIncludesSurvivorsOmittedFromServiceSummaries(t *testing.T) {
+	for _, desiredCount := range []int{1, statusmodel.MaxServices, statusmodel.MaxServices + 1} {
+		t.Run(fmt.Sprintf("desired-%d", desiredCount), func(t *testing.T) {
+			cfg := testAgentConfig(t)
+			a := New(cfg, &fakeStore{}, testLogger())
+			assertRecoveryCondition := func(want statusmodel.ConditionStatus) {
+				t.Helper()
+				condition, ok := agentCondition(a.agentStatusSnapshot(), "VMRecoveryReady")
+				if !ok || condition.Status != want {
+					t.Fatalf("recovery condition = %#v, want %s", condition, want)
+				}
+				if want == statusmodel.ConditionFalse && condition.ReasonCode != "vm_recovery_pending" {
+					t.Fatalf("missing recovery reason: %#v", condition)
+				}
+			}
+			assertRecoveryCondition(statusmodel.ConditionTrue)
+			for i := 0; i < statusmodel.MaxServices; i++ {
+				// Survivors sort before desired services, so the old global sort
+				// would evict every desired service from the bounded snapshot.
+				dir := filepath.Join(cfg.StateDir, "vms", fmt.Sprintf("a-survivor-%03d", i))
+				if err := os.MkdirAll(dir, 0755); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(filepath.Join(dir, "instance.json"), []byte("{invalid"), 0600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if _, err := a.vmManager.Recover(context.Background(), config.NodeConfig{}); err != nil {
+				t.Fatal(err)
+			}
+			desired := make([]config.ServiceConfig, desiredCount)
+			for i := range desired {
+				desired[i].Name = fmt.Sprintf("z-desired-%03d", i)
+			}
+			a.setStatusServices(config.NodeConfig{Services: desired}, "revision")
+			status := a.agentStatusSnapshot()
+			if !status.ServicesTruncated || len(status.Services) != statusmodel.MaxServices || status.DesiredServices != desiredCount {
+				t.Fatalf("unexpected bounded inventory: %#v", status)
+			}
+			reported := make(map[string]bool, len(status.Services))
+			for _, service := range status.Services {
+				// Desired VM observations are absent, so they cannot be ready;
+				// survivor presence must not inflate ready_services either.
+				reported[service.Name] = true
+				if strings.HasPrefix(service.Name, "z-desired-") && (service.ReasonCode != "resource_held" || !strings.Contains(service.Message, "runtime resource claims are unknown")) {
+					t.Fatalf("desired service lost the reason it cannot reuse survivor resources: %#v", service)
+				}
+			}
+			for i, service := range desired {
+				if i < statusmodel.MaxServices && !reported[service.Name] {
+					t.Fatalf("survivor evicted desired service %s", service.Name)
+				}
+			}
+			if status.ReadyServices != 0 {
+				t.Fatalf("survivors inflated desired ready count: %d", status.ReadyServices)
+			}
+			assertRecoveryCondition(statusmodel.ConditionFalse)
+			// Substitute an observed empty runtime inventory after resolution.
+			// This test exercises status refresh; recovery proofs are covered by
+			// the VM recovery tests.
+			a.vmManager = vm.NewManager(cfg.FirecrackerBin, t.TempDir(), testLogger())
+			assertRecoveryCondition(statusmodel.ConditionTrue)
+		})
+	}
+}
 
 // TestBuildVolumeStatusesBoundsMountPath exercises the real send-side status
 // path (BuildVolumeStatuses), not a hand-built VolumeStatus. A config store

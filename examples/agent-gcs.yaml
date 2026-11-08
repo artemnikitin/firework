@@ -74,6 +74,9 @@ enable_network_setup: true
 # Public ingress routing (optional). When traefik_config_dir is set, the agent
 # writes per-service Traefik dynamic config for services that request a route.
 # traefik_config_dir: "/etc/traefik/dynamic"
+# traefik_unit is the systemd unit serving that directory (default when
+# traefik_config_dir is set: traefik.service).
+# traefik_unit: "traefik.service"
 # ingress_domain is the deployment-owned DNS suffix used to form the public
 # hostname for a service that sets metadata.subdomain: <subdomain>.<ingress_domain>.
 # On GCP this is typically the data-plane base_domain (e.g. gcp.example.com).

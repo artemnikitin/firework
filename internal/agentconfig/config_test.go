@@ -599,3 +599,34 @@ registry_bootstrap_token_file: "/tmp/bootstrap-token"
 		t.Fatal("expected validation error when both bootstrap token fields are set")
 	}
 }
+
+func TestLoadAgentConfig_TraefikUnit(t *testing.T) {
+	tests := []struct {
+		name    string
+		extra   string
+		want    string
+		wantErr bool
+	}{
+		{name: "defaults with a route directory", extra: "traefik_config_dir: /etc/traefik/dynamic\n", want: "traefik.service"},
+		{name: "no route directory, no unit", extra: "", want: ""},
+		{name: "explicit unit", extra: "traefik_config_dir: /etc/traefik/dynamic\ntraefik_unit: ingress.service\n", want: "ingress.service"},
+		{name: "not a unit name", extra: "traefik_config_dir: /etc/traefik/dynamic\ntraefik_unit: traefik\n", wantErr: true},
+		{name: "a path", extra: "traefik_config_dir: /etc/traefik/dynamic\ntraefik_unit: /etc/systemd/system/traefik.service\n", wantErr: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			yaml := "node_name: my-node\nstore_type: git\nstore_url: https://example.com/repo.git\n" + tt.extra
+			cfgPath := filepath.Join(t.TempDir(), "agent.yaml")
+			if err := os.WriteFile(cfgPath, []byte(yaml), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			cfg, err := LoadAgentConfig(cfgPath)
+			if (err != nil) != tt.wantErr {
+				t.Fatalf("err=%v wantErr=%v", err, tt.wantErr)
+			}
+			if !tt.wantErr && cfg.TraefikUnit != tt.want {
+				t.Fatalf("TraefikUnit=%q want %q", cfg.TraefikUnit, tt.want)
+			}
+		})
+	}
+}

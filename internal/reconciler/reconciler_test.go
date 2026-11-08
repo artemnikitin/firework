@@ -218,7 +218,7 @@ func TestReconcilePreservesAllFailureStagesThroughAggregateErrors(t *testing.T) 
 	}
 }
 
-func TestUpdateDoesNotStartReplacementWhenOwnedVMCannotBeRemoved(t *testing.T) {
+func TestUpdateExcludesQuarantinedVMWithoutNodeFailure(t *testing.T) {
 	oldService := config.ServiceConfig{Name: "svc-a", Image: "/img/old", Kernel: "/kern", VCPUs: 1, MemoryMB: 256}
 	newService := oldService
 	newService.Image = "/img/new"
@@ -228,11 +228,11 @@ func TestUpdateDoesNotStartReplacementWhenOwnedVMCannotBeRemoved(t *testing.T) {
 	reconciler := New(manager, slog.New(slog.NewTextHandler(io.Discard, nil)), nil, nil, "", 0)
 
 	err := reconciler.Reconcile(context.Background(), config.NodeConfig{Services: []config.ServiceConfig{newService}})
-	if err == nil {
-		t.Fatal("expected update to fail closed")
+	if err != nil {
+		t.Fatalf("quarantine caused a node failure: %v", err)
 	}
-	if !HasFailureStage(err, FailureStageVM) {
-		t.Fatalf("unsafe VM removal error lost VM stage: %v", err)
+	if len(manager.removeCalls) != 0 {
+		t.Fatalf("quarantine entered ordinary VM removal: %v", manager.removeCalls)
 	}
 	if len(manager.startCalls) != 0 {
 		t.Fatalf("replacement started after unsafe removal failure: %v", manager.startCalls)

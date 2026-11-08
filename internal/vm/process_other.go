@@ -2,7 +2,10 @@
 
 package vm
 
-import "fmt"
+import (
+	"context"
+	"fmt"
+)
 
 // processInspectionSupported reports whether the host exposes the process
 // identity Firework needs to prove VM ownership. Without it a launch cannot be
@@ -14,5 +17,13 @@ func (osProcessInspector) Inspect(_ int) (processIdentity, error) {
 }
 
 func (osProcessInspector) FindByArguments(_, _ string) ([]processIdentity, error) {
+	return nil, fmt.Errorf("process discovery is unsupported on this platform")
+}
+
+func (osProcessInspector) FindByAnyArgument(_, _ string) ([]processIdentity, error) {
+	return nil, fmt.Errorf("process discovery is unsupported on this platform")
+}
+
+func (osProcessInspector) FindVMProcessesContext(context.Context, string) ([]processIdentity, error) {
 	return nil, fmt.Errorf("process discovery is unsupported on this platform")
 }

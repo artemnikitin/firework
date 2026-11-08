@@ -438,7 +438,7 @@ func TestRevisionStatusDerivesFleetConvergence(t *testing.T) {
 		wantPhase  string
 		wantBucket string
 	}{
-		{name: "converged", agent: currentAgentStatus(statusmodel.PhaseReady, "rendered-1"), nodeState: NodeStateReady, wantPhase: "converged", wantBucket: "converged"},
+		{name: "older agent without optional recovery condition", agent: currentAgentStatus(statusmodel.PhaseReady, "rendered-1"), nodeState: NodeStateReady, wantPhase: "converged", wantBucket: "converged"},
 		{name: "degraded", agent: func() *statusmodel.AgentStatus {
 			status := currentAgentStatus(statusmodel.PhaseReady, "rendered-1")
 			status.Conditions = append(status.Conditions, statusmodel.Condition{Type: "PeerRoutesReady", Status: statusmodel.ConditionFalse, ReasonCode: "peer_route_sync_degraded"})
@@ -460,6 +460,27 @@ func TestRevisionStatusDerivesFleetConvergence(t *testing.T) {
 			status.Services = nil
 			return status
 		}(), nodeState: NodeStateReady, wantPhase: "unknown", wantBucket: "unknown"},
+		{name: "recovery condition cannot cover truncated desired services", agent: func() *statusmodel.AgentStatus {
+			status := currentAgentStatus(statusmodel.PhaseReady, "rendered-1")
+			status.ServicesTruncated = true
+			status.Services = nil
+			status.Conditions = append(status.Conditions, statusmodel.Condition{Type: "VMRecoveryReady", Status: statusmodel.ConditionFalse})
+			return status
+		}(), nodeState: NodeStateReady, wantPhase: "unknown", wantBucket: "unknown"},
+		{name: "recovery condition cannot cover desired count mismatch", agent: func() *statusmodel.AgentStatus {
+			status := currentAgentStatus(statusmodel.PhaseReady, "rendered-1")
+			status.ServicesTruncated = true
+			status.DesiredServices = 2
+			status.Conditions = append(status.Conditions, statusmodel.Condition{Type: "VMRecoveryReady", Status: statusmodel.ConditionFalse})
+			return status
+		}(), nodeState: NodeStateReady, wantPhase: "unknown", wantBucket: "unknown"},
+		{name: "cleared recovery condition cannot excuse truncation", agent: func() *statusmodel.AgentStatus {
+			status := currentAgentStatus(statusmodel.PhaseReady, "rendered-1")
+			status.ServicesTruncated = true
+			status.DesiredServices = 1
+			status.Conditions = append(status.Conditions, statusmodel.Condition{Type: "VMRecoveryReady", Status: statusmodel.ConditionTrue})
+			return status
+		}(), nodeState: NodeStateReady, wantPhase: "unknown", wantBucket: "unknown"},
 		{name: "placed service missing from status", agent: func() *statusmodel.AgentStatus {
 			status := currentAgentStatus(statusmodel.PhaseReady, "rendered-1")
 			status.Services = []statusmodel.ServiceStatus{{Name: "other", VMState: "running", Health: "healthy"}}
@@ -478,6 +499,11 @@ func TestRevisionStatusDerivesFleetConvergence(t *testing.T) {
 		{name: "future condition", agent: func() *statusmodel.AgentStatus {
 			status := currentAgentStatus(statusmodel.PhaseReady, "rendered-1")
 			status.Conditions = append(status.Conditions, statusmodel.Condition{Type: "FutureNonBlockingCondition", Status: statusmodel.ConditionFalse})
+			return status
+		}(), nodeState: NodeStateReady, wantPhase: "unknown", wantBucket: "unknown"},
+		{name: "true future condition remains unknown", agent: func() *statusmodel.AgentStatus {
+			status := currentAgentStatus(statusmodel.PhaseReady, "rendered-1")
+			status.Conditions = append(status.Conditions, statusmodel.Condition{Type: "FutureNonBlockingCondition", Status: statusmodel.ConditionTrue})
 			return status
 		}(), nodeState: NodeStateReady, wantPhase: "unknown", wantBucket: "unknown"},
 	}

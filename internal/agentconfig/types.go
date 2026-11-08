@@ -114,6 +114,13 @@ type AgentConfig struct {
 	// directory and picks up changes without a reload.
 	// If empty, Traefik config management is disabled.
 	TraefikConfigDir string `yaml:"traefik_config_dir,omitempty"`
+	// TraefikUnit is the systemd unit whose main process serves
+	// TraefikConfigDir. A guest address withdrawn from one service's route
+	// is given to another service only after that process has restarted or
+	// stopped, because a running Traefik may still serve a route it read
+	// before the file changed. Defaults to traefik.service when
+	// TraefikConfigDir is set.
+	TraefikUnit string `yaml:"traefik_unit,omitempty"`
 	// IngressDomain is the deployment-owned DNS suffix used to form the public
 	// hostname for a service that sets metadata.subdomain: the final hostname is
 	// "<subdomain>.<ingress_domain>". It is a bare DNS domain — no "*." prefix,

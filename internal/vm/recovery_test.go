@@ -38,6 +38,16 @@ func (f *fakeProcessInspector) FindByArguments(_, _ string) ([]processIdentity, 
 	return append([]processIdentity(nil), f.find...), f.findErr
 }
 
+func (f *fakeProcessInspector) FindByAnyArgument(socket, config string) ([]processIdentity, error) {
+	matches := append([]processIdentity(nil), f.find...)
+	for _, identity := range f.identities {
+		if hasExactArgument(identity.CommandLine, "--api-sock", socket) || hasExactArgument(identity.CommandLine, "--config-file", config) {
+			matches = append(matches, identity)
+		}
+	}
+	return matches, f.findErr
+}
+
 func (f *fakeProcessInspector) SocketReady(string) error { return f.socketErr }
 
 type recordingLauncher struct {
@@ -80,6 +90,7 @@ func TestRecoverQuarantinesPIDReuseAndNeverSignalsIt(t *testing.T) {
 	identity := inspector.identities[manifest.PID]
 	identity.StartTicks++
 	inspector.identities[manifest.PID] = identity
+	inspector.find = []processIdentity{inspector.identities[manifest.PID]}
 	manager.inspector = inspector
 	launcher := &recordingLauncher{}
 	manager.launcher = launcher
@@ -165,6 +176,7 @@ func TestRecoverCleansStateAfterAHostReboot(t *testing.T) {
 	// mismatch proves the recorded process cannot have survived.
 	identity := inspector.identities[manifest.PID]
 	identity.HostBootID = "boot-after-reboot"
+	identity.CommandLine = []string{"other-process"}
 	inspector.identities[manifest.PID] = identity
 	manager.inspector = inspector
 
@@ -193,7 +205,9 @@ func TestRecoverCleansStartingSystemdStateWhenMainProcessExited(t *testing.T) {
 	if err := writeManifest(manifestPath(manifest.VMDir), manifest); err != nil {
 		t.Fatal(err)
 	}
+	manager.recoveryUnitInspectorContext = func(context.Context, *instanceManifest) (int, bool, error) { return 0, true, nil }
 	delete(inspector.identities, 3637)
+	delete(inspector.identities, 42)
 	manager.inspector = inspector
 
 	binDir := t.TempDir()
@@ -211,6 +225,53 @@ func TestRecoverCleansStartingSystemdStateWhenMainProcessExited(t *testing.T) {
 	}
 	if _, err := os.Stat(manifest.VMDir); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("dead starting VM state was not removed: %v", err)
+	}
+}
+
+func TestRecoverPersistsStartingSystemdIdentityBeforeSocketQuarantine(t *testing.T) {
+	manager, manifest, inspector := recoveryFixture(t)
+	manifest.PID = 0
+	manifest.HostBootID = ""
+	manifest.ProcessStart = 0
+	manifest.Executable = ""
+	manifest.ExecutableDev = 0
+	manifest.ExecutableIno = 0
+	manifest.Lifecycle = lifecycleStarting
+	manifest.Launcher = "systemd"
+	manifest.LauncherUnit = "firework-vm-test.service"
+	if err := writeManifest(manifestPath(manifest.VMDir), manifest); err != nil {
+		t.Fatal(err)
+	}
+	inspector.socketErr = os.ErrNotExist
+	manager.inspector = inspector
+	manager.recoveryUnitInspectorContext = func(context.Context, *instanceManifest) (int, bool, error) { return 42, false, nil }
+
+	binDir := t.TempDir()
+	systemctl := filepath.Join(binDir, "systemctl")
+	if err := os.WriteFile(systemctl, []byte("#!/bin/sh\nprintf '42\\n'\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	if adopted, err := manager.Recover(context.Background(), config.NodeConfig{}); err != nil || len(adopted) != 0 {
+		t.Fatalf("starting systemd recovery = %v, %v", adopted, err)
+	}
+	instance := manager.List()[manifest.Service]
+	if instance == nil || instance.State != StateRecoveryPending {
+		t.Fatalf("starting survivor was not quarantined while its socket was unavailable: %#v", instance)
+	}
+	durable, err := readManifest(manifestPath(manifest.VMDir))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if durable.PID != manifest.PID+42 || durable.HostBootID == "" || durable.ProcessStart == 0 || durable.Executable == "" {
+		t.Fatalf("systemd-starting identity was not reconstructed durably: %#v", durable)
+	}
+
+	inspector.socketErr = nil
+	result, err := manager.ClearRecoveryPending(manifest.Service)
+	if err != nil || result.Outcome != RecoveryOutcomeReadopted {
+		t.Fatalf("clear after systemd socket recovery = %#v, %v", result, err)
 	}
 }
 
@@ -263,7 +324,8 @@ func TestRecoverRepairsIdentityCapturedBeforeTheLaunchedExec(t *testing.T) {
 			},
 		},
 		{
-			name: "inspection captured nothing at all",
+			name:     "inspection captured nothing at all",
+			wantKept: true,
 			mutate: func(manifest *instanceManifest) {
 				manifest.HostBootID = ""
 				manifest.ProcessStart = 0
@@ -287,6 +349,9 @@ func TestRecoverRepairsIdentityCapturedBeforeTheLaunchedExec(t *testing.T) {
 				t.Fatal(err)
 			}
 			manager.inspector = inspector
+			if testCase.wantKept && manifest.ProcessStart != 0 {
+				inspector.find = []processIdentity{inspector.identities[manifest.PID]}
+			}
 			launcher := &recordingLauncher{}
 			manager.launcher = launcher
 
@@ -356,7 +421,11 @@ func TestUpdatingARepairedSurvivorNoLongerStalls(t *testing.T) {
 	}
 }
 
-func TestRecoverMigratesExactlyOneLegacyFirecrackerProcess(t *testing.T) {
+// manifestlessFixture is VM state with no ownership manifest, as an agent
+// wrote it before manifests existed, and one live process that presents the
+// configured Firecracker binary with this service's socket and config paths.
+func manifestlessFixture(t *testing.T) (*Manager, *fakeProcessInspector, processIdentity, string, config.ServiceConfig) {
+	t.Helper()
 	stateDir := t.TempDir()
 	vmDir := filepath.Join(stateDir, "vms", "app")
 	if err := os.MkdirAll(vmDir, 0o755); err != nil {
@@ -370,12 +439,10 @@ func TestRecoverMigratesExactlyOneLegacyFirecrackerProcess(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	socketPath := filepath.Join(vmDir, "firecracker.sock")
-	configPath := filepath.Join(vmDir, "vm-config.json")
 	identity := processIdentity{
 		PID: 51, HostBootID: "boot", StartTicks: 200, Executable: resolvedBinary,
 		ExecutableDev: 11, ExecutableIno: 12,
-		CommandLine: []string{binary, "--api-sock", socketPath, "--config-file", configPath},
+		CommandLine: []string{binary, "--api-sock", filepath.Join(vmDir, "firecracker.sock"), "--config-file", filepath.Join(vmDir, "vm-config.json")},
 	}
 	inspector := &fakeProcessInspector{
 		identities: map[int]processIdentity{identity.PID: identity}, errors: make(map[int]error),
@@ -383,22 +450,95 @@ func TestRecoverMigratesExactlyOneLegacyFirecrackerProcess(t *testing.T) {
 	}
 	manager := NewManager(binary, stateDir, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	manager.inspector = inspector
-	service := config.ServiceConfig{Name: "app", Image: "/image", Kernel: "/kernel", VCPUs: 1, MemoryMB: 128}
+	t.Cleanup(func() {
+		manager.mu.Lock()
+		manager.instances = make(map[string]*Instance)
+		manager.mu.Unlock()
+	})
+	return manager, inspector, identity, vmDir, config.ServiceConfig{Name: "app", Image: "/image", Kernel: "/kernel", VCPUs: 1, MemoryMB: 128}
+}
 
-	adopted, err := manager.Recover(context.Background(), config.NodeConfig{Services: []config.ServiceConfig{service}})
+// State without an ownership manifest records no identity and no
+// configuration, so even the configured Firecracker binary with this
+// service's paths is not adopted for a desired service. Once the process
+// exits, recovery still keeps it quarantined: nothing in it identifies the
+// host networking it may have left, so only --forget clears it.
+func TestRecoverNeverAdoptsManifestlessFirecrackerProcess(t *testing.T) {
+	manager, inspector, identity, vmDir, service := manifestlessFixture(t)
+	desired := config.NodeConfig{Services: []config.ServiceConfig{service}}
+	adopted, err := manager.Recover(context.Background(), desired)
 	if err != nil {
 		t.Fatal(err)
 	}
 	instance := manager.List()[service.Name]
-	if len(adopted) != 1 || instance == nil || instance.State != StateRunning || !instance.manifest.Legacy {
-		t.Fatalf("legacy process was not migrated: adopted=%v instance=%#v", adopted, instance)
+	if len(adopted) != 0 || instance == nil || instance.State != StateRecoveryPending || !strings.Contains(instance.LastError, "never adopted") {
+		t.Fatalf("manifest-less process was adopted: adopted=%v instance=%#v", adopted, instance)
 	}
-	if _, err := os.Stat(manifestPath(vmDir)); err != nil {
-		t.Fatalf("legacy ownership manifest was not written: %v", err)
+	if _, err := os.Stat(manifestPath(vmDir)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("an ownership manifest was invented: %v", err)
 	}
-	manager.mu.Lock()
-	manager.instances = make(map[string]*Instance)
-	manager.mu.Unlock()
+	delete(inspector.identities, identity.PID)
+	inspector.find = nil
+	if _, err := manager.Recover(context.Background(), desired); err != nil {
+		t.Fatal(err)
+	}
+	if got := manager.List()[service.Name]; got == nil || got.State != StateRecoveryPending || !strings.Contains(got.LastError, "--forget") {
+		t.Fatalf("absent manifest-less state was cleared without --forget: %#v", got)
+	}
+	if r, err := manager.ForgetRecoveryPending(service.Name); err != nil || r.Outcome != RecoveryOutcomeCleared {
+		t.Fatalf("--forget did not clear absent manifest-less state: %#v %v", r, err)
+	}
+	if _, err := os.Stat(vmDir); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("manifest-less state remains: %v", err)
+	}
+}
+
+// The command treats manifest-less state like startup recovery: it refuses
+// while a process may still use it, and once the process is gone only
+// --forget clears it.
+func TestManifestlessQuarantineClearsByCommandOnceProcessExits(t *testing.T) {
+	manager, inspector, identity, vmDir, service := manifestlessFixture(t)
+	if _, err := manager.Recover(context.Background(), config.NodeConfig{Services: []config.ServiceConfig{service}}); err != nil {
+		t.Fatal(err)
+	}
+	if r, err := manager.ClearRecoveryPending(service.Name); err == nil || r.Outcome != RecoveryOutcomeAmbiguous {
+		t.Fatalf("command adopted or cleared a live manifest-less VM: %#v %v", r, err)
+	}
+	delete(inspector.identities, identity.PID)
+	inspector.find = nil
+	if r, err := manager.ClearRecoveryPending(service.Name); err == nil || r.Outcome != RecoveryOutcomeAmbiguous || !strings.Contains(r.Message, "--forget") {
+		t.Fatalf("a plain clear released manifest-less state: %#v %v", r, err)
+	}
+	if r, err := manager.ForgetRecoveryPending(service.Name); err != nil || r.Outcome != RecoveryOutcomeCleared {
+		t.Fatalf("--forget did not clear absent manifest-less state: %#v %v", r, err)
+	}
+	if _, err := os.Stat(vmDir); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("manifest-less state remains: %v", err)
+	}
+}
+
+// A service that becomes desired after startup does not change the evidence:
+// automatic retry keeps a manifest-less VM quarantined, live or not.
+func TestManifestlessQuarantineIsNotAdoptedOnceDesired(t *testing.T) {
+	manager, inspector, identity, vmDir, service := manifestlessFixture(t)
+	if _, err := manager.Recover(context.Background(), config.NodeConfig{}); err != nil {
+		t.Fatal(err)
+	}
+	desired := config.NodeConfig{Services: []config.ServiceConfig{service}}
+	if adopted, err := manager.Recover(context.Background(), desired); err != nil || len(adopted) != 0 {
+		t.Fatalf("retry adopted a manifest-less VM: %v %v", adopted, err)
+	}
+	if got := manager.List()[service.Name]; got == nil || got.State != StateRecoveryPending {
+		t.Fatalf("retry released the quarantine: %#v", got)
+	}
+	delete(inspector.identities, identity.PID)
+	inspector.find = nil
+	if _, err := manager.Recover(context.Background(), desired); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(vmDir); err != nil || manager.List()[service.Name] == nil {
+		t.Fatalf("retry cleared manifest-less state without --forget: %v %#v", err, manager.List()[service.Name])
+	}
 }
 
 func recoveryFixture(t *testing.T) (*Manager, *instanceManifest, *fakeProcessInspector) {

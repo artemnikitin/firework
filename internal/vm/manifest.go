@@ -16,6 +16,9 @@ import (
 const (
 	manifestSchemaVersion = 1
 	manifestFileName      = "instance.json"
+	firecrackerLogName    = "firecracker.log"
+	firecrackerSocketName = "firecracker.sock"
+	vmConfigName          = "vm-config.json"
 )
 
 type manifestLifecycle string
@@ -64,11 +67,26 @@ func serviceConfigHash(svc config.ServiceConfig) (string, error) {
 	return hex.EncodeToString(sum[:]), nil
 }
 
+// canonicalManifest names a service's runtime paths under vmDir before anything
+// about its process is known. Placeholders and absence proofs use these paths,
+// never ones read from metadata that may be untrusted.
+func canonicalManifest(service, vmDir string) *instanceManifest {
+	return &instanceManifest{SchemaVersion: manifestSchemaVersion, Service: service, VMDir: vmDir,
+		SocketPath: filepath.Join(vmDir, firecrackerSocketName), ConfigPath: filepath.Join(vmDir, vmConfigName)}
+}
+
 func manifestPath(vmDir string) string {
 	return filepath.Join(vmDir, manifestFileName)
 }
 
 func readManifest(path string) (*instanceManifest, error) {
+	info, err := os.Lstat(path)
+	if err != nil {
+		return nil, err
+	}
+	if !info.Mode().IsRegular() {
+		return nil, fmt.Errorf("ownership manifest is not a regular file")
+	}
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return nil, err
@@ -91,7 +109,12 @@ func writeManifest(path string, manifest *instanceManifest) error {
 	if err != nil {
 		return fmt.Errorf("encode manifest: %w", err)
 	}
-	data = append(data, '\n')
+	return writeManifestFile(path, append(data, '\n'))
+}
+
+// writeManifestFile atomically replaces path with data and syncs its
+// directory, so the new content survives a crash once this returns.
+func writeManifestFile(path string, data []byte) error {
 	dir := filepath.Dir(path)
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return fmt.Errorf("create manifest directory: %w", err)

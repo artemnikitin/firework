@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"log/slog"
@@ -13,21 +14,105 @@ import (
 	"github.com/artemnikitin/firework/internal/agentconfig"
 	"github.com/artemnikitin/firework/internal/store"
 	"github.com/artemnikitin/firework/internal/version"
+	"github.com/artemnikitin/firework/internal/vm"
 )
 
 func main() {
-	configPath := flag.String("config", "/etc/firework/agent.yaml", "path to agent config file")
-	showVersion := flag.Bool("version", false, "print version and exit")
-	flag.Parse()
+	if err := runCommand(os.Args[1:], "/etc/firework/agent.yaml"); err != nil && !errors.Is(err, flag.ErrHelp) {
+		fmt.Fprintf(os.Stderr, "error: %v\n", err)
+		os.Exit(1)
+	}
+}
+
+func runCommand(args []string, defaultConfigPath string) error {
+	commandFlags := flag.NewFlagSet("firework-agent", flag.ContinueOnError)
+	commandFlags.SetOutput(os.Stderr)
+	configPath := commandFlags.String("config", defaultConfigPath, "path to agent config file")
+	showVersion := commandFlags.Bool("version", false, "print version and exit")
+	if err := commandFlags.Parse(args); err != nil {
+		return err
+	}
 
 	if *showVersion {
 		fmt.Println("firework-agent", version.String())
-		return
+		return nil
+	}
+	if commandFlags.NArg() > 0 {
+		if commandFlags.Arg(0) != "clear-recovery" {
+			return fmt.Errorf("unexpected argument %q", commandFlags.Arg(0))
+		}
+		return runClearRecovery(commandFlags.Args()[1:], *configPath)
 	}
 
-	if err := run(*configPath); err != nil {
-		fmt.Fprintf(os.Stderr, "error: %v\n", err)
-		os.Exit(1)
+	return run(*configPath)
+}
+
+func runClearRecovery(args []string, defaultConfigPath string) error {
+	commandFlags := flag.NewFlagSet("clear-recovery", flag.ContinueOnError)
+	commandFlags.SetOutput(os.Stderr)
+	configPath := commandFlags.String("config", defaultConfigPath, "path to agent config file")
+	forget := commandFlags.Bool("forget", false, "only clean up a proven absent VM; do not adopt a live VM")
+	commandFlags.Usage = func() {
+		fmt.Fprintln(commandFlags.Output(), "Usage: firework-agent clear-recovery [--config PATH] [--forget] SERVICE")
+		commandFlags.PrintDefaults()
+	}
+	if err := commandFlags.Parse(args); err != nil {
+		return err
+	}
+	// Accept flags after the service name too, as in "clear-recovery app
+	// --forget": parsing stops at the first argument that is not a flag.
+	var services []string
+	for commandFlags.NArg() > 0 {
+		services = append(services, commandFlags.Arg(0))
+		if err := commandFlags.Parse(commandFlags.Args()[1:]); err != nil {
+			return err
+		}
+	}
+	if len(services) != 1 {
+		commandFlags.Usage()
+		return fmt.Errorf("clear-recovery requires one service name")
+	}
+	service := services[0]
+	cfg, err := agentconfig.LoadAgentConfig(*configPath)
+	if err != nil {
+		return fmt.Errorf("loading config: %w", err)
+	}
+	resolve := agent.ClearRecovery
+	if *forget {
+		resolve = agent.ForgetRecovery
+	}
+	result, err := resolve(context.Background(), cfg.StateDir, service)
+	if err != nil {
+		return recoveryCommandError(result, err)
+	}
+	switch result.Outcome {
+	case vm.RecoveryOutcomeNoop:
+		if result.State == "" {
+			fmt.Fprintf(os.Stdout, "service %s has no tracked VM\n", result.Service)
+		} else {
+			fmt.Fprintf(os.Stdout, "service %s is not recovery_pending (state %s)\n", result.Service, result.State)
+		}
+	case vm.RecoveryOutcomeCleared:
+		fmt.Fprintf(os.Stdout, "cleared stale VM state for service %s\n", result.Service)
+	case vm.RecoveryOutcomeReadopted:
+		fmt.Fprintf(os.Stdout, "re-adopted the live VM for service %s; reconciliation was queued\n", result.Service)
+	default:
+		return fmt.Errorf("unexpected recovery outcome %q for service %s", result.Outcome, result.Service)
+	}
+	return nil
+}
+
+// recoveryCommandError adds the next step to a failed clear-recovery: a
+// refusal changed nothing, while an incomplete resolution may have changed
+// part of the VM's state before it failed.
+func recoveryCommandError(result vm.RecoveryResult, err error) error {
+	switch result.Outcome {
+	case vm.RecoveryOutcomeAmbiguous:
+		return fmt.Errorf("%w\nthe VM and its state were left unchanged; resolve the reason above, for example by stopping a process that still uses the VM's paths or waiting for one to finish, then run the command again (--forget clears state only once the VM is proven absent)", err)
+	case vm.RecoveryOutcomeIncomplete:
+		return fmt.Errorf("%w\nownership was settled, but part of the VM's state may already have changed; the service stays held and the running agent retries the rest, so check its status before running the command again; run it again if the service is still held after an agent restart", err)
+	default:
+		return err
 	}
 }
 

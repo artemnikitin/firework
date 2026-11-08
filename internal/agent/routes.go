@@ -1,0 +1,98 @@
+package agent
+
+import (
+	"fmt"
+
+	"github.com/artemnikitin/firework/internal/config"
+	"github.com/artemnikitin/firework/internal/ingress"
+	"github.com/artemnikitin/firework/internal/reconciler"
+	"github.com/artemnikitin/firework/internal/traefik"
+)
+
+// Peer discovery precedes this lifecycle transaction, so a slow store cannot
+// delay health-driven restarts, while selecting and publishing the local
+// snapshot is serialized with VM replacement. When localOnly is set, the peer
+// files on disk are preserved and remoteNodes is the listing they came from,
+// used only for hostname claims.
+func (a *Agent) syncRuntimeRoutes(services []config.ServiceConfig, remoteNodes []config.NodeConfig, localOnly bool) error {
+	a.lifecycleMu.Lock()
+	defer a.lifecycleMu.Unlock()
+	// Remote files written before this process started stay on disk while
+	// listing fails, but their claims are unknown until a listing succeeds.
+	peersKnown := !localOnly || a.peersListed
+	selected := a.selectLocalRoutes(a.reconciler.LocalRoutes(services), services, remoteNodes, peersKnown)
+	// Record what this publish withdraws before any file changes. A failed
+	// publish keeps the withdrawals incomplete, so their addresses stay held.
+	if err := a.beginRouteWithdrawals(selected); err != nil {
+		return fmt.Errorf("recording route withdrawals before publishing: %w", err)
+	}
+	var err error
+	if localOnly {
+		err = a.traefikMgr.SyncLocal(selected)
+	} else {
+		err = a.traefikMgr.Sync(selected, remoteNodes)
+	}
+	if err == nil {
+		if cerr := a.reconciler.CompleteRouteWithdrawals(); cerr != nil {
+			a.logger.Warn("route withdrawals cannot be completed yet", "error", cerr)
+		}
+	}
+	return err
+}
+
+// selectLocalRoutes publishes each tracked VM from its own configuration. A
+// held update keeps its previous hostname only while desired state does not
+// give that hostname to another service, local or on a peer: the desired owner
+// always wins. With no peer listing yet, only this service's own local desired
+// claim proves the hostname is still its own, because a local claim wins over
+// any peer's. A stale route is dropped rather than failing publication, so one
+// held service can never freeze every other route on the node.
+func (a *Agent) selectLocalRoutes(routes []reconciler.LocalRoute, desired []config.ServiceConfig, remoteNodes []config.NodeConfig, peersKnown bool) []config.ServiceConfig {
+	resolve := func(svc config.ServiceConfig) (string, error) {
+		return ingress.Resolve(svc.Name, svc.Metadata, a.cfg.IngressDomain)
+	}
+	claimed := make(map[string]string)
+	for _, svc := range desired {
+		if host, err := resolve(svc); err == nil && host != "" {
+			claimed[host] = svc.Name
+		}
+	}
+	for _, node := range remoteNodes {
+		for _, svc := range node.Services {
+			if host, err := resolve(svc); err == nil && host != "" {
+				if _, local := claimed[host]; !local {
+					claimed[host] = ""
+				}
+			}
+		}
+	}
+	selected := make([]config.ServiceConfig, 0, len(routes))
+	kept := make(map[string]bool)
+	for _, route := range routes {
+		svc := route.Service
+		if route.Current {
+			selected = append(selected, svc)
+			continue
+		}
+		host, err := resolve(svc)
+		if err != nil {
+			a.logger.Warn("dropping held route whose previous metadata no longer resolves", "service", svc.Name, "error", err)
+			continue
+		}
+		if host == "" || kept[host] || svc.Network == nil || svc.Network.GuestIP == "" || traefik.BackendPort(svc) == 0 {
+			continue
+		}
+		// Peer claims are recorded with no local owner, so they always win.
+		owner, taken := claimed[host]
+		if taken && owner != svc.Name {
+			a.logger.Info("dropping held route; desired state gives its hostname to another service", "service", svc.Name, "host", host)
+			continue
+		}
+		if !peersKnown && owner != svc.Name {
+			continue // A peer may own the hostname now; nothing says otherwise.
+		}
+		kept[host] = true
+		selected = append(selected, svc)
+	}
+	return selected
+}
