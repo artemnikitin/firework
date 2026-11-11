@@ -42,6 +42,23 @@ Firework is a lightweight pull-based orchestrator for Firecracker microVMs writt
 - Version/commit/build time are injected via ldflags at build time; never hardcode them.
 - When changing config schemas, CLI behavior, APIs, or user-visible runtime behavior, update `docs/`, `examples/`, and relevant tests.
 
+## Approaching a change
+
+- Agree what done means before writing code. For anything beyond a localized
+  fix, state what the change promises, what it leaves out, and the check that
+  will show it works. Keep that with the issue.
+- Keep scope proportionate. Do not regress behavior that works on `main`. New
+  guarantees need to hold for a realistic single failure in a configuration the
+  project deploys; rarer combinations become follow-up issues unless the harm
+  would be severe.
+- Treat growth as a decision. When a fix needs a new mechanism or a wider
+  guarantee than the change set out to give, ask the owner whether to expand,
+  narrow, or split.
+- Prefer running the change over reading it again. Review ends when the agreed
+  check passes with no in-scope problem open.
+- Keep review on the pull request. One agent writes to a branch; reviewers
+  comment on the PR against a named commit.
+
 ## Shared contracts and regression checks
 
 - When changing configuration, identity, ports, or image contracts, trace affected
@@ -83,6 +100,8 @@ Use the narrowest check that matches the change:
 - Dependency or module changes: run `make tidy` and verify go.mod/go.sum diffs are intentional.
 - Reconcile flow changes: run `make smoke-local`. It uses fake Firecracker and
   disables host network setup; it does not verify real guest boot or networking.
+- VM lifecycle or recovery changes: run `./scripts/systemd-recovery/run.sh`. It
+  uses real systemd in a container and does not boot a guest.
 
 For CI-equivalent local validation run the logic/steps from `.github/workflows/ci.yaml`. 
 
