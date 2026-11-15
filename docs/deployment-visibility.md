@@ -23,11 +23,19 @@ GET /v1/nodes
 GET /v1/nodes/{node_id}
 GET /v1/services
 GET /v1/services/{service_name}
+GET /v1/volumes?state=STATE&limit=N&offset=N
+GET /v1/volumes/{service}/{volume}
 ```
 
 `/healthz` is unauthenticated. List responses contain `api_version`,
 `observed_at`, `count`, and a deterministically sorted `items` array. Supported
 filters are `state` for nodes and `state`, `health`, and `node` for services.
+The retired-node state is available only when requested explicitly with
+`state=retired`; ordinary node lists remain active registry records only.
+Volume list states are `active`, `pending`, `node_unavailable`,
+`backend_unavailable`, `retained`, `orphaned`, and `invalid`. Volume list
+responses accept an optional state filter and bounded `limit` (default 100,
+maximum 500) and `offset`, and return `total` and `has_more` metadata.
 
 Node capacity is requested capacity, not measured utilization. CPU and memory
 `allocated` values are the sum of desired services assigned to the node.
@@ -86,18 +94,36 @@ snapshot's build time. A failed rebuild is never cached and an older snapshot
 is never served in its place. The controller does not use this cache.
 
 A node or volume record that cannot be read or decoded, or whose identity
-does not match its key, is left out of the snapshot and listed in `problems`
-(`kind`, the identifier from its key, and `record_unreadable` or
+does not match its key, is left out of the normal snapshot and listed in
+`problems` (`kind`, the identifier from its key, and `record_unreadable` or
 `record_invalid`) on list and status responses, instead of failing every
-endpoint. Such a fleet is never `converged`: it is `degraded` with
+endpoint. Invalid node records leave their node configs untouched and create
+no separate durable quarantine metadata. Such a fleet
+is never `converged`: it is `degraded` with
 `projection_incomplete`, or `unknown` with `node_record_unreadable` when the
 desired revision is empty and the unreadable node could still be running old
 workloads. Failing to list records, or to read the desired, placement, or
 rendered state, still fails the request.
 
-Lists are not paginated. Each snapshot reads every node and volume record,
-which is intended for deployments of up to a few hundred nodes and a few
-thousand volumes; responses always contain the complete filtered set.
+Node and service lists remain unpaginated. Volume summaries use bounded pages
+after lifecycle filtering; each snapshot still reads every volume record,
+which is intended for deployments of a few thousand retained volumes.
+
+`/v1/volumes` and `/v1/volumes/{service}/{volume}` expose desired and retained
+data from the same merged snapshot as service detail. `active` means a desired
+volume has a usable bound node or advertised shared backend and is prepared or
+durably applied. `pending` means preparation or resize is incomplete.
+`node_unavailable` and `backend_unavailable` preserve the binding while the
+required resource cannot currently be used. `retained` means the volume record
+outlived its desired declaration; `orphaned` means it is attached to a retired
+node or a shared backend no longer advertised by the active fleet. `invalid`
+means the record needs repair; malformed payload contents are not echoed into
+the response. List `problems` identifies unreadable or invalid source keys.
+
+Node retirement is a metadata operation: it leaves the explicit empty node
+config and every volume record in place. It cannot stop a disconnected VM. See
+[node retirement and recovery](node-lifecycle.md) for the disabled-by-default
+retention settings and the externally fenced tombstone recovery procedure.
 
 ## Agent convergence status
 
@@ -105,6 +131,55 @@ Registry heartbeats include a bounded `agent_status` schema shared with the
 agent-local `/status` endpoint. It reports agent version, observation time,
 desired/placement/rendered/applied revisions, reconciliation phase, typed
 conditions, and fixed-shape service summaries.
+
+The control plane accepts status schema v1 and v2. V2 adds a separately
+bounded `actual_only_services` list containing every VM manager record that is
+not in the node's desired config. Each entry reports the service name, VM
+state, running PID, and a bounded VM or volume error; actual-only entries do
+not include volume summaries. V2 always sends an explicit list, including
+`[]` when there are no tracked actual-only records. The registry preserves the
+old v1 wire shape and treats its omitted inventory as unknown.
+
+The list is capped at 256 entries. `actual_only_services_truncated: true`
+means the snapshot cannot prove absence. `actual_only_services_incomplete:
+true` independently reports an unavailable process scan or a process that no
+service accounts for, even if the list is empty. Such telemetry is accepted
+by the registry but cannot prove absence. An entry for the service blocks its
+absence claim, including `failed`, `stopped`, or `recovery_pending`; a failure
+state by itself does not prove execution ended. Node detail returns the fresh
+inventory and both completeness flags.
+
+Actual-only inventory completeness does not determine fleet health. An
+incomplete scan by itself does not make a healthy node unknown. The fleet
+still uses the reported desired workloads, revisions, and conditions:
+`VMRecoveryReady: false` keeps its recovery degradation, and service holds
+such as `unaccounted_vm` or `resource_held` keep their existing reasons and
+messages in service and node detail. Incompleteness only prevents a claim
+that a former service is absent.
+
+When a service moves, service detail and `/v1/status` report
+`previous_node_unconfirmed` until the former node freshly reports a complete
+v2 inventory matching its applied current node config, with the service absent
+from both that config and both status lists. The node can keep other services.
+V1, truncated, incomplete, or stale telemetry cannot establish this proof.
+
+The wait also ends when the former node is retired or reaches its configured
+down/stale retention threshold, with retirement enabled or disabled. This is
+a waiting policy, not evidence of VM termination or permission to reuse data.
+Unresolved executions of services removed from desired state remain in the
+fleet's warning list until proof or expiry; they do not inflate desired counts.
+Registry retirement fences later control-plane writes and cannot stop a
+disconnected VM. See [node lifecycle](node-lifecycle.md) for timing and recovery.
+
+The same ownership wait applies to any removal or move on a healthy node
+running a v1 agent. Continued heartbeats prevent stale expiry, and v1 cannot
+prove absence, so the marker remains until the agent is upgraded or another
+retirement condition applies. This is expected during the control-plane-first
+rollout; see the [rollout limits](node-lifecycle.md#agent-rollout-and-owner-history-limit).
+With v2 agents, a removal or move normally causes two placement publications:
+the first changes the assignment, and a later pass drops the former owner
+after its complete absence acknowledgement. Nodes then acknowledge the new
+rendered revision as usual; the fleet can briefly show publication progress.
 
 The wire payload accepts at most 16 unique conditions, 256 service summaries,
 and 25 volumes per service. Messages are sanitized and capped at 256

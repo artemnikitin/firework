@@ -71,7 +71,15 @@ func (f *fakeS3) PutIfMatch(ctx context.Context, key string, expected objectstor
 	return err == nil, meta, err
 }
 
-func (f *fakeS3) Delete(_ context.Context, key string) error         { delete(f.objects, key); return nil }
+func (f *fakeS3) Delete(_ context.Context, key string) error { delete(f.objects, key); return nil }
+func (f *fakeS3) DeleteIfMatch(_ context.Context, key string, expected objectstorage.WriteToken) (bool, error) {
+	obj, ok := f.objects[key]
+	if !ok || objectstorage.WriteToken(obj.token) != expected {
+		return false, nil
+	}
+	delete(f.objects, key)
+	return true, nil
+}
 func (f *fakeS3) ListKeys(context.Context, string) ([]string, error) { return nil, nil }
 func (f *fakeS3) Close() error                                       { return nil }
 

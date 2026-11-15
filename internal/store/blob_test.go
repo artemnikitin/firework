@@ -58,6 +58,10 @@ func (f *fakeBlob) PutIfMatch(context.Context, string, objectstorage.WriteToken,
 
 func (f *fakeBlob) Delete(context.Context, string) error { return nil }
 
+func (f *fakeBlob) DeleteIfMatch(context.Context, string, objectstorage.WriteToken) (bool, error) {
+	return false, fmt.Errorf("not implemented")
+}
+
 func (f *fakeBlob) ListKeys(_ context.Context, prefix string) ([]string, error) {
 	var keys []string
 	for key := range f.objects {

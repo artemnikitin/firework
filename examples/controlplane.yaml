@@ -1,5 +1,5 @@
 # Firework control-plane configuration.
-# Roles: registry | events | controller | api | all
+# Roles: registry | events | controller | api | node-maintenance | all
 role: "all"
 
 registry_listen_addr: ":9443"
@@ -29,6 +29,13 @@ state:
 leader_lease_ttl: "30s"
 leader_renew_interval: "10s"
 node_stale_ttl: "45s"
+node_down_retention: "24h"
+node_stale_retention: "168h"
+# Retirement is guarded by retention, a dry-run default, and conditional
+# deletion support. Keep disabled until the documented S3/GCS and lifecycle
+# validation gates have passed.
+node_retirement_enabled: false
+node_retirement_dry_run: true
 api_snapshot_ttl: "5s"
 controller_tick: "10s"
 

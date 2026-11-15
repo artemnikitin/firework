@@ -333,6 +333,16 @@ func (s *failingRecordStore) GetJSON(ctx context.Context, key string, out any) (
 	return s.StateStore.GetJSON(ctx, key, out)
 }
 
+func (s *failingRecordStore) GetRaw(ctx context.Context, key string) ([]byte, objectstorage.WriteToken, bool, error) {
+	if key == s.key && s.fails != 0 {
+		if s.fails > 0 {
+			s.fails--
+		}
+		return nil, "", false, errors.New("transient registry read failure")
+	}
+	return s.StateStore.GetRaw(ctx, key)
+}
+
 func placementPointer(t *testing.T, store StateStore) string {
 	t.Helper()
 	var ptr RevisionPointer
@@ -358,6 +368,7 @@ func TestRegistryReadFailureDoesNotStrandRetirement(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// Discovery reads the registry once; the next cycle exercises recovery.
 	c.store = &failingRecordStore{StateStore: store, key: recordKey, fails: 1}
 
 	c.runReconcile(context.Background())

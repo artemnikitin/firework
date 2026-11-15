@@ -112,6 +112,9 @@ func TestRandomRevisionsConvergeWithinCapacity(t *testing.T) {
 		cfg.VMSubnet, cfg.VMGateway = "172.16.0.0/29", "172.16.0.1"
 		store := &fakeStore{revision: "r1", data: map[string][]byte{"web": generatedYAML(from)}}
 		a := New(cfg, store, testLogger())
+		// This generated runtime is entirely fake; scanning the real host on
+		// every status read adds unrelated work to thousands of capacity trials.
+		a.scanUnaccountedVMs = func(context.Context) ([]string, error) { return nil, nil }
 		limit := capacity.NodeCapacity{VCPUs: capVCPUs, MemoryMB: capMemoryMB}
 		a.capacityReader = &fakeCapacityReader{cap: limit}
 		m := &recoveryTestVMManager{instances: map[string]*vm.Instance{}, limit: &limit}

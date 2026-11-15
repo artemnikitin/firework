@@ -80,11 +80,11 @@ func TestNodesJSONKeepsExactBytes(t *testing.T) {
 func TestServiceOutputShowsDiskAndPublicURL(t *testing.T) {
 	storage := operatorapi.ServiceStorageSummary{Local: operatorapi.VolumeAllocationSummary{Count: 1, AllocatedBytes: 2 * gib}}
 	responses := map[string]any{
-		"/v1/services": operatorapi.ListEnvelope[operatorapi.ServiceSummary]{Items: []operatorapi.ServiceSummary{{Name: "db", State: "running", Health: "unhealthy", Storage: storage, ReasonCode: "health_check_failed"}}},
+		"/v1/services": operatorapi.ListEnvelope[operatorapi.ServiceSummary]{Items: []operatorapi.ServiceSummary{{Name: "db", State: "running", Health: "unhealthy", Storage: storage, ReasonCode: "health_check_failed", PreviousNodeUnconfirmed: true, PreviousNodes: []string{"node-old"}}}},
 		"/v1/services/db": operatorapi.ServiceDetail{ServiceSummary: operatorapi.ServiceSummary{Name: "db", Storage: storage},
 			PublicURL: "https://db.example.com"},
 	}
-	assertContains(t, runAgainst(t, responses, "services"), "DISK", "local 2.0 GiB", "health_check_failed")
+	assertContains(t, runAgainst(t, responses, "services"), "DISK", "local 2.0 GiB", "health_check_failed", "PREVIOUS NODE UNCONFIRMED", "node-old")
 	assertContains(t, runAgainst(t, responses, "service", "db"), "PUBLIC URL", "https://db.example.com", "local 2.0 GiB")
 }
 
@@ -96,13 +96,40 @@ func TestNodeDetailShowsLabelsTimesAndRevisions(t *testing.T) {
 	assertContains(t, output, "LABELS", "web, db", "REGISTERED", "UPDATED", "DESIRED REVISION", "d-1", "PLACEMENT REVISION", "p-1", "OBSERVED REVISION", "r-2", "APPLIED REVISION", "r-1", "LOCAL DISK")
 }
 
+func TestNodeDetailShowsActualOnlyVMsAndRetirementHistory(t *testing.T) {
+	output := runAgainst(t, map[string]any{"/v1/nodes/node-old": operatorapi.NodeDetail{
+		NodeSummary:   operatorapi.NodeSummary{NodeID: "node-old", State: "retired"},
+		MaxGeneration: 42, RetirementReason: "stale_timeout",
+		ActualOnlyServices: []operatorapi.ActualOnlyService{{Name: "db", VMState: "failed", ReasonCode: "vm_failed"}},
+		RevivalHistory:     []operatorapi.NodeRevivalAudit{{ClearedGeneration: 42, OperatorReason: "host fenced", ExternalFenceReference: "incident-2", RetainedPoolReference: "disk-7", Outcome: "completed"}},
+	}}, "node", "node-old")
+	assertContains(t, output, "ACTUAL-ONLY SERVICE", "db", "failed", "MAX GENERATION", "42", "stale_timeout", "REVIVAL GENERATION", "incident-2", "disk-7", "completed")
+}
+
 func TestStatusShowsServiceCounts(t *testing.T) {
 	output := runAgainst(t, map[string]any{"/v1/status": operatorapi.RevisionStatus{
 		Phase: "degraded", ReasonCode: "service_unhealthy",
 		Services:          operatorapi.ServiceCounts{Desired: 3, Running: 3, Ready: 2, Unhealthy: 1},
-		UnhealthyServices: []string{"db"},
+		UnhealthyServices: []string{"db"}, PreviousNodeUnconfirmedServices: []string{"api"},
 	}}, "status")
-	assertContains(t, output, "3 desired, 3 running, 2 ready, 0 pending, 1 unhealthy, 0 unknown", "UNHEALTHY", "db")
+	assertContains(t, output, "3 desired, 3 running, 2 ready, 0 pending, 1 unhealthy, 0 unknown", "UNHEALTHY", "db", "PREVIOUS NODE UNCONFIRMED", "api")
+}
+
+func TestVolumeCommandsShowLifecycleAndExactBytes(t *testing.T) {
+	volume := operatorapi.VolumeSummary{
+		LogicalID: "db/data", Service: "db", Name: "data", Type: "local", MountPath: "/data",
+		BoundNode: "node-1", Desired: false, State: "orphaned", ReasonCode: "node_retired",
+		DesiredSizeBytes: 3*gib + 1, AppliedSizeBytes: 3 * gib, ResizeGeneration: 2,
+		ResizeState: "applied", LastError: "previous error",
+	}
+	list := operatorapi.ListEnvelope[operatorapi.VolumeSummary]{Count: 1, Items: []operatorapi.VolumeSummary{volume}, Limit: 100, Total: 1}
+	responses := map[string]any{
+		"/v1/volumes":         list,
+		"/v1/volumes/db/data": operatorapi.VolumeDetail{VolumeSummary: volume},
+	}
+	assertContains(t, runAgainst(t, responses, "volumes", "--state", "orphaned"), "db/data", "orphaned", "node_retired", "VOLUMES")
+	assertContains(t, runAgainst(t, responses, "volume", "db", "data"), "MOUNT PATH", "/data", "RESIZE STATE", "applied", "orphaned")
+	assertContains(t, runAgainst(t, responses, "volume", "db", "data", "--output", "json"), `"desired_size_bytes": 3221225473`, `"state": "orphaned"`)
 }
 
 func TestFormatBytes(t *testing.T) {

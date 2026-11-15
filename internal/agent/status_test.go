@@ -2,6 +2,8 @@ package agent
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -9,10 +11,79 @@ import (
 	"testing"
 
 	"github.com/artemnikitin/firework/internal/config"
+	"github.com/artemnikitin/firework/internal/reconciler"
 	"github.com/artemnikitin/firework/internal/statusmodel"
 	"github.com/artemnikitin/firework/internal/vm"
 	"github.com/artemnikitin/firework/internal/volume"
 )
+
+type statusScanningVMManager struct {
+	*recoveryTestVMManager
+	processes []string
+	err       error
+}
+
+func (m *statusScanningVMManager) UnaccountedVMs(context.Context) ([]string, error) {
+	return m.processes, m.err
+}
+
+func TestUnaccountedVMRemainsVisibleInAgentServiceStatus(t *testing.T) {
+	for _, tc := range []struct {
+		name, reason, message string
+		processes             []string
+		err                   error
+	}{
+		{name: "unaccounted process", processes: []string{"process 4242 (VM directory of gone)"}, reason: reconciler.ActionUnaccountedVM, message: "4242"},
+		{name: "scan failed", err: errors.New("process table unreadable"), reason: "resource_held", message: "process table unreadable"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			a := New(testAgentConfig(t), &fakeStore{}, testLogger())
+			manager := &statusScanningVMManager{recoveryTestVMManager: &recoveryTestVMManager{instances: map[string]*vm.Instance{}}, processes: tc.processes, err: tc.err}
+			a.reconciler = reconciler.NewWithNetworkManager(manager, testLogger(), nil, nil, "", 0).WithStateDir(t.TempDir())
+			a.scanUnaccountedVMs = manager.UnaccountedVMs
+			desired := config.NodeConfig{Services: []config.ServiceConfig{{Name: "fresh", Image: "/image", Kernel: "/kernel", Network: &config.NetworkConfig{GuestIP: "172.16.0.3"}}}}
+			if err := a.reconciler.Reconcile(context.Background(), desired); err == nil || manager.instances["fresh"] != nil {
+				t.Fatalf("new address was not held: err=%v instances=%+v", err, manager.instances)
+			}
+			a.setStatusServices(desired, "revision")
+			a.refreshAgentStatus(statusmodel.PhaseReconciling, "", "")
+			status := a.agentStatusSnapshot()
+			if !status.ActualOnlyServicesIncomplete || len(status.Services) != 1 || status.Services[0].ReasonCode != tc.reason || !strings.Contains(status.Services[0].Message, tc.message) {
+				t.Fatalf("unaccounted process evidence disappeared: %+v", status)
+			}
+		})
+	}
+}
+
+func TestActualOnlyCompletenessFollowsProcessScan(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		processes []string
+		err       error
+	}{
+		{name: "complete"},
+		{name: "unaccounted process", processes: []string{"unaccounted VM"}},
+		{name: "scan failed", err: errors.New("process scan unavailable")},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			a := New(testAgentConfig(t), &fakeStore{}, testLogger())
+			a.scanUnaccountedVMs = func(context.Context) ([]string, error) { return tc.processes, tc.err }
+			a.refreshAgentStatus(statusmodel.PhaseReady, "", "")
+			payload, err := json.Marshal(a.agentStatusSnapshot())
+			if err != nil {
+				t.Fatal(err)
+			}
+			var decoded statusmodel.AgentStatus
+			if err := json.Unmarshal(payload, &decoded); err != nil {
+				t.Fatal(err)
+			}
+			wantComplete := tc.err == nil && len(tc.processes) == 0
+			if statusmodel.HasCompleteActualOnlyInventory(decoded) != wantComplete || decoded.ActualOnlyServices == nil {
+				t.Fatalf("wrong inventory completeness on the wire: %s", payload)
+			}
+		})
+	}
+}
 
 func TestRecoveryConditionIncludesSurvivorsOmittedFromServiceSummaries(t *testing.T) {
 	for _, desiredCount := range []int{1, statusmodel.MaxServices, statusmodel.MaxServices + 1} {
@@ -50,8 +121,11 @@ func TestRecoveryConditionIncludesSurvivorsOmittedFromServiceSummaries(t *testin
 			}
 			a.setStatusServices(config.NodeConfig{Services: desired}, "revision")
 			status := a.agentStatusSnapshot()
-			if !status.ServicesTruncated || len(status.Services) != statusmodel.MaxServices || status.DesiredServices != desiredCount {
+			if status.ServicesTruncated != (desiredCount > statusmodel.MaxServices) || len(status.Services) != min(desiredCount, statusmodel.MaxServices) || status.DesiredServices != desiredCount {
 				t.Fatalf("unexpected bounded inventory: %#v", status)
+			}
+			if len(status.ActualOnlyServices) != statusmodel.MaxActualOnlyServices {
+				t.Fatalf("removed survivors are missing from actual-only inventory: %d", len(status.ActualOnlyServices))
 			}
 			reported := make(map[string]bool, len(status.Services))
 			for _, service := range status.Services {
@@ -190,6 +264,44 @@ func TestFailedVMNamesFrom(t *testing.T) {
 	})
 	if len(got) != 2 || got[0] != "batch" || got[1] != "web" {
 		t.Fatalf("expected the failed VMs in sorted order, got %#v", got)
+	}
+}
+
+func TestBuildActualOnlyServiceStatusesIncludesEveryTrackedNonDesiredVM(t *testing.T) {
+	instances := map[string]*vm.Instance{
+		"api":   {Name: "api", State: vm.StateRunning, PID: 1234},
+		"batch": {Name: "batch", State: vm.StateFailed, LastError: "child exited"},
+		"db":    {Name: "db", State: vm.StateRunning, PID: 5678},
+		"nil":   nil,
+	}
+	got, truncated := buildActualOnlyServiceStatuses(instances, map[string]struct{}{"db": {}}, map[string]string{
+		"api": strings.Repeat("volume failed ", 40),
+	})
+	if truncated || len(got) != 2 || got[0].Name != "api" || got[1].Name != "batch" {
+		t.Fatalf("actual-only inventory = %#v, truncated=%v", got, truncated)
+	}
+	if got[0].VMState != string(vm.StateRunning) || got[0].PID != 1234 || got[0].ReasonCode != "volume_failed" || len(got[0].Message) > statusmodel.MaxMessageLen {
+		t.Fatalf("running actual-only entry lost bounded volume error or identity: %+v", got[0])
+	}
+	if got[1].VMState != string(vm.StateFailed) || got[1].ReasonCode != "vm_failed" || got[1].Message != "child exited" {
+		t.Fatalf("failed actual-only entry lost execution state: %+v", got[1])
+	}
+}
+
+func TestBuildActualOnlyServiceStatusesMarksTruncationIncomplete(t *testing.T) {
+	instances := make(map[string]*vm.Instance, statusmodel.MaxActualOnlyServices+1)
+	for i := 0; i < statusmodel.MaxActualOnlyServices+1; i++ {
+		name := fmt.Sprintf("service-%04d", i)
+		instances[name] = &vm.Instance{Name: name, State: vm.StateStopped}
+	}
+	got, truncated := buildActualOnlyServiceStatuses(instances, nil, nil)
+	if !truncated || len(got) != statusmodel.MaxActualOnlyServices {
+		t.Fatalf("actual-only inventory count=%d truncated=%v", len(got), truncated)
+	}
+	if statusmodel.HasCompleteActualOnlyInventory(statusmodel.AgentStatus{
+		SchemaVersion: statusmodel.SchemaVersion, ActualOnlyServices: got, ActualOnlyServicesTruncated: truncated,
+	}) {
+		t.Fatal("truncated actual-only inventory was treated as proof of absence")
 	}
 }
 

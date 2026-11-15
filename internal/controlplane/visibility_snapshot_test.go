@@ -189,6 +189,14 @@ func (s *cancellingStore) GetJSON(ctx context.Context, key string, out any) (obj
 	return s.StateStore.GetJSON(ctx, key, out)
 }
 
+func (s *cancellingStore) GetRaw(ctx context.Context, key string) ([]byte, objectstorage.WriteToken, bool, error) {
+	if strings.HasPrefix(key, s.prefix) {
+		s.cancel()
+		return nil, "", false, ctx.Err()
+	}
+	return s.StateStore.GetRaw(ctx, key)
+}
+
 // A scan interrupted by the caller's cancellation is not a set of unreadable
 // records: it must fail, not be cached, and leave no false problems for the
 // next operator.
@@ -199,7 +207,7 @@ func TestCancelledScanFailsAndIsNotCached(t *testing.T) {
 			cfg := validConfigForRole(RoleAPI)
 			putCurrentState(t, context.Background(), base, DesiredRevision{Revision: "desired-1"}, PlacementRevision{Revision: "placement-1", DesiredRevision: "desired-1"}, "rendered-1")
 			putNode(t, context.Background(), base, cfg, NodeRecord{NodeID: "node-1", State: NodeStateReady})
-			putRecord(t, base, "db", "data", VolumeRecord{LogicalID: "db/data", Type: config.VolumeTypeLocal, BoundNode: "node-1", DesiredSizeBytes: config.GiB})
+			putRecord(t, base, "db", "data", VolumeRecord{LogicalID: "db/data", Type: config.VolumeTypeLocal, BoundNode: "node-1", DesiredSizeBytes: config.GiB, AppliedSizeBytes: config.GiB, ResizeGeneration: 1, ResizeState: VolumeResizeApplied})
 
 			ctx, cancel := context.WithCancel(context.Background())
 			defer cancel()

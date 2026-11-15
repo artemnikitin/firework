@@ -44,6 +44,10 @@ type BlobStore interface {
 	PutIfAbsent(ctx context.Context, key string, r io.Reader, opts PutOptions) (bool, BlobMeta, error)
 	PutIfMatch(ctx context.Context, key string, expected WriteToken, r io.Reader, opts PutOptions) (bool, BlobMeta, error)
 	Delete(ctx context.Context, key string) error
+	// DeleteIfMatch removes key only when its current provider version token
+	// equals expected. A false result means the object was missing or changed.
+	// Implementations must never emulate this with an unconditional delete.
+	DeleteIfMatch(ctx context.Context, key string, expected WriteToken) (bool, error)
 	ListKeys(ctx context.Context, prefix string) ([]string, error)
 }
 
