@@ -11,10 +11,49 @@ import (
 	"testing"
 
 	"github.com/artemnikitin/firework/internal/config"
+	"github.com/artemnikitin/firework/internal/reconciler"
 	"github.com/artemnikitin/firework/internal/statusmodel"
 	"github.com/artemnikitin/firework/internal/vm"
 	"github.com/artemnikitin/firework/internal/volume"
 )
+
+type statusScanningVMManager struct {
+	*recoveryTestVMManager
+	processes []string
+	err       error
+}
+
+func (m *statusScanningVMManager) UnaccountedVMs(context.Context) ([]string, error) {
+	return m.processes, m.err
+}
+
+func TestUnaccountedVMRemainsVisibleInAgentServiceStatus(t *testing.T) {
+	for _, tc := range []struct {
+		name, reason, message string
+		processes             []string
+		err                   error
+	}{
+		{name: "unaccounted process", processes: []string{"process 4242 (VM directory of gone)"}, reason: reconciler.ActionUnaccountedVM, message: "4242"},
+		{name: "scan failed", err: errors.New("process table unreadable"), reason: "resource_held", message: "process table unreadable"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			a := New(testAgentConfig(t), &fakeStore{}, testLogger())
+			manager := &statusScanningVMManager{recoveryTestVMManager: &recoveryTestVMManager{instances: map[string]*vm.Instance{}}, processes: tc.processes, err: tc.err}
+			a.reconciler = reconciler.NewWithNetworkManager(manager, testLogger(), nil, nil, "", 0).WithStateDir(t.TempDir())
+			a.scanUnaccountedVMs = manager.UnaccountedVMs
+			desired := config.NodeConfig{Services: []config.ServiceConfig{{Name: "fresh", Image: "/image", Kernel: "/kernel", Network: &config.NetworkConfig{GuestIP: "172.16.0.3"}}}}
+			if err := a.reconciler.Reconcile(context.Background(), desired); err == nil || manager.instances["fresh"] != nil {
+				t.Fatalf("new address was not held: err=%v instances=%+v", err, manager.instances)
+			}
+			a.setStatusServices(desired, "revision")
+			a.refreshAgentStatus(statusmodel.PhaseReconciling, "", "")
+			status := a.agentStatusSnapshot()
+			if !status.ActualOnlyServicesIncomplete || len(status.Services) != 1 || status.Services[0].ReasonCode != tc.reason || !strings.Contains(status.Services[0].Message, tc.message) {
+				t.Fatalf("unaccounted process evidence disappeared: %+v", status)
+			}
+		})
+	}
+}
 
 func TestActualOnlyCompletenessFollowsProcessScan(t *testing.T) {
 	for _, tc := range []struct {

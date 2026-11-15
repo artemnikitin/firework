@@ -1029,8 +1029,10 @@ func (s visibilitySnapshot) nodeRevisionStatus() operatorapi.RevisionStatus {
 			continue
 		}
 		agentStatus, fresh := s.freshStatus(record)
-		if !fresh || (agentStatus.ServicesTruncated && !truncatedRecoverySurvivors(agentStatus, expectedServices[nodeID])) ||
-			(agentStatus.SchemaVersion == statusmodel.SchemaVersion && !statusmodel.HasCompleteActualOnlyInventory(agentStatus) && !truncatedRecoverySurvivors(agentStatus, expectedServices[nodeID])) {
+		// Actual-only inventory completeness governs proof of absence, not
+		// workload health. Recovery conditions and service holds still describe
+		// known runtime problems even when a process scan is incomplete.
+		if !fresh || (agentStatus.ServicesTruncated && !truncatedRecoverySurvivors(agentStatus, expectedServices[nodeID])) {
 			status.UnknownNodes = append(status.UnknownNodes, nodeID)
 			continue
 		}
