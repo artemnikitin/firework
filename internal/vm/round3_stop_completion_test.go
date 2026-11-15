@@ -20,7 +20,8 @@ type round3StopCompletionInspector struct {
 	*round3DirectInspector
 	gateMu   sync.Mutex
 	oldPID   int
-	calls    int
+	signaled <-chan struct{}
+	blocked  bool
 	entered  chan struct{}
 	release  chan struct{}
 	finalErr error
@@ -29,11 +30,13 @@ type round3StopCompletionInspector struct {
 func (i *round3StopCompletionInspector) Inspect(pid int) (processIdentity, error) {
 	i.gateMu.Lock()
 	block := false
-	if pid == i.oldPID {
-		i.calls++
-		// First inspection validates ownership before SIGTERM. Delay only the
-		// next inspection, after Stop has signalled the old direct child.
-		block = i.calls == 2
+	if pid == i.oldPID && !i.blocked {
+		select {
+		case <-i.signaled:
+			block = true
+			i.blocked = true
+		default:
+		}
 	}
 	i.gateMu.Unlock()
 	if block {
@@ -42,6 +45,18 @@ func (i *round3StopCompletionInspector) Inspect(pid int) (processIdentity, error
 		return processIdentity{}, i.finalErr
 	}
 	return i.round3DirectInspector.Inspect(pid)
+}
+
+type round3StopCompletionLauncher struct {
+	processLauncher
+	signaled chan struct{}
+	once     sync.Once
+}
+
+func (l *round3StopCompletionLauncher) Stop(manifest *instanceManifest, signal syscall.Signal) error {
+	err := l.processLauncher.Stop(manifest, signal)
+	l.once.Do(func() { close(l.signaled) })
+	return err
 }
 
 func (*round3StopCompletionInspector) FindByAnyArgument(string, string) ([]processIdentity, error) {
@@ -66,10 +81,11 @@ func TestRound3StaleStopCannotChangeReplacement(t *testing.T) {
 			}
 			m := NewManager(binary, stateDir, slog.New(slog.NewTextHandler(io.Discard, nil)))
 			launcher := &specCapturingLauncher{inner: &directLauncher{binary: binary}}
-			m.launcher = launcher
+			signaled := make(chan struct{})
+			m.launcher = &round3StopCompletionLauncher{processLauncher: launcher, signaled: signaled}
 			inspector := &round3StopCompletionInspector{
 				round3DirectInspector: &round3DirectInspector{launchedSpecInspector: &launchedSpecInspector{launcher: launcher, executable: binary}},
-				entered:               make(chan struct{}), release: make(chan struct{}), finalErr: finalErr,
+				entered:               make(chan struct{}), release: make(chan struct{}), finalErr: finalErr, signaled: signaled,
 			}
 			m.inspector = inspector
 			var releaseOnce sync.Once

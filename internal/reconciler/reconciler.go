@@ -84,18 +84,20 @@ type Reconciler struct {
 	// cleanupMu serializes cleanup journal mutations with recovery commands.
 	// Cleanup retry may call Manager.List while holding it; the manager must
 	// release its own mutex before invoking the cleanup recorder.
-	cleanupMu       sync.Mutex
-	vmManager       VMManager
-	healthMon       *healthcheck.Monitor
-	networkMgr      NetworkManager
-	logger          *slog.Logger
-	updateStrategy  string
-	updateDelay     time.Duration
-	sleepFn         func(context.Context, time.Duration) error
-	pendingRecovery map[string]struct{}
-	heldMu          sync.RWMutex
-	heldServices    map[string]Hold
-	capacity        *capacityLimit
+	cleanupMu        sync.Mutex
+	vmManager        VMManager
+	healthMon        *healthcheck.Monitor
+	networkMgr       NetworkManager
+	logger           *slog.Logger
+	updateStrategy   string
+	updateDelay      time.Duration
+	sleepFn          func(context.Context, time.Duration) error
+	pendingRecovery  map[string]struct{}
+	heldMu           sync.RWMutex
+	heldServices     map[string]Hold
+	resizeAttempts   map[string]resizeAttempt
+	applicationExits map[string]string
+	capacity         *capacityLimit
 	// planned is the revision Reconcile is applying, so a per-action hold
 	// check sees held running owners across the whole revision.
 	planned *config.NodeConfig
@@ -745,7 +747,7 @@ func (r *Reconciler) applyAllAtOnce(ctx context.Context, actions []Action) error
 			if action.PreviousService != nil {
 				prev = *action.PreviousService
 			}
-			if err := r.deleteService(prev); err != nil {
+			if err := r.deleteForUpdate(prev, action.Service); err != nil {
 				r.logger.Error("failed to stop existing service during update", "service", action.Service.Name, "error", err)
 				errs = append(errs, fmt.Errorf("remove previous %s: %w", action.Service.Name, err))
 				continue
@@ -844,9 +846,12 @@ func (r *Reconciler) applyRolling(ctx context.Context, actions []Action) error {
 		if action.PreviousService != nil {
 			prev = *action.PreviousService
 		}
-		if err := r.deleteService(prev); err != nil {
+		if err := r.deleteForUpdate(prev, action.Service); err != nil {
 			r.logger.Error("failed to stop existing service during update", "service", action.Service.Name, "error", err)
 			errs = append(errs, fmt.Errorf("remove previous %s: %w", action.Service.Name, err))
+			if errors.Is(err, ErrServiceHeld) {
+				continue
+			}
 			break
 		}
 		if err := r.createService(ctx, action.Service, &prev); err != nil {
@@ -963,6 +968,7 @@ func (r *Reconciler) pause(ctx context.Context) error {
 
 // Reconcile is a convenience method that plans and applies in one step.
 func (r *Reconciler) Reconcile(ctx context.Context, desired config.NodeConfig) error {
+	r.pruneResizeAttempts(desired)
 	var errs []error
 	if r.journalCorrupt {
 		// Deliberately does not skip the rest of Reconcile: VMs and port
@@ -1258,6 +1264,10 @@ func (r *Reconciler) createService(ctx context.Context, svc config.ServiceConfig
 // deleteService deregisters health checks, stops the VM, and tears down host
 // networking (port forwards and the network device).
 func (r *Reconciler) deleteService(svc config.ServiceConfig) error {
+	return r.deleteServiceWith(svc, r.vmManager.Remove)
+}
+
+func (r *Reconciler) deleteServiceWith(svc config.ServiceConfig, remove func(string) error) error {
 	// Write-ahead: durably record every host resource this delete will have
 	// to clean up *before* the VM goes away. Once Remove succeeds, svc is
 	// absent from both desired and actual state, so Plan will never emit a
@@ -1279,7 +1289,7 @@ func (r *Reconciler) deleteService(svc config.ServiceConfig) error {
 
 	// Prove ownership and stop the VM before removing host resources. If the
 	// process identity is ambiguous, keep the service quarantined and intact.
-	if err := r.vmManager.Remove(svc.Name); err != nil {
+	if err := remove(svc.Name); err != nil {
 		// The entries just journalled are deliberately left in place. They
 		// are not leaked: the VM is still running, so the retry paths see
 		// svc.Name in vmManager.List() and find every one of those resources
@@ -1289,6 +1299,7 @@ func (r *Reconciler) deleteService(svc config.ServiceConfig) error {
 		// settleAllocations and retryPendingNetworkDevices.
 		return stageError(FailureStageVM, fmt.Errorf("remove VM: %w", err))
 	}
+	r.clearResizeAttempt(svc.Name)
 
 	if r.healthMon != nil {
 		r.healthMon.Deregister(svc.Name)

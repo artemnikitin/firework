@@ -16,18 +16,20 @@ import (
 // DefaultAgentConfig returns sensible defaults for the agent configuration.
 func DefaultAgentConfig() AgentConfig {
 	return AgentConfig{
-		StoreType:                 "git",
-		StoreBranch:               "main",
-		PollInterval:              30 * time.Second,
-		FirecrackerBin:            "/usr/bin/firecracker",
-		StateDir:                  "/var/lib/firework",
-		LogLevel:                  "info",
-		ImagesDir:                 "/var/lib/images",
-		VMSubnet:                  "172.16.0.0/24",
-		VMGateway:                 "172.16.0.1",
-		VMBridge:                  "br-firework",
-		RegistryCertRenewBefore:   6 * time.Hour,
-		RegistryHeartbeatInterval: 15 * time.Second,
+		StoreType:                       "git",
+		StoreBranch:                     "main",
+		PollInterval:                    30 * time.Second,
+		GuestApplicationShutdownTimeout: 15 * time.Second,
+		GuestFlushTimeout:               15 * time.Second,
+		FirecrackerBin:                  "/usr/bin/firecracker",
+		StateDir:                        "/var/lib/firework",
+		LogLevel:                        "info",
+		ImagesDir:                       "/var/lib/images",
+		VMSubnet:                        "172.16.0.0/24",
+		VMGateway:                       "172.16.0.1",
+		VMBridge:                        "br-firework",
+		RegistryCertRenewBefore:         6 * time.Hour,
+		RegistryHeartbeatInterval:       15 * time.Second,
 	}
 }
 
@@ -43,6 +45,21 @@ func LoadAgentConfig(path string) (AgentConfig, error) {
 
 	if err := yaml.Unmarshal(data, &cfg); err != nil {
 		return cfg, fmt.Errorf("parsing agent config %s: %w", path, err)
+	}
+	var keys map[string]yaml.Node
+	if err := yaml.Unmarshal(data, &keys); err != nil {
+		return cfg, err
+	}
+	if _, obsolete := keys["guest_quiesce_timeout"]; obsolete {
+		return cfg, fmt.Errorf("guest_quiesce_timeout was replaced by guest_application_shutdown_timeout and guest_flush_timeout")
+	}
+	for name, timeout := range map[string]time.Duration{
+		"guest_application_shutdown_timeout": cfg.GuestApplicationShutdownTimeout,
+		"guest_flush_timeout":                cfg.GuestFlushTimeout,
+	} {
+		if timeout < time.Second || timeout > 5*time.Minute {
+			return cfg, fmt.Errorf("%s must be between 1s and 5m", name)
+		}
 	}
 
 	if cfg.NodeName == "" && len(cfg.NodeNames) == 0 {

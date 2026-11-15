@@ -139,10 +139,13 @@ type Manager struct {
 	// identityTimeout bounds waiting for a launched process to exec, and
 	// exitConfirmTimeout bounds waiting for an abandoned launch to go away.
 	// They are fields so tests do not have to sleep out the real budgets.
-	identityTimeout    time.Duration
-	exitConfirmTimeout time.Duration
-	stopGrace          time.Duration
-	stopKill           time.Duration
+	identityTimeout                 time.Duration
+	exitConfirmTimeout              time.Duration
+	stopGrace                       time.Duration
+	stopKill                        time.Duration
+	guestApplicationShutdownTimeout time.Duration
+	guestFlushTimeout               time.Duration
+	quiescer                        guestQuiescer
 	// recoveryManifestWriter is normally nil, which uses writeManifest. Tests
 	// can inject a one-shot durable-write failure to cover recovery retries.
 	recoveryManifestWriter       func(string, *instanceManifest) error
@@ -172,6 +175,10 @@ func NewManager(firecrackerBin, stateDir string, logger *slog.Logger) *Manager {
 
 // NewManagerWithVolumes creates a VM manager with persistent-volume support.
 func NewManagerWithVolumes(firecrackerBin, stateDir string, logger *slog.Logger, volumeManager *volume.Manager) *Manager {
+	return NewManagerWithVolumesAndGuestTimeouts(firecrackerBin, stateDir, logger, volumeManager, 15*time.Second, 15*time.Second)
+}
+
+func NewManagerWithVolumesAndGuestTimeouts(firecrackerBin, stateDir string, logger *slog.Logger, volumeManager *volume.Manager, applicationTimeout, flushTimeout time.Duration) *Manager {
 	return &Manager{
 		firecrackerBin: firecrackerBin,
 		stateDir:       stateDir,
@@ -180,10 +187,12 @@ func NewManagerWithVolumes(firecrackerBin, stateDir string, logger *slog.Logger,
 		launcher:       chooseLauncher(firecrackerBin),
 		inspector:      osProcessInspector{},
 
-		identityTimeout:    launchIdentityTimeout,
-		exitConfirmTimeout: launchExitConfirmTimeout,
-		stopGrace:          stopGraceTimeout,
-		stopKill:           stopKillTimeout,
+		identityTimeout:                 launchIdentityTimeout,
+		exitConfirmTimeout:              launchExitConfirmTimeout,
+		stopGrace:                       stopGraceTimeout,
+		stopKill:                        stopKillTimeout,
+		guestApplicationShutdownTimeout: applicationTimeout,
+		guestFlushTimeout:               flushTimeout,
 
 		instances:    make(map[string]*Instance),
 		volumeErrors: make(map[string]string),
@@ -646,6 +655,10 @@ func (m *Manager) finishStart(ctx context.Context, svc config.ServiceConfig, sta
 		delete(m.instances, svc.Name)
 		return err
 	}
+	if err := os.Remove(filepath.Join(vmDir, "guest.vsock")); err != nil && !errors.Is(err, os.ErrNotExist) {
+		delete(m.instances, svc.Name)
+		return fmt.Errorf("remove stale guest socket: %w", err)
+	}
 	launchAttempted := false
 	defer func() {
 		if !launchAttempted {
@@ -948,9 +961,9 @@ func awaitProcessExit(inspector processInspector, pid int, timeout, interval tim
 }
 
 // Stop gracefully shuts down a running microVM.
-func (m *Manager) Stop(name string) error { return m.stopInstance(name, nil) }
+func (m *Manager) Stop(name string) error { return m.stopInstance(name, nil, false) }
 
-func (m *Manager) stopInstance(name string, expected *Instance) error {
+func (m *Manager) stopInstance(name string, expected *Instance, requireQuiesce bool) error {
 	m.mu.Lock()
 	inst, exists := m.instances[name]
 	if !exists {
@@ -1013,9 +1026,39 @@ func (m *Manager) stopInstance(name string, expected *Instance) error {
 			return fmt.Errorf("refusing to signal pid %d: %w", pid, err)
 		}
 	} else {
-		launcher := launcherForManifest(m.firecrackerBin, &ownedManifest)
+		applicationExited, quiesceErr := m.requestGuestQuiesce(&ownedManifest)
+		ownerErr := m.validateStopOwner(name, inst, &ownedManifest)
+		if ownerErr != nil && !errors.Is(ownerErr, errProcessNotFound) {
+			m.quarantineStopIfCurrent(name, inst, ownedManifest.InstanceID, fmt.Errorf("ownership changed after guest quiesce: %w", ownerErr))
+			return fmt.Errorf("refusing to signal pid %d after guest quiesce because ownership changed: %w", pid, ownerErr)
+		}
+		if ownerErr == nil && requireQuiesce && quiesceErr != nil {
+			if err := m.restoreAfterQuiesceFailure(name, inst, &ownedManifest); err != nil {
+				return err
+			}
+			return &GuestQuiesceRequiredError{Cause: quiesceErr, ApplicationExited: applicationExited}
+		}
+		if quiesceErr != nil {
+			if len(ownedManifest.Volumes) > 0 {
+				m.setVolumeError(name, quiesceErr)
+			}
+			m.logger.Warn("guest quiesce failed; using owned termination fallback", "service", name, "error", quiesceErr)
+		} else {
+			m.setVolumeError(name, nil)
+		}
+		if errors.Is(ownerErr, errProcessNotFound) {
+			goto stopped
+		}
+		launcher := m.stopLauncher(&ownedManifest)
 		if err := launcher.Stop(&ownedManifest, syscall.SIGTERM); err != nil {
 			m.logger.Warn("SIGTERM failed, sending SIGKILL", "service", name, "error", err)
+			if err := m.validateStopOwner(name, inst, &ownedManifest); err != nil {
+				if errors.Is(err, errProcessNotFound) {
+					goto stopped
+				}
+				m.quarantineStopIfCurrent(name, inst, ownedManifest.InstanceID, err)
+				return fmt.Errorf("refusing to signal pid %d with SIGKILL because ownership changed: %w", pid, err)
+			}
 			_ = launcher.Stop(&ownedManifest, syscall.SIGKILL)
 		}
 
@@ -1027,6 +1070,13 @@ func (m *Manager) stopInstance(name string, expected *Instance) error {
 		}
 		if !exited {
 			m.logger.Warn("microVM did not exit after SIGTERM, sending SIGKILL", "service", name, "pid", pid)
+			if err := m.validateStopOwner(name, inst, &ownedManifest); err != nil {
+				if errors.Is(err, errProcessNotFound) {
+					goto stopped
+				}
+				m.quarantineStopIfCurrent(name, inst, ownedManifest.InstanceID, err)
+				return err
+			}
 			_ = launcher.Stop(&ownedManifest, syscall.SIGKILL)
 			exited, waitErr = waitForOwnedProcessExit(m.inspector, &ownedManifest, killTimeout)
 			if waitErr != nil {
@@ -1044,6 +1094,7 @@ func (m *Manager) stopInstance(name string, expected *Instance) error {
 		}
 	}
 
+stopped:
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if m.instances[name] != inst || inst.instanceID != ownedManifest.InstanceID {
@@ -1057,6 +1108,9 @@ func (m *Manager) stopInstance(name string, expected *Instance) error {
 	writeErr := m.writeRecoveryManifest(manifestPath(manifest.VMDir), manifest)
 	// Keep unlink serialized with replacement starts, just like manifest commit.
 	_ = os.Remove(socketPath)
+	if path, err := guestVsockPath(&ownedManifest); err == nil {
+		_ = os.Remove(path)
+	}
 	if writeErr != nil {
 		return fmt.Errorf("persist stopped VM state: %w", writeErr)
 	}
@@ -1067,6 +1121,12 @@ func (m *Manager) stopInstance(name string, expected *Instance) error {
 
 // Remove stops (if running) and removes all state for a service.
 func (m *Manager) Remove(name string) error {
+	return m.remove(name, false)
+}
+
+func (m *Manager) RemoveForResize(name string) error { return m.remove(name, true) }
+
+func (m *Manager) remove(name string, requireQuiesce bool) error {
 	if err := ValidateRecoveryServiceName(name); err != nil {
 		return err
 	}
@@ -1098,7 +1158,7 @@ func (m *Manager) Remove(name string) error {
 	}
 
 	if exists && (state == StateRunning || state == StateStopping) {
-		if err := m.stopInstance(name, inst); err != nil {
+		if err := m.stopInstance(name, inst, requireQuiesce); err != nil {
 			return fmt.Errorf("stopping VM during remove: %w", err)
 		}
 	}
@@ -1313,6 +1373,7 @@ func (m *Manager) writeVMConfig(vmDir string, svc config.ServiceConfig, prepared
 		Drives:            drives,
 		MachineConfig:     firecrackerMachineConfig{VCPUCount: svc.VCPUs, MemSizeMiB: svc.MemoryMB},
 		NetworkInterfaces: networkInterfaces,
+		Vsock:             firecrackerVsock{GuestCID: 3, UDSPath: filepath.Join(vmDir, "guest.vsock")},
 	}
 	configJSON, err := json.MarshalIndent(vmConfig, "", "  ")
 	if err != nil {
@@ -1331,6 +1392,12 @@ type firecrackerConfig struct {
 	Drives            []firecrackerDrive            `json:"drives"`
 	MachineConfig     firecrackerMachineConfig      `json:"machine-config"`
 	NetworkInterfaces []firecrackerNetworkInterface `json:"network-interfaces,omitempty"`
+	Vsock             firecrackerVsock              `json:"vsock"`
+}
+
+type firecrackerVsock struct {
+	GuestCID uint32 `json:"guest_cid"`
+	UDSPath  string `json:"uds_path"`
 }
 
 type firecrackerBootSource struct {

@@ -346,6 +346,7 @@ func (a *Agent) refreshAgentStatus(phase statusmodel.Phase, code, message string
 				service.ReasonCode = "health_check_failed"
 			}
 		}
+		applyGuestQuiesceObservation(&service, held[desired.Name])
 		if hold := held[desired.Name]; hold.Reason != "" && service.ReasonCode == "" {
 			// Keep the running/health observation while explaining why a
 			// requested change is deferred. A passing health check does not
@@ -487,6 +488,19 @@ func (a *Agent) agentStatusSnapshot() statusmodel.AgentStatus {
 	out.Conditions = append([]statusmodel.Condition(nil), a.currentStatus.Conditions...)
 	out.Services = append([]statusmodel.ServiceStatus(nil), a.currentStatus.Services...)
 	return out
+}
+
+func applyGuestQuiesceObservation(service *statusmodel.ServiceStatus, observation reconciler.Hold) {
+	if !observation.ApplicationExited {
+		return
+	}
+	if service.Health != "unhealthy" {
+		service.Health = "unknown"
+	}
+	if observation.Reason == "" && service.ReasonCode == "" {
+		service.ReasonCode = "guest_application_stopped"
+		service.Message = "application exited during guest quiesce; a VM restart is required to run it again"
+	}
 }
 
 // serviceReady reports whether a service counts toward ready_services: it is

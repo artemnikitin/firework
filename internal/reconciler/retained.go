@@ -14,8 +14,9 @@ import (
 // that unresolved VM ownership caused: those alone let a revision apply as
 // degraded, because pending recovery explains them and keeps retrying them.
 type Hold struct {
-	Reason   string
-	Recovery bool
+	Reason            string
+	ApplicationExited bool
+	Recovery          bool
 	// Admission is the reason code of a hold waiting cannot resolve, such as
 	// desired services that exceed node capacity. It fails the revision.
 	Admission string
@@ -134,11 +135,12 @@ func retainedIn(actual map[string]*vm.Instance) []*vm.Instance {
 // is reported in per-service status like any other hold.
 func (r *Reconciler) Holds(desired config.NodeConfig, external map[string]Hold) map[string]Hold {
 	actual := r.vmManager.List()
-	held := HoldsIn(actual, desired, external)
+	resizeOwners := r.resizeOwners(desired, actual)
+	held := HoldsIn(actual, desired, external, resizeOwners...)
 	// VMs the plan removes before any start, unless a retained claim holds
 	// their removal.
 	leaving := make(map[string]bool)
-	deleteHeld := DeleteHoldsIn(actual, desired)
+	deleteHeld := DeleteHoldsIn(actual, desired, resizeOwners...)
 	for name, instance := range actual {
 		if _, wanted := held[name]; !wanted && !RetainsRuntime(instance.State) && deleteHeld[name].Reason == "" &&
 			!slices.ContainsFunc(desired.Services, func(s config.ServiceConfig) bool { return s.Name == name }) {
@@ -164,9 +166,9 @@ func (r *Reconciler) Holds(desired config.NodeConfig, external map[string]Hold) 
 // HoldsIn is Holds over the given inventory instead of the current one, so
 // admission can read one snapshot throughout, or weigh what would hold if
 // part of the runtime were gone.
-func HoldsIn(actual map[string]*vm.Instance, desired config.NodeConfig, external map[string]Hold) map[string]Hold {
+func HoldsIn(actual map[string]*vm.Instance, desired config.NodeConfig, external map[string]Hold, additionalOwners ...*vm.Instance) map[string]Hold {
 	unknown := unknownRuntimeOwner(actual)
-	owners := retainedIn(actual)
+	owners := append(retainedIn(actual), additionalOwners...)
 	held := make(map[string]Hold)
 	// A tracked VM whose update is held keeps its actual guest IP, MAC, host
 	// ports and devices, so it is an owner for every other service. That
@@ -197,17 +199,18 @@ func HoldsIn(actual map[string]*vm.Instance, desired config.NodeConfig, external
 // why their removal must wait: a host claim a retained VM shares with them.
 // Such a VM keeps running, and keeps its resources, until the hold clears.
 func (r *Reconciler) DeleteHolds(desired config.NodeConfig) map[string]Hold {
-	return DeleteHoldsIn(r.vmManager.List(), desired)
+	actual := r.vmManager.List()
+	return DeleteHoldsIn(actual, desired, r.resizeOwners(desired, actual)...)
 }
 
 // DeleteHoldsIn is DeleteHolds over the given inventory.
-func DeleteHoldsIn(actual map[string]*vm.Instance, desired config.NodeConfig) map[string]Hold {
+func DeleteHoldsIn(actual map[string]*vm.Instance, desired config.NodeConfig, additionalOwners ...*vm.Instance) map[string]Hold {
 	wanted := make(map[string]bool, len(desired.Services))
 	for _, service := range desired.Services {
 		wanted[service.Name] = true
 	}
 	held := make(map[string]Hold)
-	retained := retainedIn(actual)
+	retained := append(retainedIn(actual), additionalOwners...)
 	for name, instance := range actual {
 		if wanted[name] || RetainsRuntime(instance.State) {
 			continue
@@ -233,7 +236,21 @@ func deleteHold(instance *vm.Instance, retained []*vm.Instance) Hold {
 
 // HeldServiceHolds is HeldServices with each hold's full classification.
 func (r *Reconciler) HeldServiceHolds(desired config.NodeConfig) map[string]Hold {
-	return r.holds(desired)
+	held := r.holds(desired)
+	for name, attempt := range r.validResizeAttempts(desired, r.vmManager.List()) {
+		if held[name].Reason == "" {
+			held[name] = Hold{Reason: attempt.reason, ApplicationExited: attempt.applicationExited}
+		}
+	}
+	actual := r.vmManager.List()
+	for _, service := range desired.Services {
+		if r.applicationExited(service.Name, actual[service.Name]) {
+			hold := held[service.Name]
+			hold.ApplicationExited = true
+			held[service.Name] = hold
+		}
+	}
+	return held
 }
 
 // HeldServices identifies desired services whose work must wait for retained
@@ -405,7 +422,11 @@ func (r *Reconciler) actionHold(action Action) Hold {
 		}
 		return hold
 	}
-	return deleteHold(&vm.Instance{Config: action.Service}, r.retainedInstances())
+	owners := r.retainedInstances()
+	if r.planned != nil {
+		owners = append(owners, r.resizeOwners(*r.planned, actual)...)
+	}
+	return deleteHold(&vm.Instance{Config: action.Service}, owners)
 }
 
 func unknownRuntimeOwner(actual map[string]*vm.Instance) string {
