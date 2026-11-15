@@ -23,14 +23,16 @@ func TestActualOnlyCompletenessDoesNotOverrideWorkloadHealth(t *testing.T) {
 				s.Conditions[0].Status = statusmodel.ConditionFalse
 			}},
 			{name: "missing desired service", phase: "unknown", reason: "node_status_unavailable", change: func(s *statusmodel.AgentStatus) {
-				s.Services = nil
+				s.Services[0].Name = "other"
 			}},
 			{name: "unaccounted VM hold", phase: "progressing", serviceReason: "unaccounted_vm", change: func(s *statusmodel.AgentStatus) {
 				s.Phase = statusmodel.PhaseReconciling
+				s.ReadyServices = 0
 				s.Services[0] = statusmodel.ServiceStatus{Name: "service", VMState: "unknown", Health: "not_configured", ReasonCode: "unaccounted_vm", Message: "process 4242 uses this node's VM state but no VM tracks it"}
 			}},
 			{name: "failed scan hold", phase: "progressing", serviceReason: "resource_held", change: func(s *statusmodel.AgentStatus) {
 				s.Phase = statusmodel.PhaseReconciling
+				s.ReadyServices = 0
 				s.Services[0] = statusmodel.ServiceStatus{Name: "service", VMState: "unknown", Health: "not_configured", ReasonCode: "resource_held", Message: "VM processes cannot be scanned, so an untracked VM may hold any address"}
 			}},
 		} {
@@ -47,10 +49,15 @@ func TestActualOnlyCompletenessDoesNotOverrideWorkloadHealth(t *testing.T) {
 				putCurrentState(t, ctx, store, desired, placement, "rendered-1")
 				status := currentAgentStatus(statusmodel.PhaseReady, "rendered-1")
 				status.SchemaVersion = statusmodel.SchemaVersion
+				status.NodeID = "node-1"
+				status.DesiredServices, status.ReadyServices = 1, 1
 				status.ActualOnlyServices = []statusmodel.ServiceStatus{}
 				status.ActualOnlyServicesIncomplete = incomplete
 				if tc.change != nil {
 					tc.change(status)
+				}
+				if err := validateAgentStatus(*status); err != nil {
+					t.Fatalf("invalid v2 telemetry fixture: %v", err)
 				}
 				putNode(t, ctx, store, cfg, NodeRecord{NodeID: "node-1", State: NodeStateReady, LastSeenAt: time.Now().UTC(), AgentStatus: status})
 				visibility := NewVisibilityService(cfg, store)
