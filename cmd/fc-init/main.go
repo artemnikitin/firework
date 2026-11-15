@@ -333,14 +333,6 @@ func execService(meta runtimeMetadata, volumes []guestVolume) int {
 	return superviseChild(pid, calls, signals, volumes, osGuestFilesystem{})
 }
 
-func startApplicationChild(bin string, argv, environment []string, files []uintptr, credential *syscall.Credential) (int, error) {
-	return syscall.ForkExec(bin, argv, &syscall.ProcAttr{
-		Env:   environment,
-		Files: files,
-		Sys:   &syscall.SysProcAttr{Setpgid: true, Credential: credential},
-	})
-}
-
 func execInitFallback(meta runtimeMetadata, volumes []guestVolume, argv []string) int {
 	if err := launchApplication(applicationLaunch{Metadata: meta, Volumes: volumes, Argv: argv}, realApplicationOperations()); err != nil {
 		fmt.Fprintln(os.Stderr, "fc-init:", err)

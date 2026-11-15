@@ -259,6 +259,13 @@ func TestQuiesceReportsEveryUnmountFailure(t *testing.T) {
 	}
 }
 
+func startApplicationChild(bin string, argv, environment []string, files []uintptr, credential *syscall.Credential) (int, error) {
+	return syscall.ForkExec(bin, argv, &syscall.ProcAttr{
+		Env: environment, Files: files,
+		Sys: &syscall.SysProcAttr{Setpgid: true, Credential: credential},
+	})
+}
+
 func startTestChild(t *testing.T, bin string, argv, environment []string, credential *syscall.Credential, files []uintptr) testChild {
 	t.Helper()
 	if len(files) == 0 {

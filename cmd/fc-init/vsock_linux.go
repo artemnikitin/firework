@@ -32,7 +32,7 @@ func startLifecycleServer() (<-chan lifecycleCall, func(), error) {
 	}
 	requests := make(chan lifecycleCall)
 	done := make(chan struct{})
-	go acceptLifecycleConnections(fd, requests, done)
+	go acceptLifecycleConnections(fd, requests, done, unix.Accept4)
 	closeServer := func() {
 		close(done)
 		_ = unix.Shutdown(fd, unix.SHUT_RDWR)
@@ -41,9 +41,10 @@ func startLifecycleServer() (<-chan lifecycleCall, func(), error) {
 	return requests, closeServer, nil
 }
 
-func acceptLifecycleConnections(listener int, requests chan<- lifecycleCall, done <-chan struct{}) {
+func acceptLifecycleConnections(listener int, requests chan<- lifecycleCall, done <-chan struct{}, accept func(int, int) (int, unix.Sockaddr, error)) {
+	retryDelay := 50 * time.Millisecond
 	for {
-		fd, _, err := unix.Accept4(listener, unix.SOCK_CLOEXEC|unix.SOCK_NONBLOCK)
+		fd, _, err := accept(listener, unix.SOCK_CLOEXEC|unix.SOCK_NONBLOCK)
 		if err == unix.EINTR {
 			continue
 		}
@@ -53,8 +54,22 @@ func acceptLifecycleConnections(listener int, requests chan<- lifecycleCall, don
 				return
 			default:
 			}
-			return
+			if err == unix.EBADF || err == unix.EINVAL || err == unix.ENOTSOCK || err == unix.EOPNOTSUPP {
+				fmt.Fprintf(os.Stderr, "fc-init: lifecycle listener failed: %v\n", err)
+				return
+			}
+			fmt.Fprintf(os.Stderr, "fc-init: lifecycle accept failed: %v; retrying in %s\n", err, retryDelay)
+			timer := time.NewTimer(retryDelay)
+			select {
+			case <-done:
+				timer.Stop()
+				return
+			case <-timer.C:
+			}
+			retryDelay = min(2*retryDelay, time.Second)
+			continue
 		}
+		retryDelay = 50 * time.Millisecond
 		go handleLifecycleConnection(fd, requests, done)
 	}
 }
