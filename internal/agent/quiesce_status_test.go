@@ -3,8 +3,10 @@ package agent
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/artemnikitin/firework/internal/capacity"
 	"github.com/artemnikitin/firework/internal/config"
@@ -39,6 +41,29 @@ func TestQuiesceExitObservationCannotCountStoppedApplicationReady(t *testing.T) 
 	applyGuestQuiesceObservation(&oldGuest, reconciler.Hold{Reason: "guest has no listener"})
 	if !serviceReady(oldGuest) {
 		t.Fatalf("unavailable listener falsely stopped a healthy app: %#v", oldGuest)
+	}
+}
+
+func TestQuiesceHoldAndHealthFailureRemainVisibleWithinMessageLimit(t *testing.T) {
+	for _, test := range []struct{ name, health, hold string }{
+		{"short", "health timeout", "guest_quiesce_required: unmount busy"},
+		{"long health", "health timeout " + strings.Repeat("x", 1000), "guest_quiesce_required: unmount busy"},
+		{"long hold", "health timeout", "guest_quiesce_required: " + strings.Repeat("x", 1000)},
+		{"unicode", "health timeout " + strings.Repeat("界", 1000), "guest_quiesce_required: " + strings.Repeat("界", 1000)},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			service := statusmodel.ServiceStatus{VMState: "running", Health: "unhealthy", ReasonCode: "health_check_failed", Message: test.health}
+			hold := reconciler.Hold{Reason: test.hold, ApplicationExited: true}
+			applyGuestQuiesceObservation(&service, hold)
+			applyServiceHold(&service, hold)
+			if service.ReasonCode != "health_check_failed" || service.Health != "unhealthy" || serviceReady(service) {
+				t.Fatalf("hold replaced health diagnosis/readiness: %#v", service)
+			}
+			if !utf8.ValidString(service.Message) || utf8.RuneCountInString(service.Message) > statusmodel.MaxMessageLen ||
+				!strings.Contains(service.Message, "health timeout") || !strings.Contains(service.Message, "guest_quiesce_required") {
+				t.Fatalf("bounded status lost a diagnosis: %q", service.Message)
+			}
+		})
 	}
 }
 

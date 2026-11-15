@@ -347,18 +347,7 @@ func (a *Agent) refreshAgentStatus(phase statusmodel.Phase, code, message string
 			}
 		}
 		applyGuestQuiesceObservation(&service, held[desired.Name])
-		if hold := held[desired.Name]; hold.Reason != "" && service.ReasonCode == "" {
-			// Keep the running/health observation while explaining why a
-			// requested change is deferred. A passing health check does not
-			// erase the resource hold, but an actual failure (VM, volume or
-			// health check) or quarantine keeps its own diagnosis. A hold only
-			// an operator can resolve names its own code.
-			service.ReasonCode = "resource_held"
-			if hold.Action != "" {
-				service.ReasonCode = hold.Action
-			}
-			service.Message = statusmodel.BoundedMessage(hold.Reason)
-		}
+		applyServiceHold(&service, held[desired.Name])
 		if serviceReady(service) {
 			ready++
 		}
@@ -488,6 +477,33 @@ func (a *Agent) agentStatusSnapshot() statusmodel.AgentStatus {
 	out.Conditions = append([]statusmodel.Condition(nil), a.currentStatus.Conditions...)
 	out.Services = append([]statusmodel.ServiceStatus(nil), a.currentStatus.Services...)
 	return out
+}
+
+func applyServiceHold(service *statusmodel.ServiceStatus, hold reconciler.Hold) {
+	if hold.Reason == "" {
+		return
+	}
+	if service.ReasonCode == "health_check_failed" {
+		health := []rune(statusmodel.BoundedMessage(service.Message))
+		reason := []rune(statusmodel.BoundedMessage(hold.Reason))
+		const separator = "; hold: "
+		budget := statusmodel.MaxMessageLen - len(separator)
+		healthBudget := min(len(health), budget/2)
+		reasonBudget := min(len(reason), budget-healthBudget)
+		healthBudget = min(len(health), budget-reasonBudget)
+		service.Message = string(health[:healthBudget]) + separator + string(reason[:reasonBudget])
+		return
+	}
+	// Other failures retain their primary diagnosis. A passing health check
+	// still leaves the deferred change visible as its resource hold.
+	if service.ReasonCode != "" {
+		return
+	}
+	service.ReasonCode = "resource_held"
+	if hold.Action != "" {
+		service.ReasonCode = hold.Action
+	}
+	service.Message = statusmodel.BoundedMessage(hold.Reason)
 }
 
 func applyGuestQuiesceObservation(service *statusmodel.ServiceStatus, observation reconciler.Hold) {

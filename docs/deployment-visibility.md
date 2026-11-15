@@ -329,6 +329,24 @@ that waits for capacity, including capacity a quarantined VM keeps, keeps the
 revision reconciling, and its hold says whether the quarantine keeps the
 capacity or the node needs headroom.
 
+Guest shutdown adds these service-level observations:
+
+- `resource_held` with a `guest_quiesce_required` message means an accepted
+  resize is waiting for guest confirmation. The same revision retries.
+- `guest_application_stopped` means quiesce confirmed that the app exited and
+  the resize-attempt reason has cleared while that same VM remains. The app
+  does not count as ready, even with a cached passing health result or no
+  configured check. A same-generation withdrawal leaves it stopped; a new
+  generation follows the normal VM restart.
+- When a health check is failing too, the code stays `health_check_failed`;
+  the message contains bounded excerpts of both the health failure and hold
+  reason within the 256-character limit.
+
+An ordinary-stop quiesce fallback uses the existing `volume_failed`/volume-error
+channel. The controller may temporarily report that volume's resize state as
+`failed` until a new prepared observation arrives. Read its error message: this
+can describe a stop fallback rather than a failed filesystem resize.
+
 Other holds do not let the revision apply. `VMsReconciled` reports
 `resource_held` and names every held service in its message:
 
