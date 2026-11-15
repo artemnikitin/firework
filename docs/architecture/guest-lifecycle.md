@@ -75,8 +75,14 @@ A failed request may already have stopped the application or unmounted some
 volumes. PID 1 stays available for another request; retries skip absent mounts.
 There is no automatic application restart, remount or forced VM replacement for
 this refusal. A separately tracked observation of application exit prevents stale
-passing health data, or withdrawal alone, from making that same VM ready again.
-Normal health restarts use the previous actual config and sizes. Without a working
+passing health data, or clearing an attempt reason, from making that same VM ready
+again. Withdrawal at the original generation keeps the VM if no other runtime
+setting changes. The control plane instead mints a new generation, so its
+withdrawal follows the normal VM restart, including ordinary-stop fallback.
+Preparing the already applied size at that new generation records metadata only
+when no resize transaction exists. Present transactions retain their existing
+recovery or quarantine behavior. Normal health restarts use the previous actual
+config and sizes. Without a working
 health check, operator action may be required.
 
 After an agent restart, main's recovery policy still re-adopts a validated live

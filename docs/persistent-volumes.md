@@ -132,8 +132,15 @@ A rejected shrink and a no-op effective size do not enter this path.
 The application may already have exited, and some mounts may already be absent.
 The guest remains available for cleanup retry; the refusal does not restart the
 app, remount volumes or force VM replacement. Cancelling or changing the resize
-clears its old attempt reason without claiming that the app recovered. A known
-application exit continues to suppress readiness for that VM. Existing health
+clears its old attempt reason. Returning to the applied size at the same
+generation keeps the existing VM if no other setting changes; clearing the
+reason does not restart its app or restore mounts. Control-plane withdrawal
+mints a new generation and triggers the normal VM replacement, using ordinary
+quiesce with termination fallback. At the same applied size, with no pending
+resize transaction, preparation records that generation without running
+filesystem commands or changing the image. Pending transactions still follow
+their existing recovery or quarantine rules. A known application exit continues
+to suppress readiness until that VM is replaced. Existing health
 restarts use the prior actual config and sizes; without a working health check,
 operator action may be needed. An agent restart relies on ordinary ownership
 recovery and a fresh request, without persisted quiesce proof. A VM proven stopped
@@ -202,8 +209,11 @@ identify each request explicitly. The runtime compares both size and
 generation, so changing the size can trigger growth or shrink even when the
 generation is unchanged, zero, or omitted. A corrected size at an unchanged
 generation is re-measured rather than inheriting a refusal for a different
-size; reverting to the size already running withdraws the request at any
-generation.
+size. Reverting to the size already running withdraws the request at any
+generation. A generation change still causes the normal VM restart, including
+its ordinary-stop fallback. With no pending resize transaction, preparation at
+the applied size only records the new generation and runs no filesystem tools.
+A same-generation withdrawal keeps the VM when no other runtime setting changes.
 
 `configcheck --node-config <file>` validates the config and warns when it
 declares a volume size with an absent or zero generation. That warning is

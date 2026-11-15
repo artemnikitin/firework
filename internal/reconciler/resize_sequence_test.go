@@ -60,7 +60,7 @@ func TestResizeRefusalRetriesSameRevisionAndIndependentWorkContinues(t *testing.
 }
 
 func TestResizeAttemptClearsForChangedRequestAndOwner(t *testing.T) {
-	for _, change := range []string{"withdraw", "new-size", "new-generation", "remove", "replace"} {
+	for _, change := range []string{"withdraw", "withdraw-new-generation", "new-size", "new-generation", "remove", "replace"} {
 		t.Run(change, func(t *testing.T) {
 			r, manager, old, wanted := resizeSequenceFixture(t, "rolling")
 			desired := config.NodeConfig{Services: []config.ServiceConfig{wanted}}
@@ -70,6 +70,8 @@ func TestResizeAttemptClearsForChangedRequestAndOwner(t *testing.T) {
 			switch change {
 			case "withdraw":
 				desired.Services[0] = old
+			case "withdraw-new-generation":
+				desired.Services[0] = volumeService(old.Name, old.Volumes[0].SizeBytes, wanted.Volumes[0].ResizeGeneration+1)
 			case "new-size":
 				desired.Services[0].Volumes = slices.Clone(wanted.Volumes)
 				desired.Services[0].Volumes[0].SizeBytes *= 2
@@ -87,12 +89,16 @@ func TestResizeAttemptClearsForChangedRequestAndOwner(t *testing.T) {
 			if len(r.resizeAttempts) != 0 {
 				t.Fatalf("stale request survived %s: %#v", change, r.resizeAttempts)
 			}
-			if change == "withdraw" {
+			if strings.HasPrefix(change, "withdraw") {
 				if err := r.Reconcile(context.Background(), desired); err != nil {
 					t.Fatal(err)
 				}
-				if len(manager.startCalls) != 0 || len(manager.removeForResizeCalls) != 1 {
-					t.Fatalf("withdrawal restarted VM: starts=%v resizes=%v", manager.startCalls, manager.removeForResizeCalls)
+				expectedRestarts := 0
+				if change == "withdraw-new-generation" {
+					expectedRestarts = 1
+				}
+				if len(manager.startCalls) != expectedRestarts || len(manager.removeCalls) != expectedRestarts || len(manager.removeForResizeCalls) != 1 {
+					t.Fatalf("unexpected withdrawal lifecycle: starts=%v removes=%v resizes=%v", manager.startCalls, manager.removeCalls, manager.removeForResizeCalls)
 				}
 			}
 		})
@@ -100,37 +106,53 @@ func TestResizeAttemptClearsForChangedRequestAndOwner(t *testing.T) {
 }
 
 func TestKnownApplicationExitSurvivesRetryAndWithdrawal(t *testing.T) {
-	r, manager, old, wanted := resizeSequenceFixture(t, "rolling")
-	desired := config.NodeConfig{Services: []config.ServiceConfig{wanted}}
-	manager.removeForResizeErr = &vm.GuestQuiesceRequiredError{Cause: errors.New("unmount busy"), ApplicationExited: true}
-	if err := r.Reconcile(context.Background(), desired); !errors.Is(err, ErrServiceHeld) {
-		t.Fatal(err)
-	}
-	manager.removeForResizeErr = &vm.GuestQuiesceRequiredError{Cause: errors.New("transport timed out")}
-	if err := r.Reconcile(context.Background(), desired); !errors.Is(err, ErrServiceHeld) {
-		t.Fatal(err)
-	}
-	if !r.HeldServiceHolds(desired)[old.Name].ApplicationExited {
-		t.Fatal("uninformative retry erased known exit")
-	}
-	desired.Services[0] = old
-	if err := r.Reconcile(context.Background(), desired); err != nil {
-		t.Fatal(err)
-	}
-	observation := r.HeldServiceHolds(desired)[old.Name]
-	if observation.Reason != "" || !observation.ApplicationExited {
-		t.Fatalf("withdrawal falsely restored application: %#v", observation)
-	}
-	manager.instances[old.Name].State = vm.StateRecoveryPending
-	r.pruneResizeAttempts(desired)
-	manager.instances[old.Name].State = vm.StateRunning
-	if !r.HeldServiceHolds(desired)[old.Name].ApplicationExited {
-		t.Fatal("readoption of the same VM erased known application exit")
-	}
-	manager.instances[old.Name] = &vm.Instance{Name: old.Name, InstanceID: "new-owner", State: vm.StateRunning, Config: old}
-	r.pruneResizeAttempts(desired)
-	if r.HeldServiceHolds(desired)[old.Name].ApplicationExited {
-		t.Fatal("old exit attached to new owner")
+	for _, strategy := range []string{"", "rolling"} {
+		for _, withdrawal := range []struct {
+			name       string
+			generation int64
+			restarts   int
+		}{{"same generation", 1, 0}, {"new generation", 3, 1}} {
+			t.Run(strategy+"/"+withdrawal.name, func(t *testing.T) {
+				r, manager, old, wanted := resizeSequenceFixture(t, strategy)
+				desired := config.NodeConfig{Services: []config.ServiceConfig{wanted}}
+				manager.removeForResizeErr = &vm.GuestQuiesceRequiredError{Cause: errors.New("unmount busy"), ApplicationExited: true}
+				if err := r.Reconcile(context.Background(), desired); !errors.Is(err, ErrServiceHeld) {
+					t.Fatal(err)
+				}
+				manager.removeForResizeErr = &vm.GuestQuiesceRequiredError{Cause: errors.New("transport timed out")}
+				if err := r.Reconcile(context.Background(), desired); !errors.Is(err, ErrServiceHeld) {
+					t.Fatal(err)
+				}
+				if !r.HeldServiceHolds(desired)[old.Name].ApplicationExited {
+					t.Fatal("uninformative retry erased known exit")
+				}
+				desired.Services[0] = volumeService(old.Name, old.Volumes[0].SizeBytes, withdrawal.generation)
+				if err := r.Reconcile(context.Background(), desired); err != nil {
+					t.Fatal(err)
+				}
+				observation := r.HeldServiceHolds(desired)[old.Name]
+				if observation.Reason != "" || observation.ApplicationExited != (withdrawal.restarts == 0) {
+					t.Fatalf("withdrawal confused old and new application state: %#v", observation)
+				}
+				if len(manager.startCalls) != withdrawal.restarts || len(manager.removeCalls) != withdrawal.restarts || len(manager.removeForResizeCalls) != 2 {
+					t.Fatalf("withdrawal lifecycle: starts=%v removes=%v resizes=%v", manager.startCalls, manager.removeCalls, manager.removeForResizeCalls)
+				}
+				if got := manager.instances[old.Name].Config.Volumes[0]; got.SizeBytes != old.Volumes[0].SizeBytes || got.ResizeGeneration != withdrawal.generation {
+					t.Fatalf("withdrawal did not apply requested generation at the actual size: %#v", got)
+				}
+				manager.instances[old.Name].State = vm.StateRecoveryPending
+				r.pruneResizeAttempts(desired)
+				manager.instances[old.Name].State = vm.StateRunning
+				if r.HeldServiceHolds(desired)[old.Name].ApplicationExited != (withdrawal.restarts == 0) {
+					t.Fatal("readoption changed the same VM's exit observation")
+				}
+				manager.instances[old.Name] = &vm.Instance{Name: old.Name, InstanceID: "new-owner", State: vm.StateRunning, Config: old}
+				r.pruneResizeAttempts(desired)
+				if r.HeldServiceHolds(desired)[old.Name].ApplicationExited {
+					t.Fatal("old exit attached to new owner")
+				}
+			})
+		}
 	}
 }
 

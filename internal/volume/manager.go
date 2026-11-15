@@ -717,6 +717,15 @@ func (m *Manager) prepareOne(ctx context.Context, service string, volume config.
 				RequestedSizeBytes: current.RejectedSizeBytes, AppliedSizeBytes: current.AppliedSizeBytes,
 				MinimumSizeBytes: current.RejectedMinimumBytes, At: current.RejectedAt,
 			}
+		} else if current.AppliedSizeBytes == volume.SizeBytes && current.ResizeGeneration != volume.ResizeGeneration && os.IsNotExist(transactionErr) {
+			// A new generation at the applied size is bookkeeping. A
+			// present transaction still takes the recovery path below.
+			current.ResizeGeneration = volume.ResizeGeneration
+			current.clearRejection()
+			current.UpdatedAt = time.Now().UTC()
+			if err := writeJSONAtomic(manifestPath, current); err != nil {
+				return PreparedVolume{}, err
+			}
 		} else if current.AppliedSizeBytes != volume.SizeBytes || current.ResizeGeneration != volume.ResizeGeneration {
 			operation = "grow"
 			if volume.SizeBytes < current.AppliedSizeBytes {

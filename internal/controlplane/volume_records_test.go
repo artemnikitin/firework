@@ -48,6 +48,28 @@ func TestVolumeRecordsRetainBindingAndAdvanceResizeGeneration(t *testing.T) {
 	if got := reservations.LocalByNode["node-1"]; got != 20*config.GiB {
 		t.Fatalf("reservation = %d", got)
 	}
+
+	// The node never applied the grow. A withdrawal is rendered at a new
+	// generation even though its size equals the original applied size.
+	services[0].Volumes[0].SizeBytes = 10 * config.GiB
+	records, err = controller.loadVolumeRecords(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := controller.applyExistingVolumeRecords(ctx, services, records, nodes); err != nil {
+		t.Fatal(err)
+	}
+	withdrawn := services[0].Volumes[0]
+	if withdrawn.SizeBytes != 10*config.GiB || withdrawn.ResizeGeneration != 3 || withdrawn.BoundNode != "node-1" {
+		t.Fatalf("withdrawal was not rendered at a new generation: %#v", withdrawn)
+	}
+	persisted, err := controller.loadVolumeRecords(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if record := persisted.Records["db/data"].Record; record.ResizeGeneration != 3 || record.DesiredSizeBytes != 10*config.GiB || record.AppliedSizeBytes != 10*config.GiB {
+		t.Fatalf("withdrawal generation was not persisted: %#v", record)
+	}
 }
 
 func TestCreateAssignedVolumeRecordUsesSchedulerBinding(t *testing.T) {
