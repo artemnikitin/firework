@@ -149,6 +149,14 @@ absence claim, including `failed`, `stopped`, or `recovery_pending`; a failure
 state by itself does not prove execution ended. Node detail returns the fresh
 inventory and both completeness flags.
 
+Actual-only inventory completeness does not determine fleet health. An
+incomplete scan by itself does not make a healthy node unknown. The fleet
+still uses the reported desired workloads, revisions, and conditions:
+`VMRecoveryReady: false` keeps its recovery degradation, and service holds
+such as `unaccounted_vm` or `resource_held` keep their existing reasons and
+messages in service and node detail. Incompleteness only prevents a claim
+that a former service is absent.
+
 When a service moves, service detail and `/v1/status` report
 `previous_node_unconfirmed` until the former node freshly reports a complete
 v2 inventory matching its applied current node config, with the service absent
@@ -162,6 +170,16 @@ Unresolved executions of services removed from desired state remain in the
 fleet's warning list until proof or expiry; they do not inflate desired counts.
 Registry retirement fences later control-plane writes and cannot stop a
 disconnected VM. See [node lifecycle](node-lifecycle.md) for timing and recovery.
+
+The same ownership wait applies to any removal or move on a healthy node
+running a v1 agent. Continued heartbeats prevent stale expiry, and v1 cannot
+prove absence, so the marker remains until the agent is upgraded or another
+retirement condition applies. This is expected during the control-plane-first
+rollout; see the [rollout limits](node-lifecycle.md#agent-rollout-and-owner-history-limit).
+With v2 agents, a removal or move normally causes two placement publications:
+the first changes the assignment, and a later pass drops the former owner
+after its complete absence acknowledgement. Nodes then acknowledge the new
+rendered revision as usual; the fleet can briefly show publication progress.
 
 The wire payload accepts at most 16 unique conditions, 256 service summaries,
 and 25 volumes per service. Messages are sanitized and capped at 256
