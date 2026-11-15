@@ -30,7 +30,6 @@ type Controller struct {
 	conditionalDeleteProbeDone bool
 	conditionalDeleteProbeErr  error
 	retirementCursor           string
-	quarantineCursor           string
 	lastTombstoneIndexRepairAt time.Time
 }
 
@@ -200,9 +199,38 @@ func (c *Controller) runReconcile(ctx context.Context) {
 		return
 	}
 
+	existingPlacementRevision, placementFound, err := c.readExistingPlacementRevision(ctx)
+	if err != nil {
+		c.logger.Error("reading existing placement failed; not publishing a replacement", "error", err)
+		c.lastInputSignature = ""
+		return
+	}
+	if !placementFound {
+		var pointer RevisionPointer
+		_, pointerExists, pointerErr := c.store.GetJSON(ctx, placementCurrentKey(c.cfg.State.Prefix), &pointer)
+		if pointerErr != nil {
+			c.logger.Error("reading placement pointer failed; not publishing a replacement", "error", pointerErr)
+			c.lastInputSignature = ""
+			return
+		}
+		if pointerExists {
+			c.logger.Error("placement pointer targets missing state; not publishing a replacement", "revision", pointer.Revision)
+			c.lastInputSignature = ""
+			return
+		}
+	}
 	inputSig, err := schedulingInputSignature(desired.Revision, activeNodes, hostIPByNode, knownNodeIDs, volumeRecordsDigest(volumeRecords))
 	if err != nil {
 		c.logger.Error("failed to compute scheduling input signature; skipping signature cache optimization", "error", err)
+	}
+	// Heartbeat evidence and retention expiry can resolve old owners without
+	// changing scheduling inputs. Publish their removal instead of caching it
+	// until an unrelated desired-state change.
+	for _, owner := range existingPlacementRevision.UnconfirmedPrevious {
+		if c.previousOwnerResolved(ctx, owner) {
+			c.lastInputSignature = ""
+			break
+		}
 	}
 	if inputSig != "" && c.lastInputSignature == inputSig {
 		c.logger.Debug("reconcile skipped: desired revision and active nodes unchanged",
@@ -221,23 +249,6 @@ func (c *Controller) runReconcile(ctx context.Context) {
 	// once this cycle completes.
 	c.lastInputSignature = ""
 
-	existingPlacementRevision, placementFound, err := c.readExistingPlacementRevision(ctx)
-	if err != nil {
-		c.logger.Error("reading existing placement failed; not publishing a replacement", "error", err)
-		return
-	}
-	if !placementFound {
-		var pointer RevisionPointer
-		_, pointerExists, pointerErr := c.store.GetJSON(ctx, placementCurrentKey(c.cfg.State.Prefix), &pointer)
-		if pointerErr != nil {
-			c.logger.Error("reading placement pointer failed; not publishing a replacement", "error", pointerErr)
-			return
-		}
-		if pointerExists {
-			c.logger.Error("placement pointer targets missing state; not publishing a replacement", "revision", pointer.Revision)
-			return
-		}
-	}
 	existingPlacement := placementServices(existingPlacementRevision)
 	// A held service is one already running that must keep running, and the
 	// prior placement is the only source for where. Without it the service
@@ -384,7 +395,7 @@ func (c *Controller) discoverActiveNodes(ctx context.Context) ([]scheduler.Node,
 	var known []string
 	hostIPByNode := make(map[string]string)
 	for _, key := range keys {
-		raw, token, exists, err := c.store.GetRaw(ctx, key)
+		raw, _, exists, err := c.store.GetRaw(ctx, key)
 		if err != nil {
 			c.logger.Warn("failed reading node record", "key", key, "error", err)
 			continue
@@ -392,17 +403,9 @@ func (c *Controller) discoverActiveNodes(ctx context.Context) ([]scheduler.Node,
 		if !exists {
 			continue
 		}
-		rec, nodeID, valid := decodeNodeRegistryRecord(c.cfg.State.Prefix, key, raw)
+		rec, _, valid := decodeNodeRegistryRecord(c.cfg.State.Prefix, key, raw)
 		if !valid {
-			if nodeID != "" {
-				if quarantineErr := c.writeNodeQuarantine(ctx, nodeID, token); quarantineErr != nil {
-					c.logger.Warn("node quarantine write will retry", "node", nodeID, "error", quarantineErr)
-				}
-			}
 			continue
-		}
-		if err := c.clearStaleNodeQuarantine(ctx, rec.NodeID, token, false); err != nil {
-			c.logger.Warn("stale node quarantine cleanup will retry", "node", rec.NodeID, "error", err)
 		}
 		if _, retired := tombstoneIDs[rec.NodeID]; retired {
 			var tombstone NodeTombstone

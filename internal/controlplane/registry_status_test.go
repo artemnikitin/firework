@@ -1,12 +1,44 @@
 package controlplane
 
 import (
+	"encoding/json"
 	"fmt"
 	"strings"
 	"testing"
 
 	"github.com/artemnikitin/firework/internal/statusmodel"
 )
+
+func TestV2RegistryAcceptsRemovedSurvivorAndIncompleteInventory(t *testing.T) {
+	for _, incomplete := range []bool{false, true} {
+		incoming := statusmodel.AgentStatus{
+			SchemaVersion: statusmodel.SchemaVersion, NodeID: "node-1", Phase: statusmodel.PhaseReady,
+			DesiredServices: 1, ReadyServices: 1,
+			Services:                     []statusmodel.ServiceStatus{{Name: "healthy", VMState: "running", Health: "healthy"}},
+			ActualOnlyServices:           []statusmodel.ServiceStatus{{Name: "removed", VMState: "recovery_pending", Health: "unknown", ReasonCode: "vm_recovery_pending"}},
+			ActualOnlyServicesIncomplete: incomplete,
+			Conditions:                   []statusmodel.Condition{{Type: "VMRecoveryReady", Status: statusmodel.ConditionFalse, ReasonCode: "vm_recovery_pending"}},
+		}
+		payload, err := json.Marshal(incoming)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var decoded statusmodel.AgentStatus
+		if err := json.Unmarshal(payload, &decoded); err != nil {
+			t.Fatal(err)
+		}
+		status, err := validatedHeartbeatAgentStatus("node-1", &decoded)
+		if err != nil || status == nil {
+			t.Fatalf("valid inventory rejected: %v", err)
+		}
+		if status.ActualOnlyServicesIncomplete != incomplete || status.DesiredServices != 1 || len(status.Services) != 1 || len(status.ActualOnlyServices) != 1 {
+			t.Fatalf("inventory changed at registry boundary: %+v", status)
+		}
+		if incomplete && statusmodel.HasCompleteActualOnlyInventory(*status) {
+			t.Fatal("incomplete inventory proves absence")
+		}
+	}
+}
 
 func TestApplyHeartbeatAgentStatusClearsCachedStatusForOldAgent(t *testing.T) {
 	record := NodeRecord{AgentStatus: &statusmodel.AgentStatus{SchemaVersion: statusmodel.SchemaVersion, ActualOnlyServices: []statusmodel.ServiceStatus{}}}

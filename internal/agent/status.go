@@ -1,6 +1,7 @@
 package agent
 
 import (
+	"context"
 	"fmt"
 	"sort"
 	"strings"
@@ -257,6 +258,13 @@ func (a *Agent) markAgentStatusApplied(revision string) {
 
 func (a *Agent) refreshAgentStatus(phase statusmodel.Phase, code, message string) {
 	instances := a.vmManager.List()
+	scan := a.scanUnaccountedVMs
+	if scan == nil {
+		scan = a.vmManager.UnaccountedVMs
+	}
+	scanCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	unaccounted, scanErr := scan(scanCtx)
+	cancel()
 	results := make(map[string]healthcheck.Result)
 	if a.healthMon != nil {
 		results = a.healthMon.Results()
@@ -411,6 +419,7 @@ func (a *Agent) refreshAgentStatus(phase statusmodel.Phase, code, message string
 	a.currentStatus.Services = services
 	a.currentStatus.ActualOnlyServices = actualOnly
 	a.currentStatus.ActualOnlyServicesTruncated = actualOnlyTruncated
+	a.currentStatus.ActualOnlyServicesIncomplete = scanErr != nil || len(unaccounted) > 0
 }
 
 func buildActualOnlyServiceStatuses(instances map[string]*vm.Instance, desiredNames map[string]struct{}, volumeErrors map[string]string) ([]statusmodel.ServiceStatus, bool) {

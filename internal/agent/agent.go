@@ -86,6 +86,7 @@ type Agent struct {
 	routeProcess routeProcess
 	// proveServiceAbsent replaces vmManager.ProveServiceAbsent in tests.
 	proveServiceAbsent func(context.Context, string) error
+	scanUnaccountedVMs func(context.Context) ([]string, error)
 	lifecycleMu        sync.Mutex
 	// restartNeedsReconcile is set by a health restart that left its service
 	// without a running VM; the next tick then skips the unchanged-revision

@@ -21,6 +21,8 @@ import (
 type visibilitySnapshot struct {
 	now                      time.Time
 	staleTTL                 time.Duration
+	downRetention            time.Duration
+	staleRetention           time.Duration
 	nodes                    []NodeRecord
 	desired                  DesiredRevision
 	placement                PlacementRevision
@@ -33,12 +35,9 @@ type visibilitySnapshot struct {
 	pendingByService         map[string]PendingPlacement
 	volumeByID               map[string]VolumeRecord
 	invalidVolumes           map[string]string
-	nodeSourceTokens         map[string]string
-	invalidNodeTokens        map[string]string
-	nodeQuarantines          map[string]NodeQuarantine
 	tombstoneNodeIDs         map[string]struct{}
 	tombstoneIndexKnown      bool
-	emptyNodeConfigs         map[string]config.NodeConfig
+	previousNodeConfigs      map[string]config.NodeConfig
 	// problems lists records left out because they could not be read or
 	// interpreted; one bad record degrades the projection instead of failing
 	// every endpoint.
@@ -103,17 +102,6 @@ func (s *VisibilityService) Nodes(ctx context.Context, stateFilter string) (oper
 		}
 		items = append(items, summary)
 	}
-	if stateFilter == "" || stateFilter == "unknown" {
-		for nodeID := range snapshot.invalidNodeTokens {
-			if _, active := snapshot.nodeByID[nodeID]; active {
-				continue
-			}
-			if summary, ok := snapshot.quarantinedNodeSummary(nodeID); ok {
-				items = append(items, summary)
-			}
-		}
-		sort.Slice(items, func(i, j int) bool { return items[i].NodeID < items[j].NodeID })
-	}
 	return operatorapi.ListEnvelope[operatorapi.NodeSummary]{APIVersion: operatorapi.APIVersion, ObservedAt: snapshot.now, Count: len(items), Items: items, Problems: snapshot.problems}, nil
 }
 
@@ -124,12 +112,6 @@ func (s *VisibilityService) Node(ctx context.Context, nodeID string) (operatorap
 	}
 	record, ok := snapshot.nodeByID[nodeID]
 	if !ok {
-		if summary, quarantined := snapshot.quarantinedNodeSummary(nodeID); quarantined {
-			return operatorapi.NodeDetail{
-				APIVersion: operatorapi.APIVersion, ObservedAt: snapshot.now, NodeSummary: summary,
-				Reconciliation: "unknown", StatusMissing: true, Services: []operatorapi.ServiceSummary{},
-			}, true, nil
-		}
 		return s.retiredNodeDetail(ctx, snapshot, nodeID)
 	}
 	summary := snapshot.nodeSummary(record)
@@ -155,6 +137,7 @@ func (s *VisibilityService) Node(ctx context.Context, nodeID string) (operatorap
 		if status.SchemaVersion == statusmodel.SchemaVersion {
 			detail.ActualOnlyServices = toOperatorActualOnlyServices(status.ActualOnlyServices)
 			detail.ActualOnlyServicesTruncated = status.ActualOnlyServicesTruncated
+			detail.ActualOnlyServicesIncomplete = status.ActualOnlyServicesIncomplete
 		}
 	}
 	for _, desired := range snapshot.desired.Services {
@@ -507,7 +490,7 @@ func (s *VisibilityService) build(ctx context.Context) (visibilitySnapshot, erro
 	s.builds++
 	s.mu.Unlock()
 	now := time.Now().UTC()
-	snapshot := visibilitySnapshot{now: now, staleTTL: s.cfg.NodeStaleTTL, placementByService: make(map[string]placedService), nodeByID: make(map[string]NodeRecord), pendingByService: make(map[string]PendingPlacement), volumeByID: make(map[string]VolumeRecord), invalidVolumes: make(map[string]string), nodeSourceTokens: make(map[string]string), invalidNodeTokens: make(map[string]string), nodeQuarantines: make(map[string]NodeQuarantine), tombstoneNodeIDs: make(map[string]struct{}), emptyNodeConfigs: make(map[string]config.NodeConfig)}
+	snapshot := visibilitySnapshot{now: now, staleTTL: s.cfg.NodeStaleTTL, downRetention: s.cfg.NodeDownRetention, staleRetention: s.cfg.NodeStaleRetention, placementByService: make(map[string]placedService), nodeByID: make(map[string]NodeRecord), pendingByService: make(map[string]PendingPlacement), volumeByID: make(map[string]VolumeRecord), invalidVolumes: make(map[string]string), tombstoneNodeIDs: make(map[string]struct{}), previousNodeConfigs: make(map[string]config.NodeConfig)}
 	index, indexExists, indexErr := loadNodeTombstoneIndex(ctx, s.store, s.cfg.State.Prefix)
 	if indexErr != nil {
 		if scanInterrupted(ctx, indexErr) {
@@ -525,10 +508,10 @@ func (s *VisibilityService) build(ctx context.Context) (visibilitySnapshot, erro
 		return snapshot, fmt.Errorf("listing nodes: %w", err)
 	}
 	for _, key := range keys {
-		keyNodeID, keyValid := nodeIDFromRegistryKey(s.cfg.State.Prefix, key)
+		_, keyValid := nodeIDFromRegistryKey(s.cfg.State.Prefix, key)
 		id := projectionID(strings.TrimSuffix(path.Base(key), ".json"))
 		var record NodeRecord
-		raw, sourceToken, exists, err := s.store.GetRaw(ctx, key)
+		raw, _, exists, err := s.store.GetRaw(ctx, key)
 		if err != nil {
 			if scanInterrupted(ctx, err) {
 				return snapshot, fmt.Errorf("reading node records: %w", err)
@@ -539,20 +522,11 @@ func (s *VisibilityService) build(ctx context.Context) (visibilitySnapshot, erro
 		if !exists {
 			continue
 		}
-		if keyValid {
-			snapshot.nodeSourceTokens[keyNodeID] = string(sourceToken)
-		}
 		if err := json.Unmarshal(raw, &record); err != nil {
-			if keyValid {
-				snapshot.invalidNodeTokens[keyNodeID] = string(sourceToken)
-			}
 			snapshot.problems = append(snapshot.problems, operatorapi.ProjectionProblem{Kind: "node", ID: id, ReasonCode: "record_unreadable"})
 			continue
 		}
 		if !keyValid || !validNodeRegistryRecord(s.cfg.State.Prefix, key, record) {
-			if keyValid {
-				snapshot.invalidNodeTokens[keyNodeID] = string(sourceToken)
-			}
 			snapshot.problems = append(snapshot.problems, operatorapi.ProjectionProblem{Kind: "node", ID: id, ReasonCode: "record_invalid"})
 			continue
 		}
@@ -569,32 +543,11 @@ func (s *VisibilityService) build(ctx context.Context) (visibilitySnapshot, erro
 			if record.Generation <= tombstone.MaxGeneration {
 				continue
 			}
+			// All projections share this generation-aware retirement decision.
+			delete(snapshot.tombstoneNodeIDs, record.NodeID)
 		}
 		snapshot.nodes = append(snapshot.nodes, record)
 		snapshot.nodeByID[record.NodeID] = record
-	}
-	quarantineKeys, err := s.store.ListKeys(ctx, nodeQuarantinesPrefix(s.cfg.State.Prefix))
-	if err != nil {
-		return snapshot, fmt.Errorf("listing node quarantines: %w", err)
-	}
-	for _, key := range quarantineKeys {
-		raw, _, exists, err := s.store.GetRaw(ctx, key)
-		if err != nil {
-			if scanInterrupted(ctx, err) {
-				return snapshot, fmt.Errorf("reading node quarantines: %w", err)
-			}
-			snapshot.problems = append(snapshot.problems, operatorapi.ProjectionProblem{Kind: "node_quarantine", ID: projectionID(strings.TrimSuffix(path.Base(key), ".json")), ReasonCode: "record_unreadable"})
-			continue
-		}
-		if !exists {
-			continue
-		}
-		var quarantine NodeQuarantine
-		if err := json.Unmarshal(raw, &quarantine); err != nil || !validNodeQuarantine(quarantine.NodeID, quarantine) || !nodeQuarantineKeyMatches(s.cfg.State.Prefix, key, quarantine.NodeID) {
-			snapshot.problems = append(snapshot.problems, operatorapi.ProjectionProblem{Kind: "node_quarantine", ID: projectionID(strings.TrimSuffix(path.Base(key), ".json")), ReasonCode: "record_invalid"})
-			continue
-		}
-		snapshot.nodeQuarantines[quarantine.NodeID] = quarantine
 	}
 	sort.Slice(snapshot.nodes, func(i, j int) bool { return snapshot.nodes[i].NodeID < snapshot.nodes[j].NodeID })
 	if err := loadCurrentRevision(ctx, s.store, desiredCurrentKey(s.cfg.State.Prefix), func(revision string) (string, any) {
@@ -694,9 +647,12 @@ func (s *VisibilityService) build(ctx context.Context) (visibilitySnapshot, erro
 		previousNodes[owner.Node] = struct{}{}
 	}
 	for nodeID := range previousNodes {
-		if nodeConfig, ok := readExplicitEmptyNodeConfig(ctx, s.store, s.cfg.State.Prefix, nodeID); ok {
-			snapshot.emptyNodeConfigs[nodeID] = nodeConfig
+		if nodeConfig, ok := readPublishedNodeConfig(ctx, s.store, s.cfg.State.Prefix, nodeID); ok {
+			snapshot.previousNodeConfigs[nodeID] = nodeConfig
 		}
+	}
+	if err := ctx.Err(); err != nil {
+		return snapshot, err
 	}
 	sort.Slice(snapshot.desired.Services, func(i, j int) bool { return snapshot.desired.Services[i].Name < snapshot.desired.Services[j].Name })
 	return snapshot, nil
@@ -776,24 +732,7 @@ func (s visibilitySnapshot) nodeSummary(record NodeRecord) operatorapi.NodeSumma
 	} else {
 		summary.ReasonCode = statusUnavailableReason(record, s.now, s.staleTTL)
 	}
-	if quarantine, ok := s.nodeQuarantines[record.NodeID]; ok && quarantine.ObjectToken == s.nodeSourceTokens[record.NodeID] {
-		summary.Quarantined = true
-		summary.QuarantineReason = quarantine.ReasonCode
-		summary.QuarantineMessage = nodeQuarantineMessage
-	}
 	return summary
-}
-
-func (s visibilitySnapshot) quarantinedNodeSummary(nodeID string) (operatorapi.NodeSummary, bool) {
-	quarantine, ok := s.nodeQuarantines[nodeID]
-	if !ok || s.invalidNodeTokens[nodeID] == "" || quarantine.ObjectToken != s.invalidNodeTokens[nodeID] {
-		return operatorapi.NodeSummary{}, false
-	}
-	return operatorapi.NodeSummary{
-		NodeID: nodeID, State: "unknown", ReasonCode: "node_quarantined",
-		Quarantined: true, QuarantineReason: quarantine.ReasonCode,
-		QuarantineMessage: nodeQuarantineMessage,
-	}, true
 }
 
 func toOperatorResources(resources Resources) operatorapi.Resources {
@@ -890,6 +829,26 @@ func (s visibilitySnapshot) revisionStatus() operatorapi.RevisionStatus {
 		if summary.Health == "unhealthy" {
 			status.Services.Unhealthy++
 			status.UnhealthyServices = append(status.UnhealthyServices, desired.Name)
+		}
+	}
+	// Removed services no longer count as desired, but their possible old
+	// executions remain relevant to cleanup until evidence or expiry resolves
+	// them, just as for services that are still desired.
+	unconfirmed := make(map[string]bool)
+	for _, name := range status.PreviousNodeUnconfirmedServices {
+		unconfirmed[name] = true
+	}
+	owners := append([]PreviousPlacementOwner(nil), s.placement.UnconfirmedPrevious...)
+	for _, node := range s.previousPlacement.NodeConfigs {
+		for _, service := range node.Services {
+			owners = append(owners, PreviousPlacementOwner{Service: service.Name, Node: node.Node})
+		}
+	}
+	for _, owner := range owners {
+		current := s.placementByService[owner.Service].node.Node
+		if !unconfirmed[owner.Service] && len(s.unconfirmedPreviousNodes(owner.Service, current)) > 0 {
+			unconfirmed[owner.Service] = true
+			status.PreviousNodeUnconfirmedServices = append(status.PreviousNodeUnconfirmedServices, owner.Service)
 		}
 	}
 	sort.Strings(status.UnhealthyServices)
@@ -1326,7 +1285,7 @@ func (s visibilitySnapshot) serviceSummary(desired config.ServiceConfig) operato
 	actual, exists := findAgentService(status, desired.Name)
 	if !exists {
 		summary.ReasonCode = "service_status_missing"
-		return summary
+		return finish()
 	}
 	applyAgentServiceState(&summary, actual)
 	summary.ReasonCode = actual.ReasonCode
@@ -1351,7 +1310,7 @@ func (s visibilitySnapshot) unconfirmedPreviousNodes(service, currentNode string
 		}
 	}
 	for nodeID := range nodes {
-		if s.previousNodeConfirmedEmpty(nodeID) {
+		if s.previousServiceResolved(service, nodeID) {
 			delete(nodes, nodeID)
 		}
 	}
@@ -1363,21 +1322,20 @@ func (s visibilitySnapshot) unconfirmedPreviousNodes(service, currentNode string
 	return out
 }
 
-func (s visibilitySnapshot) previousNodeConfirmedEmpty(nodeID string) bool {
+func (s visibilitySnapshot) previousServiceResolved(service, nodeID string) bool {
 	record, exists := s.nodeByID[nodeID]
 	if !exists {
-		return false
+		_, retired := s.tombstoneNodeIDs[nodeID]
+		return retired // Policy ends the wait; this does not prove VM termination.
+	}
+	if previousOwnerWaitExpired(record, s.now, Config{
+		NodeStaleTTL: s.staleTTL, NodeDownRetention: s.downRetention, NodeStaleRetention: s.staleRetention,
+	}) {
+		return true
 	}
 	status, fresh := s.freshStatus(record)
-	nodeConfig, configExists := s.emptyNodeConfigs[nodeID]
-	return fresh && configExists && statusmodel.HasCompleteActualOnlyInventory(status) &&
-		status.NodeID == nodeID &&
-		!status.ServicesTruncated && status.DesiredServices == 0 && status.ReadyServices == 0 &&
-		len(status.Services) == 0 && len(status.ActualOnlyServices) == 0 &&
-		status.DesiredRevision == nodeConfig.DesiredRevision &&
-		status.PlacementRevision == nodeConfig.PlacementRevision &&
-		status.ObservedRevision == nodeConfig.RenderedRevision &&
-		status.AppliedRevision == nodeConfig.RenderedRevision
+	nodeConfig, configExists := s.previousNodeConfigs[nodeID]
+	return fresh && configExists && serviceExecutionAbsent(status, nodeConfig, nodeID, service)
 }
 
 // applyAgentServiceState copies an agent's per-service observation into a

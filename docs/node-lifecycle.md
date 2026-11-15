@@ -8,21 +8,11 @@ it is not proof that an old process stopped.
 
 ## Malformed registry records
 
-The controller leader scans registry records in bounded batches, even while
-automatic retirement is disabled. A malformed record or one whose node ID or
-lifecycle state does not match its key is excluded from scheduling and stored
-under a quarantine key derived from the registry object key's SHA-256 hash.
-Quarantine metadata records the exact source token, detection time, a reason
-code, and a fixed safe message. It never replaces or deletes the source record.
-
-The API role only reads quarantine metadata. `fireworkctl nodes` and
-`fireworkctl node NODE_ID` show an `unknown` node with `quarantined: true` only
-when the quarantine's source token still matches the invalid registry object;
-the response does not include the provider token or malformed payload. After
-an operator repairs the source and its token changes, the controller
-conditionally clears the stale quarantine. Retirement also clears quarantine
-before conditionally deleting the registry record; a cleanup failure defers
-that delete.
+A malformed record, mismatched node ID, negative generation, or unsupported
+lifecycle state is excluded from scheduling and retirement. Its node config
+and registry object remain untouched. Read-only visibility reports the source
+key through the existing bounded `problems` list. No durable node-quarantine
+objects or quarantine API fields are created.
 
 ## Automatic retirement
 
@@ -44,11 +34,20 @@ conditionally marks the exact registry generation, writes a durable
 generation tombstone and its compact index, and conditionally deletes only
 that registry version. A newer registration wins the compare-and-swap race.
 
-The explicit empty node document and all retained volume records remain. A
-local volume stays bound to its original node. Service and volume status keep
-reporting an old possible VM as `previous_node_unconfirmed` until a fresh v2
-empty-config observation has no tracked VM records. Retirement metadata alone
-does not clear that warning.
+The explicit empty node document remains authoritative at its own immutable
+revision even after the fleet publishes later revisions. All retained volume
+records remain, and a local volume stays bound to its original node.
+
+`previous_node_unconfirmed` clears per service when the old node reports a
+fresh, complete v2 inventory at its applied current node config, which no
+longer assigns or reports that service. Other services may remain on that
+node. The waiting period also ends when the node is retired or reaches its
+configured down/stale retention threshold, even with retirement disabled.
+Down retention uses the down-transition timestamp (with the documented legacy
+fallbacks); stale retention uses the last heartbeat receipt time. Expiry ends
+the control plane's wait, without proving VM termination or authorizing storage
+reuse. Removed services retain unresolved ownership history until one of these
+conditions occurs, without counting as desired services.
 
 Keep automatic retirement disabled until the configured S3/GCS provider has
 passed conditional-delete validation and the deployment has exercised the

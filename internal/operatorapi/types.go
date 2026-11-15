@@ -52,22 +52,19 @@ type NodeStorageSummary struct {
 }
 
 type NodeSummary struct {
-	NodeID            string             `json:"node_id"`
-	Labels            []string           `json:"labels,omitempty"`
-	State             string             `json:"state"`
-	LastSeenAt        time.Time          `json:"last_seen_at,omitempty"`
-	StatusAgeSeconds  int64              `json:"status_age_seconds,omitempty"`
-	AgentVersion      string             `json:"agent_version,omitempty"`
-	Capacity          Resources          `json:"capacity"`
-	Allocated         Resources          `json:"allocated"`
-	Available         Resources          `json:"available"`
-	Storage           NodeStorageSummary `json:"storage"`
-	DesiredServices   int                `json:"desired_services"`
-	RunningServices   int                `json:"running_services"`
-	ReasonCode        string             `json:"reason_code,omitempty"`
-	Quarantined       bool               `json:"quarantined,omitempty"`
-	QuarantineReason  string             `json:"quarantine_reason,omitempty"`
-	QuarantineMessage string             `json:"quarantine_message,omitempty"`
+	NodeID           string             `json:"node_id"`
+	Labels           []string           `json:"labels,omitempty"`
+	State            string             `json:"state"`
+	LastSeenAt       time.Time          `json:"last_seen_at,omitempty"`
+	StatusAgeSeconds int64              `json:"status_age_seconds,omitempty"`
+	AgentVersion     string             `json:"agent_version,omitempty"`
+	Capacity         Resources          `json:"capacity"`
+	Allocated        Resources          `json:"allocated"`
+	Available        Resources          `json:"available"`
+	Storage          NodeStorageSummary `json:"storage"`
+	DesiredServices  int                `json:"desired_services"`
+	RunningServices  int                `json:"running_services"`
+	ReasonCode       string             `json:"reason_code,omitempty"`
 }
 
 type Condition struct {
@@ -82,26 +79,27 @@ type NodeDetail struct {
 	APIVersion string    `json:"api_version"`
 	ObservedAt time.Time `json:"observed_at"`
 	NodeSummary
-	HostIP                      string              `json:"host_ip,omitempty"`
-	RegisteredAt                time.Time           `json:"registered_at,omitempty"`
-	UpdatedAt                   time.Time           `json:"updated_at,omitempty"`
-	DesiredRevision             string              `json:"desired_revision,omitempty"`
-	PlacementRevision           string              `json:"placement_revision,omitempty"`
-	ObservedRevision            string              `json:"observed_revision,omitempty"`
-	AppliedRevision             string              `json:"applied_revision,omitempty"`
-	Reconciliation              string              `json:"reconciliation"`
-	Message                     string              `json:"message,omitempty"`
-	StatusMissing               bool                `json:"status_missing"`
-	StatusStale                 bool                `json:"status_stale"`
-	Conditions                  []Condition         `json:"conditions,omitempty"`
-	Services                    []ServiceSummary    `json:"services"`
-	ActualOnlyServices          []ActualOnlyService `json:"actual_only_services,omitempty"`
-	ActualOnlyServicesTruncated bool                `json:"actual_only_services_truncated,omitempty"`
-	MaxGeneration               int64               `json:"max_generation,omitempty"`
-	RetiredAt                   time.Time           `json:"retired_at,omitempty"`
-	RetirementReason            string              `json:"retirement_reason,omitempty"`
-	RevivalHistory              []NodeRevivalAudit  `json:"revival_history,omitempty"`
-	RevivalHistoryTruncated     bool                `json:"revival_history_truncated,omitempty"`
+	HostIP                       string              `json:"host_ip,omitempty"`
+	RegisteredAt                 time.Time           `json:"registered_at,omitempty"`
+	UpdatedAt                    time.Time           `json:"updated_at,omitempty"`
+	DesiredRevision              string              `json:"desired_revision,omitempty"`
+	PlacementRevision            string              `json:"placement_revision,omitempty"`
+	ObservedRevision             string              `json:"observed_revision,omitempty"`
+	AppliedRevision              string              `json:"applied_revision,omitempty"`
+	Reconciliation               string              `json:"reconciliation"`
+	Message                      string              `json:"message,omitempty"`
+	StatusMissing                bool                `json:"status_missing"`
+	StatusStale                  bool                `json:"status_stale"`
+	Conditions                   []Condition         `json:"conditions,omitempty"`
+	Services                     []ServiceSummary    `json:"services"`
+	ActualOnlyServices           []ActualOnlyService `json:"actual_only_services,omitempty"`
+	ActualOnlyServicesTruncated  bool                `json:"actual_only_services_truncated,omitempty"`
+	ActualOnlyServicesIncomplete bool                `json:"actual_only_services_incomplete,omitempty"`
+	MaxGeneration                int64               `json:"max_generation,omitempty"`
+	RetiredAt                    time.Time           `json:"retired_at,omitempty"`
+	RetirementReason             string              `json:"retirement_reason,omitempty"`
+	RevivalHistory               []NodeRevivalAudit  `json:"revival_history,omitempty"`
+	RevivalHistoryTruncated      bool                `json:"revival_history_truncated,omitempty"`
 }
 
 type ActualOnlyService struct {

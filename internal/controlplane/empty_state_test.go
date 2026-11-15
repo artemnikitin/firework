@@ -368,9 +368,8 @@ func TestRegistryReadFailureDoesNotStrandRetirement(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// The quarantine maintenance scan reads before discovery, so fail both
-	// reads in this cycle; the next cycle then exercises recovery.
-	c.store = &failingRecordStore{StateStore: store, key: recordKey, fails: 2}
+	// Discovery reads the registry once; the next cycle exercises recovery.
+	c.store = &failingRecordStore{StateStore: store, key: recordKey, fails: 1}
 
 	c.runReconcile(context.Background())
 	if got, _ := readNodeConfig(t, store, "node-b"); !bytes.Equal(got, original) {

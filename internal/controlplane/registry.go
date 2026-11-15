@@ -399,6 +399,7 @@ func applyHeartbeatAgentStatus(cur *NodeRecord, nodeID string, incoming *statusm
 		// unknown rather than becoming a complete empty list.
 		status.ActualOnlyServices = nil
 		status.ActualOnlyServicesTruncated = false
+		status.ActualOnlyServicesIncomplete = false
 	}
 	cur.AgentStatus = &status
 	return nil

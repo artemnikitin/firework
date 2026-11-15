@@ -183,21 +183,7 @@ func validateNodeTombstoneRecoveryRequest(request NodeTombstoneRecoveryRequest) 
 }
 
 func currentExplicitEmptyNodeConfig(ctx context.Context, store StateStore, prefix, nodeID string) (config.NodeConfig, bool) {
-	var first RevisionPointer
-	_, exists, err := store.GetJSON(ctx, renderedCurrentKey(prefix), &first)
-	if err != nil || !exists || first.Revision == "" {
-		return config.NodeConfig{}, false
-	}
-	nodeConfig, ok := readExplicitEmptyNodeConfig(ctx, store, prefix, nodeID)
-	if !ok || nodeConfig.RenderedRevision != first.Revision {
-		return config.NodeConfig{}, false
-	}
-	var second RevisionPointer
-	_, exists, err = store.GetJSON(ctx, renderedCurrentKey(prefix), &second)
-	if err != nil || !exists || second.Revision != first.Revision {
-		return config.NodeConfig{}, false
-	}
-	return nodeConfig, true
+	return readExplicitEmptyNodeConfig(ctx, store, prefix, nodeID)
 }
 
 func requireNoActiveNodeRecord(ctx context.Context, store StateStore, prefix, nodeID string) error {

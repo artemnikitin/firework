@@ -225,6 +225,9 @@ type AgentStatus struct {
 	// so its absence there is never interpreted as an empty inventory.
 	ActualOnlyServices          []ServiceStatus `json:"actual_only_services,omitempty"`
 	ActualOnlyServicesTruncated bool            `json:"actual_only_services_truncated,omitempty"`
+	// Incomplete distinguishes an unsuccessful scan or an unaccounted process
+	// from a complete inventory, independently of list-size truncation.
+	ActualOnlyServicesIncomplete bool `json:"actual_only_services_incomplete,omitempty"`
 }
 
 // MarshalJSON preserves the v1 wire shape while requiring v2 senders to carry
@@ -252,7 +255,8 @@ func IsSupportedSchemaVersion(version int) bool {
 // HasCompleteActualOnlyInventory reports whether an observation can prove
 // absence of every VM manager record outside the desired config.
 func HasCompleteActualOnlyInventory(status AgentStatus) bool {
-	return status.SchemaVersion == SchemaVersion && status.ActualOnlyServices != nil && !status.ActualOnlyServicesTruncated
+	return status.SchemaVersion == SchemaVersion && status.ActualOnlyServices != nil &&
+		!status.ActualOnlyServicesTruncated && !status.ActualOnlyServicesIncomplete
 }
 
 func BoundedMessage(message string) string {

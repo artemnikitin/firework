@@ -2,6 +2,8 @@ package agent
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -13,6 +15,36 @@ import (
 	"github.com/artemnikitin/firework/internal/vm"
 	"github.com/artemnikitin/firework/internal/volume"
 )
+
+func TestActualOnlyCompletenessFollowsProcessScan(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		processes []string
+		err       error
+	}{
+		{name: "complete"},
+		{name: "unaccounted process", processes: []string{"unaccounted VM"}},
+		{name: "scan failed", err: errors.New("process scan unavailable")},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			a := New(testAgentConfig(t), &fakeStore{}, testLogger())
+			a.scanUnaccountedVMs = func(context.Context) ([]string, error) { return tc.processes, tc.err }
+			a.refreshAgentStatus(statusmodel.PhaseReady, "", "")
+			payload, err := json.Marshal(a.agentStatusSnapshot())
+			if err != nil {
+				t.Fatal(err)
+			}
+			var decoded statusmodel.AgentStatus
+			if err := json.Unmarshal(payload, &decoded); err != nil {
+				t.Fatal(err)
+			}
+			wantComplete := tc.err == nil && len(tc.processes) == 0
+			if statusmodel.HasCompleteActualOnlyInventory(decoded) != wantComplete || decoded.ActualOnlyServices == nil {
+				t.Fatalf("wrong inventory completeness on the wire: %s", payload)
+			}
+		})
+	}
+}
 
 func TestRecoveryConditionIncludesSurvivorsOmittedFromServiceSummaries(t *testing.T) {
 	for _, desiredCount := range []int{1, statusmodel.MaxServices, statusmodel.MaxServices + 1} {

@@ -97,10 +97,8 @@ A node or volume record that cannot be read or decoded, or whose identity
 does not match its key, is left out of the normal snapshot and listed in
 `problems` (`kind`, the identifier from its key, and `record_unreadable` or
 `record_invalid`) on list and status responses, instead of failing every
-endpoint. For a node, the leader may also maintain separate quarantine
-metadata. If that metadata matches the exact invalid source token, the node
-list and detail include an `unknown` summary with `quarantined: true` and a
-generic message; the source token and payload are never projected. Such a fleet
+endpoint. Invalid node records leave their node configs untouched and create
+no separate durable quarantine metadata. Such a fleet
 is never `converged`: it is `degraded` with
 `projection_incomplete`, or `unknown` with `node_record_unreadable` when the
 desired revision is empty and the unreadable node could still be running old
@@ -143,18 +141,27 @@ not include volume summaries. V2 always sends an explicit list, including
 old v1 wire shape and treats its omitted inventory as unknown.
 
 The list is capped at 256 entries. `actual_only_services_truncated: true`
-means the snapshot cannot prove absence. Any listed entry blocks an absence
-claim, including an entry in `failed`, `stopped`, or `recovery_pending`; a
-failure state by itself does not prove that execution has ended. Node detail
-returns the fresh v2 inventory in `actual_only_services` and reports its
-truncation flag.
+means the snapshot cannot prove absence. `actual_only_services_incomplete:
+true` independently reports an unavailable process scan or a process that no
+service accounts for, even if the list is empty. Such telemetry is accepted
+by the registry but cannot prove absence. An entry for the service blocks its
+absence claim, including `failed`, `stopped`, or `recovery_pending`; a failure
+state by itself does not prove execution ended. Node detail returns the fresh
+inventory and both completeness flags.
 
 When a service moves, service detail and `/v1/status` report
-`previous_node_unconfirmed` until the former node freshly reports that it
-observed and applied its explicit empty config and has no actual-only VM
-records. A v1 heartbeat, a truncated v2 inventory, a stale/down node, or a
-retired registry record cannot clear this condition. Registry retirement
-fences later control-plane writes; it does not stop a disconnected VM.
+`previous_node_unconfirmed` until the former node freshly reports a complete
+v2 inventory matching its applied current node config, with the service absent
+from both that config and both status lists. The node can keep other services.
+V1, truncated, incomplete, or stale telemetry cannot establish this proof.
+
+The wait also ends when the former node is retired or reaches its configured
+down/stale retention threshold, with retirement enabled or disabled. This is
+a waiting policy, not evidence of VM termination or permission to reuse data.
+Unresolved executions of services removed from desired state remain in the
+fleet's warning list until proof or expiry; they do not inflate desired counts.
+Registry retirement fences later control-plane writes and cannot stop a
+disconnected VM. See [node lifecycle](node-lifecycle.md) for timing and recovery.
 
 The wire payload accepts at most 16 unique conditions, 256 service summaries,
 and 25 volumes per service. Messages are sanitized and capped at 256

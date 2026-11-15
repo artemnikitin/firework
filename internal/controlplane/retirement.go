@@ -31,7 +31,6 @@ func (c *Controller) runNodeRetirementMaintenance(ctx context.Context) {
 	if !c.leader {
 		return
 	}
-	c.runNodeQuarantineMaintenance(ctx)
 	if !c.cfg.NodeRetirementEnabled || c.cfg.NodeRetirementDryRun {
 		return
 	}
@@ -74,17 +73,9 @@ func (c *Controller) runNodeRetirementMaintenance(ctx context.Context) {
 		if !exists {
 			continue
 		}
-		record, nodeID, valid := decodeNodeRegistryRecord(c.cfg.State.Prefix, key, raw)
+		record, _, valid := decodeNodeRegistryRecord(c.cfg.State.Prefix, key, raw)
 		if !valid {
-			if nodeID != "" {
-				if quarantineErr := c.writeNodeQuarantine(ctx, nodeID, token); quarantineErr != nil {
-					c.logger.Warn("node retirement quarantine write will retry", "node", nodeID, "error", quarantineErr)
-				}
-			}
 			continue
-		}
-		if quarantineErr := c.clearStaleNodeQuarantine(ctx, record.NodeID, token, false); quarantineErr != nil {
-			c.logger.Warn("node retirement quarantine cleanup will retry", "node", record.NodeID, "error", quarantineErr)
 		}
 		reason, eligible := retirementEligibility(record, time.Now().UTC(), c.cfg)
 		if !eligible && record.RetirementPendingAt.IsZero() {
@@ -192,33 +183,32 @@ func retirementReason(record NodeRecord) string {
 	return ""
 }
 
-// readBackExplicitEmptyNodeConfig proves the latest published node document is
+// readBackExplicitEmptyNodeConfig proves the retained current node document is
 // an explicit empty list with revision metadata and an identical immutable
-// rendered copy. Missing, malformed, partial, or superseded documents fail
+// rendered copy. Missing, malformed, partial, or concurrently changed documents fail
 // closed and will be reconsidered on a later pass.
 func (c *Controller) readBackExplicitEmptyNodeConfig(ctx context.Context, nodeID string) bool {
-	var rendered RevisionPointer
-	_, exists, err := c.store.GetJSON(ctx, renderedCurrentKey(c.cfg.State.Prefix), &rendered)
-	if err != nil || !exists || rendered.Revision == "" {
-		return false
-	}
-	nc, ok := readExplicitEmptyNodeConfig(ctx, c.store, c.cfg.State.Prefix, nodeID)
-	if !ok || nc.RenderedRevision != rendered.Revision {
-		return false
-	}
-	var after RevisionPointer
-	_, exists, err = c.store.GetJSON(ctx, renderedCurrentKey(c.cfg.State.Prefix), &after)
-	return err == nil && exists && after.Revision == rendered.Revision
+	_, ok := readExplicitEmptyNodeConfig(ctx, c.store, c.cfg.State.Prefix, nodeID)
+	return ok
 }
 
 func readExplicitEmptyNodeConfig(ctx context.Context, store StateStore, prefix, nodeID string) (config.NodeConfig, bool) {
+	nc, ok := readPublishedNodeConfig(ctx, store, prefix, nodeID)
+	return nc, ok && len(nc.Services) == 0
+}
+
+// A retained node document is authoritative independently of later fleet
+// publications. Its own immutable copy and unchanged current token prove the
+// document; the fleet pointer need not continue referring to its revision.
+func readPublishedNodeConfig(ctx context.Context, store StateStore, prefix, nodeID string) (config.NodeConfig, bool) {
 	var zero config.NodeConfig
-	data, _, exists, err := store.GetRaw(ctx, legacyNodeConfigKey(prefix, nodeID))
+	key := legacyNodeConfigKey(prefix, nodeID)
+	data, token, exists, err := store.GetRaw(ctx, key)
 	if err != nil || !exists {
 		return zero, false
 	}
 	nc, err := config.ParseNodeConfig(data)
-	if err != nil || nc.Node != nodeID || len(nc.Services) != 0 || nc.Services == nil ||
+	if err != nil || nc.Node != nodeID || nc.Services == nil ||
 		nc.DesiredRevision == "" || nc.PlacementRevision == "" || nc.RenderedRevision == "" {
 		return zero, false
 	}
@@ -226,10 +216,15 @@ func readExplicitEmptyNodeConfig(ctx context.Context, store StateStore, prefix, 
 	if err != nil || !exists || !bytes.Equal(data, immutable) {
 		return zero, false
 	}
-	return nc, true
+	after, afterToken, exists, err := store.GetRaw(ctx, key)
+	return nc, err == nil && exists && afterToken == token && bytes.Equal(data, after)
 }
 
 func confirmedNodeExecutionAbsent(ctx context.Context, store StateStore, prefix string, staleTTL time.Duration, nodeID string) bool {
+	return confirmedServiceExecutionAbsent(ctx, store, prefix, staleTTL, nodeID, "")
+}
+
+func confirmedServiceExecutionAbsent(ctx context.Context, store StateStore, prefix string, staleTTL time.Duration, nodeID, service string) bool {
 	key, err := nodeRecordKey(prefix, nodeID)
 	if err != nil {
 		return false
@@ -244,24 +239,46 @@ func confirmedNodeExecutionAbsent(ctx context.Context, store StateStore, prefix 
 		return false
 	}
 	status, fresh := freshAgentStatus(record, time.Now().UTC(), staleTTL)
-	if !fresh || !statusmodel.HasCompleteActualOnlyInventory(status) || status.ServicesTruncated ||
-		status.DesiredServices != 0 || status.ReadyServices != 0 || len(status.Services) != 0 || len(status.ActualOnlyServices) != 0 {
+	if !fresh {
 		return false
 	}
-	firstConfig, ok := readExplicitEmptyNodeConfig(ctx, store, prefix, nodeID)
-	if !ok || status.DesiredRevision != firstConfig.DesiredRevision ||
-		status.PlacementRevision != firstConfig.PlacementRevision || status.ObservedRevision != firstConfig.RenderedRevision ||
-		status.AppliedRevision != firstConfig.RenderedRevision {
+	firstConfig, ok := readPublishedNodeConfig(ctx, store, prefix, nodeID)
+	if !ok || !serviceExecutionAbsent(status, firstConfig, nodeID, service) {
 		return false
 	}
 	secondToken, exists, err := store.GetJSON(ctx, key, &NodeRecord{})
 	if err != nil || !exists || secondToken != token {
 		return false
 	}
-	secondConfig, ok := readExplicitEmptyNodeConfig(ctx, store, prefix, nodeID)
+	secondConfig, ok := readPublishedNodeConfig(ctx, store, prefix, nodeID)
 	return ok && secondConfig.DesiredRevision == firstConfig.DesiredRevision &&
 		secondConfig.PlacementRevision == firstConfig.PlacementRevision &&
 		secondConfig.RenderedRevision == firstConfig.RenderedRevision
+}
+
+func serviceExecutionAbsent(status statusmodel.AgentStatus, nc config.NodeConfig, nodeID, service string) bool {
+	if !statusmodel.HasCompleteActualOnlyInventory(status) || status.ServicesTruncated || status.NodeID != nodeID ||
+		status.DesiredServices != len(status.Services) || status.DesiredRevision != nc.DesiredRevision ||
+		status.PlacementRevision != nc.PlacementRevision || status.ObservedRevision != nc.RenderedRevision ||
+		status.AppliedRevision != nc.RenderedRevision {
+		return false
+	}
+	if service == "" {
+		return len(nc.Services) == 0 && len(status.Services) == 0 && len(status.ActualOnlyServices) == 0 && status.ReadyServices == 0
+	}
+	for _, desired := range nc.Services {
+		if desired.Name == service {
+			return false
+		}
+	}
+	for _, entries := range [][]statusmodel.ServiceStatus{status.Services, status.ActualOnlyServices} {
+		for _, actual := range entries {
+			if actual.Name == service {
+				return false
+			}
+		}
+	}
+	return true
 }
 
 func (c *Controller) retireNodeRecord(ctx context.Context, observed NodeRecord, observedToken objectstorage.WriteToken, reason string) error {
@@ -309,9 +326,6 @@ func (c *Controller) retireNodeRecord(ctx context.Context, observed NodeRecord, 
 		// A strictly newer registration is allowed to win while pending. Its
 		// generation exceeds the tombstone floor, so readers keep it active.
 		return nil
-	}
-	if err := c.clearStaleNodeQuarantine(ctx, observed.NodeID, token, true); err != nil {
-		return fmt.Errorf("clear node quarantine before deleting registry record: %w", err)
 	}
 	if !c.stillLeader(ctx) {
 		return errors.New("lost leadership before deleting node record")

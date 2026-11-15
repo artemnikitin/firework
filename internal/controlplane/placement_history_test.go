@@ -168,7 +168,7 @@ func TestVisibilityReportsPreviousNodeUnconfirmedUntilV2EmptyProof(t *testing.T)
 				Conditions:         trueBlockingConditions(now),
 			}},
 		},
-		emptyNodeConfigs: map[string]config.NodeConfig{"node-a": {
+		previousNodeConfigs: map[string]config.NodeConfig{"node-a": {
 			Node: "node-a", DesiredRevision: "desired-1", PlacementRevision: "placement-1", RenderedRevision: "rendered-a", Services: []config.ServiceConfig{},
 		}},
 	}

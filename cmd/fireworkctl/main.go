@@ -320,6 +320,9 @@ func runNode(cfg cliConfig, args []string, out io.Writer) error {
 		if response.ActualOnlyServicesTruncated {
 			fmt.Fprintln(w, "ACTUAL-ONLY SERVICES TRUNCATED\tyes")
 		}
+		if response.ActualOnlyServicesIncomplete {
+			fmt.Fprintln(w, "ACTUAL-ONLY INVENTORY INCOMPLETE\tyes")
+		}
 		if len(response.ActualOnlyServices) > 0 {
 			fmt.Fprintln(w, "\nACTUAL-ONLY SERVICE\tVM STATE\tPID\tREASON")
 			for _, service := range response.ActualOnlyServices {

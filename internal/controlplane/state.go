@@ -1,8 +1,6 @@
 package controlplane
 
 import (
-	"crypto/sha256"
-	"encoding/hex"
 	"fmt"
 	"path"
 	"strings"
@@ -113,8 +111,8 @@ type PlacementRevision struct {
 	// they are reported here rather than being invisible.
 	HeldServices []PendingPlacement `json:"held_services,omitempty"`
 	// UnconfirmedPrevious retains old service owners across subsequent
-	// placements until a fresh v2 observation proves their explicit empty
-	// config was applied and no actual-only VM remains. This bounded set keeps
+	// placements until per-service v2 evidence or the retention policy ends
+	// the wait. Removed services remain in this set. This bounded set keeps
 	// a second placement change from forgetting the first possible writer.
 	UnconfirmedPrevious []PreviousPlacementOwner `json:"unconfirmed_previous,omitempty"`
 }
@@ -277,17 +275,6 @@ type NodeRevivalAudit struct {
 	Outcome                string    `json:"outcome"`
 }
 
-// NodeQuarantine projects malformed node records without replacing or
-// deleting the source object. The source object's exact provider token lets a
-// later maintenance pass clear stale quarantine metadata after repair.
-type NodeQuarantine struct {
-	NodeID      string    `json:"node_id"`
-	ObjectToken string    `json:"object_token"`
-	DetectedAt  time.Time `json:"detected_at"`
-	ReasonCode  string    `json:"reason_code"`
-	Message     string    `json:"message"`
-}
-
 // EventDedupeMarker marks a processed event.
 type EventDedupeMarker struct {
 	EventID    string    `json:"event_id"`
@@ -334,22 +321,6 @@ func nodeRevivalAuditKey(prefix, nodeID, timestamp string) (string, error) {
 
 func nodeRevivalAuditsPrefix(prefix, nodeID string) string {
 	return path.Join(stateRoot(prefix), "registry", "node-revivals", nodeID) + "/"
-}
-
-func nodeQuarantineKey(prefix, nodeID string) (string, error) {
-	if strings.TrimSpace(nodeID) == "" || len(nodeID) > statusmodel.MaxVolumeIDLen || strings.Contains(nodeID, "/") {
-		return "", fmt.Errorf("invalid node_id %q", nodeID)
-	}
-	sourceKey, err := nodeRecordKey(prefix, nodeID)
-	if err != nil {
-		return "", err
-	}
-	digest := sha256.Sum256([]byte(sourceKey))
-	return path.Join(stateRoot(prefix), "quarantine", "nodes", hex.EncodeToString(digest[:])+".json"), nil
-}
-
-func nodeQuarantinesPrefix(prefix string) string {
-	return path.Join(stateRoot(prefix), "quarantine", "nodes") + "/"
 }
 
 func desiredRevisionKey(prefix, rev string) string {
