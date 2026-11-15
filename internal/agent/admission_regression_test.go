@@ -23,6 +23,9 @@ func admissionAgent(t *testing.T, yaml string, limit capacity.NodeCapacity, inst
 		cfg.VMSubnet, cfg.VMGateway = subnet, "172.16.0.1"
 	}
 	a := New(cfg, &fakeStore{revision: "r2", data: map[string][]byte{"web": []byte(yaml)}}, testLogger())
+	// Capacity scenarios use a fake VM inventory, independent of host
+	// processes. Real process scanning is covered by status/systemd tests.
+	a.scanUnaccountedVMs = func(context.Context) ([]string, error) { return nil, nil }
 	a.capacityReader = &fakeCapacityReader{cap: limit}
 	m := &recoveryTestVMManager{instances: instances, limit: &limit}
 	a.reconciler = reconciler.NewWithNetworkManager(m, testLogger(), nil, &recoveryTestNetworkManager{}, "", 0)
