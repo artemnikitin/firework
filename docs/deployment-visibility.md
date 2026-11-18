@@ -329,6 +329,10 @@ that waits for capacity, including capacity a quarantined VM keeps, keeps the
 revision reconciling, and its hold says whether the quarantine keeps the
 capacity or the node needs headroom.
 
+When a service has a failing health check and a hold of any kind, its reason
+code stays `health_check_failed`. The message includes excerpts of both the
+health failure and the hold reason within the 256-character limit.
+
 Guest shutdown adds these service-level observations:
 
 - `resource_held` with a `guest_quiesce_required` message means an accepted
@@ -338,9 +342,6 @@ Guest shutdown adds these service-level observations:
   does not count as ready, even with a cached passing health result or no
   configured check. A same-generation withdrawal leaves it stopped; a new
   generation follows the normal VM restart.
-- When a health check is failing too, the code stays `health_check_failed`;
-  the message contains bounded excerpts of both the health failure and hold
-  reason within the 256-character limit.
 
 An ordinary-stop quiesce fallback uses the existing `volume_failed`/volume-error
 channel. The controller may temporarily report that volume's resize state as
