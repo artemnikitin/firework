@@ -199,11 +199,58 @@ store_url: "https://github.com/example/configs.git"
 	if cfg.PollInterval != 30*time.Second {
 		t.Errorf("expected default 30s poll interval, got %v", cfg.PollInterval)
 	}
+	if cfg.GuestApplicationShutdownTimeout != 15*time.Second {
+		t.Errorf("expected default 15s application shutdown timeout, got %v", cfg.GuestApplicationShutdownTimeout)
+	}
+	if cfg.GuestFlushTimeout != 15*time.Second {
+		t.Errorf("expected default 15s guest flush timeout, got %v", cfg.GuestFlushTimeout)
+	}
 	if cfg.FirecrackerBin != "/usr/bin/firecracker" {
 		t.Errorf("expected default firecracker bin, got %s", cfg.FirecrackerBin)
 	}
 	if cfg.LogLevel != "info" {
 		t.Errorf("expected default log level info, got %s", cfg.LogLevel)
+	}
+}
+
+func TestLoadAgentConfig_GuestTimeoutRanges(t *testing.T) {
+	tests := []struct {
+		name    string
+		value   string
+		wantErr bool
+	}{
+		{name: "minimum", value: "1s"},
+		{name: "maximum", value: "5m"},
+		{name: "below minimum", value: "999ms", wantErr: true},
+		{name: "zero", value: "0s", wantErr: true},
+		{name: "above maximum", value: "5m1s", wantErr: true},
+		{name: "negative", value: "-1s", wantErr: true},
+		{name: "malformed", value: "slow", wantErr: true},
+	}
+	for _, key := range []string{"guest_application_shutdown_timeout", "guest_flush_timeout"} {
+		for _, test := range tests {
+			t.Run(key+"/"+test.name, func(t *testing.T) {
+				data := "store_url: https://example.com/config.git\n" + key + ": \"" + test.value + "\"\n"
+				path := filepath.Join(t.TempDir(), "agent.yaml")
+				if err := os.WriteFile(path, []byte(data), 0o600); err != nil {
+					t.Fatal(err)
+				}
+				_, err := LoadAgentConfig(path)
+				if (err != nil) != test.wantErr {
+					t.Fatalf("LoadAgentConfig %s=%s err=%v wantErr=%v", key, test.value, err, test.wantErr)
+				}
+			})
+		}
+	}
+}
+
+func TestLoadAgentConfig_RejectsObsoleteQuiesceTimeout(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "agent.yaml")
+	if err := os.WriteFile(path, []byte("store_url: https://example.com/config.git\nguest_quiesce_timeout: 30s\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := LoadAgentConfig(path); err == nil || !strings.Contains(err.Error(), "guest_quiesce_timeout") {
+		t.Fatalf("obsolete setting was silently ignored: %v", err)
 	}
 }
 

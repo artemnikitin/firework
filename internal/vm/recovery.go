@@ -374,9 +374,13 @@ func (m *Manager) monitorAdopted(name, instanceID string) {
 	for range ticker.C {
 		m.mu.Lock()
 		instance := m.instances[name]
-		if instance == nil || instance.instanceID != instanceID || instance.State != StateRunning {
+		if instance == nil || instance.instanceID != instanceID || (instance.State != StateRunning && instance.State != StateStopping) {
 			m.mu.Unlock()
 			return
+		}
+		if instance.State == StateStopping {
+			m.mu.Unlock()
+			continue
 		}
 		manifest := *instance.manifest
 		m.mu.Unlock()
@@ -386,17 +390,30 @@ func (m *Manager) monitorAdopted(name, instanceID string) {
 			continue
 		}
 		if !errors.Is(err, errProcessNotFound) {
-			m.quarantineIfCurrent(name, instance, instanceID,
-				fmt.Errorf("process identity changed while monitoring: %w", err))
+			if !m.quarantineIfCurrent(name, instance, instanceID,
+				fmt.Errorf("process identity changed while monitoring: %w", err)) {
+				// A stop may have taken ownership during inspection and may
+				// return this same instance to running after a resize refusal.
+				m.mu.Lock()
+				sameInstance := m.instances[name] == instance
+				m.mu.Unlock()
+				if sameInstance {
+					continue
+				}
+			}
 			return
 		}
 
 		m.mu.Lock()
 		m.waitRecoveryPublicationLocked(name)
 		current := m.instances[name]
-		if current != instance || current == nil || current.instanceID != instanceID || current.State != StateRunning {
+		if current != instance || current == nil || current.instanceID != instanceID || (current.State != StateRunning && current.State != StateStopping) {
 			m.mu.Unlock()
 			return
+		}
+		if current.State == StateStopping {
+			m.mu.Unlock()
+			continue
 		}
 		current.State = StateFailed
 		current.exitedOwner = cloneInstanceManifest(current.manifest)

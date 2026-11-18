@@ -50,6 +50,8 @@ Examples:
 | `gcs_project` | no | ADC project | GCP project containing the bucket |
 | `gcs_credentials_file` | no | ADC | Service-account credentials file; omit on GCE |
 | `poll_interval` | no | `30s` | Poll cadence |
+| `guest_application_shutdown_timeout` | no | `15s` | Budget for application shutdown and descendant reaping; `1s` through `5m` |
+| `guest_flush_timeout` | no | `15s` | Separate budget for guest sync and all persistent-volume unmounts together; `1s` through `5m`. The total host wait adds 15s for transport. The obsolete `guest_quiesce_timeout` key is rejected |
 | `firecracker_bin` | no | `/usr/bin/firecracker` | Firecracker binary path |
 | `state_dir` | no | `/var/lib/firework` | Runtime state (VM sockets/logs) |
 | `images_dir` | no | `/var/lib/images` | Local image cache directory |

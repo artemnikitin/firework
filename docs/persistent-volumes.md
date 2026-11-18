@@ -97,15 +97,73 @@ The two numbers are a contract: `destructiveCommandTimeout` in
 `internal/volume` bounds the command, and `TimeoutStopSec` must stay above it.
 Raising one without the other reopens the gap.
 
-### Guest data is not flushed before a microVM is stopped
+### Guest quiesce before stopping a microVM
 
-Stopping a microVM — including every service update and every volume resize,
-which are implemented as stop-then-start — terminates the Firecracker process
-without a guest-side shutdown. The ext4 journal keeps the filesystem
-consistent, but application data still in the guest page cache is lost.
-Workloads with persistent volumes should be configured to fsync data they
-cannot afford to lose. A guest quiesce channel is tracked in
-[#49](https://github.com/artemnikitin/firework/issues/49).
+The guest `fc-init` remains root as PID 1 and starts the application as a child
+with the configured user, primary group, argv, environment and working directory.
+Directory setup happens only in the child, while privileged, before dropping
+credentials; PID 1 never holds an application volume as its working directory.
+It forwards signals to the immediate child, reaps adopted descendants, and listens
+for a versioned lifecycle request over Firecracker vsock. Before sync and
+reverse-order unmount, every application descendant must exit and be reaped.
+Each unmount result is checked before the host treats quiesce as successful.
+
+`guest_application_shutdown_timeout` covers application shutdown and reaping.
+`guest_flush_timeout` starts afterwards and covers sync plus every unmount
+together. Each defaults to `15s` and accepts `1s` through `5m`. The total host
+quiesce wait is their sum plus 15s for transport; existing VMM termination timers
+are separate. Existing agent configs inherit both defaults. Custom values must be
+wired into deployed configs. The old branch-only `guest_quiesce_timeout` key is
+rejected. A timeout cannot cancel a blocking guest sync/unmount syscall; only one
+flush job runs at a time, and an expired response cannot authorize resize.
+
+For an ordinary stop or service update, a failed or unavailable guest request
+is reported and the host continues with the existing ownership-validated
+Firecracker termination fallback. That fallback can still lose dirty guest
+data. For an accepted volume resize, Firework requires confirmed guest
+quiesce before removing the old VM or changing its volume image. If quiesce
+fails while the VMM remains live, its actual config and resource claims are
+retained and no host resize, truncation or offline filesystem modification occurs.
+Guest writes and sync can still change the image contents. The revision stays
+incomplete with a named `guest_quiesce_required` service hold. The identical
+revision retries on the next reconcile while unrelated services can progress.
+A rejected shrink and a no-op effective size do not enter this path.
+
+The application may already have exited, and some mounts may already be absent.
+The guest remains available for cleanup retry; the refusal does not restart the
+app, remount volumes or force VM replacement. Cancelling or changing the resize
+clears its old attempt reason. Returning to the applied size at the same
+generation keeps the existing VM if no other setting changes; clearing the
+reason does not restart its app or restore mounts. Control-plane withdrawal
+mints a new generation and triggers the normal VM replacement, using ordinary
+quiesce with termination fallback. At the same applied size, with no pending
+resize transaction, preparation records that generation without running
+filesystem commands or changing the image. Pending transactions still follow
+their existing recovery or quarantine rules. A known application exit continues
+to suppress readiness until that VM is replaced. Existing health
+restarts use the prior actual config and sizes; without a working health check,
+operator action may be needed. An agent restart relies on ordinary ownership
+recovery and a fresh request, without persisted quiesce proof. A VM proven stopped
+or failed can resize on its next start through the existing offline filesystem
+checks, without a previous quiesce confirmation.
+
+Older guest images without the lifecycle listener remain stoppable through
+the ordinary fallback but cannot pass the resize-required quiesce check. Ship
+the agent first, then images with the new guest `fc-init`, then request size
+changes in a later revision. Restart VMs on those images first; combining image
+and size changes still holds the old guest.
+Firework's `firework-gitops-example` builds a bundled `scripts/fc-init/main.go`
+by default, so the [companion port](https://github.com/artemnikitin/firework-gitops-example/issues/34)
+must include protocol version 2 and both timeout fields, or the build must select
+a pinned core binary through `FC_INIT_BIN`. Updating the core agent alone does not update an already published
+guest rootfs.
+
+Quiesce terminates the workload and stops the VM; it is not a reversible,
+process-preserving snapshot. Applications still need to handle termination
+signals and keep their own transaction guarantees for abrupt host failure,
+kernel failure, timeouts, or old guest images. The guest kernel must enable
+`CONFIG_VIRTIO_VSOCKETS=y`, and the host must support Firecracker's vsock
+device.
 
 ### Refused size requests
 
@@ -151,8 +209,11 @@ identify each request explicitly. The runtime compares both size and
 generation, so changing the size can trigger growth or shrink even when the
 generation is unchanged, zero, or omitted. A corrected size at an unchanged
 generation is re-measured rather than inheriting a refusal for a different
-size; reverting to the size already running withdraws the request at any
-generation.
+size. Reverting to the size already running withdraws the request at any
+generation. A generation change still causes the normal VM restart, including
+its ordinary-stop fallback. With no pending resize transaction, preparation at
+the applied size only records the new generation and runs no filesystem tools.
+A same-generation withdrawal keeps the VM when no other runtime setting changes.
 
 `configcheck --node-config <file>` validates the config and warns when it
 declares a volume size with an absent or zero generation. That warning is

@@ -49,7 +49,7 @@ func TestCommandRuntimeBoundaries(t *testing.T) {
 		{
 			command: "agent", targets: linuxReleaseTargets,
 			internalDependencies: []string{
-				"agent", "agentconfig", "api", "capacity", "config", "healthcheck",
+				"agent", "agentconfig", "api", "capacity", "config", "guestlifecycle", "healthcheck",
 				"imagesync", "ingress", "network", "objectstorage", "reconciler",
 				"registryapi", "statusmodel", "store", "traefik", "version", "vm", "volume",
 			},
@@ -71,7 +71,8 @@ func TestCommandRuntimeBoundaries(t *testing.T) {
 				"agentconfig", "config", "enricher", "ingress", "statusmodel", "volume",
 			},
 		},
-		{command: "fc-init", targets: linuxReleaseTargets},
+		{command: "fc-init", targets: linuxReleaseTargets,
+			internalDependencies: []string{"guestlifecycle"}},
 	}
 
 	for _, tt := range tests {
