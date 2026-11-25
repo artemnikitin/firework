@@ -10,6 +10,7 @@ require (
 	github.com/aws/smithy-go v1.24.0
 	github.com/fsouza/fake-gcs-server v1.52.3
 	github.com/go-git/go-git/v5 v5.16.5
+	golang.org/x/oauth2 v0.30.0
 	google.golang.org/api v0.247.0
 	gopkg.in/yaml.v3 v3.0.1
 )
@@ -87,7 +88,6 @@ require (
 	go.opentelemetry.io/otel/trace v1.36.0 // indirect
 	golang.org/x/crypto v0.45.0 // indirect
 	golang.org/x/net v0.47.0 // indirect
-	golang.org/x/oauth2 v0.30.0 // indirect
 	golang.org/x/sync v0.18.0 // indirect
 	golang.org/x/sys v0.38.0 // indirect
 	golang.org/x/text v0.31.0 // indirect

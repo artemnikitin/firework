@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -38,6 +39,8 @@ func (s *VisibilityServer) HTTPServer() (*http.Server, error) {
 	mux.HandleFunc("GET /v1/nodes/{id}", s.auth(s.handleNode))
 	mux.HandleFunc("GET /v1/services", s.auth(s.handleServices))
 	mux.HandleFunc("GET /v1/services/{name}", s.auth(s.handleService))
+	mux.HandleFunc("GET /v1/volumes", s.auth(s.handleVolumes))
+	mux.HandleFunc("GET /v1/volumes/{service}/{volume}", s.auth(s.handleVolume))
 	mux.HandleFunc("GET /login", s.handleLoginPage)
 	mux.HandleFunc("POST /login", s.handleLogin)
 	mux.HandleFunc("POST /logout", s.handleLogout)
@@ -130,6 +133,51 @@ func (s *VisibilityServer) handleService(w http.ResponseWriter, r *http.Request)
 		return
 	}
 	writeJSON(w, http.StatusOK, item)
+}
+
+func (s *VisibilityServer) handleVolumes(w http.ResponseWriter, r *http.Request) {
+	query := r.URL.Query()
+	offset, err := parseNonNegativeQuery(query.Get("offset"), 0)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "offset must be a non-negative integer"})
+		return
+	}
+	limit, err := parseNonNegativeQuery(query.Get("limit"), 0)
+	if err != nil || limit > maxVolumeListLimit {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": fmt.Sprintf("limit must be between 1 and %d", maxVolumeListLimit)})
+		return
+	}
+	state := query.Get("state")
+	if state != "" && !validVolumeLifecycleState(state) {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid volume state"})
+		return
+	}
+	items, err := s.service.Volumes(r.Context(), state, offset, limit)
+	respondVisibility(w, items, err)
+}
+
+func (s *VisibilityServer) handleVolume(w http.ResponseWriter, r *http.Request) {
+	item, found, err := s.service.Volume(r.Context(), r.PathValue("service"), r.PathValue("volume"))
+	if err != nil {
+		respondVisibility(w, nil, err)
+		return
+	}
+	if !found {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "volume not found"})
+		return
+	}
+	writeJSON(w, http.StatusOK, item)
+}
+
+func parseNonNegativeQuery(value string, fallback int) (int, error) {
+	if value == "" {
+		return fallback, nil
+	}
+	parsed, err := strconv.Atoi(value)
+	if err != nil || parsed < 0 {
+		return 0, fmt.Errorf("expected non-negative integer")
+	}
+	return parsed, nil
 }
 
 func respondVisibility(w http.ResponseWriter, value any, err error) {

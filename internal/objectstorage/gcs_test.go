@@ -4,10 +4,14 @@ import (
 	"context"
 	"errors"
 	"io"
+	"net/http"
 	"strings"
 	"testing"
 
+	"cloud.google.com/go/storage"
 	"github.com/fsouza/fake-gcs-server/fakestorage"
+	"golang.org/x/oauth2/google"
+	"google.golang.org/api/option"
 )
 
 func newTestGCSStore(t *testing.T) BlobStore {
@@ -87,6 +91,63 @@ func TestGCSBlobStoreConditionalWrites(t *testing.T) {
 	if err != nil || !exists || string(data) != `{"holder":"two"}` || meta.WriteToken != updated.WriteToken {
 		t.Fatalf("GetBytes = data %q, meta %#v, exists %v, err %v", data, meta, exists, err)
 	}
+}
+
+func TestGCSBlobStoreConditionalDelete(t *testing.T) {
+	ctx := context.Background()
+	server := fakestorage.NewServer(nil)
+	t.Cleanup(server.Stop)
+	server.CreateBucketWithOpts(fakestorage.CreateBucketOpts{Name: "test-bucket"})
+	transport := &generationMatchTransport{next: server.HTTPClient().Transport}
+	httpClient := server.HTTPClient()
+	httpClient.Transport = transport
+	client, err := storage.NewClient(ctx, option.WithHTTPClient(httpClient), option.WithCredentials(&google.Credentials{}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	store := NewGCSBlobStoreFromClient(client, "test-bucket")
+	t.Cleanup(func() { _ = store.Close() })
+	meta, err := store.Put(ctx, "node.json", strings.NewReader(`{"generation":7}`), PutOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	transport.expectedGeneration = string(meta.WriteToken)
+	wrong := WriteToken("999999999")
+	deleted, err := store.DeleteIfMatch(ctx, "node.json", wrong)
+	if err != nil || deleted {
+		t.Fatalf("wrong-token delete = %v, %v; want conflict", deleted, err)
+	}
+	if _, exists, err := store.Head(ctx, "node.json"); err != nil || !exists {
+		t.Fatalf("wrong-token delete removed object: exists %v, err %v", exists, err)
+	}
+	deleted, err = store.DeleteIfMatch(ctx, "node.json", meta.WriteToken)
+	if err != nil || !deleted {
+		t.Fatalf("matching delete = %v, %v", deleted, err)
+	}
+	deleted, err = store.DeleteIfMatch(ctx, "node.json", meta.WriteToken)
+	if err != nil || deleted {
+		t.Fatalf("missing-object delete = %v, %v; want conflict", deleted, err)
+	}
+}
+
+// fake-gcs-server currently ignores delete preconditions. This transport
+// checks the JSON API condition emitted by the Cloud Storage client and
+// supplies the precondition response a conforming endpoint returns.
+type generationMatchTransport struct {
+	next               http.RoundTripper
+	expectedGeneration string
+}
+
+func (t *generationMatchTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	if req.Method == http.MethodDelete && req.URL.Query().Get("ifGenerationMatch") != t.expectedGeneration {
+		return &http.Response{
+			StatusCode: http.StatusPreconditionFailed,
+			Header:     make(http.Header),
+			Body:       io.NopCloser(strings.NewReader(`{"error":{"code":412}}`)),
+			Request:    req,
+		}, nil
+	}
+	return t.next.RoundTrip(req)
 }
 
 func TestGCSBlobStoreRejectsInvalidWriteToken(t *testing.T) {

@@ -73,6 +73,8 @@ jobs:
             path: ./cmd/configcheck/
           - binary: fireworkctl
             path: ./cmd/fireworkctl/
+          - binary: firework-node-maintenance
+            path: ./cmd/nodemaint/
           - binary: fc-init
             path: ./cmd/fc-init/
             env: GOOS=linux GOARCH=arm64

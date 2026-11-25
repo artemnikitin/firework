@@ -83,7 +83,7 @@ func TestQuarantineDoesNotFreezeAppliedRevisionOrRepeatImages(t *testing.T) {
 	s.revision = "three"
 	a.tick(context.Background())
 	status := a.agentStatusSnapshot()
-	if status.AppliedRevision != "three" || status.DesiredServices != 0 || len(status.Services) != 1 || status.Services[0].ReasonCode != "vm_recovery_pending" {
+	if status.AppliedRevision != "three" || status.DesiredServices != 0 || len(status.Services) != 0 || len(status.ActualOnlyServices) != 1 || status.ActualOnlyServices[0].ReasonCode != "vm_recovery_pending" {
 		t.Fatalf("removed quarantine lost or froze revision: %#v", status)
 	}
 	if condition, ok := agentCondition(status, "VMRecoveryReady"); !ok || condition.Status != "false" {

@@ -20,6 +20,7 @@ type StateStore interface {
 	PutRawIfAbsent(ctx context.Context, key string, data []byte, contentType string) (bool, objectstorage.WriteToken, error)
 	PutRawIfMatch(ctx context.Context, key string, expected objectstorage.WriteToken, data []byte, contentType string) (bool, objectstorage.WriteToken, error)
 	Delete(ctx context.Context, key string) error
+	DeleteIfMatch(ctx context.Context, key string, expected objectstorage.WriteToken) (bool, error)
 	ListKeys(ctx context.Context, prefix string) ([]string, error)
 	Close() error
 }
@@ -115,6 +116,10 @@ func (s *blobStateStore) PutRawIfMatch(ctx context.Context, key string, expected
 
 func (s *blobStateStore) Delete(ctx context.Context, key string) error {
 	return s.store.Delete(ctx, key)
+}
+
+func (s *blobStateStore) DeleteIfMatch(ctx context.Context, key string, expected objectstorage.WriteToken) (bool, error) {
+	return s.store.DeleteIfMatch(ctx, key, expected)
 }
 
 func (s *blobStateStore) ListKeys(ctx context.Context, prefix string) ([]string, error) {

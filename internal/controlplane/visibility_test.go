@@ -204,19 +204,19 @@ func TestNodeStorageSummariesUseDurableReservations(t *testing.T) {
 	for _, record := range []VolumeRecord{
 		{
 			LogicalID: "removed/data", Type: config.VolumeTypeLocal, BoundNode: "node-1",
-			DesiredSizeBytes: 20 * config.GiB, AppliedSizeBytes: 30 * config.GiB,
+			DesiredSizeBytes: 20 * config.GiB, AppliedSizeBytes: 30 * config.GiB, ResizeGeneration: 1, ResizeState: VolumeResizePending,
 		},
 		{
 			LogicalID: "other/data", Type: config.VolumeTypeLocal, BoundNode: "node-2",
-			DesiredSizeBytes: 50 * config.GiB,
+			DesiredSizeBytes: 50 * config.GiB, AppliedSizeBytes: 50 * config.GiB, ResizeGeneration: 1, ResizeState: VolumeResizeApplied,
 		},
 		{
 			LogicalID: "shared/data", Type: config.VolumeTypeShared, SharedBackendID: "shared-a",
-			DesiredSizeBytes: 60 * config.GiB,
+			DesiredSizeBytes: 60 * config.GiB, AppliedSizeBytes: 60 * config.GiB, ResizeGeneration: 1, ResizeState: VolumeResizeApplied,
 		},
 		{
 			LogicalID: "shared-other/data", Type: config.VolumeTypeShared, SharedBackendID: "shared-b",
-			DesiredSizeBytes: 80 * config.GiB,
+			DesiredSizeBytes: 80 * config.GiB, AppliedSizeBytes: 80 * config.GiB, ResizeGeneration: 1, ResizeState: VolumeResizeApplied,
 		},
 	} {
 		parts := strings.Split(record.LogicalID, "/")

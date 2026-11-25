@@ -72,6 +72,7 @@ func validTestAgentStatus(nodeID string) *statusmodel.AgentStatus {
 	return &statusmodel.AgentStatus{
 		SchemaVersion: statusmodel.SchemaVersion, NodeID: nodeID, ObservedAt: time.Now().UTC(), Phase: statusmodel.PhaseReady,
 		DesiredServices: 1, ReadyServices: 1,
+		ActualOnlyServices: []statusmodel.ServiceStatus{},
 		Services: []statusmodel.ServiceStatus{{Name: "web", VMState: "running", Health: "healthy", Volumes: []statusmodel.VolumeStatus{
 			{LogicalID: "web/data", Type: "local", State: "prepared", BoundNode: nodeID},
 		}}},

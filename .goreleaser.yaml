@@ -62,6 +62,20 @@ builds:
     ldflags:
       - -s -w -X github.com/artemnikitin/firework/internal/version.Version={{.Version}} -X github.com/artemnikitin/firework/internal/version.Commit={{.ShortCommit}} -X github.com/artemnikitin/firework/internal/version.BuildTime={{.Date}}
 
+  - id: firework-node-maintenance
+    main: ./cmd/nodemaint
+    binary: firework-node-maintenance
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - linux
+      - darwin
+    goarch:
+      - amd64
+      - arm64
+    ldflags:
+      - -s -w -X github.com/artemnikitin/firework/internal/version.Version={{.Version}} -X github.com/artemnikitin/firework/internal/version.Commit={{.ShortCommit}} -X github.com/artemnikitin/firework/internal/version.BuildTime={{.Date}}
+
 archives:
   - id: firework-agent-binaries
     ids:
@@ -91,6 +105,14 @@ archives:
     ids:
       - fireworkctl
     name_template: "fireworkctl-{{ .Os }}-{{ .Arch }}"
+    formats:
+      - binary
+    files: []
+
+  - id: firework-node-maintenance-binaries
+    ids:
+      - firework-node-maintenance
+    name_template: "firework-node-maintenance-{{ .Os }}-{{ .Arch }}"
     formats:
       - binary
     files: []

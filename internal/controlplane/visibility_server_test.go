@@ -125,6 +125,30 @@ func TestVisibilityStatusEndpointReturnsRevisionDerivation(t *testing.T) {
 	}
 }
 
+func TestVisibilityVolumeEndpointsValidateAndProject(t *testing.T) {
+	cfg := validConfigForRole(RoleAPI)
+	store := newBlobStateStore(newMemBlob())
+	server := NewVisibilityServer(cfg, store, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	request := httptest.NewRequest(http.MethodGet, "/v1/volumes?limit=999", nil)
+	recorder := httptest.NewRecorder()
+	server.handleVolumes(recorder, request)
+	if recorder.Code != http.StatusBadRequest {
+		t.Fatalf("invalid limit returned %d: %s", recorder.Code, recorder.Body.String())
+	}
+	request = httptest.NewRequest(http.MethodGet, "/v1/volumes?state=unknown", nil)
+	recorder = httptest.NewRecorder()
+	server.handleVolumes(recorder, request)
+	if recorder.Code != http.StatusBadRequest {
+		t.Fatalf("invalid state returned %d: %s", recorder.Code, recorder.Body.String())
+	}
+	recorder = httptest.NewRecorder()
+	request = httptest.NewRequest(http.MethodGet, "/v1/volumes/db/data", nil)
+	server.handleVolume(recorder, request)
+	if recorder.Code != http.StatusNotFound {
+		t.Fatalf("missing volume returned %d: %s", recorder.Code, recorder.Body.String())
+	}
+}
+
 func TestVisibilityWebUsesServiceObservationAndCapacityBars(t *testing.T) {
 	data, err := visibilityWeb.ReadFile("web/app.js")
 	if err != nil {

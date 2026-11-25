@@ -159,6 +159,21 @@ func (s *gcsBlobStore) Delete(ctx context.Context, key string) error {
 	return nil
 }
 
+func (s *gcsBlobStore) DeleteIfMatch(ctx context.Context, key string, expected WriteToken) (bool, error) {
+	generation, err := strconv.ParseInt(string(expected), 10, 64)
+	if err != nil || generation <= 0 {
+		return false, fmt.Errorf("invalid GCS write token")
+	}
+	err = s.bucket.Object(key).If(storage.Conditions{GenerationMatch: generation}).Delete(ctx)
+	if errors.Is(err, storage.ErrObjectNotExist) || gcsPreconditionFailure(err) {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("conditional delete gs://%s/%s: %w", s.bucket.BucketName(), key, err)
+	}
+	return true, nil
+}
+
 func (s *gcsBlobStore) ListKeys(ctx context.Context, prefix string) ([]string, error) {
 	it := s.bucket.Objects(ctx, &storage.Query{Prefix: prefix})
 	var keys []string
